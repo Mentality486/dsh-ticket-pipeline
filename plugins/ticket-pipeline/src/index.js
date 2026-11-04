@@ -46,6 +46,7 @@ import { createPipelineScanTool } from './tools/pipeline-scan.js'
 import { createPipelineStatusTool } from './tools/pipeline-status.js'
 import { createPipelineCancelTool } from './tools/pipeline-cancel.js'
 import { createPipelineResetTool } from './tools/pipeline-reset.js'
+import { createPipelineDoctorTool } from './tools/pipeline-doctor.js'
 
 export const name = 'ticket-pipeline'
 
@@ -312,6 +313,35 @@ function makeSecretReader (ctx) {
 }
 
 /**
+ * 造一个「只说配没配、绝不返回值」的凭据描述器，供 pipeline_doctor 用。
+ * 宿主 credentials 服务有 describe(ref) 就直接用；没有就用 resolve() 结果映射成布尔。
+ *
+ * @param {any} ctx
+ * @returns {{ describe: (ref: string) => Promise<{ configured: boolean } | undefined> } | null}
+ */
+function makeCredentialsDescriber (ctx) {
+  let credentials = null
+  try {
+    credentials = ctx.get('credentials')
+  } catch {
+    credentials = null
+  }
+  if (!credentials) return null
+  return {
+    async describe (ref) {
+      if (typeof credentials.describe === 'function') {
+        const hit = await credentials.describe(ref)
+        if (hit) return { configured: Boolean(hit.configured) }
+        return { configured: false }
+      }
+      const hit = await credentials.resolve(ref)
+      const value = hit ? (typeof hit === 'string' ? hit : hit.value) : undefined
+      return { configured: Boolean(value) }
+    },
+  }
+}
+
+/**
  * 造一个「读本地文件字节」的函数，供路径形态的截图用。
  *
  * 走 `ctx.fs.resolve(path)` → `ctx.fs.readBytes(target, signal, maxBytes)`，
@@ -529,6 +559,12 @@ export async function apply (ctx, config) {
   }))
   // 人工重开：store.resetByHuman 早就实现了却没有入口，文档承诺的「再跑一次」在生产里走不通。
   ctx.tools.register(createPipelineResetTool({ store }))
+  // 环境体检：把「跑票时才炸」的环境问题（git 链路、仓库、凭据、mock 状态）提前到装完就能看到。
+  ctx.tools.register(createPipelineDoctorTool({
+    gitRunner,
+    getConfig: () => config,
+    credentials: makeCredentialsDescriber(ctx),
+  }))
 
   // ── 5. 启动恢复 ───────────────────────────────────────
   try {

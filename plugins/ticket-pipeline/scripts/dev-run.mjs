@@ -30,6 +30,7 @@ import { fingerprintOf } from '../src/contracts/types.js'
 import { validateConfig, describeConfig } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
 import { createPipelineResetTool } from '../src/tools/pipeline-reset.js'
+import { createPipelineDoctorTool } from '../src/tools/pipeline-doctor.js'
 import { sanitizeBranchName } from '../src/core/branch-name.js'
 import { pushplusOptionsFromConfig } from '../src/adapters/push-pushplus/index.js'
 import { runFeishuChecks } from './feishu-checks.mjs'
@@ -860,6 +861,45 @@ async function main () {
     assert.equal(store.getTicket(k('rec-mock-001')).phase, 'done', '拒绝时不能把 done 票动成 pending')
   })
 
+  section('11.5 pipeline_doctor：环境体检')
+
+  await check('pipeline_doctor 全绿：git 可用 + 仓库正常 + 凭据齐', async () => {
+    const tool = createPipelineDoctorTool({
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      credentials: { describe: async (ref) => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, true, `应该全绿：${out.text}`)
+    assert.equal(out.problems.length, 0)
+    assert.equal(out.warnings.length, 0)
+  })
+
+  await check('pipeline_doctor 报 git 不可用 + 占位 remote + mock 提醒', async () => {
+    const tool = createPipelineDoctorTool({
+      gitRunner: async () => ({ code: 1, stdout: '', stderr: 'fatal: not a git repository' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/nope', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'mock', pushAdapter: 'mock' }),
+      credentials: null,
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false, '有问题时必须不是 ok')
+    assert.ok(out.problems.length > 0, '要有 problems')
+    assert.ok(out.text.includes('占位符'), '占位 remote 要点名')
+    assert.ok(out.text.includes('mock'), 'mock 状态要提醒')
+  })
+
+  await check('pipeline_doctor 在 gitRunner 缺席时给出明确指引', async () => {
+    const tool = createPipelineDoctorTool({
+      gitRunner: null,
+      getConfig: () => ({ projects: [] }),
+      credentials: null,
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false)
+    assert.ok(out.text.includes('git'), '要点出 git 不可用')
+    assert.ok(out.text.includes('projects 为空') === false || out.warnings.length > 0, '空项目要提醒')
+  })
+
   section('12. 组合根接线：工具真的注册进 ctx、真的拿到 store')
 
   await check('apply() 注册四个工具，pipeline_reset 接的是同一个 store', async () => {
@@ -872,7 +912,7 @@ async function main () {
     await apply(ctx, config)
 
     const byName = new Map(registered.map((tool) => [tool.name, tool]))
-    for (const toolName of ['pipeline_scan', 'pipeline_status', 'pipeline_cancel', 'pipeline_reset']) {
+    for (const toolName of ['pipeline_scan', 'pipeline_status', 'pipeline_cancel', 'pipeline_reset', 'pipeline_doctor']) {
       assert.ok(byName.has(toolName), `${toolName} 应该被注册进来，实际注册了：${[...byName.keys()].join(', ')}`)
     }
 
