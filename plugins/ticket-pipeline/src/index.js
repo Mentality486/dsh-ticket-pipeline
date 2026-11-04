@@ -743,6 +743,9 @@ export async function apply (ctx, config) {
     gitRunner,
     getConfig: () => config,
     credentials: makeCredentialsDescriber(ctx),
+    // 基准分支猜错 = fetch 直接失败（fatal: couldn't find remote ref main），
+    // 所以体检时就把「实际会用的分支」显出来，而不是等第一张票跑挂。
+    detectBaseBranch: (runner, repoPath) => detectBaseBranch(runner, repoPath, log),
   }))
 
   // ── 5. 启动恢复 ───────────────────────────────────────

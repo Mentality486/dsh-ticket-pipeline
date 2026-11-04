@@ -888,6 +888,37 @@ async function main () {
     assert.ok(out.text.includes('mock'), 'mock 状态要提醒')
   })
 
+  await check('pipeline_doctor 会显示自动识别出的基准分支，并在回退 main 时提醒', async () => {
+    // 分支名猜错是这个插件最贵的一种错：fetch 第一步就失败，错误里看不出是分支名问题。
+    const base = {
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
+      credentials: { describe: async () => ({ configured: true }) },
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+    }
+
+    const detected = createPipelineDoctorTool({ ...base, detectBaseBranch: async () => 'v2.x' })
+    const out1 = await detected.execute({}, {})
+    assert.ok(out1.text.includes('基准分支 v2.x'), `要显示识别出的分支：${out1.text}`)
+    assert.equal(out1.ok, true, '识别成功不该算问题')
+
+    const fallback = createPipelineDoctorTool({ ...base, detectBaseBranch: async () => 'main' })
+    const out2 = await fallback.execute({}, {})
+    assert.ok(out2.warnings.some((w) => w.includes('repo.baseBranch')), '回退 main 必须提醒去显式配置')
+  })
+
+  await check('pipeline_doctor 显式配了 repo.baseBranch 就不再去识别', async () => {
+    let called = false
+    const tool = createPipelineDoctorTool({
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
+      credentials: { describe: async () => ({ configured: true }) },
+      detectBaseBranch: async () => { called = true; return 'main' },
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git', baseBranch: 'v2.x' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(called, false, '配置写了就不该再猜')
+    assert.ok(out.text.includes('基准分支 v2.x'), '要显示配置里的分支')
+  })
+
   await check('pipeline_doctor 在 gitRunner 缺席时给出明确指引', async () => {
     const tool = createPipelineDoctorTool({
       gitRunner: null,

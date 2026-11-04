@@ -115,7 +115,25 @@ export function createPipelineDoctorTool (options) {
           warnings.push(`项目 ${name}：repo.remote 还是占位符（${remote}）——需要换成真实 GitLab 地址。`)
           remoteNote = '（占位符！）'
         }
-        lines.push(`${mark} 项目 ${name}（${platform}）：仓库 ${path}${exists ? '' : ' ⚠️ 不可用'}${remoteNote}`)
+        // 基准分支：没显式配就去仓库里认，认不出来要说清（猜错分支 = fetch 直接失败）。
+        let branchNote = ''
+        const configuredBase = typeof repo.baseBranch === 'string' ? repo.baseBranch.trim() : ''
+        if (exists) {
+          if (configuredBase.length > 0) {
+            branchNote = `，基准分支 ${configuredBase}`
+          } else if (typeof options.detectBaseBranch === 'function') {
+            try {
+              const detected = await options.detectBaseBranch(options.gitRunner, path)
+              branchNote = `，基准分支 ${detected}（自动识别，建议写进 repo.baseBranch）`
+              if (detected === 'main') {
+                warnings.push(`项目 ${name}：仓库里认不出主干分支，回退到 main —— 若主干不叫 main，fetch 一定失败，请显式配 repo.baseBranch。`)
+              }
+            } catch {
+              branchNote = '，基准分支未知'
+            }
+          }
+        }
+        lines.push(`${mark} 项目 ${name}（${platform}）：仓库 ${path}${branchNote}${exists ? '' : ' ⚠️ 不可用'}${remoteNote}`)
       }
 
       // ── 3. 凭据 ──────────────────────────────────────
