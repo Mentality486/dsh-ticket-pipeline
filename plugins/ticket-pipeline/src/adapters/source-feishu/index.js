@@ -687,16 +687,46 @@ export function createFeishuSource (options = {}) {
    * @param {AbortSignal} [signal] 调用方的取消信号（B5）
    * @returns {Promise<{ appToken: string, tableId: string }>}
    */
+  /**
+   * 把配置里的 appToken 归一成 bitable 的 app_token。
+   *
+   * 用户常把 wiki 链接（或 wiki token）直接贴进来 —— wiki 里的多维表格，
+   * 它的 app_token 不是 wiki token 本身，要调 get_node 换算出 obj_token。
+   * 支持：完整 wiki/base URL、wiki token、原生 app_token（原样返回）。
+   */
+  async function normalizeAppToken (signal) {
+    let token = String(appToken ?? '').trim()
+    // 完整 URL：/wiki/<token> 或 /base/<token> —— 直接抠出 token。
+    const urlMatch = token.match(/(?:\/wiki\/|\/base\/)([A-Za-z0-9]+)/)
+    if (urlMatch) token = urlMatch[1]
+    if (!/^wiki/i.test(token)) return token // 原生 app_token，原样返回
+    const payload = await apiCall('/open-apis/wiki/v2/spaces/get_node', {
+      query: { token, obj_type: 'bitable' },
+      signal,
+    })
+    const node = payload?.data?.node
+    const objToken = String(node?.obj_token ?? '')
+    if (!objToken) {
+      throw new PipelineError(
+        'invalid-input',
+        `wiki 节点 ${token} 换算不出多维表格（obj_token 为空）。请确认这个链接指向的是一张多维表格，且应用有该知识库的阅读权限。`,
+      )
+    }
+    return objToken
+  }
+
   async function resolveTable (signal) {
     if (tableCache) return tableCache
 
-    if (appToken && tableId) {
-      tableCache = { appToken, tableId }
+    const resolvedAppToken = await normalizeAppToken(signal)
+
+    if (resolvedAppToken && tableId) {
+      tableCache = { appToken: resolvedAppToken, tableId }
       return tableCache
     }
 
-    if (appToken) {
-      const payload = await apiCall(`/open-apis/bitable/v1/apps/${appToken}/tables`, { query: { page_size: 100 }, signal })
+    if (resolvedAppToken) {
+      const payload = await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 100 }, signal })
       const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
       const matched = docNamePattern
         ? items.filter((item) => matchesPattern(String(item?.name ?? ''), docNamePattern))
@@ -708,7 +738,7 @@ export function createFeishuSource (options = {}) {
             + `现有表：${items.map((item) => String(item?.name ?? '?')).join('、') || '（空）'}`,
         )
       }
-      tableCache = { appToken, tableId: String(matched[0].table_id) }
+      tableCache = { appToken: resolvedAppToken, tableId: String(matched[0].table_id) }
       return tableCache
     }
 

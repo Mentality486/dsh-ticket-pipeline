@@ -178,6 +178,14 @@ function createFakeServer (options = {}) {
       return jsonResponse({ code: 0, data: { items: state.tables } })
     }
 
+    if (path.includes('/wiki/v2/spaces/get_node')) {
+      const token = new URL(url, 'http://x').searchParams.get('token') ?? ''
+      return jsonResponse({
+        code: 0,
+        data: { node: { obj_type: 'bitable', obj_token: `btplNormal-${token}` } },
+      })
+    }
+
     if (path.includes('/open-apis/drive/v1/medias/')) {
       return binaryResponse(PNG_BYTES, 'image/png')
     }
@@ -467,6 +475,42 @@ export async function runFeishuChecks (check) {
       () => source.scan(new AbortController().signal),
       (error) => error.kind === 'invalid-input' && /匹配到 0 张表/.test(error.message),
     )
+  })
+
+  await check('wiki 链接形式的 appToken 会先换算成 obj_token 再访问表', async () => {
+    const server = createFakeServer({
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://vcn6ijgss3oy.feishu.cn/wiki/WIKITOKEN123?fromScene=spaceOverview',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    const nodeRequest = server.requests.find((r) => r.url.includes('/wiki/v2/spaces/get_node'))
+    assert.ok(nodeRequest, '应该调 wiki get_node 换算')
+    assert.ok(nodeRequest.url.includes('token=WIKITOKEN123'), '应该把 URL 里抠出的 wiki token 传给 get_node')
+    const tablesRequest = server.requests.find((r) => /\/bitable\/v1\/apps\/[^/]+\/tables/.test(r.url))
+    assert.ok(tablesRequest, '应该调 tables')
+    assert.ok(tablesRequest.url.includes('btplNormal-WIKITOKEN123'), '应该用换算出的 obj_token 访问表')
+  })
+
+  await check('wiki token（非 URL）也能换算', async () => {
+    const server = createFakeServer({
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'wikiWIKITOKEN456',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    const tablesRequest = server.requests.find((r) => /\/bitable\/v1\/apps\/[^/]+\/tables/.test(r.url))
+    assert.ok(tablesRequest?.url.includes('btplNormal-wikiWIKITOKEN456'), 'wiki token 应换算成 obj_token')
   })
 
   await check('docNamePattern 恰好命中 1 张表就用它', async () => {
