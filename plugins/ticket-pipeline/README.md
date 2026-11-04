@@ -1,6 +1,9 @@
 # 工单流水线（ticket-pipeline）
 
-从工单表检测变化 → 定位代码 → 改动验证 → 开 draft MR → 微信推送。一个 DSH Host 插件。
+从工单表检测变化 → 定位代码 → 改动验证 → 开 draft MR → 邮箱/微信推送。一个 DSH Host 插件。
+
+> 📖 **怎么用？** 看 [使用手册](../../docs/ticket-pipeline/user-guide.md) ——
+> 从准备工单表、配凭据、装插件，到 mock 首跑、切真执行、日常循环与排障，全流程一步步讲。
 
 ## 一句话架构
 
@@ -66,7 +69,11 @@ src/
 
 ## 安装
 
-只能走 `plugin_manager install_bundle`（target = 本目录绝对路径，等价 `file:<abs>`）。
+> 完整的分步流程（含凭据申请、配置示例、mock 首跑、日常循环、排障）见
+> **[使用手册 §2-§5](../../docs/ticket-pipeline/user-guide.md)**。
+
+只能走 `plugin_manager install_bundle`（target = 本目录绝对路径，等价 `file:<abs>`），
+或直接 `dsh.cmd plugin --profile desktop add "file:<本目录绝对路径>"`。
 **不要手改 profile 的 `cordis.patch.yml` / `package.json`。**
 
 装上后总开关 `enabled` 默认是 **`false`** —— 不会自动扫表、建工作区、开 MR。
