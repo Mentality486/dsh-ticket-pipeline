@@ -161,7 +161,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
 | `repo.path` | 本地 git 检出根目录（**必填**） |
 | `repo.remote` | GitLab remote URL（开 MR 用） |
-| `repo.baseBranch` | 切 worktree 的基准分支（默认 `main`） |
+| `repo.baseBranch` | 切 worktree 的基准分支。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上 |
 | `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接开 draft MR** |
 
 ---
@@ -237,6 +237,11 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 - AI 只被授权改 worktree 里的代码 + 跑 `verify` 配置的命令；**敏感文件**（`application.yml`/`.env`/`*.pem`/`*secret*`）不会被提交
 - 凭据全部走 DSH credentials 存储，不落配置文件、不出现在错误信息里
 - 只开 **Draft MR**，不 push 分支到远端、不合 MR —— 合并权永远在人手上
+- **插件里的 `git` 与 `verify` 命令以完整文件系统权限执行**。这不是疏忽，是宿主沙箱的硬约束：
+  插件不是会话，调宿主 shell 时拿不到会话的写入授权，不显式声明 `danger-full-access` 就写不了
+  `.git`（连 `git fetch` 都会 `Permission denied`）。所以这条旁路**只给 git 和 verify 用**，
+  不用于执行工单正文里出现的任何命令。代价是你需要知道：跑票期间这两个子进程能写你的整台机器。
+  详见 `docs/ticket-pipeline/architecture.md` §12.1
 
 ---
 
@@ -244,7 +249,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 154 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 175 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -273,6 +278,18 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 **Q：AI 会直接动我的 main 分支吗？**
 不会。每票一个独立 worktree + 独立分支（`<branchPrefix>...`），最终产物是 Draft MR。
+
+**Q：报 `git fetch 失败：couldn't find remote ref main` 怎么办？**
+你的仓库主分支不叫 `main`。插件会自动识别（`origin/HEAD` → 当前分支），但显式写上更稳：
+在项目配置里加 `repo.baseBranch: "v2.x"`（换成你的真实分支名）。跑 `pipeline_doctor` 能看到它实际用的分支。
+
+**Q：报 `git fetch 失败：cannot open '.git/FETCH_HEAD': Permission denied` 怎么办？**
+这是旧版本的行为（插件没给 shell 带沙箱策略，拿不到写授权）。更新到最新版即可；
+若仍出现，确认安装副本已同步、且宿主**完全重启**过（页面刷新不算，模块有进程内缓存）。
+
+**Q：`pipeline_status` 报 `value is not lossless JSON` 怎么办？**
+同样是旧版本的 bug（工具输出里残留 `undefined`，宿主判整次调用失败）。最新版已在
+`defineTool` 层统一剥掉 `undefined`，更新并重启即可。
 
 ---
 
