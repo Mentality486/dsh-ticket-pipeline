@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
-> 状态：设计定稿（对应地图票 #10）
-> 日期：2026-11-03
+> 状态：设计定稿（对应地图票 #10）；§12A 安全与权限边界按 2026-11-04 的代码状态补写
+> 日期：2026-11-03（§4 / §7.2 / §12A 于 2026-11-04 按实现回填）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -21,6 +21,7 @@
 10. [可替换点（文件级）](#10-可替换点文件级)
 11. [一次完整跑的时序](#11-一次完整跑的时序)
 12. [已知约束与未决](#12-已知约束与未决)
+12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
 ---
@@ -65,8 +66,8 @@
               │TicketSource│ │RepoLocator│ │WorkExec│ │PushAdapter│
               └─────┬──────┘ └─────┬─────┘ └──┬─────┘ └┬──────────┘
                     │              │          │        │
-              飞书 / WPS / xlsx   projects[]   agent    PushPlus
-              / mock             查表         + MR      / 企微 / mock
+              飞书 / WPS         projects[]   agent    PushPlus
+              / mock             查表         + MR      / mock
 ```
 
 内核**四个接口都要用，一个都不实现**。它不知道飞书长什么样、不知道 GitLab 的 URL 怎么拼、不知道该改哪个文件。它只知道：拿到票 → 建工作区 → 让执行器干活 → 把结果推出去 → 记住进度。
@@ -106,26 +107,41 @@
 一个 DSH Host 插件（Cordis 插件），随 Harness 进程常驻。`apply(ctx, config)` 里：
 
 ```js
-export const name = 'dsh-ticket-pipeline'
-export const inject = ['timer', 'agents', 'worktrees', 'storage', 'credentials', 'tools', 'commands']
+export const name = 'ticket-pipeline'
+// 硬依赖只有两个：没有 tools 和 storageDomain，插件本身就没有意义。
+export const inject = ['tools', 'storageDomain']
 
-export function apply (ctx, config) {
-  // 1. 组装：注册表 → 拿四个实现
-  // 2. 建内核：Scheduler + TicketStore
-  // 3. 注册工具与命令：pipeline_scan / pipeline_status
-  // 4. 启动单飞定时器：ensureTimer()
-  // 5. 启动恢复：扫描未完成 phase 的票
+export async function apply (ctx, config) {
+  // 1. 持久化：ctx.storageDomain.open(...) → TicketStore
+  // 2. 适配器：projects[] → sources[]、locator、executor、push
+  // 3. 内核：createScheduler({ store, sources, locator, executor, push, ... })
+  // 4. 注册四个工具：pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset
+  // 5. 启动恢复：recoverPending()，把跑到一半的票从当前 phase 接着走
+  // 6. 注册 ctx.interval 轮询（enabled 关着时 tick 直接返回 disabled）
 }
 ```
 
 所有注册都用 `ctx.effect()` / 返回 disposer 的形式 —— 插件卸载时定时器、监听器、agent 句柄一起收干净。
+
+**`inject` 为什么只有两个**（见 [`src/index.js:61`](../../plugins/ticket-pipeline/src/index.js)）：
+
+| 宿主服务 | 取法 | 为什么 |
+|---|---|---|
+| `tools` | `inject` | 注册四个工具，缺了插件没有入口 |
+| `storageDomain` | `inject` | 票据 / 水位 / 租约三张表都在这上面 |
+| `subprocess` | `ctx.get('subprocess')` | 只有「要跑 git」时才需要；取不到就跳过建工作区、不挂清理 |
+| `credentials` | `ctx.get('credentials')` | 凭据可能还没配，缺了应该让飞书那一路报 `auth`，不该让整个插件挂载失败 |
+| `fs` | `ctx.get('fs')` | 只有路径形态的截图要读本地字节 |
+| `attachments` | `ctx.get('attachments')` | 离线自测没有附件库，`saveImage` 要能降级成 `undefined` |
+
+惰性取的共同理由：这几个服务「缺了也要能装得上」，否则一个平台的环境问题会连带把其它平台拖死。代价是缺服务时只在运行期暴露 —— 所以每个 `ctx.get()` 都写了降级分支，并用日志说清降级到了哪一步。
 
 ### 4.2 什么时候跑
 
 | 触发 | 方式 | 说明 |
 |---|---|---|
 | 定时扫描 | `ctx.interval(() => tick(), Config.pollIntervalMinutes * 60_000)` | **唯一默认入口**，默认 3 分钟 |
-| 手动扫描 | 工具 `pipeline_scan` / 命令 `/pipeline-scan` | 直接调 `tick()`，返回本轮结论 |
+| 手动扫描 | 工具 `pipeline_scan` | 直接调 `tick()`，返回本轮结论 |
 | 启动恢复 | `apply` 末尾扫一遍 `TicketStore` | 未到终态的票从当前 phase 接着走 |
 | 外部事件 | 适配器可选 `onExternalChange()` | 不支持就不实现，内核只轮询 |
 
@@ -154,6 +170,17 @@ async function tick () {
 
 - 内存布尔 `running` —— 防同进程内定时器重入
 - 存储层租约 —— 防多个 Harness 窗口抢同一张票（见 §6.5）
+
+**四个工具**（都注册在 `apply` 里，见 [`src/index.js`](../../plugins/ticket-pipeline/src/index.js)）：
+
+| 工具 | 作用 | 关键边界 |
+|---|---|---|
+| `pipeline_scan` | 立刻推一轮 | 不绕过单飞，正在跑时返回 `already-running`；不动 `enabled` |
+| `pipeline_status` | 只读查队列与历史 | 不改任何状态 |
+| `pipeline_cancel` | 取消当前在跑的那一票 | 落 `failed` + `lastError='cancelled by user'`，**不通知**，工作区保留；空闲时返回 `cancelled:false` |
+| `pipeline_reset` | 人工重开一张卡住的票 | 只对 `failed` / `needs-info` / `gone` 生效；同名 recordId 冲突时要求补 `projectId`，不猜 |
+
+`pipeline_reset` 与「把表格里『是否处理』拨走再拨回『处理中』」是**同一个底层动作**（`store.resetByHuman`），区别只在于一个在表格里做、一个在插件里做。
 
 ---
 
@@ -495,26 +522,51 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 
 ### 7.2 转移表
 
-| 从 | 到 | 触发 | 副作用 |
+**以代码为准**：[`PHASE_TRANSITIONS`](../../plugins/ticket-pipeline/src/contracts/types.js)（`src/contracts/types.js` 第 57–71 行）。
+下表逐格抄自它；`TicketStore.setPhase` 拿它当闸门 —— 表外的转移一律拒绝并记日志（`store.js` 的 `setPhase`）。
+
+**先看入口**。状态机的输入是 `scan()` 的三类结果（§5.2）：
+
+- `scan.created` → `pending`：落库、入队尾、写 `WatermarkRow`。
+- `scan.updated`（指纹变）→ `pending`：`revisionCount++`、移队尾、**不打断当前运行**。
+  若该票已在 `done` / `skipped` / `gone`，走的是**复活**（直接入队回 `pending`、`attempt = 0`），不是表里的边。
+- `scan.disappeared`（连续 `goneAfterScans` 轮没扫到）→ `gone`：静默退役、不通知。
+
+**转移表**（左列 = 从哪来，中列 = 表里允许的去处，含自环）：
+
+| 从 | 允许到 | 谁触发 | 副作用 |
 |---|---|---|---|
-| — | `pending` | `scan.created` | 落库、入队尾、写 `WatermarkRow` |
-| `pending` | `pending` | `scan.updated`（指纹变） | `revisionCount++`、移队尾、**不打断当前运行** |
-| `pending` | `worktree-ready` | fetch + `worktrees.create` 成功 | 记 `worktreePath`/`branch`/`baseCommit` |
+| `pending` | `pending` · `worktree-ready` · `needs-info` · `gone` · `failed` | 修订打点 / 建工作区 / 截图取不到 / 行被删 / 早期失败 | 见下三行 |
+| `pending` | `worktree-ready` | `prepareWorkspace` 成功（未注入它时也会推进） | 回填并记 `worktreePath`/`branch`/`baseCommit` |
 | `pending` | `needs-info` | `loadScreenshot` 抛错 | 通知人补图、释放租约、**不标 failed** |
-| `pending` | `gone` | `scan.disappeared`（连续 `goneAfterScans` 轮） | 静默退役、释放租约 |
-| `needs-info` | `pending` | 下一轮 `scan.updated` 且指纹变了 | 指纹变才回到队里，否则继续等人 |
-| `worktree-ready` | `planning` | 起 agent 并 `followup` | 起超时定时器、抢租约、`startedAt = now` |
-| `planning` | `editing` | agent 报「定位完成、开始改」 | 存 `Plan` |
-| `editing` | `testing` | agent 报「改完了」 | 存 `changedFiles` |
-| `testing` | `mr-opening` | 构建/测试有结论 | 存 `testOutcome`、`testDetail` |
-| `mr-opening` | `done` | MR 创建成功且 `testOutcome ≠ skipped` | 存 `mr`、发通知、释放租约、清超时定时器 |
-| `mr-opening` | `skipped` | MR 创建成功且 `testOutcome = skipped` | 同上，通知里写明为什么没测 |
-| 任意非终态 | `failed` | 超时（见下） | `agent.cancel()`、通知、**保留 worktree**、释放租约 |
-| 任意非终态 | `failed` | 不可重试错误（`auth`/`not-found`/`invalid-input`） | 通知、保留 worktree、释放租约 |
-| 任意非终态 | `failed` | 可重试错误且 `attempt ≥ maxAttempts` | 同上 |
-| 任意非终态 | `pending` | 可重试错误且 `attempt < maxAttempts` | `attempt++`、回队首、**保留 worktree** |
-| `failed` | `pending` | 人工重置：表格里「是否处理」由非处理中 → 处理中 | `attempt = 0`、清 `lastError`、回队首 |
-| `done` / `skipped` | `done` | 表格里「是否处理」= `是` | **以表格为准**，幂等，不改任何东西 |
+| `pending` | `gone` | 连续 `goneAfterScans` 轮没扫到 | 静默退役、释放租约 |
+| `needs-info` | `pending` · `gone` · `failed` | 人在表格里改了内容 / 行被删 / 人工重开后重跑失败 | 指纹变才回到队里，否则继续等人 |
+| `worktree-ready` | `worktree-ready` · `planning` · `pending` · `failed` | 重打点 / 开工 / 工作区丢了回队列 / 失败 | 开工时起超时定时器、`startedAt = now` |
+| `planning` | `planning` · `editing` · `worktree-ready` · `pending` · `failed` | agent 报「定位完成」/ 要重建工作区 / 可重试错误回队 / 失败 | 存 `Plan` |
+| `editing` | `editing` · `testing` · `planning` · `worktree-ready` · `pending` · `failed` | agent 报「改完了」/ 验证不通过退回重做 | 存 `changedFiles` |
+| `testing` | `testing` · `mr-opening` · `done` · `skipped` · `planning` · `worktree-ready` · `pending` · `failed` | 构建/测试有结论；或退回重做 | 存 `testOutcome`、`testDetail` |
+| `mr-opening` | `mr-opening` · `done` · `skipped` · `planning` · `worktree-ready` · `pending` · `failed` | MR 开成功 / 开之前发现问题退回 | 存 `mr`、发通知、释放租约、清超时定时器 |
+| `done` | `done` | 幂等重打点 | 不改任何东西；**终态一旦落下就不再退回**（要重跑只能靠复活） |
+| `skipped` | `skipped` | 同上 | 同上 |
+| `failed` | `failed` · `pending` | 幂等重打点 / **人工重开** | 人工重开：`attempt = 0`、清 `lastError`、回队首 |
+| `gone` | `gone` | 幂等重打点 | 行真回来了走「复活」，不是这条边 |
+
+**两类恢复边**——这张表比「一条直线」宽的原因（注释在 `types.js` 里）：
+
+1. **自环**（`X → X`）：恢复时把票留在原地再打一次点，语义不变。
+2. **回退到 `worktree-ready` / `planning`**：工作区丢了要重建，或上一轮改到一半要重做。
+   没有这两类边，坏数据恢复会被静默拒绝，票会永远卡在中间态。
+
+**「任意非终态 → `failed`」在代码里并不是一条通配边**：`failed` 之所以能从每个中间态到达，是因为上表每个中间态那一行都列了 `failed`。
+超时 / 不可重试错误（`auth`/`not-found`/`invalid-input`）/ 可重试错误且 `attempt ≥ maxAttempts` 这三种情况都落到 `failed`，
+差别在副作用：**保留 worktree**、发通知、释放租约；超时还要先 `agent.cancel()`。
+而可重试错误且 `attempt < maxAttempts` 走的是**回 `pending`**（`attempt++`、回队首、同样保留 worktree）。
+
+**回退路径**（`recover.js`，§7.6）：`worktreePath` 不在时优先退到 `worktree-ready`；
+若当前 phase 不允许（实际不会发生，上表每个中间态都允许），再退一步回 `pending` 并清掉工作区坐标。
+
+**人工重开有两个入口、同一个动作**（`store.resetByHuman`）：表格里「是否处理」由非处理中 → 处理中，
+或直接调 `pipeline_reset` 工具（§4.3）。
 
 ### 7.3 非法转移（实现时必须拒绝并记日志）
 
@@ -698,11 +750,15 @@ src/
 │   ├── source-feishu/             ← 飞书多维表格（票 12）
 │   ├── source-wps/                ← 金山文档（第二平台，暂不实现）
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
-│   ├── executor-agent/            ← agent 驱动 + 构建 / 单测 / 起后端 + 开 MR
+│   ├── executor-agent/            ← agent 驱动 + 构建 / 单测 / 起后端 + 开 MR（目前是占位实现）
+│   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端（executor-agent 落地时使用）
 │   └── push-pushplus/             ← PushPlus channel=clawbot
 ├── tools/
 │   ├── pipeline-scan.js           ← 工具 pipeline_scan
-│   └── pipeline-status.js         ← 工具 pipeline_status（只读查询队列与历史）
+│   ├── pipeline-status.js         ← 工具 pipeline_status（只读查询队列与历史）
+│   ├── pipeline-cancel.js         ← 工具 pipeline_cancel（人工取消在跑的那一票）
+│   ├── pipeline-reset.js          ← 工具 pipeline_reset（人工重开 failed / needs-info / gone）
+│   └── define.js                  ← 工具定义的最小封装（名字校验、文本块渲染）
 └── index.js                       ← 组合根：注册表 + apply
 ```
 
@@ -734,6 +790,8 @@ const PUSHES    = { mock: createMockPush, pushplus: createPushplus }
 > 删掉 `src/adapters/source-feishu/` 整个目录 + `src/index.js` 里那个 import 和表里那一行，
 > 插件仍能构建、仍能用 `projects: [{ name:'demo', match:{ platform:'mock' }, repo:{ path:'...' } }]` 跑通整条链路。
 
+> 静态注册表背后的取舍写在 [ADR 0001：平台适配层可插拔](../adr/0001-平台适配层可插拔.md)；错误模型见 [ADR 0002：PipelineError 错误模型](../adr/0002-PipelineError错误模型.md)；工单正文不可信的边界见 [ADR 0003：工单正文不可信](../adr/0003-工单正文不可信.md)。术语表在仓库根 [GLOSSARY.md](../../GLOSSARY.md)。
+
 做不到就说明边界漏了 —— 有内核代码直接引用了飞书的细节，或者适配器之间互相 import 了。
 
 ---
@@ -756,18 +814,25 @@ T+0:01  drainOne() 取出票A（并发 1，一轮只跑一票）
         ├─ locate = locator.locate(票A)  → { repoPath, baseBranch, targetBranch,
         │                                    candidatePaths:[], ambiguous:false }
         ├─ 若 fetchBeforeCreate → git fetch <项目 baseBranch>
-        ├─ agent = ctx.agents.create({ sessionId, meta:{cwd: repoPath} })
-        ├─ wt = await ctx.worktrees.create(agent, { name:'<branchPrefix><projectId>-<recordId>-r1',
-        │                                           from:'<项目 baseBranch>' })
-        │    └─ 副作用：**这个 agent 的 cwd** 被切到 wt.path（不是主会话）
-        └─ onPhase('worktree-ready') 记 worktreePath/branch/baseCommit
+        ├─ [executor-agent 实现时使用，当前 scheduler 里不存在]
+        │    agent = ctx.agents.create({ sessionId, meta:{cwd: repoPath} })
+        │    wt = await ctx.worktrees.create(agent, { name:'<branchPrefix><projectId>-<recordId>-r1',
+        │                                            from:'<项目 baseBranch>' })
+        │    副作用：**这个 agent 的 cwd** 被切到 wt.path（不是主会话）
+        ├─ 当前实现：组合根的 prepareWorkspace 跑 git fetch + git worktree add，
+        │    落到 `<repoPath>/.agents/worktrees/<branch>`；没有 subprocess 时返回 {}，阶段照走
+        └─ onPhase('worktree-ready') 记 worktreePath/branch/baseCommit（先回填进 ws 再落库，执行器读 ws）
 
 T+0:02  onPhase('planning')，起超时定时器（40 min）
-        ├─ 内核构造 UserMessage：
-        │    文本 = 工单全文 + 别名提示 + ambiguous 候选 + 阶段要求
-        │    图片 = 截图 × N（source.loadScreenshot → attachments.saveImage →
-        │           ImageBlock{type:'image', attachment:ref}）
-        └─ agent.followup(msg)   ← 必须 followup（inject 不唤醒 agent）
+        ├─ 截图是**输入**不是阶段，在开工之前就取：
+        │    逐条 source.loadScreenshot → 组合根 saveImage →
+        │    attachments.saveImage({data, mediaType, name}) → ImageBlock{...}
+        ├─ 内核渲染任务书：renderTicketPrompt() 出纯文本，renderTicketContent() 出「文本块 + 图片块」
+        ├─ 调 executor.run(ticket, located, ctx)
+        │    ctx 里 prompt / content / images 三个都给：老适配器只读 prompt，
+        │    新适配器按 content 才看得见图；falsy 的图在 content 里被跳过
+        └─ [executor-agent 实现时使用，当前 scheduler 里不存在] agent.followup(msg)
+              ← 必须 followup（inject 不唤醒 agent）
 
 T+0:03  … agent 在 wt.path 里读代码、定位、规划
         └─ 报「定位完成」→ onPhase('editing')，存 Plan

@@ -7,7 +7,9 @@
  * 通用化之后的三条硬性要求：
  * 1. 不内置任何项目的「模块 → 代码路径」别名表 —— 那是某个具体项目专属的知识，
  *    通用插件装不下，代码定位交给 executor-agent 现场读仓库做。
- * 2. 截图不是路径也不是 base64，是 `ImageBlock`，得由调用方塞进 `content`。
+ * 2. 截图不是路径也不是 base64，是 `ImageBlock`，得由调用方塞进 `content` ——
+ *    这件事现在由本文件的 `renderTicketContent` 承担：它把任务书渲染成 text 块，
+ *    再按顺序把截图引用接成 image 块，调用方只需要拿着 `saveImage` 的返回值来找它。
  * 3. 验证命令**从项目配置 `verify` 注入**，不在 prompt 里硬编码任何构建/测试命令。
  */
 
@@ -66,6 +68,30 @@ export function renderTicketPrompt (ticket, located) {
   lines.push('- 全程用中文写说明、注释与提交信息。')
 
   return lines.join('\n')
+}
+
+/**
+ * 把任务书 + 截图拼成消息内容块数组。
+ *
+ * 为什么不让调用方自己拼：text 块必须与 `renderTicketPrompt` 保持一致（否则
+ * 走 content 的适配器和走 prompt 的适配器会看到两份不同的任务书），
+ * 这个拼装只应该有一个实现。image 块按截图原顺序追加，模型才能对得上文字里说的「第几张图」。
+ *
+ * `images` 里可能有 undefined（`saveImage` 什么都不返回时），这里直接跳过：
+ * 空引用塞进 content 会让适配器组装消息时炸掉，而没有图本身不是错误。
+ *
+ * @param {Ticket} ticket
+ * @param {LocateResult} located
+ * @param {unknown[]} [images] 截图引用（`saveImage` 的返回值）
+ * @returns {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>}
+ */
+export function renderTicketContent (ticket, located, images = []) {
+  const blocks = [{ type: 'text', text: renderTicketPrompt(ticket, located) }]
+  for (const image of images) {
+    if (!image) continue
+    blocks.push({ type: 'image', image })
+  }
+  return blocks
 }
 
 /**

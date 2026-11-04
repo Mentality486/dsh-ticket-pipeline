@@ -7,10 +7,29 @@
  *
  * 通用化之后，mock source 是**每个项目一个实例**：构造时带上 `projectId`，
  * 它生成的每张票都挂上这个 projectId，id 用 `mock:<projectId>` 保证多实例可区分。
+ *
+ * ## 为什么它也要过契约校验、也要给真 PNG
+ *
+ * mock 是别人照着写真实适配器的样板。样板自己不合契约（少方法、类型不对）等于把人教错，
+ * 所以它在构造期就走一遍 `assertTicketSource`。
+ *
+ * 截图字节以前是「PNG 魔数 + 一堆零」：解出来根本不是图。它的下游是 DSH 附件层，
+ * 那边会真的解码 —— 拿到坏图要么报错、要么静默丢图，而自测里全程看不到，
+ * 因为没有人去解它。现在换成一张真的 1×1 图（合法的 IHDR/IDAT/IEND），
+ * 让它走完附件库时和真实截图一样能被解开。
  */
 
-import { makeTicket } from '../../contracts/ticket-source.js'
+import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
 import { PipelineError } from '../../contracts/errors.js'
+
+/**
+ * 最小合法 PNG：1×1、RGBA、单个 IDAT。
+ *
+ * 为什么写死成常量而不是运行时现算：现算要 `zlib.deflateSync` 加一段 CRC 表，
+ * 为了 70 个字节引入这些不划算；而这张图的内容没有意义（没有断言会去看像素），
+ * 只要**字节合法**就够了。它由「IHDR + IDAT(未压缩块) + IEND」拼成，长度 70。
+ */
+const MINIMAL_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mOwbvr2HwAFYgKzQLzFTwAAAABJRU5ErkJggg=='
 
 /**
  * 一条 mock 工单的种子数据形状。
@@ -74,7 +93,7 @@ export const DEFAULT_SEEDS = Object.freeze([
  * @param {MockTicketSeed[]} [options.seeds]
  * @param {boolean} [options.failScan] 强制扫描失败（用来验证「扫失败要暴露出来」）
  * @param {boolean} [options.failScreenshot] 强制截图取不到（用来验证 needs-info 分支）
- * @param {number} [options.screenshotBytes] 假截图的字节数
+ * @param {number} [options.screenshotBytes] 假截图的目标字节数（只用于「大图」场景，边界见 loadScreenshot）
  * @returns {import('../../contracts/ticket-source.js').TicketSource & {
  *   projectId: string,
  *   seeds: MockTicketSeed[],
@@ -127,7 +146,7 @@ export function createMockSource (options = {}) {
     })
   }
 
-  return {
+  return assertTicketSource({
     id: `mock:${projectId}`,
     projectId,
     seeds,
@@ -194,9 +213,31 @@ export function createMockSource (options = {}) {
       if (ref.kind === 'unknown') {
         throw new PipelineError('invalid-input', 'mock：无法识别的截图引用')
       }
-      // 最小合法 PNG 头 + 补零，够 `saveImage` 之外的逻辑用；真正的解码在 DSH 附件层。
-      const data = new Uint8Array(screenshotBytes)
-      data.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0)
+      // 一张真能被解码的 1×1 PNG（见 MINIMAL_PNG_B64）。补零的「假装是 PNG」会被附件层丢掉。
+      //
+      // `screenshotBytes` 仍然保留：有些自测要在「大图」上验证上限/分页行为，
+      // 那时才需要凑够字节数 —— 把 IDAT 的负载重复到目标长度，外面仍是合法 PNG 容器。
+      // 注意重复块里带着每块的 CRC，所以只能整块复制，不能简单补零。
+      const png = Buffer.from(MINIMAL_PNG_B64, 'base64')
+      let data = new Uint8Array(png)
+      const target = Number.isInteger(screenshotBytes) && screenshotBytes > png.length ? screenshotBytes : 0
+      if (target > 0) {
+        // 取 IDAT 那一段（偏移 33 = 8 字节签名 + IHDR 块 25 字节；长度另算），重复填到目标长度，
+        // 再补一个 IEND 收尾，保证 capstone 之前的内容都是合法块。
+        const idatStart = 8 + 25
+        const idatLen = png.readUInt32BE(idatStart)
+        const idatChunk = png.subarray(idatStart, idatStart + 12 + idatLen)
+        const head = png.subarray(0, idatStart)
+        const tail = png.subarray(idatStart + 12 + idatLen)
+        const parts = [head]
+        let size = head.length + tail.length
+        while (size + idatChunk.length <= target) {
+          parts.push(idatChunk)
+          size += idatChunk.length
+        }
+        parts.push(tail)
+        data = new Uint8Array(Buffer.concat(parts))
+      }
       return { data, mediaType: /** @type {const} */ ('image/png'), name: `${ref.kind}-shot.png` }
     },
 
@@ -212,5 +253,5 @@ export function createMockSource (options = {}) {
       const index = seeds.findIndex((seed) => seed.recordId === recordId)
       if (index >= 0) seeds.splice(index, 1)
     },
-  }
+  }, `TicketSource("mock:${projectId}")`)
 }

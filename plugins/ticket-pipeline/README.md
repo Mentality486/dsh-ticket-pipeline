@@ -31,7 +31,7 @@ src/
     executor-agent/  真执行器（占位，需单独的地图票）
     push-mock/       假通知（记内存）
     push-pushplus/   PushPlus 真实现
-  tools/             pipeline_scan / pipeline_status 两个工具
+  tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset 四个工具
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
 ```
 

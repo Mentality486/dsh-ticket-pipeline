@@ -1,0 +1,20 @@
+# GLOSSARY 术语表
+
+工单流水线（`plugins/ticket-pipeline`）的领域词汇。改代码时用词以此为准；新术语先加进来再写代码。
+
+| 术语 | 英文/代码名 | 含义 |
+| --- | --- | --- |
+| 工单源 | ticket source | 工单的来源平台适配器（飞书 / 金山 WPS / mock），实现 `TicketSource` 契约，负责扫描表格并产出工单 |
+| 工单 | ticket | 一行待处理的缺陷记录，含项目、模块、问题描述、操作流程、截图引用与指纹 |
+| 票 | record / row | 工单在本地存储（`TicketStore`）里的一行持久化状态，带 phase、attempt、租约等执行账目字段 |
+| 指纹 | fingerprint | 工单内容的哈希。内容变了指纹就变，扫描靠它区分「新工单」和「旧工单被修订」 |
+| 水位 | watermark | 每个工单源的扫描进度记忆（见过的 recordId、上次扫描时间），支持持久化；适配器没接持久化时退化为进程内内存 |
+| 租约 | lease | 处理一张票前先从 `TicketStore` 拿的独占锁，带 TTL 与心跳续期，防止多个进程同时处理同一张票 |
+| 工作区 | worktree | 为一张票检出的独立 git worktree（默认 `<repo>/.agents/worktrees/`），改码、跑验证、提交都在里面，失败也不污染主工作区 |
+| 仓库定位器 | repo locator | 把「工单里的模块名」翻译成「本地仓库路径 + 代码位置」的适配器（`locator-table`，配置驱动的映射表） |
+| 执行器 | work executor | 真正拿工单干活的角色（`executor-agent`）：读提示与截图、改码、跑验证、提交、开 MR。mock 执行器只演不动真格 |
+| 推送 | push | 把结果（完成 / 失败 / 需要补信息）通知人的适配器（PushPlus / QQ 邮箱 / mock） |
+| 扫描 | scan | 工单源的一次轮询：对比水位产出 created / updated / disappeared 三类变化 |
+| 退役 | retire / disappeared | 工单行从表格消失或连续多轮不再「处理中」，终态标 `gone`，不再执行 |
+| needs-info | 需要补信息 | 中间态：截图取不到、信息不全或工单正文疑似提示注入时，停下等人补，发通知 |
+| dead-letter | 死信 | 重试耗尽（attempt 达到 maxAttempts）后的 failed 票。保留工作区与最后错误，等人工 `pipeline_reset` 或改表重跑 |

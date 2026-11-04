@@ -44,7 +44,7 @@
 
 /**
  * @typedef {Object} ProjectMatch
- * @property {'feishu'|'wps'|'mock'} platform 工单表所在平台
+ * @property {string} platform 工单表所在平台，取值见下面的 `PLATFORMS`
  * @property {string} [appToken] 飞书多维表格 app_token（显式绑定）
  * @property {string} [tableId] 飞书数据表 id（显式绑定，和 appToken 一起用）
  * @property {string} [viewId] 可选：只扫某个视图
@@ -112,6 +112,16 @@ export const CONFIG_FIELDS = Object.freeze({
     max: 60,
     description: '票级租约的存活时间（分钟），防止多进程抢同一张票',
   },
+  leaseHeartbeatSeconds: {
+    type: 'number',
+    default: 60,
+    min: 1,
+    max: 1800,
+    description:
+      '租约心跳间隔（秒）：跑票期间每这么多秒续一次租。'
+      + '必须显著小于 leaseTtlMinutes，否则长票会被别的进程抢走，'
+      + '两边在同一个 worktree 上同时改代码。',
+  },
   maxAttempts: {
     type: 'integer',
     default: 2,
@@ -174,7 +184,7 @@ export const CONFIG_FIELDS = Object.freeze({
   pushAdapter: {
     type: 'string',
     default: 'pushplus',
-    description: '通知适配器 id（mock / pushplus）',
+    description: '通知适配器 id（mock / pushplus / qqmail）',
   },
   'pushplus.token': {
     type: 'string',
@@ -191,6 +201,44 @@ export const CONFIG_FIELDS = Object.freeze({
     default: 'txt',
     enum: ['txt'],
     description: '必须用 txt：富模板在 ClawBot 里只显示前 50 字',
+  },
+  // ── QQ 邮箱（SMTP）──
+  // 密码是「授权码」，不是登录密码；不写进配置，走 ctx.credentials 的 QQMAIL_AUTH_CODE。
+  'qqmail.host': {
+    type: 'string',
+    default: 'smtp.qq.com',
+    description: 'QQ 邮箱 SMTP 主机（企业邮箱换成自己的）',
+  },
+  'qqmail.port': {
+    type: 'number',
+    default: 465,
+    min: 1,
+    max: 65535,
+    description: 'SMTP 端口：465 = TLS 直连（推荐），587 = STARTTLS',
+  },
+  'qqmail.secure': {
+    type: 'boolean',
+    default: true,
+    description: 'true = 连上就是 TLS（465）；false = 先明文 EHLO 再 STARTTLS（587）',
+  },
+  'qqmail.user': {
+    type: 'string',
+    default: '',
+    description: '发件邮箱地址，例如 someone@qq.com',
+  },
+  'qqmail.to': {
+    type: 'string',
+    default: '',
+    description: '收件邮箱；多个用逗号分隔',
+  },
+
+  'pushplus.callbackUrl': {
+    type: 'string',
+    default: '',
+    description:
+      '送达回执地址（可选）。PushPlus 把 sendStatus 回吐到这个地址：'
+      + '0=未发 / 1=发送中 / 2=成功 / 3=失败。'
+      + 'HTTP 200 只代表受理，不代表送达 —— 想知道「人真收到了」要配这个。',
   },
   notifyOn: {
     type: 'string-array',
@@ -238,10 +286,35 @@ function flatten (source, prefix, out) {
   return out
 }
 
-/** 校验平台，返回规范后的平台名或 undefined。 */
+/**
+ * 本插件认识的平台，顺序就是报错文案里的展示顺序。
+ *
+ * 为什么这份名单放在 config.js 而不是从 `index.js` 的 `SOURCES` 反推：配置校验是
+ * 纯函数，不该依赖「所有适配器都 import 成功」（离线自测时任何一个适配器炸掉，
+ * 连配置都校验不了）。反向由组合根负责对齐：`index.js` 的 `SOURCES` 键必须落在
+ * `PLATFORMS` 里，两边对不上由自测脚本报出来。
+ *
+ * 这份名单只用来「拒绝错字」：新增平台要同时改这里和 `SOURCES`（各加一行）。
+ *
+ * @type {readonly string[]}
+ */
+export const PLATFORMS = Object.freeze(['feishu', 'wps', 'mock'])
+
+/** 报错文案用的平台清单（「只能是 a / b / c」），从表里拼出来，免得两处各写一遍。 */
+const PLATFORM_HINT = PLATFORMS.join(' / ')
+
+/**
+ * 校验平台，返回规范后的平台名或 undefined。
+ *
+ * 不传时退到 `mock`：老配置里没有 `match.platform`，以前一律按 mock 跑；
+ * 现在照样能跑，但不给默认值的话「漏写平台」会被当成「写错平台」而拒绝启动。
+ *
+ * @param {unknown} platform
+ * @returns {string | undefined}
+ */
 function normalizePlatform (platform) {
-  if (platform === 'feishu' || platform === 'wps' || platform === 'mock') return platform
-  return undefined
+  const value = platform === undefined || platform === null || platform === '' ? 'mock' : platform
+  return PLATFORMS.includes(/** @type {string} */ (value)) ? /** @type {string} */ (value) : undefined
 }
 
 /**
@@ -266,7 +339,7 @@ function validateProject (raw, index) {
 
   const match = p.match && typeof p.match === 'object' && !Array.isArray(p.match) ? p.match : {}
   const platform = normalizePlatform(match.platform)
-  if (!platform) fail('match.platform', '只能是 feishu / wps / mock')
+  if (!platform) fail('match.platform', `只能是 ${PLATFORM_HINT}`)
 
   const repo = p.repo && typeof p.repo === 'object' && !Array.isArray(p.repo) ? p.repo : {}
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''

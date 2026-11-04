@@ -4,7 +4,8 @@
  * 这个工具**不写任何东西、不跑任何票**。它的唯一用途是回答人的三个问题：
  * 1. 我的工单进去了吗？→ 看队列里有没有那条 `recordId`
  * 2. 为什么不动了？→ 看 `phase` 与 `lastError`
- * 3. 该怎么让它动？→ `needs-info` 要补图、`failed` 要把「是否处理」拨走再拨回「处理中」
+ * 3. 该怎么让它动？→ `needs-info` 要补图、`failed` 用 `pipeline_reset` 放回队列
+ *    （「拨走再拨回」在生产里其实点不到：重置入口只有工具这一条）
  *
  * 输出刻意用中文短句而不是 JSON dump：这是给人在对话里看的东西。
  * 需要机器可读的字段也一并放在返回值里（`tickets` 数组），不牺牲程序可用性。
@@ -13,7 +14,7 @@
 import { defineTool, textBlocks } from './define.js'
 import { PHASE_LABEL, TERMINAL } from '../contracts/types.js'
 import { describeConfig } from '../core/config.js'
-import { summarize } from '../core/store.js'
+import { foundAtSortKey, summarize } from '../core/store.js'
 
 const PHASE_ADVICE = {
   pending: '排队中，下一轮会轮到它。',
@@ -25,7 +26,7 @@ const PHASE_ADVICE = {
   'needs-info': '在等人：通常是截图取不到。补一张图或改「截图」列，再让它重来。',
   done: '已完成，draft MR 已开。等人去看、本地验证后自己提交。',
   skipped: '代码改完、MR 也开了，但构建/测试没跑成（原因见下）。这是合法的成功路径，仍需人工验证。',
-  failed: '失败了。要重跑：把「是否处理」先改成别的值、再改回「处理中」，下一轮就会重新入队。',
+  failed: '失败了。要重跑就用 pipeline_reset（传它的 recordId）；失败不会自动重试，超时也一样。',
   gone: '表格里这一行已经删掉了，静默退役。',
 }
 
@@ -74,9 +75,16 @@ export function createPipelineStatusTool (options) {
       if (typeof args.recordId === 'string' && args.recordId.length > 0) {
         rows = rows.filter((row) => row.recordId === args.recordId)
         if (rows.length === 0) {
+          // 早退分支的口径要和正常分支一致：counts 是全库，filteredCounts 是筛选后（这里是 0）。
+          /** @type {Record<string, number>} */
+          const allCounts = {}
+          for (const row of options.store.listTickets()) {
+            allCounts[row.phase] = (allCounts[row.phase] ?? 0) + 1
+          }
           return {
             enabled: config?.enabled === true,
-            counts: {},
+            counts: allCounts,
+            filteredCounts: {},
             tickets: [],
             config: describeConfig(config),
             text: `没有这条工单的记录：${args.recordId}\n`
@@ -87,20 +95,35 @@ export function createPipelineStatusTool (options) {
         rows = rows.filter((row) => !TERMINAL.includes(row.phase))
       }
 
+      // 「本次筛选」这个口径只在真的筛过的时候才显示，否则它就等于全库，白占一行。
+      const filteredScope = (typeof args.recordId === 'string' && args.recordId.length > 0) || !includeDone
+
+      // 两个口径必须分开算、分开写明，否则会互相冒充：
+      //   total    —— 全库（不受 recordId / includeDone 影响），回答「整个流水线大概什么样」
+      //   filtered —— 这次请求筛完之后、尚未被 limit 截断（回答「我这次问到的这批有多少」）
+      // 以前只有一组 counts 却用全库算，列表却按过滤后显示：传了 recordId 时
+      // 上面写着「失败 7」，下面只有 1 条，人会以为列表漏了。
       /** @type {Record<string, number>} */
-      const counts = {}
+      const total = {}
       for (const row of options.store.listTickets()) {
-        counts[row.phase] = (counts[row.phase] ?? 0) + 1
+        total[row.phase] = (total[row.phase] ?? 0) + 1
+      }
+      /** @type {Record<string, number>} */
+      const filtered = {}
+      for (const row of rows) {
+        filtered[row.phase] = (filtered[row.phase] ?? 0) + 1
       }
 
       // 排队顺序 = pickNext 的顺序：优先级降序 → 发现日期升序 → 入队时间升序。
+      // 比较逻辑直接复用 store 的那两个函数，不在这里再写一份：
+      // 写两份就会在「没有发现日期时排哪儿」这种细节上分道扬镳。
       const priorityOrder = { high: 3, medium: 2, low: 1 }
       rows = [...rows].sort((a, b) => {
         const pa = priorityOrder[a.priority ?? ''] ?? 0
         const pb = priorityOrder[b.priority ?? ''] ?? 0
         if (pa !== pb) return pb - pa
-        const fa = a.foundAt ?? ''
-        const fb = b.foundAt ?? ''
+        const fa = foundAtSortKey(a)
+        const fb = foundAtSortKey(b)
         if (fa !== fb) return fa < fb ? -1 : 1
         return (a.enqueuedAt ?? 0) - (b.enqueuedAt ?? 0)
       })
@@ -110,15 +133,22 @@ export function createPipelineStatusTool (options) {
 
       const lines = []
       lines.push(enabled ? '流水线：已开启' : '流水线：总开关是关的（enabled=false），不会自动扫表')
-      if (rows.length === 0) {
-        lines.push(includeDone ? '库里还没有任何票。' : '没有未收尾的票。')
-      } else {
-        const summary = Object.entries(counts)
-          .map(([phase, count]) => `${PHASE_LABEL[phase] ?? phase} ${count}`)
-          .join(' / ')
-        lines.push(`全库分布：${summary}`)
-        lines.push('')
+      const formatDistribution = (source) => {
+        const entries = Object.entries(source)
+        if (entries.length === 0) return '（无）'
+        return entries.map(([phase, count]) => `${PHASE_LABEL[phase] ?? phase} ${count}`).join(' / ')
+      }
+      // 先把两个口径都写上，再决定列不列票：这样「筛选结果为空」时，
+      // 人也还能看到全库其实有多少票 —— 否则只剩一句「没有未收尾的票」，看不出是全空了还是筛空了。
+      lines.push(`全库分布：${formatDistribution(total)}`)
+      if (filteredScope) lines.push(`本次筛选：${formatDistribution(filtered)}`)
+      lines.push('')
 
+      if (rows.length === 0) {
+        lines.push(filteredScope
+          ? '这次筛选一条都没命中（全库分布见上）。'
+          : (includeDone ? '库里还没有任何票。' : '没有未收尾的票。'))
+      } else {
         for (const row of shown) {
           const title = row.problemSummary ?? summarize(row.description ?? '')
           const projectTag = row.projectId ? `[${row.projectId}] ` : ''
@@ -141,7 +171,9 @@ export function createPipelineStatusTool (options) {
 
       return {
         enabled,
-        counts,
+        // counts = 全库口径（老字段名不变，避免调用方炸）；filteredCounts = 本次筛选口径。
+        counts: total,
+        filteredCounts: filtered,
         tickets: shown.map((row) => ({
           projectId: row.projectId,
           recordId: row.recordId,

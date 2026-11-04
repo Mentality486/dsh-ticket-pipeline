@@ -35,8 +35,9 @@ export function createPipelineScanTool (options) {
     outputSchema: { type: 'object' },
     render: (value) => textBlocks(value.text),
     async execute (args, exec) {
-      const result = await options.tick({ skipScan: args.skipScan === true })
-      void exec
+      // 把工具的取消信号一路递进内核：取消 = 「别再扫了、别再动票了」，
+      // 而不是「只让调用方收不到结果」。内核在扫描阶段把它转给每个 source.scan。
+      const result = await options.tick({ skipScan: args.skipScan === true, signal: exec?.signal })
 
       const lines = []
       switch (result.status) {
@@ -51,6 +52,16 @@ export function createPipelineScanTool (options) {
           lines.push('扫描工单源失败了，本轮不跑票。')
           lines.push(`原因：${result.error ?? '(未提供)'}`)
           lines.push('这是「本轮失败」，不是「没变化」——队列里已有的票不受影响，下一轮会重试。')
+          break
+        case 'aborted':
+          // 取消要如实证：这一轮扫到一半就停了，没跑票，票面也没被动过。
+          // 写成「扫描完成」会让人以为刚才那一下没啥影响，接着以为队列是新的。
+          lines.push('这一轮被取消了：扫描中途停下，没跑票，票面状态没有被动过。')
+          lines.push(`取消前已处理：新票 ${result.scan.created}，修订 ${result.scan.updated}，退役 ${result.scan.disappeared}，复活 ${result.scan.revivals}。`)
+          if (result.ran) {
+            lines.push(`本轮在取消前已经跑完了 ${result.ran.recordId}，现在停在 ${result.ran.phase}。`)
+          }
+          if (result.cleaned) lines.push('另外清掉了一个过期的工作区（清理不受取消影响）。')
           break
         default:
           lines.push('扫描完成。')

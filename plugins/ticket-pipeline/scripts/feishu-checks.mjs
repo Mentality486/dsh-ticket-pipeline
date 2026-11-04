@@ -23,6 +23,9 @@ import {
   FEISHU_COLUMNS,
   IN_PROGRESS_VALUE,
 } from '../src/adapters/source-feishu/index.js'
+// 分支名清洗是纯函数，顺带在这里一起测：它虽然住在 core/，但唯一的调用方是拼分支名的上层，
+// 而 recordId 正是从飞书适配器里出来的 —— 放在这一节能顺手验证「飞书的脏 recordId 不会炸 git」。
+import { sanitizeBranchName } from '../src/core/branch-name.js'
 
 const APP_TOKEN = 'app-token-1'
 const TABLE_ID = 'tbl-1'
@@ -31,6 +34,64 @@ const TABLE_ID = 'tbl-1'
 const PNG_BYTES = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0x03,
 ])
+
+// 响应头不再只认 content-type：SSRF / 字节上限的用例要看 location 与 content-length，
+// 用一个通用的小 map 让每条用例自己给需要的头。
+const headerBag = (map) => ({
+  get: (key) => {
+    const wanted = String(key).toLowerCase()
+    for (const [name, value] of Object.entries(map ?? {})) {
+      if (name.toLowerCase() === wanted) return value
+    }
+    return null
+  },
+})
+
+const jsonResponse = (payload, status = 200, extraHeaders = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: headerBag({ 'content-type': 'application/json', ...extraHeaders }),
+  json: async () => payload,
+  arrayBuffer: async () => new TextEncoder().encode(JSON.stringify(payload)).buffer,
+})
+
+/**
+ * 造一个二进制响应。
+ *
+ * @param {Uint8Array} bytes
+ * @param {string} contentType
+ * @param {number} [status]
+ * @param {{ streaming?: boolean, extraHeaders?: Object }} [options]
+ *   streaming：带上 `body.getReader()` —— 只有走这条路径才能验证「边读边累加、超限立刻断」；
+ *   extraHeaders：重定向要 location，预声明大小要 content-length。
+ */
+const binaryResponse = (bytes, contentType, status = 200, options = {}) => {
+  /** @type {any} */
+  const response = {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: headerBag({ 'content-type': contentType, ...(options.extraHeaders ?? {}) }),
+    json: async () => { throw new Error('not json') },
+    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+  }
+  if (options.streaming) {
+    let offset = 0
+    response.body = {
+      getReader: () => ({
+        read: async () => {
+          if (offset >= bytes.byteLength) return { done: true, value: undefined }
+          // 每次只吐 64 字节，模拟真实网络分块 —— 一次性吐完就测不出「边读边累加」了。
+          const end = Math.min(offset + 64, bytes.byteLength)
+          const value = bytes.slice(offset, end)
+          offset = end
+          return { done: false, value }
+        },
+        cancel: async () => {},
+      }),
+    }
+  }
+  return response
+}
 
 /**
  * 造一个假的飞书服务端。
@@ -54,23 +115,21 @@ function createFakeServer (options = {}) {
     failCode: options.failCode ?? null,
     /** @type {string} */
     token: options.token ?? 't-access-token',
+    /**
+     * 用旧 token 打业务接口时回什么（B3 用例用）。
+     * 每次认证都会把 {@code token} 换成 `t-<n>`，所以旧 token 自然就"过期"了。
+     * @type {number | null}
+     */
+    rejectStale: options.rejectStale ?? null,
+    /**
+     * 从第几次业务请求之后才开始吊销旧 token（B3 用例用）。
+     * 冷启动第一次认证一定是好的 —— 不设这个阈值，401 根本不会发生，重取逻辑也就不被测到。
+     * @type {number}
+     */
+    rejectAfterRequests: Number(options.rejectAfterRequests ?? 0),
+    /** 认证接口被调了几次（single-flight / 重取的证据） */
+    authCallsByReason: 0,
   }
-
-  const jsonResponse = (payload, status = 200) => ({
-    ok: status >= 200 && status < 300,
-    status,
-    headers: { get: (key) => (String(key).toLowerCase() === 'content-type' ? 'application/json' : null) },
-    json: async () => payload,
-    arrayBuffer: async () => new TextEncoder().encode(JSON.stringify(payload)).buffer,
-  })
-
-  const binaryResponse = (bytes, contentType, status = 200) => ({
-    ok: status >= 200 && status < 300,
-    status,
-    headers: { get: (key) => (String(key).toLowerCase() === 'content-type' ? contentType : null) },
-    json: async () => { throw new Error('not json') },
-    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-  })
 
   const fetchImpl = async (url, init = {}) => {
     const rawUrl = String(url)
@@ -85,7 +144,19 @@ function createFakeServer (options = {}) {
 
     if (path === '/open-apis/auth/v3/tenant_access_token/internal') {
       state.authCalls += 1
+      state.authCallsByReason += 1
+      // 每次重新认证都换一个新 token —— 这样测试里"旧 token 已失效"是可观察的。
+      if (state.rejectStale !== null) state.token = `t-${state.authCalls}`
       return jsonResponse({ code: 0, msg: 'ok', tenant_access_token: state.token, expire: 7200 })
+    }
+
+    // B3：模拟「token 在拿到之后、用之前被服务端提前吊销」——
+    // 第一次认证（authCalls === 1）之后、第二次认证之前，所有业务请求一律 401；
+    // 重取（authCalls >= 2）之后带新 token 就正常。
+    // 注意不能用「token 是否等于最新值」判断：业务请求永远带的就是最新 token，
+    // 那样 401 永远不触发，重取逻辑根本测不到（这正是旧写法的缺陷）。
+    if (state.rejectStale !== null && state.authCalls < 2 && !path.includes('/auth/v3/')) {
+      return jsonResponse({ code: 99991663, msg: 'token invalid' }, state.rejectStale)
     }
 
     if (state.failCode !== null) {
@@ -167,15 +238,25 @@ function makeSource (server, options = {}) {
     tableId: options.tableId ?? TABLE_ID,
     docNamePattern: options.docNamePattern ?? '',
     getSecret: options.getSecret ?? (async (ref) => (ref === 'FEISHU_APP_ID' ? 'cli_test' : 'secret_test')),
-    fetch: server.fetchImpl,
+    // 允许用例在 createFakeServer 之外再包一层（比如注入挂起不返回的 fetch 来测超时）。
+    fetch: options.fetch ?? server.fetchImpl,
     getWatermark: async () => watermark,
     saveWatermark: async (_sourceId, value) => {
       watermark.seen = value.seen
       watermark.lastScanAt = value.lastScanAt
     },
     readLocalFile: options.readLocalFile,
+    // url 形态截图默认一律拒绝（SSRF 防线），用例要测它就必须显式放行主机。
+    // 注意 `in` 而不是 `??`：SSRF 用例要验证「白名单为空 = 一律拒绝」，
+    // 写成 ?? 就没法用 [] 显式覆盖默认值了。
+    allowedImageHosts: 'allowedImageHosts' in options ? options.allowedImageHosts : ['example.com'],
     safePageRun: options.safePageRun,
     goneAfterScans: options.goneAfterScans,
+    // —— task-9 新增：这些参数不透传，离线打桩就测不到超时 / 字节上限 / 日志 ——
+    requestTimeoutMs: options.requestTimeoutMs,
+    imageTimeoutMs: options.imageTimeoutMs,
+    maxBytes: options.maxBytes,
+    log: options.log,
   })
   return { source, watermark }
 }
@@ -461,6 +542,108 @@ export async function runFeishuChecks (check) {
     )
   })
 
+  await check('早停时没访问到的行不算「不见了」，不许进阶退役', async () => {
+    // 回归 B1：翻页循环早停（连续 safePageRun 条已知未变）后，后面没请求过的行不进 live。
+    // 若照样给它们累加 missingScans，一张静止的表扫几轮就会把后半批行全当删除地误退役。
+    const rows = []
+    for (let i = 1; i <= 12; i += 1) rows.push(makeRow(`rec-${i}`))
+    const server = createFakeServer({ rows })
+    const { source, watermark } = makeSource(server, { safePageRun: 5, goneAfterScans: 2 })
+    const signal = new AbortController().signal
+
+    // 第一轮全新建水位，12 行都算新票。
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 12, '第一轮应该收下全部 12 行')
+    assert.equal(first.disappeared.length, 0)
+
+    // 第二、三轮内容完全不变：第 5 行之后就会早停，rec-7..rec-12 根本没被请求到。
+    // goneAfterScans = 2，若早停后仍累加 missingScans，这两轮就足以把它们误退役。
+    for (let round = 2; round <= 3; round += 1) {
+      const result = await source.scan(signal)
+      assert.equal(result.disappeared.length, 0, `第 ${round} 轮是早停，没访问到的行不是删除，不该退役任何一行`)
+      assert.equal(result.created.length, 0, `第 ${round} 轮内容没变，不该重复收票`)
+      assert.equal(result.updated.length, 0, `第 ${round} 轮内容没变，不该算修订`)
+    }
+    for (let i = 7; i <= 12; i += 1) {
+      assert.ok(watermark.seen[`rec-${i}`], `rec-${i} 在早停轮里没被访问到，必须留在水位里（否则下一轮会被当成新票或已删除）`)
+    }
+    assert.equal(watermark.seen['rec-6'].missingScans, 0, '被早停截断的轮次不能推进 missingScans')
+  })
+
+  await check('真删的行在完整扫完的轮次里照旧退役', async () => {
+    // 回归 B1 的反面：只允许「没早停的轮次」判删除，但真删了必须照样退役，不能因为加了守卫就不再收尸。
+    // safePageRun 调到上限 99，保证只剩 3 行时不会早停，走的是完整扫完整条表的路径。
+    const allRows = []
+    for (let i = 1; i <= 6; i += 1) allRows.push(makeRow(`rec-${i}`))
+    const server = createFakeServer({ rows: allRows })
+    const { source, watermark } = makeSource(server, { safePageRun: 99, goneAfterScans: 2 })
+    const signal = new AbortController().signal
+
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 6, '第一轮应该收下 6 行')
+
+    // 只剩 rec-1..rec-3，且内容与之前完全一致 —— 既不会早停，miss 的只有真正的删除。
+    server.state.rows = [makeRow('rec-1'), makeRow('rec-2'), makeRow('rec-3')]
+    const second = await source.scan(signal)
+    assert.equal(second.disappeared.length, 0, '第 1 轮不见还不退役（goneAfterScans = 2）')
+
+    const third = await source.scan(signal)
+    assert.ok(third.disappeared.includes('rec-6'), '第 2 轮完整扫完仍不见，rec-6 必须退役')
+    assert.equal(third.disappeared.length, 3, 'rec-4 / rec-5 / rec-6 应该一起退役')
+    assert.equal(watermark.seen['rec-6'], undefined, '退役后要从水位里删掉')
+    assert.ok(watermark.seen['rec-1'], '仍在表里的行不能被误删')
+  })
+
+  await check('处理中的行内容变了要报修订；在「否」期间改的内容不算丢', async () => {
+    // 回归 B2 的正反两面：
+    // 正面（本用例）：同一行始终「处理中」，内容变了必须真的报 updated —— 指纹只能在收下修订之后才更新，
+    //   否则第一次修订之后指纹就和内容对齐了，人再改一次就永远收不到。
+    // 反面（下一个用例）：非「处理中」的行在「否」期间改的内容，拨回「处理中」时要按「新票」收下来
+    //   （见 P0 语义：拨回处理中 = 人工重置 = 重新收票），不能被旧的「已更新指纹」吞掉。
+    const server = createFakeServer({ rows: [makeRow('rec-1')] })
+    const { source } = makeSource(server)
+    const signal = new AbortController().signal
+
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 1, '首轮收票')
+    assert.equal(first.updated.length, 0)
+
+    server.state.rows = [makeRow('rec-1', { description: '登录页报 500，还多了个 502' })]
+    const second = await source.scan(signal)
+    assert.equal(second.updated.length, 1, '内容变了要算修订')
+    assert.equal(second.updated[0].recordId, 'rec-1')
+    assert.equal(second.updated[0].description, '登录页报 500，还多了个 502')
+
+    server.state.rows = [makeRow('rec-1', { description: '登录页报 500，还多了个 502 和 503' })]
+    const third = await source.scan(signal)
+    assert.equal(third.updated.length, 1, '第二次修订也必须收得到（指纹没被提前消耗掉）')
+    assert.equal(third.updated[0].description, '登录页报 500，还多了个 502 和 503')
+  })
+
+  await check('「否」期间改过的内容，拨回「处理中」时按新票收下来', async () => {
+    // 回归 B2：以前 prev.fingerprint 在「是否处理」判定之前就更新了，
+    // 「否」期间改过的内容会被永久吞掉 —— 拨回「处理中」时指纹已与内容对齐，
+    // 既收不到 updated 也收不到 created，这张票就再也回不来了。
+    const server = createFakeServer({ rows: [makeRow('rec-1', { status: '否' })] })
+    const { source } = makeSource(server)
+    const signal = new AbortController().signal
+
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 0, '「否」= 待认领，不进流水线')
+
+    server.state.rows = [makeRow('rec-1', { status: '否', description: '登录页报 500，还多了个 502' })]
+    const second = await source.scan(signal)
+    assert.equal(second.created.length, 0, '还是「否」，不该收票')
+    assert.equal(second.updated.length, 0, '不是「处理中」的行不产生修订')
+
+    server.state.rows = [makeRow('rec-1', { status: IN_PROGRESS_VALUE, description: '登录页报 500，还多了个 502' })]
+    const third = await source.scan(signal)
+    const collected = third.created.length + third.updated.length
+    assert.equal(collected, 1, '拨回「处理中」必须把这张票收回来，不能因为「否」期间改过内容就丢掉')
+    assert.equal(third.created[0].recordId, 'rec-1')
+    assert.equal(third.created[0].description, '登录页报 500，还多了个 502', '收下来的应该是改过的新内容')
+  })
+
   await check('绝不写回表格：全程没有对记录的写操作', async () => {
     const server = createFakeServer({ rows: [makeRow('rec-1')] })
     const { source } = makeSource(server)
@@ -484,5 +667,263 @@ export async function runFeishuChecks (check) {
         `出现了记录写接口：${request.url}`,
       )
     }
+  })
+
+  await check('恶意截图链接不许让服务器去请求内网（SSRF 白名单）', async () => {
+    // 为什么这么重要：截图地址是**填表的人**写的，等于外部输入。
+    // 不加白名单，一条 `http://169.254.169.254/latest/meta-data/` 就能让插件替人读云元数据。
+    const server = createFakeServer({ rows: [] })
+
+    // 用例 1：白名单为空（默认）时，任何 url 形态都拒绝，并提示改用附件。
+    const { source: closed } = makeSource(server, { allowedImageHosts: [] })
+    await assert.rejects(
+      () => closed.loadScreenshot({ kind: 'url', url: 'https://example.com/a.png' }),
+      (error) => error.kind === 'invalid-input' && /allowedImageHosts/.test(error.message),
+      '白名单为空时必须直接拒绝，而且错误信息要说清是配置没放行（不是网络问题）',
+    )
+
+    // 用例 2：白名单放行 example.com 后，打内网地址必须被拒，而且**一个请求都不能发出去**。
+    const { source: opened } = makeSource(server, { allowedImageHosts: ['example.com'] })
+    const before = server.requests.length
+    await assert.rejects(
+      () => opened.loadScreenshot({ kind: 'url', url: 'http://169.254.169.254/latest/meta-data/' }),
+      (error) => error.kind === 'invalid-input' && /白名单/.test(error.message),
+      '内网地址必须在发请求之前就被拦下',
+    )
+    assert.equal(server.requests.length, before, '被拦下的地址不能真的发出请求（否则白名单形同虚设）')
+
+    // 用例 3：非 http/https 协议（file: 能读本地文件）一律拒。
+    await assert.rejects(
+      () => opened.loadScreenshot({ kind: 'url', url: 'file:///etc/passwd' }),
+      (error) => error.kind === 'invalid-input' && /http/.test(error.message),
+      'file: 协议必须在协议层就被拒，不能走到 fetch',
+    )
+
+    // 用例 4：放行的主机照常能取到图，证明白名单不是「一律拒绝」。
+    const loaded = await opened.loadScreenshot({ kind: 'url', url: 'https://example.com/a.png' })
+    assert.equal(loaded.mediaType, 'image/png')
+  })
+
+  await check('重定向每一跳都重新校验主机，跳满 3 次就拒', async () => {
+    // 为什么不能交给 fetch 自己 follow：放行 cdn.example.com 之后，它 302 到 127.0.0.1，
+    // 白名单就白设了。必须手动跟跳、每跳重新过白名单。
+    const server = createFakeServer({ rows: [] })
+    const realFetch = server.fetchImpl
+    const hops = []
+    const fetchImpl = async (url, init) => {
+      const raw = String(url)
+      hops.push(raw)
+      if (raw === 'https://cdn.example.com/a.png') {
+        return {
+          ok: false,
+          status: 302,
+          headers: { get: (key) => (String(key).toLowerCase() === 'location' ? 'http://127.0.0.1/admin' : null) },
+          json: async () => ({}),
+        }
+      }
+      return realFetch(raw, init)
+    }
+    const { source } = makeSource(server, {
+      allowedImageHosts: ['cdn.example.com', 'example.com'],
+      fetch: fetchImpl,
+    })
+
+    await assert.rejects(
+      () => source.loadScreenshot({ kind: 'url', url: 'https://cdn.example.com/a.png' }),
+      (error) => error.kind === 'invalid-input' && /白名单/.test(error.message),
+      '第一跳在白名单里，但跳到 127.0.0.1 的**第二跳**必须被拒',
+    )
+    assert.ok(
+      !hops.includes('http://127.0.0.1/admin'),
+      '内网跳转目标绝不能被真的请求（说明校验发生在发请求之前）',
+    )
+
+    // 无限重定向：每一跳都在白名单里但一直跳，最多 3 跳后必须放弃。
+    let redirectCount = 0
+    const loopingFetch = async () => {
+      redirectCount += 1
+      return {
+        ok: false,
+        status: 302,
+        headers: { get: () => 'https://cdn.example.com/loop' },
+        json: async () => ({}),
+      }
+    }
+    const { source: looping } = makeSource(server, {
+      allowedImageHosts: ['cdn.example.com'],
+      fetch: loopingFetch,
+    })
+    await assert.rejects(
+      () => looping.loadScreenshot({ kind: 'url', url: 'https://cdn.example.com/loop' }),
+      (error) => error.kind === 'invalid-input' && /重定向/.test(error.message),
+      '一直重定向必须被判成可疑链接，不能无限跟',
+    )
+    // 首次请求 + 最多 3 跳 = 4 次；再多就是没拦住。
+    assert.ok(redirectCount <= 4, `最多跟 3 跳，实际请求了 ${redirectCount} 次`)
+  })
+
+  await check('附件下载有字节上限，超了不吞内存直接报错', async () => {
+    // 为什么：原来的 arrayBuffer() 会先把整个附件读进内存再判断大小，
+    // 一个几百 MB 的附件足以把进程打爆 —— 上限必须在**读的过程中**生效。
+    const server = createFakeServer({ rows: [] })
+    const big = new Uint8Array(4096)
+    // 注意只能拦**下载**这一条：把整个 fetch 换掉会把认证请求也一起吞了，
+    // 那样报出来的是「认证响应不是 JSON」，测不到字节上限本身。
+    const fakeFetch = async (url, init) => (
+      String(url).includes('/medias/')
+        ? binaryResponse(big, 'image/png', 200, { streaming: true })
+        : server.fetchImpl(url, init)
+    )
+    const { source } = makeSource(server, { maxBytes: 1024, fetch: fakeFetch })
+
+    await assert.rejects(
+      () => source.loadScreenshot({ kind: 'attachment', fileToken: 'ft-big' }),
+      (error) => error.kind === 'invalid-input' && /太大/.test(error.message) && /上限 1024 字节/.test(error.message),
+      '超过上限要报 invalid-input 并写清是哪个资源超了多少',
+    )
+  })
+
+  await check('url 截图同样受字节上限约束（流式边读边累加）', async () => {
+    const server = createFakeServer({ rows: [] })
+    const big = new Uint8Array(4096)
+    const target = 'https://example.com/a.png'
+    const fakeFetch = async (url, init) => (
+      String(url) === target
+        ? binaryResponse(big, 'image/png', 200, { streaming: true })
+        : server.fetchImpl(url, init)
+    )
+    const { source } = makeSource(server, { maxBytes: 1024, fetch: fakeFetch, allowedImageHosts: ['example.com'] })
+
+    await assert.rejects(
+      () => source.loadScreenshot({ kind: 'url', url: target }),
+      (error) => error.kind === 'invalid-input' && /太大/.test(error.message) && /上限 1024 字节/.test(error.message),
+      'url 形态也是外部输入，必须有同样的上限',
+    )
+  })
+
+  await check('token 失效（401）会清缓存、重取一次再重试，且只重取一次', async () => {
+    // 为什么：token 在有效期边缘被服务端提前吊销时，整轮扫描会直接 auth 失败；
+    // 正确做法是重取一次再试，而不是把整轮扫描判死。但也不能无限重试。
+    // rejectAfterRequests: 1 —— 第一次认证是好的，从第二个请求（第一次 records/search）起才 401。
+    const server = createFakeServer({ rows: [makeRow('rec-1')], rejectStale: 401, rejectAfterRequests: 1 })
+    const { source } = makeSource(server)
+
+    const result = await source.scan()
+    assert.equal(result.created.length, 1, '重取 token 之后应该照常扫到票')
+    assert.ok(server.state.authCalls >= 2, `至少要重新认证一次，实际 ${server.state.authCalls} 次`)
+
+    // 再扫一轮：token 现在是对的，不该再为了一次 401 反复认证。
+    const callsBefore = server.state.authCalls
+    await source.scan()
+    assert.equal(server.state.authCalls, callsBefore, 'token 仍然有效时不该平白认证')
+  })
+
+  await check('重取之后仍被拒就报 auth，不会无限重试', async () => {
+    const server = createFakeServer({ rows: [] })
+    // 无论拿什么 token 都 403：模拟「真的没权限」。
+    const alwaysForbidden = async () => ({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      json: async () => ({ code: 0 }),
+    })
+    const { source } = makeSource(server, { fetch: alwaysForbidden })
+    await assert.rejects(
+      () => source.scan(),
+      (error) => error.kind === 'auth',
+      '重试一次后仍拒绝，必须收敛成 auth 错误，而不是死循环',
+    )
+  })
+
+  await check('并发拿 token 只换一次（single-flight）', async () => {
+    // 为什么：scan 与 loadScreenshot 是并发调用的，冷启动时它们会同时打认证接口，
+    // 飞书对这个接口有频率限制。在途 Promise 必须复用。
+    const server = createFakeServer({ rows: [makeRow('rec-1')] })
+    const { source } = makeSource(server)
+    await Promise.all([
+      source.scan(),
+      source.loadScreenshot({ kind: 'attachment', fileToken: 'ft-1' }),
+      source.loadScreenshot({ kind: 'attachment', fileToken: 'ft-2' }),
+    ])
+    assert.equal(server.state.authCalls, 1, `并发的三次调用只该认证一次，实际 ${server.state.authCalls} 次`)
+  })
+
+  await check('请求超时会收敛成 network 错误，而不是永远挂着', async () => {
+    // 为什么：fetch 本身没有超时，服务端不回包时整轮扫描会挂着不走，
+    // 上层既看不到失败也等不到结果。必须自己带头。
+    const server = createFakeServer({ rows: [] })
+    // 一个永不 resolve、但尊重 abort 信号的 fetch —— 模拟卡死的连接。
+    // 注意：Promise 里要放一个 ref'ed 的 keepAlive 定时器撑住事件循环 ——
+    // AbortSignal.timeout 的定时器是不撑循环的，循环一空进程就静默退出，
+    // 超时永远等不到，用例会以「unsettled top-level await」挂死（dev-run 65 ✓ 后 exit 0 的元凶）。
+    const hangingFetch = (_url, init = {}) => new Promise((resolve, reject) => {
+      const keepAlive = setTimeout(() => {}, 10_000)
+      const signal = init.signal
+      const bail = (reason) => { clearTimeout(keepAlive); reject(signal.reason ?? reason) }
+      if (signal?.aborted) return bail(new Error('aborted'))
+      signal?.addEventListener?.('abort', () => bail(new Error('aborted')), { once: true })
+    })
+    const { source } = makeSource(server, { fetch: hangingFetch, requestTimeoutMs: 20 })
+    await assert.rejects(
+      () => source.scan(),
+      (error) => error.kind === 'network' || error.kind === 'aborted',
+      '卡死的请求必须在超时后以错误结束，不能永远 pending',
+    )
+  })
+
+  await check('调用方的 signal 会透传到请求层，取消能立刻生效', async () => {
+    // 为什么：内核取消整轮扫描时，正在飞的请求必须立刻断，不能等它自己超时。
+    const server = createFakeServer({ rows: [] })
+    const seenSignals = []
+    const hangingFetch = (_url, init = {}) => new Promise((resolve, reject) => {
+      seenSignals.push(init.signal)
+      const signal = init.signal
+      if (signal?.aborted) return reject(new Error('aborted'))
+      signal?.addEventListener?.('abort', () => reject(new Error('aborted')), { once: true })
+    })
+    const { source } = makeSource(server, { fetch: hangingFetch, requestTimeoutMs: 60_000 })
+    const controller = new AbortController()
+    const pending = source.scan(controller.signal)
+    // 让请求先飞出去，再取消。
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort()
+    await assert.rejects(() => pending, (error) => error.kind === 'aborted' || error.kind === 'network')
+    assert.ok(seenSignals.length > 0, '请求层应该收到 signal')
+    assert.ok(seenSignals.every((signal) => signal && typeof signal === 'object'), '传下去的必须是真正的 AbortSignal')
+  })
+
+  await check('safePageRun 不再被偷偷钳到 5（配置写多少就跑多少）', async () => {
+    // 为什么：以前 Math.max(5, ...) 会把配置里的 2 改成 5，人按 2 排的页数预期全都对不上，
+    // 出问题很难查。现在直接用配置值，并 log 一次生效值方便对账。
+    const logs = []
+    const server = createFakeServer({ rows: [] })
+    makeSource(server, { safePageRun: 2, log: (...args) => logs.push(args) })
+    assert.ok(
+      logs.some((args) => args[1] && args[1].safePageRun === 2),
+      `应该 log 出实际生效的 safePageRun=2，实际日志：${JSON.stringify(logs)}`,
+    )
+  })
+
+  await check('分支名清洗：空格 / 中文 / 斜杠 / 超长都不会让 git worktree add 失败', async () => {
+    // 为什么：分支名由 recordId 拼出来，recordId 是手填的，含空格或中文会让 git 直接拒绝。
+    assert.equal(sanitizeBranchName('rec-1'), 'rec-1', '本来就合法的名字不该被改')
+    assert.equal(sanitizeBranchName('rec 1 bug'), 'rec-1-bug', '空格要变成 -')
+    assert.equal(sanitizeBranchName('工单-登录故障'), 'ticket', '全是中文时没有可用字符，回退成 ticket')
+    assert.equal(
+      sanitizeBranchName('feature/login/rec-1'),
+      'feature/login/rec-1',
+      '斜杠是有意分层（branchPrefix 会用到），必须原样保留',
+    )
+    assert.equal(sanitizeBranchName('--abc--'), 'abc', '首尾的 - 是替换残留，要去掉')
+    assert.equal(sanitizeBranchName('a---b'), 'a-b', '连续 - 要合并')
+    assert.equal(sanitizeBranchName('a..b'), 'a.b', '.. 在 git ref 里非法，要折成 .')
+    assert.equal(sanitizeBranchName(''), 'ticket', '空串要兜底')
+    assert.equal(sanitizeBranchName(null), 'ticket', 'null 也要兜底，不能抛')
+    assert.equal(sanitizeBranchName('///'), 'ticket', '只剩分隔符仍然是非法 ref，必须兜底')
+    const long = sanitizeBranchName('a'.repeat(500))
+    assert.equal(long.length, 200, '超长的要截到 200，别撞路径上限')
+    assert.ok(!/-$/.test(long), '截断后不能以 - 结尾')
+    const dirty = sanitizeBranchName('rec 9 / 登录 * 故障')
+    assert.ok(!/[^A-Za-z0-9._/-]/.test(dirty), `清洗后不能残留非法字符：${dirty}`)
   })
 }

@@ -103,6 +103,21 @@ function compileParameters (parameters) {
 }
 
 /**
+ * 把收到的值写进错误文案。
+ *
+ * 只说「必须是数字」而不说收到的是什么，调用方（通常是模型）就不知道是自己传错了类型，
+ * 还是参数名拼错了 —— 前者改类型，后者改名字，动作完全不同。
+ *
+ * @param {unknown} value
+ */
+function describeValue (value) {
+  if (typeof value === 'string') return `字符串 "${value}"`
+  if (Array.isArray(value)) return '数组'
+  if (value === null) return 'null'
+  return `${typeof value} ${String(value)}`
+}
+
+/**
  * 校验入参。抛出的错误会被 `ctx.tools` 的调用链当成工具参数错误处理。
  *
  * 只做「明显不对」的检查：必填缺失、类型不符、数字越界、枚举越界。
@@ -128,12 +143,23 @@ function assertArgs (toolName, parameters, args) {
         if (spec.enum && !spec.enum.includes(value)) throw new Error(`${toolName}: ${key} 只能是 ${spec.enum.join(' / ')}`)
         break
       case 'number':
-        if (typeof value !== 'number' || Number.isNaN(value)) throw new Error(`${toolName}: ${key} 必须是数字`)
-        if (spec.min !== undefined && value < spec.min) throw new Error(`${toolName}: ${key} 不能小于 ${spec.min}`)
-        if (spec.max !== undefined && value > spec.max) throw new Error(`${toolName}: ${key} 不能大于 ${spec.max}`)
+        if (typeof value !== 'number' || Number.isNaN(value)) throw new Error(`${toolName}: ${key} 必须是数字（收到 ${describeValue(value)}）`)
+        // 同样的越界文案在 integer 分支也要出现 —— 两个分支错开写，读的人就会以为是两套规则。
+        if (spec.min !== undefined && value < spec.min) throw new Error(`${toolName}: ${key} 不能小于 ${spec.min}（收到 ${value}）`)
+        if (spec.max !== undefined && value > spec.max) throw new Error(`${toolName}: ${key} 不能大于 ${spec.max}（收到 ${value}）`)
         break
       case 'integer':
-        if (!Number.isInteger(value)) throw new Error(`${toolName}: ${key} 必须是整数`)
+        // 整数分支一开始只查了「是不是整数」，`min`/`max` 写了等于没写：
+        // pipeline_status 把 limit 声明成 min 1 / max 100，传 1000 照样被放行，
+        // 于是一个「只回 100 条」的承诺在工具层没有兑现，要到几十万行之后才被记住。
+        // 下界必须和 number 分支一样严，不能只把「写错类型」拦住。
+        if (!Number.isInteger(value)) throw new Error(`${toolName}: ${key} 必须是整数（收到 ${describeValue(value)}）`)
+        if (spec.min !== undefined && value < spec.min) {
+          throw new Error(`${toolName}: ${key} 不能小于 ${spec.min}（收到 ${value}）`)
+        }
+        if (spec.max !== undefined && value > spec.max) {
+          throw new Error(`${toolName}: ${key} 不能大于 ${spec.max}（收到 ${value}）`)
+        }
         break
       case 'boolean':
         if (typeof value !== 'boolean') throw new Error(`${toolName}: ${key} 必须是布尔值`)

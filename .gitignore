@@ -1,0 +1,4 @@
+# DSH 会话临时产物与本地缓存
+.scratch/
+*.log
+node_modules/

@@ -32,7 +32,9 @@ export class PipelineError extends Error {
    * @param {ErrorKind} kind
    * @param {string} message
    * @param {unknown} [cause]
-   * @param {number} [retryAfterMs] `kind='rate-limit'` 时服务端给的等待时间
+   * @param {number} [retryAfterMs] `kind='rate-limit'` 时服务端给的等待时间（来自 `Retry-After`）。
+   *   内核的重试退避会读它：服务端自己说的「什么时候再来」比我们猜的指数曲线准。
+   *   不传就按内核的退避曲线走；传了也仍会被夹到退避上限内。
    */
   constructor (kind, message, cause, retryAfterMs) {
     super(message)

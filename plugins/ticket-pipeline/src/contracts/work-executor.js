@@ -20,6 +20,12 @@
  * @property {string} branch 已创建的分支名
  * @property {(phase: Phase, detail?: string) => Promise<void>} onPhase
  * @property {(msg: string) => void} log 写进插件日志，带 recordId 前缀
+ * @property {string} [baseCommit]
+ * @property {string} [repoPath]
+ * @property {string} prompt 已经渲染好的任务书（纯文本）
+ * @property {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图
+ * @property {unknown[]} images 截图引用数组（saveImage 的返回值），content 里只用到了非空项
+ * @property {Record<string, any>} config 生效中的插件配置
  */
 
 /**

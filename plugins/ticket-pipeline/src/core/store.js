@@ -174,8 +174,12 @@ export class TicketStore {
       row.testDetail = existing.testDetail
       row.mr = existing.mr
       row.startedAt = existing.startedAt
-      row.lastError = existing.lastError
     }
+    // 不继承 lastError：重新入队就是「从头再来一遍」，上一轮为什么没跑成
+    // 与这一轮无关。留着它，一次偶发失败会永远挂在票上 —— 人看队列时
+    // 以为还没修好，而这一轮的真实原因又被旧值盖着看不见。
+    // 新行本来就没有 lastError 字段，覆盖写入时旧值随之消失，不需要显式写 undefined。
+    
 
     await this.repo.put(TABLES.tickets, key, row)
     return row
@@ -250,8 +254,17 @@ export class TicketStore {
     }
 
     const now = this.now()
+    // 过滤掉值为 undefined 的键：{...row, ...patch} 遇到 undefined 会**覆盖**旧值，
+    // 而「patch 里没提」与「patch 里显式写了 undefined」在对象展开下区分不出来。
+    // 偏偏调用方大量用 undefined 表达「清掉它」（recover 清 mr、清理工作区清 branch），
+    // 那些地方靠显式写；这里再兜一道，是为了让「顺手多传一个 undefined」不至于
+    // 悄悄抹掉存储里的真实字段（例如把 mr 抹掉却以为只是更新了 lastError）。
+    const defined = {}
+    for (const [field, value] of Object.entries(patch ?? {})) {
+      if (value !== undefined) defined[field] = value
+    }
     /** @type {TicketRecordRow} */
-    const next = { ...row, ...patch, phase: to }
+    const next = { ...row, ...defined, phase: to }
     if (row.phase !== to && !TERMINAL.includes(to)) {
       // 「已经开始跑了」的标记：第一次离开 pending 时打点
       if (next.startedAt === undefined && to !== 'pending') next.startedAt = now
@@ -378,17 +391,30 @@ export class TicketStore {
    * 选出下一张该跑的票。
    *
    * 排序：优先级降序 → 发现日期升序 → 入队时间升序。
-   * 跳过：终态、`needs-info`（等人补信息）、`failed`（不自动重试）、被别的进程租住的。
+   * 跳过：终态、`needs-info`（等人补信息）、`failed`（不自动重试）、被别的进程租住的、
+   * **还没到点**的（重试退避，见 `enqueuedAt`）。
+   *
+   * 只挑 `pending`：其它非终态都是「上一轮跑到一半」的中间态（planning/editing/testing…），
+   * 该不该继续由启动恢复（`recover.js`）说了算 —— 它知道工作区还在不在、MR 开没开过。
+   * 内核在这里擅自接手，等于绕开那套判定，会在别的进程还捧着这票时把它抢过来跑。
+   *
+   * `enqueuedAt` 早于「现在」才可跑：重试路径把 enqueuedAt 写成「现在 + 退避」，
+   * 于是同一张票在退避期内不会被立刻再捞回来空转。
    *
    * 并发恒为 1，所以一次只返回一张。
    *
    * @returns {TicketRecordRow | undefined}
    */
   pickNext () {
+    const now = this.now()
     const candidates = this.listTickets().filter((row) => {
       if (TERMINAL.includes(row.phase)) return false
       if (row.phase === 'needs-info') return false
+      // 只跑排队中的票；中间态留给启动恢复。
+      if (row.phase !== 'pending') return false
       if (this.isLeasedByOther(row.key)) return false
+      // 退避未到期：当作还排在队尾后面。
+      if ((row.enqueuedAt ?? 0) > now) return false
       return true
     })
 
@@ -398,8 +424,8 @@ export class TicketStore {
       const pa = priorityWeight(a.priority)
       const pb = priorityWeight(b.priority)
       if (pa !== pb) return pb - pa
-      const fa = a.foundAt ?? '9999-99-99'
-      const fb = b.foundAt ?? '9999-99-99'
+      const fa = foundAtSortKey(a)
+      const fb = foundAtSortKey(b)
       if (fa !== fb) return fa < fb ? -1 : 1
       return (a.enqueuedAt ?? 0) - (b.enqueuedAt ?? 0)
     })
@@ -439,6 +465,23 @@ export class TicketStore {
  * @param {string} description
  * @returns {string}
  */
+/**
+ * 「发现日期」的排序键。缺省值必须是**最大值**：没有发现日期的票排在最后。
+ *
+ * 为什么单独抽一个函数：内核选票（pickNext）与工具层排序（pipeline_status 的列表）
+ * 都按这一条规则排，两处各写一份「缺省到底当什么」就是对不上——曾经内核用
+ * `'9999-99-99'`、工具层用 `''`，同一个队列在两处显示的先后顺序不一样，
+ * 人照着 pipeline_status 的列表判断「下一个该轮到谁」会判断错。
+ * 日期的格式是 ISO 串（`YYYY-MM-DD`），字典序即时间序，所以可以直接比字符串。
+ *
+ * @param {{ foundAt?: string }} row
+ * @returns {string}
+ */
+export function foundAtSortKey (row) {
+  const value = row?.foundAt
+  return typeof value === 'string' && value !== '' ? value : '9999-99-99'
+}
+
 export function summarize (description) {
   const firstLine = String(description ?? '').split(/\r?\n/).find((line) => line.trim().length > 0) ?? ''
   const trimmed = firstLine.trim()

@@ -6,11 +6,14 @@
  *   contracts/  纯接口与数据，彼此单向依赖，不 import 任何具体适配器
  *   core/       内核：scheduler / store / recover / prompt / config / domain
  *   adapters/   每个平台一个目录，各自实现一个接口
- *   tools/      对用户可见的两个工具
+ *   tools/      对用户可见的四个工具
  *   index.js    把上面这些用静态注册表拼起来，注册轮询与工具
  *
  * 可替换点的唯一依据是 `SOURCES` / `EXECUTORS` / `PUSHES` 三张静态表。
  * 换平台 = 在对应目录写一个实现 + 在表里加一行，**内核一行都不用改**。
+ * 平台专属的依赖（水位、凭据、本地文件、扫描节流）不在组合根里按平台名 if 判断，
+ * 而是由适配器在 `SOURCES` 里**声明能力**，`CAPABILITY_ASSEMBLERS` 统一装配 ——
+ * 所以「新增平台」连本文件的 `apply()` 也不用动。
  * 仓库定位器（`RepoLocator`）通用化后只有 `table` 一种实现（查 `projects[]`），
  * 不再是一张可替换表，而是直接由配置驱动。
  *
@@ -26,6 +29,7 @@ import { makeDomainSpec } from './core/domain.js'
 import { TicketStore, makeDomainRepo } from './core/store.js'
 import { createScheduler } from './core/scheduler.js'
 import { recoverPending, checkWorktreeByGit } from './core/recover.js'
+import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
@@ -38,6 +42,8 @@ import { createPushplusPush, pushplusOptionsFromConfig } from './adapters/push-p
 
 import { createPipelineScanTool } from './tools/pipeline-scan.js'
 import { createPipelineStatusTool } from './tools/pipeline-status.js'
+import { createPipelineCancelTool } from './tools/pipeline-cancel.js'
+import { createPipelineResetTool } from './tools/pipeline-reset.js'
 
 export const name = 'ticket-pipeline'
 
@@ -65,6 +71,107 @@ export const inject = ['tools', 'storageDomain']
 export { Config }
 
 /**
+ * 能力装配器：每种「内核能替适配器办到的事」对应一个函数，产出的键合进工单源
+ * 的构造参数。
+ *
+ * 为什么要有这层：平台专属注入以前是组合根里一串 `if (platform === 'feishu')`，
+ * 新增平台就得回头改组合根，而组合根是最不该常改的地方。现在适配器只在
+ * `SOURCES` 里**声明**自己要什么能力，怎么装配由这张表统一负责 ——
+ * 新增一种能力 = 这里加一个装配器，新增一个平台 = `SOURCES` 里加一行。
+ *
+ * 每个装配器签名都是 `(deps) => Record<string, unknown>`，`deps` 见
+ * `buildSourceOptions` 的第二个参数。
+ *
+ * @type {Record<string, (deps: CapabilityDeps) => Record<string, unknown>>}
+ */
+export const CAPABILITY_ASSEMBLERS = {
+  /** 水位：适配器自己判断「见过什么」，但水位必须落到持久化存储里，否则重启后满屏都是新票。 */
+  watermark: (deps) => ({
+    getWatermark: (sourceId) => deps.store.getWatermark(sourceId),
+    saveWatermark: (sourceId, value) => deps.store.saveWatermark(sourceId, value),
+  }),
+  /** 凭据：密钥不能落进明文配置，只能现取。 */
+  secret: (deps) => ({
+    getSecret: deps.readSecret,
+  }),
+  /** 本地文件：路径形态的截图要读本机字节（走文件系统服务，沙箱策略照旧生效）。 */
+  localFile: (deps) => ({
+    readLocalFile: deps.readLocalFile,
+  }),
+  /** 扫描节流：连续 N 条已知未变就停、连续 N 轮扫不到就退役，两个数都来自全局配置。 */
+  scanTuning: (deps) => ({
+    safePageRun: Number(deps.config.safePageRun) || 20,
+    goneAfterScans: Number(deps.config.goneAfterScans) || 3,
+  }),
+}
+
+/**
+ * @typedef {Object} CapabilityDeps
+ * @property {any} project 项目条目（含 match / repo）
+ * @property {any} store `TicketStore`
+ * @property {(ref: string) => Promise<string | undefined>} readSecret 凭据读取器
+ * @property {(path: string, signal?: AbortSignal) => Promise<{ data: Uint8Array, name?: string }>} readLocalFile
+ * @property {Record<string, unknown>} config 已校验的插件配置
+ * @property {(msg: string, detail?: unknown) => void} log
+ */
+
+/**
+ * 按 `SOURCES` 里的能力声明，把一个项目的工单源构造参数装配出来。
+ *
+ * **没声明的能力一律不注入**：注入多余的东西不会让适配器变强，只会让「这平台
+ * 到底依赖什么」越来越说不清，也会把不该给的宿主能力（读本地文件、读密钥）
+ * 顺手递给一个根本没这个需求的适配器。
+ *
+ * 能力名写错（装配器表里没有）时只记日志、跳过 —— 一个平台拼错能力名不该把
+ * 整个插件拖垮，但必须在启动日志里看得见。
+ *
+ * @param {{ capabilities?: string[], factory: (opts: any) => any }} entry `SOURCES` 表里的一行
+ * @param {CapabilityDeps} deps
+ * @returns {Record<string, unknown>} 交给适配器工厂的构造参数
+ */
+export function buildSourceOptions (entry, deps) {
+  const capabilities = Array.isArray(entry?.capabilities) ? entry.capabilities : []
+  const platform = deps.project?.match?.platform ?? ''
+
+  /** @type {Record<string, unknown>} */
+  const opts = { projectId: deps.project?.name }
+
+  // 绑定参数先合：能力装配器产出的键优先级更高，不会被 match 里的同名字段盖掉。
+  const matchAssembler = entry?.match ?? DEFAULT_MATCH_OPTIONS
+  Object.assign(opts, matchAssembler.build(deps.project?.match))
+
+  for (const capability of capabilities) {
+    const assembler = CAPABILITY_ASSEMBLERS[capability]
+    if (!assembler) {
+      deps.log('能力未注册，跳过', { platform, capability })
+      continue
+    }
+    Object.assign(opts, assembler(deps))
+  }
+
+  // 记一行已经装配好的能力：排障时能一眼看出这个平台到底拿到了什么，
+  // 而不是去翻装配器表反推。
+  deps.log('已注入能力', { project: deps.project?.name, platform, capabilities })
+  return opts
+}
+
+/**
+ * 绑定参数装配器：把 `projects[].match` 里属于「这个平台怎么定位那张表」的字段
+ * 摘进构造参数。
+ *
+ * 为什么不放进 `capabilities`：能力是「内核能代办的事」（水位、凭据……），绑定
+ * 参数是「平台自己的定位字段」。混在一起，装配器就得认识某个平台的字段名，
+ * 以后新平台字段不一样时又得回头改内核。
+ *
+ * 默认认领 `appToken / tableId / viewId / docNamePattern`，也就是飞书表定位的
+ * 那几个键；mock 用不到它们，多给四个空串无副作用。新平台字段不一样时，在
+ * `SOURCES` 那一行写 `match` 覆盖即可。
+ */
+export const DEFAULT_MATCH_OPTIONS = {
+  build: (match) => feishuOptionsFromMatch(match),
+}
+
+/**
  * 静态注册表。表里的「键」就是 `Config` 里 `workExecutor` / `pushAdapter`
  * 等字段能写的值；「值」是工厂函数（造出对应适配器）。
  *
@@ -74,12 +181,26 @@ export { Config }
  * 注意：`SOURCES` 的工厂签名是「按项目条目造实例」，与 `EXECUTORS` / `PUSHES`
  * 的「全局单实例」不同 —— 一个项目一个工单源，但执行器与通知器全局共享。
  *
- * @type {Record<string, (opts: any) => import('./contracts/ticket-source.js').TicketSource>}
+ * 每行三件事：`capabilities`（要内核提供哪些能力，由 `CAPABILITY_ASSEMBLERS`
+ * 装配）、`factory`、可选的 `match`（怎么从 `match` 摘绑定参数）。
+ * 新增平台 = 加一个目录 + 这里加一行，组合根其余部分一行都不用改。
+ *
+ * @type {Record<string, {
+ *   capabilities: string[],
+ *   factory: (opts: any) => import('./contracts/ticket-source.js').TicketSource,
+ *   match?: { build: (match: any) => Record<string, unknown> },
+ * }>}
  */
 export const SOURCES = {
-  mock: (opts) => createMockSource(opts),
-  feishu: (opts) => createFeishuSource(opts),
-  wps: (opts) => createWpsSource(opts),
+  // mock 零依赖，只给基本信息就能跑。
+  mock: { capabilities: [], factory: (opts) => createMockSource(opts) },
+  // 飞书：水位要落盘、密钥现取、截图可能给本地路径、扫描要按全局配置节流。
+  feishu: {
+    capabilities: ['watermark', 'secret', 'localFile', 'scanTuning'],
+    factory: (opts) => createFeishuSource(opts),
+  },
+  // wps 还没实现，先不声明能力：真接上时按需往里加。
+  wps: { capabilities: [], factory: (opts) => createWpsSource(opts) },
 }
 
 /** @type {Record<string, (opts: any) => import('./contracts/work-executor.js').WorkExecutor>} */
@@ -191,7 +312,7 @@ function makeLocalFileReader (ctx, logger) {
  * 1. 打开 storage-domain、包成 `TicketStore`
  * 2. 遍历 `config.projects[]` 按平台造每个项目的工单源；仓库定位器查表化
  * 3. 造 scheduler，注入 `prepareWorkspace` / `saveImage` / `removeWorktree`
- * 4. 注册两个工具（`pipeline_scan` / `pipeline_status`）
+ * 4. 注册四个工具（`pipeline_scan` / `pipeline_status` / `pipeline_cancel` / `pipeline_reset`）
  * 5. 启动恢复：把跑到一半的票从当前 phase 往后接着走
  * 6. 起轮询定时器（`ctx.interval`），`enabled` 关着时 tick 会直接 `disabled`
  *
@@ -233,32 +354,31 @@ export async function apply (ctx, config) {
 
   for (const project of projects) {
     const platform = project.match?.platform ?? 'mock'
-    const factory = SOURCES[platform]
-    if (!factory) {
+    const entry = SOURCES[platform]
+    if (!entry) {
+      // 配置校验已经按 `PLATFORMS` 卡过一道，走到这里说明表与名单不同步。
+      // 只记日志跳过、不抛：一个项目配错不该让其它项目的轮询停摆。
       log('项目配置了未知平台，跳过', { project: project.name, platform })
       continue
     }
-    /** @type {Record<string, unknown>} */
-    const sourceOpts = { projectId: project.name }
-    if (platform === 'feishu') {
-      Object.assign(sourceOpts, feishuOptionsFromMatch(project.match))
-      // 适配器自己维护「见过什么」的水位，但水位要落到持久化存储里 ——
-      // 否则重启后它会以为所有行都是新票。内核不参与比对（见 contracts/ticket-source.js）。
-      sourceOpts.getWatermark = (sourceId) => store.getWatermark(sourceId)
-      sourceOpts.saveWatermark = (sourceId, value) => store.saveWatermark(sourceId, value)
-      sourceOpts.getSecret = readSecret
-      sourceOpts.readLocalFile = readLocalFile
-      sourceOpts.safePageRun = Number(config.safePageRun) || 20
-      sourceOpts.goneAfterScans = Number(config.goneAfterScans) || 3
-    }
-    const source = factory(sourceOpts)
+    // 平台专属的东西（绑定参数 + 声明的能力）全在这里装配，组合根不再认平台名。
+    const sourceOpts = buildSourceOptions(entry, { project, store, readSecret, readLocalFile, config, log })
+    const source = entry.factory(sourceOpts)
     source.projectId = project.name
     sources.push(source)
     log('已挂载工单源', { project: project.name, platform, sourceId: source.id })
   }
 
   const locator = createTableLocator({ projects })
-  const executor = executorFactory({})
+  // 执行器选项只传它真正用得上的东西。
+  // `prompts` 是内核渲染好的反注入提醒：工单正文本身来自外部（表格里谁都能改），
+  // 混进任务书里就成了不可信输入，所以措辞由内核统一给，适配器只管拼在什么位置。
+  // 现在还没有执行器真读它，留着是为了让 executor-agent 落地时不必再动组合根。
+  const executor = executorFactory({
+    prompts: {
+      untrustedNotice: UNTRUSTED_TICKET_NOTICE,
+    },
+  })
   const push = pushFactory(pushAdapterOptions(config, logger))
 
   // ── 3. scheduler 的宿主钩子 ───────────────────────────
@@ -366,6 +486,12 @@ export async function apply (ctx, config) {
     store,
     getConfig: () => config,
   }))
+  // 人工取消：内核的 cancelActive 此前没有调用方，人只能干等超时。
+  ctx.tools.register(createPipelineCancelTool({
+    cancelActive: () => scheduler.cancelActive(),
+  }))
+  // 人工重开：store.resetByHuman 早就实现了却没有入口，文档承诺的「再跑一次」在生产里走不通。
+  ctx.tools.register(createPipelineResetTool({ store }))
 
   // ── 5. 启动恢复 ───────────────────────────────────────
   try {
@@ -373,7 +499,7 @@ export async function apply (ctx, config) {
       if (!gitRunner) return true
       return checkWorktreeByGit(gitRunner, path)
     }
-    await recoverPending({ store, worktreeExists, log })
+    await recoverPending({ store, worktreeExists, log, now: () => Date.now() })
   } catch (error) {
     log('启动恢复失败（不影响后续轮询）', error)
   }

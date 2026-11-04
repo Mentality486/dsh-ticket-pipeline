@@ -42,10 +42,13 @@ const RESUME_PHASE = Object.freeze({
  * @param {TicketStore} options.store
  * @param {(path: string) => Promise<boolean>} [options.worktreeExists] 判定工作区是否有效
  * @param {(msg: string, detail?: unknown) => void} [options.log]
+ * @param {() => number} [options.now] 注入时钟。恢复时要把 `enqueuedAt` 写成「现在」，
+ *   用 `Date.now()` 会让离线自测无法断言（假时钟与真时钟对不上）。
  * @returns {Promise<{ resumed: number, reset: number, skipped: number }>}
  */
-export async function recoverPending ({ store, worktreeExists, log }) {
+export async function recoverPending ({ store, worktreeExists, log, now }) {
   const logInfo = log ?? (() => {})
+  const nowFn = now ?? (() => Date.now())
   let resumed = 0
   let reset = 0
   let skipped = 0
@@ -84,6 +87,10 @@ export async function recoverPending ({ store, worktreeExists, log }) {
             worktreePath: undefined,
             branch: undefined,
             baseCommit: undefined,
+            // 要退回 mr-opening 之前，就跑不回那条 MR 上了：工作区一重建就是新分支
+            // （分支名带 revisionCount），旧 MR 指向的是被删掉的分支。不清掉的话，
+            // 通知里会挂着一条已经作废的链接，人点进去以为活还在。
+            mr: undefined,
             lastError: '工作区丢失，启动恢复时重建',
           })
           reset += 1
@@ -95,6 +102,10 @@ export async function recoverPending ({ store, worktreeExists, log }) {
             worktreePath: undefined,
             branch: undefined,
             baseCommit: undefined,
+            // 同上：pending 是比 mr-opening 更靠前的阶段，旧 MR 的坐标必须一起清掉。
+            // 这里原本还指望执行器「自己去查重」，但那要求执行器知道旧 MR 的存在；
+            // 存储里留一条作废记录，最可能的结局是下轮通知把人引到一条死链上。
+            mr: undefined,
             lastError: '工作区丢失，启动恢复时重新排队',
           })
           reset += 1
@@ -107,7 +118,7 @@ export async function recoverPending ({ store, worktreeExists, log }) {
       if (target && canTransition(row.phase, target)) {
         await store.setPhase(row.key, target, {
           lastError: undefined,
-          enqueuedAt: Date.now(),
+          enqueuedAt: nowFn(),
         })
         resumed += 1
         logInfo('启动恢复：从当前阶段继续', { projectId: row.projectId, recordId: row.recordId, from: row.phase, to: target })
