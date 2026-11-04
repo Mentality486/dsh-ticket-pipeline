@@ -234,6 +234,12 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
+| 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
+
+> **排查：启动时看到 `cannot get property "X" without inject` + `did not activate`？**
+> 这是插件声明的 `inject` 与实际用到的宿主服务不匹配（v0.1.0-test.1 曾因缺 `'timer'` 崩过，已修）。
+> 自检：`src/index.js` 的 `inject` 数组必须覆盖 `ctx.interval`（timer）等全部硬依赖；
+> 弱依赖一律走 `ctx.get(name)` 而不是 `ctx.<name>` 直接属性访问。
 
 > 注意：`scripts/` 不进安装包（发布白名单只含 src/locale/icon/patch），
 > 自测命令要在**开发目录** `D:/WorkSpace/dsh-ticket-pipeline/plugins/ticket-pipeline` 下跑。

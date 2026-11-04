@@ -102,6 +102,11 @@ src/
    空串不算已配置，会被当成「没配」报 `auth` 错。
 8. **飞书文档级授权必须人工做**：把协作者加给应用只对 `user_access_token` 有效，
    插件用的是 `tenant_access_token`，没法自己给自己加权限。
+9. **sandbox ctx 的属性访问是白名单制**（实测踩过，激活期崩溃）：
+   `ctx.interval`/`ctx.timeout` 等 timer 类动词要求插件 `inject` 里声明 `'timer'`，
+   否则宿主直接抛 `cannot get property "timer" without inject`、整个 bundle 激活失败；
+   其余服务（`logger` 等）走 `ctx.get(name)` 弱取（`get` 不要求声明，缺失即降级），
+   **不要**写 `ctx.logger` 这种直接属性访问 —— proxy 上它等于「读一个未声明服务」，同样会抛。
 
 ## 自测
 

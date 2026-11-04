@@ -63,7 +63,7 @@ export const name = 'ticket-pipeline'
  *
  * 不写 `webhookRuntime`：这个 build 里它没有 provider（见 research/dsh-capabilities）。
  */
-export const inject = ['tools', 'storageDomain']
+export const inject = ['tools', 'storageDomain', 'timer']
 
 /**
  * 配置 schema（standard-schema 形状，见 `core/config.js`）。
@@ -324,7 +324,9 @@ function makeLocalFileReader (ctx, logger) {
  * @param {Record<string, unknown>} config 已经过 `Config` 校验（含默认值）
  */
 export async function apply (ctx, config) {
-  const logger = ctx.logger?.() ?? ctx.logger ?? {
+  // logger 走 ctx.get 弱取（不声明进 inject）：desktop profile 不一定 provide "logger" 服务，
+  // 声明了反而会在 provider 缺席时被 cordis park。sandbox proxy 的 get() 不要求声明，取不到就降级静默。
+  const logger = ctx.get('logger') ?? {
     debug: () => {},
     info: () => {},
     warn: () => {},
