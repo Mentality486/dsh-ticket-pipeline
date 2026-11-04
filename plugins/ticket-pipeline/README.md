@@ -24,13 +24,16 @@ src/
   core/              scheduler / store / recover / prompt / config / domain
   adapters/
     source-mock/     内存工单源（离线跑通全链路用，每个项目一个实例）
-    source-feishu/   飞书多维表格（真实实现，票 #12）
-    source-wps/      金山文档（不实现，见文件内说明）
+    source-feishu/   飞书多维表格（真实实现）
+    source-wps/      金山文档共享 Excel（真实实现：零依赖手写 zip/xlsx 解析）
+    source-webform/  演示平台（内存表单源，实证可插拔流程）
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
-    executor-agent/  真执行器（占位，需单独的地图票）
+    executor-agent/  真执行器：起 agent 改码 → 过滤敏感文件 → GitLab Commits API 提交 → Draft MR
+    gitlab-client/   GitLab REST 客户端（分支/提交/MR/错误分类）
     push-mock/       假通知（记内存）
     push-pushplus/   PushPlus 真实现
+    push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
   tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset 四个工具
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
 ```
@@ -39,9 +42,9 @@ src/
 
 | 接口 | 注册表键 | 现状 |
 |---|---|---|
-| `TicketSource` | `mock` / `feishu` / `wps` | mock ✅ / feishu ✅ / wps 不实现 |
-| `WorkExecutor` | `mock` / `agent` | mock ✅ / agent 占位 |
-| `PushAdapter` | `mock` / `pushplus` | mock ✅ / pushplus ✅ |
+| `TicketSource` | `mock` / `feishu` / `wps` / `webform` | 全部 ✅ |
+| `WorkExecutor` | `mock` / `agent` | 全部 ✅ |
+| `PushAdapter` | `mock` / `pushplus` / `qqmail` | 全部 ✅ |
 
 > `RepoLocator` 通用化后不再是可替换表 —— 它只有「查 `projects[]`」一种实现
 > （`locator-table`），直接由配置驱动。代码定位交给 executor-agent 现场读仓库。
@@ -95,16 +98,43 @@ src/
 
 ## 自测
 
+主入口（工作目录 = 本目录）：
+
 ```bash
 node scripts/dev-run.mjs
 ```
 
-54 项断言，全绿 exit 0。它**不 import `src/index.js`**（那需要宿主服务），
-测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，
-外加第 9 节的**飞书适配器打桩测试**（`scripts/feishu-checks.mjs`，假飞书服务端，不联网）。
+**153 项断言，全绿 exit 0**，共 13 段。它不 import `src/index.js`（那需要宿主服务），
+测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 
-第 9 节覆盖：认证与 token 缓存、`records/search` 的 `page_size`/`automatic_fields`/降序排序、
-只收「处理中」、下拉字段形状规范化、水位推进与内容指纹判变更、`safePageRun` 停止条件、
-状态改走退役 / 拨回重开、连续多轮不见才退役、截图三形态取字节、
-`docNamePattern` 命中 0 张或 >1 张 = 配置错误、`sort` 被拒时兜底重试、
-飞书错误码分类、凭据缺失、扫描取消，以及**全程没有写操作**。
+| 段 | 覆盖 |
+|---|---|
+| 内核与契约 | 调度、租约心跳、退避重试、状态机、store 持久化、pipeline_* 四工具、组合根接线 |
+| `feishu-checks`（37 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、全程无写操作 |
+| `gitlab-checks`（25 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤 |
+| `push-qqmail`（18 项） | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
+| `wps-checks`（21 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底 |
+
+另有**全链路接线冒烟**（独立于 dev-run，测「组件之间接没接对」而不是单模块行为）：
+
+```bash
+node scripts/chain-smoke.mjs
+```
+
+11 项断言：真扫描 → 定位 → 截图入消息 → 执行器 → 通知的完整链路，
+含「截图取不到 → needs-info + 通知」「saveImage 返回空 → 跳过图块」等边界。
+
+单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
+
+```bash
+node scripts/feishu-checks.mjs      # exit 0 = 全绿（库式脚本，详情由 dev-run 打印）
+node scripts/gitlab-checks.mjs
+node scripts/push-qqmail-checks.mjs
+node scripts/wps-checks.mjs
+```
+
+### 真端到端验收（需要真实凭据，不在自测范围内）
+
+自测全部离线。真链路验收需要：飞书应用凭据（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`）、
+`GITLAB_TOKEN`、可选 `QQMAIL_AUTH_CODE`；安装插件后在配置里填好 `projects[]`
+（工单表定位 + 仓库路径 + 验证命令），确认无误后再打开 `enabled`。
