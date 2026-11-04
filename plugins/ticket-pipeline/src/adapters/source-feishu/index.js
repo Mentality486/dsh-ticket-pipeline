@@ -496,7 +496,14 @@ export function createFeishuSource (options = {}) {
         const retryAfter = Number(response.headers?.get?.('retry-after') ?? 5)
         throw new PipelineError('rate-limit', `飞书接口限流（HTTP 429）`, undefined, Math.max(1000, retryAfter * 1000))
       }
-      throw new PipelineError('internal', `飞书接口返回 HTTP ${response.status}`)
+      // 把飞书返回的错误片段带出来 —— HTTP 状态码本身不带原因，
+      // 没这段就排不了「400 到底是 token 错还是权限错」。
+      let bodyHint = ''
+      try {
+        const raw = await response.text()
+        bodyHint = `：${raw.slice(0, 200)}`
+      } catch { /* 读不到 body 就只报状态码 */ }
+      throw new PipelineError('internal', `飞书接口返回 HTTP ${response.status}${bodyHint}`)
     }
 
     let payload
