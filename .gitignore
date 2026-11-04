@@ -3,3 +3,6 @@
 *.log
 node_modules/
 dist/
+
+# 跑票用的仓库克隆（本地镜像，不进版本库）
+.repos/
