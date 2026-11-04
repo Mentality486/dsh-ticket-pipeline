@@ -697,16 +697,20 @@ export function createFeishuSource (options = {}) {
   /**
    * 把配置里的 appToken 归一成 bitable 的 app_token。
    *
-   * 用户常把 wiki 链接（或 wiki token）直接贴进来 —— wiki 里的多维表格，
-   * 它的 app_token 不是 wiki token 本身，要调 get_node 换算出 obj_token。
+   * 用户常把 wiki 链接（或 wiki token）直接贴进来 —— wiki 里的多维表格有两种形态：
+   * 旧版要换成 get_node 的 obj_token，新版 bitable API 直接吃 wiki token 本身。
+   * 所以这里不做单一换算，而是返回候选列表（obj_token 优先，wiki token 兜底），
+   * 由 resolveTable 逐个试，哪个能列出表就用哪个。
    * 支持：完整 wiki/base URL、wiki token、原生 app_token（原样返回）。
+   *
+   * @returns {Promise<string[]>} 按优先级排的候选 app_token 列表
    */
   async function normalizeAppToken (signal) {
     let token = String(appToken ?? '').trim()
     // 完整 URL：/wiki/<token> 或 /base/<token> —— 直接抠出 token。
     const urlMatch = token.match(/(?:\/wiki\/|\/base\/)([A-Za-z0-9]+)/)
     if (urlMatch) token = urlMatch[1]
-    if (!/^wiki/i.test(token)) return token // 原生 app_token，原样返回
+    if (!/^wiki/i.test(token)) return [token] // 原生 app_token，原样返回
     const payload = await apiCall('/open-apis/wiki/v2/spaces/get_node', {
       query: { token, obj_type: 'bitable' },
       signal,
@@ -726,34 +730,29 @@ export function createFeishuSource (options = {}) {
         `wiki 节点 ${token} 换算不出多维表格（obj_token 为空）。请确认这个链接指向的是一张多维表格，且应用有该知识库的阅读权限。`,
       )
     }
-    return objToken
+    // 新版 wiki base 直接用 wiki token；旧版用换算出的 obj_token。两个都试。
+    const candidates = [objToken]
+    if (token !== objToken) candidates.push(token)
+    return candidates
   }
 
   async function resolveTable (signal) {
     if (tableCache) return tableCache
 
-    const resolvedAppToken = await normalizeAppToken(signal)
-
-    if (resolvedAppToken && tableId) {
-      tableCache = { appToken: resolvedAppToken, tableId }
-      return tableCache
-    }
-
-    if (resolvedAppToken) {
-      const payload = await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 100 }, signal })
-      const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
-      const matched = docNamePattern
-        ? items.filter((item) => matchesPattern(String(item?.name ?? ''), docNamePattern))
-        : items
-      if (matched.length !== 1) {
-        throw new PipelineError(
-          'invalid-input',
-          `多维表格 ${appToken} 里按 "${docNamePattern || '（未指定表名）'}" 匹配到 ${matched.length} 张表，需要恰好 1 张。`
-            + `现有表：${items.map((item) => String(item?.name ?? '?')).join('、') || '（空）'}`,
-        )
+    if (appToken && String(appToken).trim().length > 0) {
+      const candidates = await normalizeAppToken(signal)
+      // 逐个候选试列表层：第一个能列出表的胜出（旧版 wiki base 用 obj_token，新版直接吃 wiki token）。
+      let lastError = null
+      for (const candidate of candidates) {
+        try {
+          const found = await resolveTableWithAppToken(candidate, signal)
+          tableCache = found
+          return tableCache
+        } catch (error) {
+          lastError = error
+        }
       }
-      tableCache = { appToken: resolvedAppToken, tableId: String(matched[0].table_id) }
-      return tableCache
+      throw lastError ?? new PipelineError('invalid-input', `appToken ${String(appToken)} 无法定位多维表格`)
     }
 
     if (!docNamePattern) {
@@ -780,6 +779,29 @@ export function createFeishuSource (options = {}) {
     }
     tableCache = { appToken: doc.token, tableId: String(items[0].table_id) }
     return tableCache
+  }
+
+  /**
+   * 用确定的 app_token 走原来的两条路：有 tableId 直接绑定，没 tableId 按 pattern 在表清单里挑唯一一张。
+   */
+  async function resolveTableWithAppToken (resolvedAppToken, signal) {
+    if (tableId) {
+      return { appToken: resolvedAppToken, tableId }
+    }
+
+    const payload = await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 100 }, signal })
+    const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
+    const matched = docNamePattern
+      ? items.filter((item) => matchesPattern(String(item?.name ?? ''), docNamePattern))
+      : items
+    if (matched.length !== 1) {
+      throw new PipelineError(
+        'invalid-input',
+        `多维表格 ${appToken} 里按 "${docNamePattern || '（未指定表名）'}" 匹配到 ${matched.length} 张表，需要恰好 1 张。`
+          + `现有表：${items.map((item) => String(item?.name ?? '?')).join('、') || '（空）'}`,
+      )
+    }
+    return { appToken: resolvedAppToken, tableId: String(matched[0].table_id) }
   }
 
   /**

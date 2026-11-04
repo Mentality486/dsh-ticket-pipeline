@@ -111,6 +111,8 @@ function createFakeServer (options = {}) {
     tables: options.tables ? [...options.tables] : [],
     /** @type {any[]} */
     files: options.files ? [...options.files] : [],
+    /** 这些 app_token 调 tables 时报 1254003 WrongBaseToken（测 wiki 双探测回退用） */
+    failAppTokens: options.failAppTokens ?? [],
     /** @type {string | null} */
     failCode: options.failCode ?? null,
     /** @type {string} */
@@ -175,6 +177,11 @@ function createFakeServer (options = {}) {
     }
 
     if (/\/tables$/.test(path)) {
+      const m = path.match(/\/apps\/([^/]+)\/tables/)
+      const reqToken = m ? decodeURIComponent(m[1]) : ''
+      if (Array.isArray(state.failAppTokens) && state.failAppTokens.includes(reqToken)) {
+        return jsonResponse({ code: 1254003, msg: 'WrongBaseToken' }, 400)
+      }
       return jsonResponse({ code: 0, data: { items: state.tables } })
     }
 
@@ -511,6 +518,25 @@ export async function runFeishuChecks (check) {
     assert.equal(result.created.length, 1)
     const tablesRequest = server.requests.find((r) => /\/bitable\/v1\/apps\/[^/]+\/tables/.test(r.url))
     assert.ok(tablesRequest?.url.includes('btplNormal-wikiWIKITOKEN456'), 'wiki token 应换算成 obj_token')
+  })
+
+  await check('obj_token 无效时回退用原 wiki token（新版 wiki base）', async () => {
+    const server = createFakeServer({
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+      failAppTokens: ['btplNormal-WIKITOKEN789'],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://x.feishu.cn/wiki/WIKITOKEN789',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    const tablesCalls = server.requests.filter((r) => /\/bitable\/v1\/apps\/[^/]+\/tables\?/.test(r.url))
+    assert.equal(tablesCalls.length, 2, '应该先试 obj_token 失败，再回退试 wiki token')
+    assert.ok(tablesCalls[0].url.includes('btplNormal-WIKITOKEN789'), '第一次用 obj_token')
+    assert.ok(tablesCalls[1].url.includes('/apps/WIKITOKEN789/'), '第二次回退用原 wiki token')
   })
 
   await check('docNamePattern 恰好命中 1 张表就用它', async () => {
