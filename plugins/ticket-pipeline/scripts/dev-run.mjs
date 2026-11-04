@@ -877,17 +877,41 @@ async function main () {
     assert.equal(out.warnings.length, 0)
   })
 
-  await check('pipeline_doctor 报 git 不可用 + 占位 remote + mock 提醒', async () => {
+  await check('pipeline_doctor 报 git 不可用 + remote 连不上 + mock 提醒', async () => {
     const tool = createPipelineDoctorTool({
       gitRunner: async () => ({ code: 1, stdout: '', stderr: 'fatal: not a git repository' }),
       getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/nope', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'mock', pushAdapter: 'mock' }),
       credentials: null,
+      probeRemote: async () => ({ ok: false, reason: "fatal: could not read Username for 'http://gitlab.example.com'" }),
     })
     const out = await tool.execute({}, {})
     assert.equal(out.ok, false, '有问题时必须不是 ok')
     assert.ok(out.problems.length > 0, '要有 problems')
-    assert.ok(out.text.includes('占位符'), '占位 remote 要点名')
+    assert.ok(out.text.includes('连不上'), 'remote 连不上要点名')
+    assert.ok(out.text.includes('could not read Username'), '要把 git 的原话带出来，人才知道是认证还是 DNS')
     assert.ok(out.text.includes('mock'), 'mock 状态要提醒')
+  })
+
+  await check('pipeline_doctor 用握手判 remote，不靠域名猜占位符', async () => {
+    // gitlab.example.com 在有些内网部署里就是真服务器：按域名判占位符会把健康配置报成故障，
+    // 而真正连不上的地址反而不一定长得像占位符。
+    const make = (probeRemote) => createPipelineDoctorTool({
+      gitRunner: async (argv) => (argv[0] === 'ls-remote'
+        ? { code: 0, stdout: '', stderr: '' }
+        : { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      credentials: { describe: async () => ({ configured: true }) },
+      detectBaseBranch: async () => 'v2.x',
+      probeRemote,
+    })
+
+    const reachable = await make(async () => ({ ok: true })).execute({}, {})
+    assert.equal(reachable.ok, true, `真服务器不该被报成问题：${reachable.text}`)
+    assert.ok(!reachable.text.includes('占位符'), '不该再出现「占位符」这个词')
+    assert.ok(reachable.text.includes('remote 已连通'), '连通要说清')
+
+    const unreachable = await make(async () => ({ ok: false, reason: 'timeout' })).execute({}, {})
+    assert.ok(unreachable.warnings.some((w) => w.includes('连不上')), '连不上要提醒')
   })
 
   await check('pipeline_doctor 会显示自动识别出的基准分支，并在回退 main 时提醒', async () => {

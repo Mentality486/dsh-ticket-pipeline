@@ -319,7 +319,8 @@ export function makeGitRunner (ctx) {
       const command = quoted
       const execution = await shell.execute(shell.resolve({
         command,
-        timeoutMs: 120000,
+        // 体检探 remote 这类网络命令不能等两分钟：调用方可以显式缩短。
+        timeoutMs: Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 120000,
         sandboxPolicy: fullAccessSandboxPolicy(opts.cwd),
       }))
       const result = await execution.result()
@@ -748,6 +749,20 @@ export async function apply (ctx, config) {
     gitRunner,
     getConfig: () => config,
     credentials: makeCredentialsDescriber(ctx),
+    // 「remote 是不是占位符」不能靠域名猜：`gitlab.example.com` 在有些部署里就是真服务器，
+    // 猜错会把健康的配置报成问题，也会漏掉真正连不上的地址。这里改成真的去握一次手
+    // （`git ls-remote`，只读、不改仓库），连不上才提醒，并把 git 的原话带出来。
+    probeRemote: async (remote) => {
+      if (!gitRunner) return { ok: false, reason: 'git 执行链路不可用' }
+      try {
+        const r = await gitRunner(['ls-remote', '--heads', remote], { timeoutMs: 20000 })
+        if (r.code === 0) return { ok: true }
+        const firstLine = String(r.stderr ?? '').split('\n').map((s) => s.trim()).find(Boolean) ?? ''
+        return { ok: false, reason: firstLine.slice(0, 200) || ('git ls-remote 退出码 ' + r.code) }
+      } catch (error) {
+        return { ok: false, reason: String(error?.message ?? error).slice(0, 200) }
+      }
+    },
     // 基准分支猜错 = fetch 直接失败（fatal: couldn't find remote ref main），
     // 所以体检时就把「实际会用的分支」显出来，而不是等第一张票跑挂。
     detectBaseBranch: (runner, repoPath) => detectBaseBranch(runner, repoPath, log),

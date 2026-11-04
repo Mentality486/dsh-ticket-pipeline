@@ -22,11 +22,22 @@
  * 而不是等跑到一半才炸。组合根按 `src/index.js` 里 `executorOptions()` 的说明接线。
  */
 
+import { randomUUID } from 'node:crypto'
+
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
 import { assertWorkExecutor, makeExecResult } from '../../contracts/work-executor.js'
 
 /** 给 `agents.create` 的 sessionId 前缀。sessionId 里不能出现 `/`，所以下面全部替换掉。 */
 const SESSION_PREFIX = 'ticket'
+
+/**
+ * 没配 `agentPreset` 时挂哪个 preset。
+ *
+ * 取 `ptc` 是因为它是本仓 profile 的 `agent-preset-registry.selectedDefault`
+ * （`cordis.patch.yml` 里 `config: {default: standard, selectedDefault: ptc}`），
+ * 也就是「这套部署里最完整的工具矩阵」。配置为空串可以显式不挂。
+ */
+export const DEFAULT_AGENT_PRESET = 'ptc'
 
 /**
  * 敏感文件：命中了就**不提交**，并在结果里写清为什么。
@@ -152,12 +163,18 @@ export function createAgentExecutor (options = {}) {
         // 指到别处就会在人的主目录里改代码。
         meta: { cwd: worktreePath },
         agentOptions: agentOptionsFromConfig(config),
-        // setup 是宿主装载工具/提示的地方。这里只记一行 —— 插件没有宿主内部的
-        // 安装器可用（import 不到 @deepseek-ai/*），真需要再加。
-        setup: (agentCtx) => {
-          void agentCtx
-          log('executor-agent：agent 已就绪', { sessionId })
-        },
+        // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
+        // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
+        // 起来是个没有任何工具的壳，改不出任何文件。
+        setup: (agentCtx, agent) => setupAgent(options, {
+          agentCtx,
+          agent,
+          worktreePath,
+          presetId: config.agentPreset,
+          signal,
+          sessionId,
+          log,
+        }),
       })
       const agent = created?.agent
       if (!agent || typeof agent.followup !== 'function') {
@@ -406,18 +423,135 @@ async function waitForAgentIdle (agent, signal, cancelAgent) {
 }
 
 /**
+ * 在宿主 publish 之前把子 agent 装配起来。这是 setup 的全部职责。
+ *
+ * 三件事，缺任何一件都会让 agent「看起来起来了、实际什么也没干」：
+ *
+ * 1. **挂 preset**（`agentPresets.mount`）：preset 决定这个 agent 有哪些工具。
+ *    不挂 = 一个没有任何工具的壳，它只会回一句「我看不到文件」，然后
+ *    `collectChanges` 拿到空改动 → 票被判 failed。宿主自己的子 agent 走的是
+ *    同一个 API（`dsh-subagent:applyChildComposition`）。
+ * 2. **记策略事件**：宿主的沙箱模式与会话绑定，且**必须自己 append**
+ *    （`dsh-subagent` 的 `appendDelegatedPolicyOverrides` 就是这么做的）。
+ *    不 append 就吃部署默认（可能是 read-only），agent 改不动 worktree 里任何文件。
+ * 3. **钉 cwd**：`meta.cwd` 已经写进 session header，但若宿主有
+ *    `workingDirectory` 服务且当前值不同，要显式 set —— 工具按它解析相对路径。
+ *
+ * 全部用 `agentCtx.get(name)` 弱取：这些服务不是每个 profile 都装
+ * （headless profile 就没有 agentPresets），弱取能让插件在缺服务时给出
+ * 一条说清缺什么的日志，而不是让宿主在启动期把插件 park 掉。
+ *
+ * @param {any} options createAgentExecutor 的 options
+ * @param {{
+ *   agentCtx: any,
+ *   agent: any,
+ *   worktreePath: string,
+ *   presetId?: string,
+ *   signal?: AbortSignal,
+ *   sessionId: string,
+ *   log: (msg: string, detail?: unknown) => void,
+ * }} input
+ * @returns {Promise<void>}
+ */
+export async function setupAgent (options, input) {
+  void options
+  const { agentCtx, agent, worktreePath, signal, sessionId, log } = input
+  // 三态语义：undefined = 没配（用默认 ptc）、空串 = 明确不挂、其它 = 挂指定的那个。
+  const presetId = input.presetId === undefined
+    ? DEFAULT_AGENT_PRESET
+    : String(input.presetId).trim()
+
+  // ── 1. 挂 preset（工具矩阵）────────────────────────
+  if (presetId.length > 0) {
+    const presets = agentCtx?.get?.('agentPresets')
+    if (!presets || typeof presets.mount !== 'function') {
+      // 没装 agent-preset-registry 的 profile（如 headless）没有这个服务。
+      // 这时候起出来的 agent 没有工具，改动一定为空 —— 说明白，别让人猜。
+      log('executor-agent：本机没有 agentPresets 服务，agent 不会有任何工具（改动必为空）', { sessionId, presetId })
+    } else {
+      try {
+        const mounted = await presets.mount(agentCtx, presetId)
+        log('executor-agent：preset 已挂载', { sessionId, presetId: mounted?.id ?? presetId })
+      } catch (error) {
+        // 挂不上就不要继续：让它跑下去只会拿到「没有产生任何文件改动」，
+        // 真正的原因（preset 名写错 / preset 定义坏了）会被埋掉。
+        const available = await listPresetIds(presets)
+        throw new PipelineError(
+          'invalid-input',
+          `executor-agent 挂 agentPreset "${presetId}" 失败：${error?.message ?? String(error)}` +
+          (available.length > 0 ? `。本机可用的 preset：${available.join(' / ')}` : '') +
+          '。把配置项 agentPreset 改成本机存在的值，或留空表示不挂 preset。',
+        )
+      }
+    }
+  } else {
+    log('executor-agent：agentPreset 留空，不挂 preset（agent 有哪些工具取决于宿主默认）', { sessionId })
+  }
+
+  // ── 2. 会话策略：沙箱模式 + 审批策略 ─────────────────
+  // 这两个是「本会话」的策略，写进 session 事件，宿主按它解析每次受限调用。
+  const session = agent?.session
+  if (session && typeof session.append === 'function') {
+    try {
+      session.append('sandbox/mode', { mode: 'danger-full-access' })
+      session.append('approval/policy', { policy: 'never' })
+      log('executor-agent：会话策略已记（danger-full-access / approval never）', { sessionId })
+    } catch (error) {
+      log('executor-agent：写入会话策略事件失败，agent 可能改不动 worktree', { sessionId, reason: String(error) })
+    }
+  }
+
+  // ── 3. 钉 cwd ───────────────────────────────────────
+  const workingDirectory = agentCtx?.get?.('workingDirectory')
+  if (workingDirectory && typeof workingDirectory.set === 'function' && worktreePath.length > 0) {
+    try {
+      const current = typeof workingDirectory.get === 'function' ? workingDirectory.get(agent.session) : undefined
+      if (current !== worktreePath) await workingDirectory.set(agent, worktreePath, signal)
+    } catch (error) {
+      // meta.cwd 已经写进 session header，set 失败只是没能再钉一遍，不必判失败。
+      log('executor-agent：把 cwd 钉到 worktree 失败（继续用 session header 里的 cwd）', { sessionId, worktreePath, reason: String(error) })
+    }
+  }
+}
+
+/**
+ * 列本机可用的 preset id —— 只在挂载失败时用来把「可选项」写进报错。
+ *
+ * @param {any} presets
+ * @returns {Promise<string[]>}
+ */
+async function listPresetIds (presets) {
+  if (typeof presets.list !== 'function') return []
+  try {
+    const items = await presets.list()
+    return (Array.isArray(items) ? items : []).map((item) => String(item?.id ?? '')).filter((id) => id.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
  * `createUserMessage`：优先用注入的宿主实现，没有就手搓一个等价物。
  *
  * 为什么要有兜底：`@deepseek-ai/dsh-llm` 只在宿主 asar 里，插件目录 import 不到。
- * 手搓的形状只带 `role/content/source` —— host 的 `createMessage` 额外加了 `id` 并冻结，
- * 那是宿主内部身份，followup 时由宿主自己补，插件这层不需要。
+ *
+ * **`id` 必须自己补**：宿主的 `createMessage` 是
+ * `structuredClone({...input, id: randomUUID()})`，而 inbox 投影（`dsh-agent-loop`
+ * 的 `inboxProjectionDefinition.apply`）按 `id` 记账 —— 没有 `id` 的消息会直接把
+ * `followup()` 炸成 `invalid persisted inbox splice`。所以兜底实现照宿主的形状补齐，
+ * 而不是只带 `role/content/source`。
  *
  * @param {any} injected
  * @returns {(input: { content: unknown, source?: { kind: string } }) => any}
  */
 function resolveCreateUserMessage (injected) {
   if (typeof injected === 'function') return injected
-  return (input) => ({ role: 'user', content: input.content, source: input.source ?? { kind: 'user' } })
+  return (input) => ({
+    id: randomUUID(),
+    role: 'user',
+    content: input.content,
+    source: input.source ?? { kind: 'user' },
+  })
 }
 
 /**

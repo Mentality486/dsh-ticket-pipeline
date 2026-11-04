@@ -12,8 +12,8 @@
  *
  * 1. **git 执行链路**：优先走 `ctx.shell`（bash -c，Windows 沙箱下唯一能落地的路径），
  *    跑 `git --version`；不可用时退回 `ctx.subprocess` 探测。两种都不行会给出明确提示。
- * 2. **每个项目的仓库**：路径存在、是 git 仓库（有 .git）、remote 是否还是
- *    `gitlab.example.com` 占位符（占位符会导致 fetch/MR 全部失败）。
+ * 2. **每个项目的仓库**：路径存在、是 git 仓库（有 .git）、remote 能不能真的连上
+ *    （走 `git ls-remote` 握手；连不上意味着 fetch/MR 全部失败）。
  * 3. **凭据**：用 credentials.describe()（只说配没配，绝不返回值）。
  * 4. **执行器/通知适配器**：是否还是 mock（mock 能跑通链路但不会真的改代码、发通知）。
  *
@@ -41,6 +41,7 @@ import { defineTool, textBlocks } from './define.js'
  * @property {() => unknown} getConfig
  * @property {{ describe?: (ref: string) => Promise<{ configured: boolean, source?: string } | undefined> } | null} [credentials]
  * @property {(runner: any, repoPath: string) => Promise<string>} [detectBaseBranch]
+ * @property {(remote: string) => Promise<{ ok: boolean, reason?: string }>} [probeRemote]
  */
 
 /**
@@ -125,9 +126,25 @@ for (const project of projects) {
   let remoteNote = ''
   if (remote.length === 0) {
     warnings.push(`项目 ${name}：repo.remote 没配 —— fetch/PR 将无法进行。`)
-  } else if (/gitlab\.example\.com|example\.com|placeholder/i.test(remote)) {
-    warnings.push(`项目 ${name}：repo.remote 还是占位符（${remote}）——需要换成真实 GitLab 地址。`)
-    remoteNote = '（占位符！）'
+  } else if (typeof options.probeRemote === 'function') {
+    // 只按域名猜「是不是占位符」是不可靠的：`gitlab.example.com` 在某些内网部署里
+    // 就是真服务器（猜错 = 把健康配置报成故障），而真正连不上的地址反而不一定长得像占位符。
+    // 所以这里真的握一次手（`git ls-remote`，只读），连不上才提醒，并把 git 的原话带出来。
+    try {
+      const probe = await options.probeRemote(remote)
+      if (probe?.ok) {
+        remoteNote = '，remote 已连通'
+      } else {
+        const why = String(probe?.reason ?? '').trim()
+        warnings.push(`项目 ${name}：repo.remote 连不上（${remote}）${why ? `—— git 说：${why}` : ''}。`)
+        remoteNote = '（remote 连不上！）'
+      }
+    } catch (error) {
+      warnings.push(`项目 ${name}：探测 repo.remote 失败（${error?.message ?? String(error)}）。`)
+      remoteNote = '（remote 未探测）'
+    }
+  } else {
+    remoteNote = '，remote 未探测'
   }
   // 基准分支：没显式配就去仓库里认，认不出来要说清（猜错分支 = fetch 直接失败）。
   let branchNote = ''

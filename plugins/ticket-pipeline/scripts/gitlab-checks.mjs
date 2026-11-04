@@ -127,13 +127,18 @@ function createFakeAgent (options = {}) {
   let cancelled = false
   let released = false
   let seq = 1
-  const state = { followups, injects, get cancelled () { return cancelled }, get released () { return released } }
+  /** 记录 setup 期间发生的事：preset 挂载、会话策略事件。 */
+  const appends = []
+  const mounts = []
+  const state = { followups, injects, appends, mounts, get cancelled () { return cancelled }, get released () { return released } }
   /** @type {Array<() => void>} */
   const abortWaiters = []
-
   const agent = {
     status: 'idle',
-    session: { get seq () { return seq } },
+    session: {
+      get seq () { return seq },
+      append (type, data) { appends.push({ type, data }) },
+    },
     followup (message) {
       followups.push(message)
       options.onFollowup?.()
@@ -160,6 +165,37 @@ function createFakeAgent (options = {}) {
     get idleCalls () { return idleCalls },
   }
   return { agent, state }
+}
+
+/**
+ * 造一个只实现了 host 那部分能力的假 agentCtx（setup 回调拿到的第一个参数）。
+ *
+ * @param {{ presetError?: Error, presetIds?: string[] }} [options]
+ * @returns {any}
+ */
+function createFakeAgentCtx (options = {}) {
+  const state = { mounts: [], setCalls: [] }
+  const presets = {
+    list: async () => (options.presetIds ?? ['ptc', 'standard']).map((id) => ({ id })),
+    mount: async (ctx, id) => {
+      if (options.presetError) throw options.presetError
+      state.mounts.push(id)
+      return { id }
+    },
+  }
+  const agentCtx = {
+    get (name) {
+      if (name === 'agentPresets') return presets
+      if (name === 'workingDirectory') {
+        return {
+          get: () => undefined,
+          set: async (_agent, path) => { state.setCalls.push(path); return path },
+        }
+      }
+      return undefined
+    },
+  }
+  return { agentCtx, state }
 }
 
 const TICKET = Object.freeze({
@@ -191,9 +227,13 @@ function makeRunEnv (options = {}) {
   const files = options.files ?? ['src/login.js', 'src/helper.js']
   const contents = options.contents ?? {}
 
+  // 宿主的 setup 是「publish 之前」调用的：这里照样在返回 agent 之前 await 它，
+  // 这样断言能看到 preset 挂载与会话策略事件的真实顺序。
+  const { agentCtx, state: setupState } = createFakeAgentCtx(options)
   const agents = {
     create: async (input) => {
       created.push(input)
+      await input.setup?.(agentCtx, agent)
       return { agent }
     },
   }
@@ -247,7 +287,7 @@ function makeRunEnv (options = {}) {
     onPhase: async (phase) => { phases.push(phase) },
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, gitCalls, gitServer, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, phases, gitCalls, gitServer, setupState, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -406,6 +446,62 @@ export async function runGitlabChecks (check) {
     const opts = agentOptionsFromConfig({ provider: '', model: '', maxTokens: 8192 })
     assert.deepEqual(opts, { maxTokens: 8192 }, '空串有语义：表示跟随默认，传下去会被当成「空模型名」')
     assert.equal(agentOptionsFromConfig({ provider: 'workbuddy', model: 'x' }).provider, 'workbuddy')
+  })
+
+  await check('执行器：setup 里挂 preset —— 不挂的话 agent 没有任何工具，改动必为空', async () => {
+    // 这是「切到 agent 执行器后票永远 failed」的根因：setup 曾经只打一行日志。
+    // 宿主自己的子 agent 走 presets.mount（dsh-subagent:applyChildComposition），
+    // 插件起的 agent 必须做同一件事。
+    const env = makeRunEnv()
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.deepEqual(env.setupState.mounts, ['ptc'], `应该挂默认 preset ptc，实际挂了 ${JSON.stringify(env.setupState.mounts)}`)
+  })
+
+  await check('执行器：agentPreset 可配置，留空则不挂', async () => {
+    const custom = makeRunEnv()
+    custom.ctx.config.agentPreset = 'standard'
+    await custom.executor.run(custom.ticket, custom.target, custom.ctx)
+    assert.deepEqual(custom.setupState.mounts, ['standard'], 'agentPreset 配置要能被读到')
+
+    const none = makeRunEnv()
+    none.ctx.config.agentPreset = ''
+    await none.executor.run(none.ticket, none.target, none.ctx)
+    assert.deepEqual(none.setupState.mounts, [], '留空 = 不挂 preset（交给宿主默认）')
+  })
+
+  await check('执行器：setup 里记 sandbox/mode 与 approval/policy —— 不记就吃部署默认（可能只读）', async () => {
+    const env = makeRunEnv()
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    const mode = env.state.appends.find((event) => event.type === 'sandbox/mode')
+    const approval = env.state.appends.find((event) => event.type === 'approval/policy')
+    assert.ok(mode, '必须 append sandbox/mode，否则 agent 改不动 worktree')
+    assert.equal(mode.data.mode, 'danger-full-access')
+    assert.ok(approval, '必须 append approval/policy，否则 worker 里会弹审批卡死')
+    assert.equal(approval.data.policy, 'never')
+  })
+
+  await check('执行器：preset 挂不上时报 invalid-input 并列出可用 preset（不埋掉真因）', async () => {
+    const env = makeRunEnv({ presetError: new Error('Unknown agent preset: nope') })
+    await assert.rejects(
+      () => env.executor.run(env.ticket, env.target, env.ctx),
+      (error) => {
+        assert.equal(error.kind, 'invalid-input', 'preset 名写错是配置问题，不该重试')
+        assert.match(error.message, /agentPreset "ptc" 失败/)
+        assert.ok(error.message.includes('ptc / standard'), '要把本机可用的 preset 列出来，人才能改对')
+        return true
+      },
+    )
+  })
+
+  await check('执行器：跟进消息必须带 id（宿主 inbox 按 id 记账，缺了会炸 invalid inbox splice）', async () => {
+    const env = makeRunEnv()
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    const message = env.state.followups[0]
+    assert.ok(typeof message.id === 'string' && message.id.length > 0, 'followup 的消息必须有 id')
+    // 两条消息的 id 必须不同，否则第二条会被宿主判成「重复 id」。
+    const second = makeRunEnv()
+    await second.executor.run(second.ticket, second.target, second.ctx)
+    assert.notEqual(second.state.followups[0].id, message.id, '每条 followup 的 id 必须唯一')
   })
 
   await check('执行器：阶段按 editing → testing → mr-opening 推进', async () => {

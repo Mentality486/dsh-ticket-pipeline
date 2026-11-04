@@ -134,7 +134,7 @@ export const CONFIG_FIELDS = Object.freeze({
   workExecutor: {
     type: 'string',
     default: 'mock',
-    description: '执行器 id（mock / agent）。agent 还没实现，先用 mock 跑通链路',
+    description: '执行器 id（mock / agent）。mock 只跑通链路、不改代码；agent 会真的起一个 agent 改代码并开 draft MR',
   },
   ticketTimeoutMinutes: {
     type: 'number',
@@ -178,6 +178,11 @@ export const CONFIG_FIELDS = Object.freeze({
     min: 1024,
     max: 200000,
     description: '单次模型调用的最大输出 token',
+  },
+  agentPreset: {
+    type: 'string',
+    default: 'ptc',
+    description: 'agent 执行器给子 agent 挂的 preset id（决定它有哪些工具）。留空 = 不挂，适合宿主已自带工具的场合',
   },
 
   // ── 通知 ────────────────────────────────────────────
@@ -307,6 +312,7 @@ export const CONFIG_GROUPS = Object.freeze([
       Object.freeze(['provider', '模型 provider']),
       Object.freeze(['model', '模型名']),
       Object.freeze(['maxTokens', '最大输出 token']),
+      Object.freeze(['agentPreset', 'agent preset']),
     ]),
   }),
   Object.freeze({
