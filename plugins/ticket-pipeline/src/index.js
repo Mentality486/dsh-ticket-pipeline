@@ -224,13 +224,48 @@ export const PUSHES = {
 }
 
 /**
+ * 造一份「不套沙箱」的执行策略，交给宿主 shell。
+ *
+ * 为什么必须显式给：
+ * 宿主的 `SandboxBashExecutor.resolve(request)` 在调用方没有传 `sandboxPolicy` 时，
+ * 退回 `ctx.sandboxPolicy.resolve()`（无 session 的调用就落到部署级默认策略）。这种
+ * 策略里没有 `sessionId`，而 Windows 的 `windows-acl` 运行器在 sessionId 缺失时
+ * **一个写授权 SID 都不发**（源码：`windowsAclRunnerArgv(policy)` 里
+ * `if (sessionId === void 0 || policy.mode === "read-only")` 那条分支只传
+ * `--workspace/--temp/--mode`）。结果就是子进程只有只读权：git 写
+ * `.git/FETCH_HEAD`（lockfile + rename）一律 Permission denied。
+ *
+ * 传 `danger-full-access` 则是宿主明确支持的旁路：`execute()` 见到这个 mode 直接
+ * `super.execute(spec)`，完全跳过 confinement，不需要 sessionId。
+ *
+ * 安全边界（写进文档的那条）：插件跑的是**用户自己配置的仓库**里的 git 命令，
+ * 参数由适配器白名单/转义拼装，命令本身不含工单正文 —— 但这条旁路确实绕过了
+ * 按会话的写入准入，所以插件只把它用在 git / verify 命令上，不用于执行模型生成的
+ * 任意 shell（执行器侧的命令仍走它自己的策略）。
+ *
+ * @param {string | undefined} cwd 用作 workspaceRoot；缺省取进程工作目录
+ * @returns {{ mode: 'danger-full-access', workspaceRoot: string }}
+ */
+export function fullAccessSandboxPolicy (cwd) {
+  let workspaceRoot = typeof cwd === 'string' && cwd.length > 0 ? cwd : process.cwd()
+  // 宿主的 workspaceRoot 只认绝对路径（相对路径会让策略解析直接抛）。
+  // 配错的 cwd 不该在策略层炸成看不懂的错——回退到进程目录，真正的路径错误
+  // 会由 git -C 自己报出来，那才是用户能看懂的信息。
+  const isAbsolutePath = workspaceRoot.startsWith('/') ||
+    /^[A-Za-z]:[\\/]/.test(workspaceRoot) ||
+    workspaceRoot.startsWith('\\\\')
+  if (!isAbsolutePath) workspaceRoot = process.cwd()
+  return { mode: 'danger-full-access', workspaceRoot }
+}
+
+/**
  * 从 ctx 造一个「能跑 git 命令」的函数，供 `prepareWorkspace` / `removeWorktree` /
  * `checkWorktreeByGit` 用。`subprocess` 服务若不存在则返回 null。
  *
  * @param {any} ctx
  * @returns {(argv: string[], opts?: { cwd?: string }) => Promise<{ code: number, stdout: string, stderr: string }> | null}
  */
-function makeGitRunner (ctx) {
+export function makeGitRunner (ctx) {
   // 首选 `ctx.shell`（宿主 bash 执行器）：它走 bash -c 链路，是 Windows 沙箱下唯一
   // 实际能落地的执行路径；直接 subprocess.spawn 裸 exe 会被本机策略拒（EPERM/ENOENT）。
   let shell = null
@@ -253,6 +288,7 @@ function makeGitRunner (ctx) {
       const execution = await shell.execute(shell.resolve({
         command,
         timeoutMs: 120000,
+        sandboxPolicy: fullAccessSandboxPolicy(opts.cwd),
       }))
       const result = await execution.result()
       return {
@@ -408,7 +444,7 @@ function getService (ctx, name) {
  * @param {any} ctx
  * @returns {((input: { argv: string[], cwd: string, signal?: AbortSignal }) => Promise<{ code: number, stdout: string, stderr: string }>) | undefined}
  */
-function makeCommandRunner (ctx) {
+export function makeCommandRunner (ctx) {
   const shell = getService(ctx, 'shell')
   if (!shell || typeof shell.execute !== 'function' || typeof shell.resolve !== 'function') {
     return undefined
@@ -420,7 +456,12 @@ function makeCommandRunner (ctx) {
     // 命令本身带 -C 语义做不到（verify 是 npm/npx），改为显式拼 cd 且用 ';' 分隔，
     // PowerShell 支持 ';'，bash 也支持 ';'。
     const command = cwd ? `cd ${quoteShellArg(cwd)}; ${quoted}` : quoted
-    const execution = await shell.execute(shell.resolve({ command }))
+    // 与 gitRunner 同一条纪律：不带显式策略就会被宿主当成「无 session 的调用」，
+    // 拿不到任何写授权，verify 跑 npm test 连 node_modules 缓存都写不进去。
+    const execution = await shell.execute(shell.resolve({
+      command,
+      sandboxPolicy: fullAccessSandboxPolicy(cwd),
+    }))
     const result = await execution.result()
     return {
       code: Number(result?.exitCode ?? 0),

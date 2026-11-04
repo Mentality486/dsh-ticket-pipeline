@@ -37,7 +37,7 @@ import { runFeishuChecks } from './feishu-checks.mjs'
 import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
-import { apply } from '../src/index.js'
+import { apply, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy } from '../src/index.js'
 
 // ── 小工具 ────────────────────────────────────────────────
 
@@ -1010,6 +1010,65 @@ function makeFakeCtx ({ domain, registered }) {
     const { value: config } = validateConfig({ workExecutor: 'agent' })
     await apply(ctx, config)
     assert.ok(registered.some((tool) => tool.name === 'pipeline_scan'), 'agent 执行器下工具仍要注册')
+  })
+
+  section('12c. 走宿主 shell 时必须显式带 sandboxPolicy（否则无 session 调用拿不到写授权）')
+
+  /** 造一个假 shell 服务，记录每次 resolve 收到的请求。 */
+  function makeFakeShell (result = { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }) {
+    const requests = []
+    return {
+      requests,
+      resolve: (request) => { requests.push(request); return { ...request } },
+      execute: async () => ({ result: async () => result }),
+    }
+  }
+
+  await check('fullAccessSandboxPolicy 给出 danger-full-access + 绝对 workspaceRoot', async () => {
+    // 宿主 windows-acl 运行器在 sessionId 缺失时一个写 SID 都不发；
+    // 只有 danger-full-access 这条路能在无 session 的调用里拿到写权限。
+    const policy = fullAccessSandboxPolicy('D:/some/repo')
+    assert.equal(policy.mode, 'danger-full-access', '必须是不套沙箱的模式')
+    assert.equal(policy.workspaceRoot, 'D:/some/repo', 'workspaceRoot 用调用方给的 cwd')
+    assert.ok(typeof fullAccessSandboxPolicy(undefined).workspaceRoot === 'string', '缺 cwd 时要退到一个真实路径')
+  })
+
+  await check('gitRunner 传给 shell.resolve 的请求里带着 sandboxPolicy', async () => {
+    // 回归的正是「票每次都挂在 git fetch: Permission denied」：少了这个字段，
+    // 宿主会退回部署级默认策略，子进程只读，FETCH_HEAD 永远写不进去。
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const git = makeGitRunner(ctx)
+    assert.ok(git, '有 shell 服务时 gitRunner 必须造得出来')
+    await git(['fetch', 'origin', 'v2.x'], { cwd: 'D:/some/repo' })
+    assert.equal(shell.requests.length, 1, '应该只发一次 shell 调用')
+    const request = shell.requests[0]
+    assert.ok(request.sandboxPolicy, 'shell.resolve 请求里必须带 sandboxPolicy')
+    assert.equal(request.sandboxPolicy.mode, 'danger-full-access', '模式必须是 danger-full-access')
+    assert.equal(request.sandboxPolicy.workspaceRoot, 'D:/some/repo', 'workspaceRoot 要指向被跑命令的仓库')
+    assert.ok(String(request.command).includes("'-C'") === false, '路径不该被多余转义')
+    assert.ok(String(request.command).includes('-C'), '工作目录要用 git -C 表达')
+  })
+
+  await check('gitRunner 没有 cwd 时也带 sandboxPolicy（退到进程工作目录）', async () => {
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const git = makeGitRunner(ctx)
+    await git(['rev-parse', 'HEAD'])
+    assert.ok(shell.requests[0].sandboxPolicy, '缺省路径同样要带策略')
+    assert.ok(shell.requests[0].sandboxPolicy.workspaceRoot.length > 0, 'workspaceRoot 不能为空')
+  })
+
+  await check('commandRunner（verify 用）同样带 sandboxPolicy', async () => {
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const run = makeCommandRunner(ctx)
+    assert.ok(run, '有 shell 服务时 commandRunner 必须造得出来')
+    await run({ argv: ['npm', 'test'], cwd: 'D:/some/repo' })
+    const request = shell.requests[0]
+    assert.ok(request.sandboxPolicy, 'verify 也会写 node_modules 缓存，同样要带策略')
+    assert.equal(request.sandboxPolicy.mode, 'danger-full-access')
+    assert.equal(request.sandboxPolicy.workspaceRoot, 'D:/some/repo')
   })
 
   section('13. 新适配器：gitlab 客户端 / qqmail 推送 / wps 工单源')
