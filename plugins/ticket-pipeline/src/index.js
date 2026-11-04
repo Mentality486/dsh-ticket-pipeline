@@ -238,14 +238,15 @@ function makeGitRunner (ctx) {
   }
   if (shell && typeof shell.execute === 'function' && typeof shell.resolve === 'function') {
     return async (argv, opts = {}) => {
-      const quoted = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...argv]
+      // 工作目录用 `git -C <path>` 表达，不用 cd：
+      // ①宿主 shell.resolve 会忽略 cwd 字段（git 落在错误目录 → not a git repository）；
+      // ②宿主 shell 可能是 PowerShell（不支持 && 语法 → ParserError: InvalidEndOfLine）。
+      // git -C 在 bash / PowerShell 下语义一致；路径按单引号转义防注入。
+      const cwdArgs = opts.cwd ? ['-C', String(opts.cwd)] : []
+      const quoted = ['git', ...cwdArgs, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...argv]
         .map(a => /^[A-Za-z0-9@%+=:,./_-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\''`)}'`)
         .join(' ')
-      // cwd 不依赖 shell.resolve 的字段（实测宿主可能忽略它，git 落在错误目录报
-      // not a git repository），把 cd 显式编进命令，在任何宿主实现下都成立。
-      const command = opts.cwd
-        ? `cd '${String(opts.cwd).replace(/'/g, `'\''`)}' && ${quoted}`
-        : quoted
+      const command = quoted
       const execution = await shell.execute(shell.resolve({
         command,
         timeoutMs: 120000,
