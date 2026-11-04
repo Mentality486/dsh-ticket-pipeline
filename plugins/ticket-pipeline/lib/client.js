@@ -798,8 +798,17 @@ window.__ModuleLoader__.load({
       }
       mountedPromise = Promise.resolve()
         .then(function () { return remote['$mount'](TICKET_PIPELINE_REMOTE) })
-        .then(function () { return undefined })
+        .then(function () { return undefined }, function (error) {
+          // 挂失败不能把 Promise 缓存成永久失败：下次点体检还得能重试。
+          mountedPromise = null
+          throw error
+        })
       return mountedPromise
+    }
+
+    /** 插件卸载 / 重载时把挂载缓存清掉，下一次 apply 重新挂。 */
+    function resetMounted () {
+      mountedPromise = null
     }
 
     function apply (ctx) {
@@ -811,6 +820,10 @@ window.__ModuleLoader__.load({
         document.head.append(style)
         return function () { style.remove() }
       }, 'ticket-pipeline: settings styles')
+
+      // 卸载 / 重载（改配置会导致插件实例重建）时，$mount 的 disposer 会收回命名空间，
+      // 但模块级 Promise 还在 —— 不清掉的话下一次打开面板会以为「已挂上」而实际没有。
+      ctx.effect(function () { return resetMounted }, 'ticket-pipeline: reset remote mount')
 
       // 体检通道尽早挂上；失败只记日志，不能让设置表单跟着挂掉。
       ensureMounted(ctx.remote).catch(function (error) {
