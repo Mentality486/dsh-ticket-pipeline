@@ -2,3 +2,4 @@
 .scratch/
 *.log
 node_modules/
+dist/
