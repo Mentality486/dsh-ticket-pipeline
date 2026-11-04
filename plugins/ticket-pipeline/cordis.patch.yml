@@ -1,0 +1,9 @@
+# ticket-pipeline 插件：插入一行，挂载到 profile。
+#
+# 安装走 `plugin_manager install_bundle`（或 `dsh plugin --profile <name> add`），
+# 它会据此把包加进 profile 的 bundles 列表并合并本条 patch。
+# 绝不要手改 profile 的 cordis.patch.yml 或 package.json。
+- insert:
+    - id: ticket-pipeline
+      name: '@local/ticket-pipeline'
+      config: {}

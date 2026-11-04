@@ -1,0 +1,413 @@
+ion workbuddyMigrationName(e){return`${new Date(e.when).toISOString().replace(/\D/g,``).slice(0,14)}_${e.tag}`}var P={"0000_workbuddy_sqlite_baseline.sql":`CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    cwd TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    title TEXT,
+    custom_title TEXT,
+    status TEXT NOT NULL DEFAULT 'Pending',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_activity_at INTEGER,
+    deleted_at INTEGER,
+    is_playground INTEGER NOT NULL DEFAULT 0,
+    source_mode TEXT,
+    is_background_automation INTEGER,
+    mode TEXT,
+    model TEXT,
+    expert_id TEXT,
+    expert_locale TEXT,
+    expert_runtime_identity TEXT,
+    expert_marketplace TEXT,
+    permission_mode TEXT,
+    use_sandbox_cli INTEGER,
+    project_id TEXT
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS workspaces (
+    path TEXT PRIMARY KEY,
+    last_opened_at INTEGER NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS automations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL,
+    schedule_type TEXT NOT NULL DEFAULT 'recurring',
+    next_run_at INTEGER,
+    last_run_at INTEGER,
+    cwds TEXT NOT NULL DEFAULT '[]',
+    rrule TEXT NOT NULL DEFAULT '',
+    scheduled_at TEXT,
+    valid_from TEXT,
+    valid_until TEXT,
+    model_id TEXT,
+    model_is_thinking INTEGER NOT NULL DEFAULT 0,
+    skills_json TEXT NOT NULL DEFAULT '[]',
+    push_to_wechat INTEGER NOT NULL DEFAULT 0,
+    push_to_wecom_bot INTEGER NOT NULL DEFAULT 0,
+    wecom_bot_source TEXT,
+    owner_user_id TEXT,
+    owner_status TEXT NOT NULL DEFAULT 'legacy_unassigned',
+    owner_source TEXT,
+    expert_id TEXT,
+    expert_marketplace TEXT,
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    permission_mode TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted_at INTEGER
+);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automations_owner
+    ON automations(owner_user_id, owner_status, deleted_at);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS automation_runs (
+    thread_id TEXT PRIMARY KEY,
+    automation_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    read_at INTEGER,
+    thread_title TEXT,
+    source_cwd TEXT,
+    runs_json TEXT,
+    result_success INTEGER,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS automation_runtime_state (
+    automation_id TEXT PRIMARY KEY,
+    last_run_at INTEGER,
+    last_error TEXT,
+    running INTEGER NOT NULL DEFAULT 0,
+    running_started_at INTEGER,
+    running_conversation_id TEXT,
+    metadata_json TEXT
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS automation_delivery_outbox (
+    id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'wechatmp',
+    automation_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    automation_name TEXT NOT NULL,
+    owner_user_id TEXT,
+    host_id TEXT,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    next_run_at INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expire_at INTEGER,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    delivery_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS automation_delivery_outbox_dedupe_key_unique
+    ON automation_delivery_outbox(dedupe_key);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_delivery_outbox_status_next_run
+    ON automation_delivery_outbox(status, next_run_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_delivery_outbox_channel_status_next_run
+    ON automation_delivery_outbox(channel, status, next_run_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_delivery_outbox_run
+    ON automation_delivery_outbox(automation_id, run_id);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_delivery_outbox_owner_status
+    ON automation_delivery_outbox(owner_user_id, status);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_delivery_outbox_supersede_lookup
+    ON automation_delivery_outbox(automation_id, channel, owner_user_id, host_id, created_at);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS migration_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS session_usage (
+    session_id TEXT PRIMARY KEY,
+    used INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    credit_json TEXT
+);
+`,"0001_session_plugin_context.sql":`ALTER TABLE sessions ADD COLUMN plugin_context_json TEXT;
+`,"0002_add_addon_selection.sql":`ALTER TABLE sessions ADD COLUMN addon_selection TEXT;`,"0003_add_session_settings.sql":`ALTER TABLE sessions ADD COLUMN session_settings TEXT;`,"0004_last_user_prompt_expert_selection.sql":`ALTER TABLE sessions ADD COLUMN last_user_prompt_expert_selection TEXT;`,"0005_add_session_context_window.sql":`ALTER TABLE sessions ADD COLUMN context_window INTEGER;`,"0006_add_automation_runs_indexes.sql":`CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_id
+    ON automation_runs(automation_id);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_automation_runs_created_at
+    ON automation_runs(created_at);
+`,"0007_add_buddy_snapshots.sql":`CREATE TABLE IF NOT EXISTS buddy_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    application_id TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    template_version INTEGER NOT NULL,
+    snapshot_format_version INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    config_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN buddy_snapshot_id TEXT;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN buddy_binding_json TEXT;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_sessions_buddy_snapshot_id
+    ON sessions(buddy_snapshot_id);
+`,"0008_add_session_thought_level.sql":`ALTER TABLE sessions ADD COLUMN thought_level TEXT;`,"0009_add_automation_context_window.sql":`ALTER TABLE automations ADD COLUMN context_window INTEGER;`,"0010_add_automation_reasoning_effort.sql":`ALTER TABLE automations ADD COLUMN reasoning_effort TEXT;`,"0011_create_cloud_conversations.sql":`CREATE TABLE IF NOT EXISTS cloud_conversations (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    title TEXT,
+    conversation_origin TEXT,
+    visibility TEXT,
+    is_user_defined_title INTEGER,
+    status TEXT NOT NULL,
+    session_status TEXT,
+    lifecycle TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_activity_at INTEGER,
+    deleted_at INTEGER,
+    project_id TEXT,
+    work_dir TEXT,
+    is_playground INTEGER,
+    pin_order INTEGER NOT NULL DEFAULT 0,
+    runtime_id TEXT,
+    task_id TEXT,
+    task_title TEXT,
+    agent_id TEXT,
+    sandbox_id TEXT,
+    agent_dirty INTEGER,
+    agent_dirty_at INTEGER,
+    agent_last_synced INTEGER,
+    cached_at INTEGER NOT NULL,
+    last_fetched_at INTEGER NOT NULL,
+    verified_at INTEGER,
+    cache_source TEXT NOT NULL
+);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_sort
+    ON cloud_conversations(user_id, last_activity_at, created_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_workdir
+    ON cloud_conversations(user_id, work_dir, last_activity_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_playground
+    ON cloud_conversations(user_id, is_playground, last_activity_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_project
+    ON cloud_conversations(user_id, project_id, last_activity_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_pin
+    ON cloud_conversations(user_id, pin_order);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_user_lifecycle
+    ON cloud_conversations(user_id, lifecycle, deleted_at);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_cloudconv_verified_at
+    ON cloud_conversations(user_id, verified_at);
+`,"0012_unify_sessions_cloud.sql":`ALTER TABLE sessions ADD COLUMN transport TEXT NOT NULL DEFAULT 'local';
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN conversation_origin TEXT;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN visibility TEXT;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN group_id TEXT;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN group_title TEXT;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN agent_dirty INTEGER;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN agent_dirty_at INTEGER;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN agent_last_synced INTEGER;
+--> statement-breakpoint
+ALTER TABLE sessions ADD COLUMN verified_at INTEGER;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_sessions_cloud_sort
+    ON sessions(user_id, last_activity_at, created_at)
+    WHERE transport = 'cloud' AND deleted_at = -1;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_sessions_cloud_group
+    ON sessions(user_id, conversation_origin, group_id)
+    WHERE transport = 'cloud' AND deleted_at = -1;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_sessions_cloud_project
+    ON sessions(user_id, project_id, last_activity_at)
+    WHERE transport = 'cloud' AND deleted_at = -1;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS idx_sessions_cloud_verified
+    ON sessions(user_id, verified_at)
+    WHERE transport = 'cloud';
+--> statement-breakpoint
+DROP TABLE IF EXISTS cloud_conversations;
+`,"0013_add_session_unread.sql":`ALTER TABLE sessions ADD COLUMN unread INTEGER NOT NULL DEFAULT 0;`,"0014_add_automation_runs_failure_code.sql":`ALTER TABLE automation_runs ADD COLUMN failure_code TEXT;
+--> statement-breakpoint
+ALTER TABLE automation_runs ADD COLUMN reason_code TEXT;`,"0015_workspace_trust_decisions.sql":`CREATE TABLE IF NOT EXISTS workspace_trust_decisions (
+    workspace_key TEXT PRIMARY KEY,
+    decision TEXT NOT NULL CHECK (decision IN ('trusted', 'rejected')),
+    revision INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);`,"0016_add_automation_workspace_scope.sql":`ALTER TABLE automations ADD COLUMN workspace_scope TEXT;`,"0017_add_automation_wecom_bot_chat_id.sql":`ALTER TABLE automations ADD COLUMN wecom_bot_chat_id TEXT;`,"0018_add_automation_runs_status_index.sql":`CREATE INDEX IF NOT EXISTS idx_automation_runs_status_created_at
+    ON automation_runs(status, created_at);`},F=`__workbuddy_drizzle_migrations`,I={sessions:`id.cwd.user_id.title.custom_title.status.created_at.updated_at.last_activity_at.deleted_at.is_playground.source_mode.is_background_automation.mode.model.expert_id.expert_locale.expert_runtime_identity.expert_marketplace.permission_mode.use_sandbox_cli.project_id.plugin_context_json.addon_selection.session_settings.last_user_prompt_expert_selection.context_window.thought_level.buddy_snapshot_id.buddy_binding_json.unread.transport.conversation_origin.visibility.group_id.group_title.agent_dirty.agent_dirty_at.agent_last_synced.verified_at`.split(`.`),buddy_snapshots:[`snapshot_id`,`application_id`,`template_id`,`schema_version`,`template_version`,`snapshot_format_version`,`config_json`,`config_digest`,`created_at`],workspaces:[`path`,`last_opened_at`],automations:`id.name.prompt.status.schedule_type.next_run_at.last_run_at.cwds.workspace_scope.rrule.scheduled_at.valid_from.valid_until.model_id.model_is_thinking.context_window.reasoning_effort.skills_json.push_to_wechat.push_to_wecom_bot.wecom_bot_source.wecom_bot_chat_id.owner_user_id.owner_status.owner_source.expert_id.expert_marketplace.connector_ids_json.permission_mode.created_at.updated_at.deleted_at`.split(`.`),automation_runs:[`thread_id`,`automation_id`,`status`,`read_at`,`thread_title`,`source_cwd`,`runs_json`,`result_success`,`metadata_json`,`failure_code`,`reason_code`,`created_at`,`updated_at`],automation_runtime_state:[`automation_id`,`last_run_at`,`last_error`,`running`,`running_started_at`,`running_conversation_id`,`metadata_json`],automation_delivery_outbox:[`id`,`dedupe_key`,`channel`,`automation_id`,`run_id`,`automation_name`,`owner_user_id`,`host_id`,`payload_json`,`status`,`attempt_count`,`max_attempts`,`next_run_at`,`lease_owner`,`lease_expire_at`,`last_error_code`,`last_error_message`,`delivery_id`,`created_at`,`updated_at`,`finished_at`],migration_meta:[`key`,`value`],session_usage:[`session_id`,`used`,`size`,`updated_at`,`credit_json`]},L={sessions:[{name:`cwd`,addSql:`ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`},{name:`user_id`,addSql:`ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`},{name:`title`,addSql:`ALTER TABLE sessions ADD COLUMN title TEXT`},{name:`custom_title`,addSql:`ALTER TABLE sessions ADD COLUMN custom_title TEXT`},{name:`status`,addSql:`ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'`},{name:`created_at`,addSql:`ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`},{name:`updated_at`,addSql:`ALTER TABLE sessions ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`},{name:`last_activity_at`,addSql:`ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER`},{name:`deleted_at`,addSql:`ALTER TABLE sessions ADD COLUMN deleted_at INTEGER`},{name:`is_playground`,addSql:`ALTER TABLE sessions ADD COLUMN is_playground INTEGER NOT NULL DEFAULT 0`},{name:`source_mode`,addSql:`ALTER TABLE sessions ADD COLUMN source_mode TEXT`},{name:`is_background_automation`,addSql:`ALTER TABLE sessions ADD COLUMN is_background_automation INTEGER`},{name:`mode`,addSql:`ALTER TABLE sessions ADD COLUMN mode TEXT`},{name:`model`,addSql:`ALTER TABLE sessions ADD COLUMN model TEXT`},{name:`expert_id`,addSql:`ALTER TABLE sessions ADD COLUMN expert_id TEXT`},{name:`expert_locale`,addSql:`ALTER TABLE sessions ADD COLUMN expert_locale TEXT`},{name:`expert_runtime_identity`,addSql:`ALTER TABLE sessions ADD COLUMN expert_runtime_identity TEXT`},{name:`expert_marketplace`,addSql:`ALTER TABLE sessions ADD COLUMN expert_marketplace TEXT`},{name:`permission_mode`,addSql:`ALTER TABLE sessions ADD COLUMN permission_mode TEXT`},{name:`use_sandbox_cli`,addSql:`ALTER TABLE sessions ADD COLUMN use_sandbox_cli INTEGER`},{name:`project_id`,addSql:`ALTER TABLE sessions ADD COLUMN project_id TEXT`}],workspaces:[{name:`last_opened_at`,addSql:`ALTER TABLE workspaces ADD COLUMN last_opened_at INTEGER NOT NULL DEFAULT 0`}],automations:[{name:`name`,addSql:`ALTER TABLE automations ADD COLUMN name TEXT NOT NULL DEFAULT ''`},{name:`prompt`,addSql:`ALTER TABLE automations ADD COLUMN prompt TEXT NOT NULL DEFAULT ''`},{name:`status`,addSql:`ALTER TABLE automations ADD COLUMN status TEXT NOT NULL DEFAULT 'enabled'`},{name:`schedule_type`,addSql:`ALTER TABLE automations ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'recurring'`},{name:`next_run_at`,addSql:`ALTER TABLE automations ADD COLUMN next_run_at INTEGER`},{name:`last_run_at`,addSql:`ALTER TABLE automations ADD COLUMN last_run_at INTEGER`},{name:`cwds`,addSql:`ALTER TABLE automations ADD COLUMN cwds TEXT NOT NULL DEFAULT '[]'`},{name:`rrule`,addSql:`ALTER TABLE automations ADD COLUMN rrule TEXT NOT NULL DEFAULT ''`},{name:`scheduled_at`,addSql:`ALTER TABLE automations ADD COLUMN scheduled_at TEXT`},{name:`valid_from`,addSql:`ALTER TABLE automations ADD COLUMN valid_from TEXT`},{name:`valid_until`,addSql:`ALTER TABLE automations ADD COLUMN valid_until TEXT`},{name:`model_id`,addSql:`ALTER TABLE automations ADD COLUMN model_id TEXT`},{name:`model_is_thinking`,addSql:`ALTER TABLE automations ADD COLUMN model_is_thinking INTEGER NOT NULL DEFAULT 0`},{name:`skills_json`,addSql:`ALTER TABLE automations ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'`},{name:`push_to_wechat`,addSql:`ALTER TABLE automations ADD COLUMN push_to_wechat INTEGER NOT NULL DEFAULT 0`},{name:`push_to_wecom_bot`,addSql:`ALTER TABLE automations ADD COLUMN push_to_wecom_bot INTEGER NOT NULL DEFAULT 0`},{name:`wecom_bot_source`,addSql:`ALTER TABLE automations ADD COLUMN wecom_bot_source TEXT`},{name:`owner_user_id`,addSql:`ALTER TABLE automations ADD COLUMN owner_user_id TEXT`},{name:`owner_status`,addSql:`ALTER TABLE automations ADD COLUMN owner_status TEXT NOT NULL DEFAULT 'legacy_unassigned'`},{name:`owner_source`,addSql:`ALTER TABLE automations ADD COLUMN owner_source TEXT`},{name:`expert_id`,addSql:`ALTER TABLE automations ADD COLUMN expert_id TEXT`},{name:`expert_marketplace`,addSql:`ALTER TABLE automations ADD COLUMN expert_marketplace TEXT`},{name:`connector_ids_json`,addSql:`ALTER TABLE automations ADD COLUMN connector_ids_json TEXT NOT NULL DEFAULT '[]'`},{name:`permission_mode`,addSql:`ALTER TABLE automations ADD COLUMN permission_mode TEXT`},{name:`created_at`,addSql:`ALTER TABLE automations ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`},{name:`updated_at`,addSql:`ALTER TABLE automations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`},{name:`deleted_at`,addSql:`ALTER TABLE automations ADD COLUMN deleted_at INTEGER`}],automation_runs:[{name:`automation_id`,addSql:`ALTER TABLE automation_runs ADD COLUMN automation_id TEXT NOT NULL DEFAULT ''`},{name:`status`,addSql:`ALTER TABLE automation_runs ADD COLUMN status TEXT NOT NULL DEFAULT ''`},{name:`read_at`,addSql:`ALTER TABLE automation_runs ADD COLUMN read_at INTEGER`},{name:`thread_title`,addSql:`ALTER TABLE automation_runs ADD COLUMN thread_title TEXT`},{name:`source_cwd`,addSql:`ALTER TABLE automation_runs ADD COLUMN source_cwd TEXT`},{name:`runs_json`,addSql:`ALTER TABLE automation_runs ADD COLUMN runs_json TEXT`},{name:`result_success`,addSql:`ALTER TABLE automation_runs ADD COLUMN result_success INTEGER`},{name:`metadata_json`,addSql:`ALTER TABLE automation_runs ADD COLUMN metadata_json TEXT`},{name:`created_at`,addSql:`ALTER TABLE automation_runs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`},{name:`updated_at`,addSql:`ALTER TABLE automation_runs ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`}],automation_runtime_state:[{name:`last_run_at`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN last_run_at INTEGER`},{name:`last_error`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN last_error TEXT`},{name:`running`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN running INTEGER NOT NULL DEFAULT 0`},{name:`running_started_at`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN running_started_at INTEGER`},{name:`running_conversation_id`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN running_conversation_id TEXT`},{name:`metadata_json`,addSql:`ALTER TABLE automation_runtime_state ADD COLUMN metadata_json TEXT`}],automation_delivery_outbox:[{name:`dedupe_key`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''`},{name:`channel`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN channel TEXT NOT NULL DEFAULT 'wechatmp'`},{name:`automation_id`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN automation_id TEXT NOT NULL DEFAULT ''`},{name:`run_id`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`},{name:`automation_name`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN automation_name TEXT NOT NULL DEFAULT ''`},{name:`owner_user_id`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN owner_user_id TEXT`},{name:`host_id`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN host_id TEXT`},{name:`payload_json`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'`},{name:`status`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`},{name:`attempt_count`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`},{name:`max_attempts`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 5`},{name:`next_run_at`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN next_run_at INTEGER NOT NULL DEFAULT 0`},{name:`lease_owner`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN lease_owner TEXT`},{name:`lease_expire_at`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN lease_expire_at INTEGER`},{name:`last_error_code`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN last_error_code TEXT`},{name:`last_error_message`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN last_error_message TEXT`},{name:`delivery_id`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN delivery_id TEXT`},{name:`created_at`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`},{name:`updated_at`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`},{name:`finished_at`,addSql:`ALTER TABLE automation_delivery_outbox ADD COLUMN finished_at INTEGER`}],migration_meta:[{name:`value`,addSql:`ALTER TABLE migration_meta ADD COLUMN value TEXT NOT NULL DEFAULT ''`}],session_usage:[{name:`used`,addSql:`ALTER TABLE session_usage ADD COLUMN used INTEGER NOT NULL DEFAULT 0`},{name:`size`,addSql:`ALTER TABLE session_usage ADD COLUMN size INTEGER NOT NULL DEFAULT 0`},{name:`updated_at`,addSql:`ALTER TABLE session_usage ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`},{name:`credit_json`,addSql:`ALTER TABLE session_usage ADD COLUMN credit_json TEXT`}]},be={sessions:[{name:`plugin_context_json`,addSql:`ALTER TABLE sessions ADD COLUMN plugin_context_json TEXT`},{name:`addon_selection`,addSql:`ALTER TABLE sessions ADD COLUMN addon_selection TEXT`},{name:`session_settings`,addSql:`ALTER TABLE sessions ADD COLUMN session_settings TEXT`},{name:`last_user_prompt_expert_selection`,addSql:`ALTER TABLE sessions ADD COLUMN last_user_prompt_expert_selection TEXT`},{name:`context_window`,addSql:`ALTER TABLE sessions ADD COLUMN context_window INTEGER`},{name:`thought_level`,addSql:`ALTER TABLE sessions ADD COLUMN thought_level TEXT`},{name:`buddy_snapshot_id`,addSql:`ALTER TABLE sessions ADD COLUMN buddy_snapshot_id TEXT`},{name:`buddy_binding_json`,addSql:`ALTER TABLE sessions ADD COLUMN buddy_binding_json TEXT`},{name:`unread`,addSql:`ALTER TABLE sessions ADD COLUMN unread INTEGER NOT NULL DEFAULT 0`}],automations:[{name:`context_window`,addSql:`ALTER TABLE automations ADD COLUMN context_window INTEGER`},{name:`reasoning_effort`,addSql:`ALTER TABLE automations ADD COLUMN reasoning_effort TEXT`},{name:`workspace_scope`,addSql:`ALTER TABLE automations ADD COLUMN workspace_scope TEXT`},{name:`wecom_bot_chat_id`,addSql:`ALTER TABLE automations ADD COLUMN wecom_bot_chat_id TEXT`}],automation_runs:[{name:`failure_code`,addSql:`ALTER TABLE automation_runs ADD COLUMN failure_code TEXT`},{name:`reason_code`,addSql:`ALTER TABLE automation_runs ADD COLUMN reason_code TEXT`}]};function adoptLegacyWorkbuddySqliteSchema(e){for(let[t,n]of Object.entries(L))hasTable$1(e,t)&&runGuardedColumnMigrations(e,t,n)}function backfillPostMigrationColumns(e){e.exec(`
+        CREATE TABLE IF NOT EXISTS buddy_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            application_id TEXT NOT NULL,
+            template_id TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            template_version INTEGER NOT NULL,
+            snapshot_format_version INTEGER NOT NULL,
+            config_json TEXT NOT NULL,
+            config_digest TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    `);for(let[t,n]of Object.entries(be))hasTable$1(e,t)&&runGuardedColumnMigrations(e,t,n);e.exec(`
+        CREATE INDEX IF NOT EXISTS idx_sessions_buddy_snapshot_id
+            ON sessions(buddy_snapshot_id)
+    `)}var xe=/ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)/gi;function parseAddColumnTargets(e){let t=[];for(let n of e.matchAll(xe))t.push({table:n[1],column:n[2]});return t}var R=ye.entries.map(e=>{let t=`${e.tag}.sql`,n=P[t];if(typeof n!=`string`)throw Error(`[WorkBuddySQLite] missing migration file content for ${t}`);return{idx:e.idx,tag:e.tag,when:e.when,name:workbuddyMigrationName(e),hash:u.createHash(`sha256`).update(n).digest(`hex`),statements:n.split(`--> statement-breakpoint`),targetColumns:parseAddColumnTargets(n)}}),Se=R.filter(e=>e.idx>=1);function upgradeLegacyMigrationLedger(e){if(hasTable$1(e,`__workbuddy_drizzle_migrations`)&&readLedgerUpgrade(e).pending){e.exec(`BEGIN IMMEDIATE`);try{let t=readLedgerUpgrade(e);t.pending&&applyLedgerUpgrade(e,t),e.exec(`COMMIT`)}catch(t){try{e.exec(`ROLLBACK`)}catch{}throw t}}}function readLedgerUpgrade(e){let t=!getColumnSet(e,F).has(`name`),n=e.prepare(`SELECT rowid AS row_id, hash, created_at, ${t?`NULL`:`name`} AS name
+         FROM ${F}`).all(),r=createPlanEntryLookup();return{firstConversion:t,rows:n,pending:t||n.some(e=>typeof e.name!=`string`&&r(e)!==void 0)}}function createPlanEntryLookup(){let e=new Map(R.map(e=>[e.when,e])),t=new Map(R.map(e=>[e.hash,e]));return n=>e.get(truncateToSecond(n.created_at))??(typeof n.hash==`string`?t.get(n.hash):void 0)}function applyLedgerUpgrade(e,{firstConversion:t,rows:n}){let r=createPlanEntryLookup(),i=new Set;t&&(e.exec(`ALTER TABLE ${F} ADD COLUMN name text`),e.exec(`ALTER TABLE ${F} ADD COLUMN applied_at TEXT`));let a=e.prepare(`UPDATE ${F} SET name = ? WHERE rowid = ?`);for(let e of n){if(typeof e.name==`string`){i.add(e.name);continue}let t=r(e);t&&(a.run(t.name,e.row_id),i.add(t.name))}if(t){let t=n.reduce((e,t)=>{let n=Number(t.created_at);return Number.isFinite(n)&&(e===void 0||n>e)?n:e},void 0);if(t!==void 0)for(let n of R)n.when<=t&&!i.has(n.name)&&(insertLedgerEntry(e,n),i.add(n.name))}}function truncateToSecond(e){let t=Number(e);return Number.isFinite(t)?Math.floor(t/1e3)*1e3:NaN}function ensureLedgerTable(e){if(hasTable$1(e,`__workbuddy_drizzle_migrations`)){upgradeLegacyMigrationLedger(e);return}e.exec(`
+        CREATE TABLE IF NOT EXISTS ${F} (
+            id INTEGER PRIMARY KEY,
+            hash text NOT NULL,
+            created_at numeric,
+            name text,
+            applied_at TEXT
+        )
+    `)}function getLedgerNameSet(e){let t=e.prepare(`SELECT name FROM ${F} WHERE name IS NOT NULL`).all();return new Set(t.map(e=>e.name))}function insertLedgerEntry(e,t){e.prepare(`INSERT INTO ${F} (hash, created_at, name, applied_at) VALUES (?, ?, ?, ?)`).run(t.hash,t.when,t.name,new Date().toISOString())}function migrationTargetColumnsPresent(e,t){return t.targetColumns.length!==0&&t.targetColumns.every(t=>hasTable$1(e,t.table)?getColumnSet(e,t.table).has(t.column):!1)}function reconcileMigrationLedgerForExistingColumns(e){ensureLedgerTable(e);let t=getLedgerNameSet(e);for(let n of Se)!t.has(n.name)&&migrationTargetColumnsPresent(e,n)&&(insertLedgerEntry(e,n),t.add(n.name))}var Ce=/duplicate column name/i;function isDuplicateColumnError(e){return Ce.test(i.i(e))}function isAlreadyPresentAddColumn(e,t){let n=parseAddColumnTargets(t);return n.length!==0&&n.every(t=>hasTable$1(e,t.table)&&getColumnSet(e,t.table).has(t.column))}function applyMigrationsWithDuplicateColumnFallback(e){ensureLedgerTable(e);let t=getLedgerNameSet(e);for(let n of R)if(!t.has(n.name)){for(let t of n.statements){let n=t.trim();if(n.length!==0)try{e.exec(n)}catch(t){if(isDuplicateColumnError(t)&&isAlreadyPresentAddColumn(e,n))continue;throw t}}insertLedgerEntry(e,n),t.add(n.name)}}function ensureSessionUsageTableSchema(e){e.exec(`
+          CREATE TABLE IF NOT EXISTS session_usage (
+           session_id TEXT PRIMARY KEY,
+              used INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+    credit_json TEXT
+    );
+      `),runGuardedColumnMigrations(e,`session_usage`,L.session_usage),assertTableColumns(e,`session_usage`,I.session_usage)}var we=[{name:`transport`,addSql:`ALTER TABLE sessions ADD COLUMN transport TEXT NOT NULL DEFAULT 'local'`},{name:`conversation_origin`,addSql:`ALTER TABLE sessions ADD COLUMN conversation_origin TEXT`},{name:`visibility`,addSql:`ALTER TABLE sessions ADD COLUMN visibility TEXT`},{name:`group_id`,addSql:`ALTER TABLE sessions ADD COLUMN group_id TEXT`},{name:`group_title`,addSql:`ALTER TABLE sessions ADD COLUMN group_title TEXT`},{name:`agent_dirty`,addSql:`ALTER TABLE sessions ADD COLUMN agent_dirty INTEGER`},{name:`agent_dirty_at`,addSql:`ALTER TABLE sessions ADD COLUMN agent_dirty_at INTEGER`},{name:`agent_last_synced`,addSql:`ALTER TABLE sessions ADD COLUMN agent_last_synced INTEGER`},{name:`verified_at`,addSql:`ALTER TABLE sessions ADD COLUMN verified_at INTEGER`}];function ensureUnifiedSessionsSchema(e){let t=P[`0012_unify_sessions_cloud.sql`];if(typeof t!=`string`)throw Error(`[WorkBuddySQLite] missing migration file content for 0012_unify_sessions_cloud.sql`);runGuardedColumnMigrations(e,`sessions`,we);for(let n of t.split(`--> statement-breakpoint`)){let t=n.trim();t.length!==0&&(/^ALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN/i.test(t)||e.exec(t))}assertTableColumns(e,`sessions`,I.sessions)}function assertWorkbuddySqliteSchema(e){let t=[];for(let[n,r]of Object.entries(I))t.push(...getMissingTableColumns(e,n,r));if(t.length>0)throw Error(`[WorkBuddySQLite] schema migration incomplete; missing ${t.join(`, `)}`)}function getAutomationRunsRunsJsonColumnType(e){return getColumnDeclaredType(e,`automation_runs`,`runs_json`)}function runGuardedColumnMigrations(e,t,n){let r=getColumnSet(e,t);for(let t of n)r.has(t.name)||e.exec(t.addSql)}function assertTableColumns(e,t,n){let r=getMissingTableColumns(e,t,n);if(r.length>0)throw Error(`[WorkBuddySQLite] schema migration incomplete; missing ${r.join(`, `)}`)}function getMissingTableColumns(e,t,n){if(!hasTable$1(e,t))return[`${t}.*`];let r=getColumnSet(e,t);return n.filter(e=>!r.has(e)).map(e=>`${t}.${e}`)}function hasTable$1(e,t){return!!e.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`).get(t)}function getColumnSet(e,t){let n=e.prepare(`PRAGMA table_info(${t})`).all();return new Set(n.map(e=>e.name).filter(e=>typeof e==`string`))}function getColumnDeclaredType(e,t,n){let r=e.prepare(`PRAGMA table_info(${t})`).all();for(let e of r)if(String(e.name??``)===n)return String(e.type??``).trim()||void 0}function automationRunsBaselineTableSql(){let e=P[`0000_workbuddy_sqlite_baseline.sql`].match(/CREATE TABLE IF NOT EXISTS automation_runs \([\s\S]*?\n\);/);if(!e)throw Error(`[WorkBuddySQLite] automation_runs baseline DDL is missing from migration bundle`);return e[0]}function automationRunsIndexesSql(){return[P[`0006_add_automation_runs_indexes.sql`],P[`0018_add_automation_runs_status_index.sql`]].join(`
+`).replaceAll(`--> statement-breakpoint`,``)}function hasTable(e,t){return!!e.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`).get(t)}function ensureAutomationRunsTableBeforeMigration(e){!hasTable(e,`automation_runs`)&&hasTable(e,`__workbuddy_drizzle_migrations`)&&e.prepare(`SELECT 1 FROM __workbuddy_drizzle_migrations LIMIT 1`).get()&&e.exec(automationRunsBaselineTableSql())}function ensureAutomationRunsIndexes(e){e.exec(automationRunsIndexesSql())}var z=N(`buddy_snapshots`,{snapshotId:text(`snapshot_id`).primaryKey(),applicationId:text(`application_id`).notNull(),templateId:text(`template_id`).notNull(),schemaVersion:integer(`schema_version`).notNull(),templateVersion:integer(`template_version`).notNull(),snapshotFormatVersion:integer(`snapshot_format_version`).notNull(),configJson:text(`config_json`).notNull(),configDigest:text(`config_digest`).notNull(),createdAt:integer(`created_at`).notNull()}),B=N(`sessions`,{id:text(`id`).primaryKey(),cwd:text(`cwd`).notNull(),userId:text(`user_id`).notNull(),title:text(`title`),customTitle:text(`custom_title`),status:text(`status`).notNull().default(`Pending`),createdAt:integer(`created_at`).notNull(),updatedAt:integer(`updated_at`).notNull(),lastActivityAt:integer(`last_activity_at`),deletedAt:integer(`deleted_at`),isPlayground:integer(`is_playground`).notNull().default(0),sourceMode:text(`source_mode`),isBackgroundAutomation:integer(`is_background_automation`),mode:text(`mode`),model:text(`model`),expertId:text(`expert_id`),expertLocale:text(`expert_locale`),expertRuntimeIdentity:text(`expert_runtime_identity`),expertMarketplace:text(`expert_marketplace`),lastUserPromptExpertSelectionJson:text(`last_user_prompt_expert_selection`),permissionMode:text(`permission_mode`),useSandboxCli:integer(`use_sandbox_cli`),projectId:text(`project_id`),pluginContextJson:text(`plugin_context_json`),addonSelection:text(`addon_selection`),sessionSettings:text(`session_settings`),contextWindow:integer(`context_window`),thoughtLevel:text(`thought_level`),buddySnapshotId:text(`buddy_snapshot_id`),buddyBindingJson:text(`buddy_binding_json`),unread:integer(`unread`).notNull().default(0),transport:text(`transport`).notNull().default(`local`),conversationOrigin:text(`conversation_origin`),visibility:text(`visibility`),groupId:text(`group_id`),groupTitle:text(`group_title`),agentDirty:integer(`agent_dirty`),agentDirtyAt:integer(`agent_dirty_at`),agentLastSynced:integer(`agent_last_synced`),verifiedAt:integer(`verified_at`)},e=>({buddySnapshotId:index(`idx_sessions_buddy_snapshot_id`).on(e.buddySnapshotId),cloudSort:index(`idx_sessions_cloud_sort`).on(e.userId,e.lastActivityAt,e.createdAt).where(sql`transport = 'cloud' AND deleted_at = -1`),cloudGroup:index(`idx_sessions_cloud_group`).on(e.userId,e.conversationOrigin,e.groupId).where(sql`transport = 'cloud' AND deleted_at = -1`),cloudProject:index(`idx_sessions_cloud_project`).on(e.userId,e.projectId,e.lastActivityAt).where(sql`transport = 'cloud' AND deleted_at = -1`),cloudVerified:index(`idx_sessions_cloud_verified`).on(e.userId,e.verifiedAt).where(sql`transport = 'cloud'`)})),V=N(`workspaces`,{path:text(`path`).primaryKey(),lastOpenedAt:integer(`last_opened_at`).notNull()}),H=N(`workspace_trust_decisions`,{workspaceKey:text(`workspace_key`).primaryKey(),decision:text(`decision`,{enum:[`trusted`,`rejected`]}).notNull(),revision:integer(`revision`).notNull(),createdAt:integer(`created_at`).notNull(),updatedAt:integer(`updated_at`).notNull()}),U=N(`automations`,{id:text(`id`).primaryKey(),name:text(`name`).notNull(),prompt:text(`prompt`).notNull(),status:text(`status`).notNull(),scheduleType:text(`schedule_type`).notNull().default(`recurring`),nextRunAt:integer(`next_run_at`),lastRunAt:integer(`last_run_at`),cwds:text(`cwds`).notNull().default(`[]`),workspaceScope:text(`workspace_scope`),rrule:text(`rrule`).notNull().default(``),scheduledAt:text(`scheduled_at`),validFrom:text(`valid_from`),validUntil:text(`valid_until`),modelId:text(`model_id`),modelIsThinking:integer(`model_is_thinking`).notNull().default(0),reasoningEffort:text(`reasoning_effort`),contextWindow:integer(`context_window`),skillsJson:text(`skills_json`).notNull().default(`[]`),pushToWeChat:integer(`push_to_wechat`).notNull().default(0),pushToWecomBot:integer(`push_to_wecom_bot`).notNull().default(0),wecomBotSource:text(`wecom_bot_source`),wecomBotChatId:text(`wecom_bot_chat_id`),ownerUserId:text(`owner_user_id`),ownerStatus:text(`owner_status`).notNull().default(`legacy_unassigned`),ownerSource:text(`owner_source`),expertId:text(`expert_id`),expertMarketplace:text(`expert_marketplace`),connectorIdsJson:text(`connector_ids_json`).notNull().default(`[]`),permissionMode:text(`permission_mode`),createdAt:integer(`created_at`).notNull(),updatedAt:integer(`updated_at`).notNull(),deletedAt:integer(`deleted_at`)},e=>({owner:index(`idx_automations_owner`).on(e.ownerUserId,e.ownerStatus,e.deletedAt)})),W=N(`automation_runs`,{threadId:text(`thread_id`).primaryKey(),automationId:text(`automation_id`).notNull(),status:text(`status`).notNull(),readAt:integer(`read_at`),threadTitle:text(`thread_title`),sourceCwd:text(`source_cwd`),runsJson:text(`runs_json`),resultSuccess:integer(`result_success`),failureCode:text(`failure_code`),reasonCode:text(`reason_code`),metadataJson:text(`metadata_json`),createdAt:integer(`created_at`).notNull(),updatedAt:integer(`updated_at`).notNull()},e=>({automationId:index(`idx_automation_runs_automation_id`).on(e.automationId),createdAt:index(`idx_automation_runs_created_at`).on(e.createdAt),statusCreatedAt:index(`idx_automation_runs_status_created_at`).on(e.status,e.createdAt)})),G=N(`automation_runtime_state`,{automationId:text(`automation_id`).primaryKey(),lastRunAt:integer(`last_run_at`),lastError:text(`last_error`),running:integer(`running`).notNull().default(0),runningStartedAt:integer(`running_started_at`),runningConversationId:text(`running_conversation_id`),metadataJson:text(`metadata_json`)}),K=N(`automation_delivery_outbox`,{id:text(`id`).primaryKey(),dedupeKey:text(`dedupe_key`).notNull(),channel:text(`channel`).notNull().default(`wechatmp`),automationId:text(`automation_id`).notNull(),runId:text(`run_id`).notNull(),automationName:text(`automation_name`).notNull(),ownerUserId:text(`owner_user_id`),hostId:text(`host_id`),payloadJson:text(`payload_json`).notNull(),status:text(`status`).notNull(),attemptCount:integer(`attempt_count`).notNull().default(0),maxAttempts:integer(`max_attempts`).notNull().default(5),nextRunAt:integer(`next_run_at`).notNull(),leaseOwner:text(`lease_owner`),leaseExpireAt:integer(`lease_expire_at`),lastErrorCode:text(`last_error_code`),lastErrorMessage:text(`last_error_message`),deliveryId:text(`delivery_id`),createdAt:integer(`created_at`).notNull(),updatedAt:integer(`updated_at`).notNull(),finishedAt:integer(`finished_at`)},e=>({dedupe:uniqueIndex(`automation_delivery_outbox_dedupe_key_unique`).on(e.dedupeKey),statusNextRun:index(`idx_automation_delivery_outbox_status_next_run`).on(e.status,e.nextRunAt),channelStatusNextRun:index(`idx_automation_delivery_outbox_channel_status_next_run`).on(e.channel,e.status,e.nextRunAt),run:index(`idx_automation_delivery_outbox_run`).on(e.automationId,e.runId),ownerStatus:index(`idx_automation_delivery_outbox_owner_status`).on(e.ownerUserId,e.status),supersedeLookup:index(`idx_automation_delivery_outbox_supersede_lookup`).on(e.automationId,e.channel,e.ownerUserId,e.hostId,e.createdAt)})),q=N(`migration_meta`,{key:text(`key`).primaryKey(),value:text(`value`).notNull()}),J=N(`session_usage`,{sessionId:text(`session_id`).primaryKey(),used:integer(`used`).notNull(),size:integer(`size`).notNull(),updatedAt:integer(`updated_at`).notNull(),creditJson:text(`credit_json`)}),Te=[`workspace_key`,`decision`,`revision`,`created_at`,`updated_at`],Ee=`workspace_trust_legacy_grandfather`,De=0;function collectLegacyWorkspacePaths(e){let t=[];for(let n of[`SELECT path AS workspace_path FROM workspaces`,`SELECT DISTINCT cwd AS workspace_path FROM sessions WHERE is_playground = 0`])try{for(let r of e.prepare(n).all())typeof r.workspace_path==`string`&&r.workspace_path&&t.push(r.workspace_path)}catch{}return t}function resolveLegacyWorkspaceKeys(e){let t=new Set;for(let n of collectLegacyWorkspacePaths(e))try{let e=c.realpathSync.native(n);c.statSync(e).isDirectory()&&t.add(e)}catch{}return t}function ensureWorkspaceTrustDecisionsSchema(e){try{let t=P[`0015_workspace_trust_decisions.sql`];if(typeof t!=`string`)throw Error(`missing workspace trust migration SQL`);e.exec(t);let n=e.prepare(`PRAGMA table_info(workspace_trust_decisions)`).all(),r=new Set(n.flatMap(e=>typeof e.name==`string`?[e.name]:[]));if(Te.filter(e=>!r.has(e)).length>0)throw Error(`workspace trust schema incomplete`);return!0}catch{return getDatabaseLogger().warn(`[WorkBuddySQLite] workspace trust schema unavailable; continuing without trust persistence.`),!1}}function grandfatherLegacyWorkspaceTrust(e){try{if(e.prepare(`SELECT 1 FROM migration_meta WHERE key = ?`).get(Ee))return;let t=resolveLegacyWorkspaceKeys(e);e.exec(`BEGIN IMMEDIATE`);try{let n=Date.now(),r=e.prepare(`INSERT OR IGNORE INTO workspace_trust_decisions
+                     (workspace_key, decision, revision, created_at, updated_at)
+                 VALUES (?, 'trusted', ?, ?, ?)`),i=0;for(let e of t){let t=r.run(e,De,n,n);i+=t.changes??0}e.prepare(`INSERT OR REPLACE INTO migration_meta (key, value) VALUES (?, ?)`).run(Ee,JSON.stringify({at:n,grandfathered:i})),e.exec(`COMMIT`)}catch(t){throw e.exec(`ROLLBACK`),t}}catch{getDatabaseLogger().warn(`[WorkBuddySQLite] legacy workspace trust grandfather skipped; existing workspaces may prompt once.`)}}function restoreLegacyAutomationTitlesFromRunRecords(e){let t=sql`
+        UPDATE ${B}
+        SET title = m.automation_name
+        FROM (
+            SELECT session_id, automation_name,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY session_id ORDER BY updated_at DESC
+                   ) AS rn
+            FROM (
+                SELECT
+                    COALESCE(
+                        CASE WHEN json_valid(${W.metadataJson})
+                             THEN json_extract(${W.metadataJson}, '$.conversationId') END,
+                        CASE WHEN json_valid(${W.metadataJson})
+                             THEN json_extract(${W.metadataJson}, '$.sessionId') END,
+                        CASE WHEN json_valid(${W.runsJson})
+                             THEN json_extract(${W.runsJson}, '$[0].conversationId') END,
+                        ${W.threadId}
+                    ) AS session_id,
+                    ${U.name} AS automation_name,
+                    ${W.updatedAt} AS updated_at
+                FROM ${W}
+                JOIN ${U}
+                  ON ${U.id} = ${W.automationId}
+                 AND ${U.deletedAt} IS NULL
+            )
+        ) AS m
+        WHERE m.rn = 1
+          AND m.session_id IS NOT NULL
+          AND ${B.id} = m.session_id
+          AND ${B.isBackgroundAutomation} = 1
+          AND (${B.customTitle} IS NULL OR ${B.customTitle} = '')
+          AND COALESCE(${B.title}, '') <> m.automation_name
+    `;try{let n=e.run(t);return typeof n?.changes==`number`?n.changes:0}catch(e){return console.warn(`[WorkBuddySQLite] Legacy automation title restore via run records skipped:`,e instanceof Error?e.message:String(e)),0}}function restoreLegacyAutomationIdentityFromRunRecords(e){let t=sql`
+        WITH candidates AS (
+            SELECT
+                COALESCE(
+                    CASE WHEN json_valid(${W.metadataJson})
+                         THEN json_extract(${W.metadataJson}, '$.conversationId') END,
+                    CASE WHEN json_valid(${W.metadataJson})
+                         THEN json_extract(${W.metadataJson}, '$.sessionId') END,
+                    CASE WHEN json_valid(${W.runsJson})
+                         THEN json_extract(${W.runsJson}, '$[0].conversationId') END,
+                    ${W.threadId}
+                ) AS session_id,
+                ${W.automationId} AS automation_id,
+                ${U.workspaceScope} AS workspace_scope
+            FROM ${W}
+            JOIN ${U}
+              ON ${U.id} = ${W.automationId}
+             AND ${U.deletedAt} IS NULL
+        ), mappings AS (
+            SELECT
+                session_id,
+                MIN(automation_id) AS automation_id,
+                MIN(workspace_scope) AS workspace_scope
+            FROM candidates
+            WHERE session_id IS NOT NULL
+            GROUP BY session_id
+            HAVING COUNT(DISTINCT automation_id) = 1
+        )
+        UPDATE ${B}
+        SET
+            session_settings = json_set(
+                CASE WHEN json_valid(${B.sessionSettings})
+                     THEN CASE WHEN json_type(${B.sessionSettings}) = 'object'
+                               THEN ${B.sessionSettings} ELSE '{}' END
+                     ELSE '{}' END,
+                '$.conversationTags',
+                json(json_set(
+                    CASE WHEN json_type(
+                        CASE WHEN json_valid(${B.sessionSettings})
+                             THEN ${B.sessionSettings} ELSE '{}' END,
+                        '$.conversationTags'
+                    ) = 'object'
+                    THEN json_extract(${B.sessionSettings}, '$.conversationTags')
+                    ELSE '{}' END,
+                    '$.automationId', m.automation_id
+                ))
+            ),
+            is_playground = CASE m.workspace_scope
+                WHEN 'task' THEN 1
+                WHEN 'workspace' THEN 0
+                ELSE ${B.isPlayground}
+            END,
+            is_background_automation = 1
+        FROM mappings AS m
+        WHERE ${B.id} = m.session_id
+          AND (
+              COALESCE(${B.isBackgroundAutomation}, 0) <> 1
+              OR
+              (
+                  COALESCE(json_type(
+                      CASE WHEN json_valid(${B.sessionSettings})
+                           THEN ${B.sessionSettings} ELSE '{}' END,
+                      '$.conversationTags.automationId'
+                  ), '') <> 'text'
+                  OR TRIM(COALESCE(json_extract(
+                      CASE WHEN json_valid(${B.sessionSettings})
+                           THEN ${B.sessionSettings} ELSE '{}' END,
+                      '$.conversationTags.automationId'
+                  ), '')) = ''
+              )
+              OR (
+                  json_extract(
+                      CASE WHEN json_valid(${B.sessionSettings})
+                           THEN ${B.sessionSettings} ELSE '{}' END,
+                      '$.conversationTags.automationId'
+                  ) = m.automation_id
+                  AND (
+                      (m.workspace_scope = 'task' AND ${B.isPlayground} <> 1)
+                      OR (m.workspace_scope = 'workspace' AND ${B.isPlayground} <> 0)
+                  )
+              )
+          )
+    `,n=e.run(t);return typeof n?.changes==`number`?n.changes:0}function runWorkbuddyDrizzleMigrations(e){ensureAutomationRunsTableBeforeMigration(e),adoptLegacyWorkbuddySqliteSchema(e),reconcileMigrationLedgerForExistingColumns(e);let t=createWorkbuddyDrizzleDatabase(e);try{migrateSync(R.map(e=>({sql:e.statements,bps:!0,folderMillis:e.when,hash:e.hash,name:e.name})),t._.session,{migrationsTable:F})}catch(t){if(!isDuplicateColumnError(t))throw t;console.warn(`[WorkBuddySQLite] Drizzle migrate hit duplicate column name; falling back to guarded per-migration apply.`,t instanceof Error?t.message:String(t)),applyMigrationsWithDuplicateColumnFallback(e)}backfillPostMigrationColumns(e),ensureAutomationRunsIndexes(e),ensureUnifiedSessionsSchema(e),ensureWorkspaceTrustDecisionsSchema(e)&&grandfatherLegacyWorkspaceTrust(e),assertWorkbuddySqliteSchema(e)}var Oe=931071618,ke=931071619;function hasValidWalMagic(e){try{if(a.statSync(e).size<4)return!1;let t=a.openSync(e,`r`);try{let e=Buffer.alloc(4);a.readSync(t,e,0,4,0);let n=e.readUInt32BE(0);return n===Oe||n===ke}finally{a.closeSync(t)}}catch{return!1}}function countSessions(e){try{let t=e.prepare(`SELECT COUNT(*) AS cnt FROM sessions`).get();return Number(t?.cnt??0)}catch{return 0}}function passesQuickCheck(e){try{let t=e.pragma(`quick_check(100)`);return Array.isArray(t)&&t.length===1&&t[0]?.quick_check===`ok`}catch{return!1}}function openReadonly(e){try{return i.r(e,{readonly:!0})}catch{return}}function closeQuietly(e){try{e?.close()}catch{}}function openCorruptBackupForRead(e){let t,n,dispose=()=>{if(closeQuietly(n),n=void 0,t){try{a.rmSync(t,{recursive:!0,force:!0})}catch{}t=void 0}},failed=()=>(dispose(),{ok:!1,walReplayed:!1,sessionCount:0,dispose}),mainDbOnly=r=>(n=openReadonly(e.db),n?{ok:!0,walReplayed:!1,walIgnoredReason:r,sessionCount:countSessions(n),db:n,tempDir:t,dispose}:failed()),r=openReadonly(e.db);if(!r)return getDatabaseLogger().warn(`Corrupt backup .db cannot be opened read-only: ${e.db}`),failed();let i=passesQuickCheck(r),c=countSessions(r);if(closeQuietly(r),!i)return getDatabaseLogger().warn(`Corrupt backup .db failed quick_check: ${e.db}`),failed();if(!e.wal||!a.existsSync(e.wal))return mainDbOnly(void 0);if(!hasValidWalMagic(e.wal))return getDatabaseLogger().warn(`Corrupt backup WAL has invalid header magic, ignoring WAL`),mainDbOnly(`invalid-wal-header-magic`);let l;try{t=a.mkdtempSync(s.join(o.tmpdir(),`wb-recovery-pair-`)),l=s.join(t,`workbuddy.db`),a.copyFileSync(e.db,l),a.copyFileSync(e.wal,`${l}-wal`)}catch(e){if(getDatabaseLogger().warn(`Failed to stage WAL pairing, ignoring WAL: ${e instanceof Error?e.message:String(e)}`),t){try{a.rmSync(t,{recursive:!0,force:!0})}catch{}t=void 0}return mainDbOnly(`wal-staging-failed`)}let u=openReadonly(l);if(!u)return getDatabaseLogger().warn(`Paired WAL replay could not be opened, ignoring WAL`),mainDbOnly(`paired-open-failed`);if(!passesQuickCheck(u))return closeQuietly(u),getDatabaseLogger().warn(`Paired WAL replay failed quick_check, ignoring WAL`),mainDbOnly(`paired-quick-check-failed`);let d=countSessions(u);return d<=c?(closeQuietly(u),getDatabaseLogger().warn(`WAL appears silently ignored by SQLite (paired=${d} <= baseline=${c}), ignoring WAL`),mainDbOnly(`wal-silently-ignored`)):(n=u,{ok:!0,walReplayed:!0,sessionCount:d,db:n,tempDir:t,dispose})}var Ae=[`sessions`,`migration_meta`,`automations`,`automation_runs`,`automation_runtime_state`,`automation_delivery_outbox`,`session_usage`,`workspaces`,`workspace_trust_decisions`,`buddy_snapshots`],Y=`recovery_src`;function quoteIdent(e){return`"${e.replace(/"/g,`""`)}"`}function readColumns(e,t,n){try{return e.prepare(`PRAGMA ${t}.table_info(${quoteIdent(n)})`).all().filter(e=>!!e.name).map(e=>({name:e.name,notNull:Number(e.notnull??0)===1,hasDefault:e.dflt_value!==null&&e.dflt_value!==void 0}))}catch{return[]}}function fallbackLiteralFor(e,t,n){if(t.notNull&&!t.hasDefault)switch(t.name){case`cwd`:return`''`;case`user_id`:return`''`;case`created_at`:case`updated_at`:case`last_opened_at`:return String(n);default:getDatabaseLogger().warn(`No fallback for NOT NULL column ${e}.${t.name}; skipping table to avoid silent zero-restore`);return}}function restoreSingleTable(e,t,n){let r=readColumns(e,Y,t);if(r.length===0)return getDatabaseLogger().info(`Backup has no table ${t}, skipping`),0;let i=readColumns(e,`main`,t);if(i.length===0)return getDatabaseLogger().warn(`Target has no table ${t}, skipping`),0;let a=new Set(r.map(e=>e.name)),o=i.filter(e=>a.has(e.name)).map(e=>e.name);if(o.length===0)return getDatabaseLogger().warn(`No shared columns for ${t}, skipping`),0;let s=new Set(o),c=[...o],l=o.map(e=>`${Y}.${quoteIdent(t)}.${quoteIdent(e)}`);for(let e of i){if(s.has(e.name)||!e.notNull||e.hasDefault)continue;let r=fallbackLiteralFor(t,e,n);if(r===void 0)return 0;c.push(e.name),l.push(r)}let u=`INSERT OR IGNORE INTO main.${quoteIdent(t)} (${c.map(quoteIdent).join(`, `)}) SELECT ${l.join(`, `)} FROM ${Y}.${quoteIdent(t)}`;try{return e.transaction(()=>{let t=e.prepare(u).run();return Number(t.changes??0)})()}catch(e){return getDatabaseLogger().warn(`Failed to restore table ${t}: ${e instanceof Error?e.message:String(e)}`),0}}function readBackupSessionIds(e){try{let t=e.prepare(`SELECT id FROM ${Y}.sessions`).all(),n=new Set;for(let e of t)typeof e.id==`string`&&e.id&&n.add(e.id);return n}catch{return new Set}}function makeBackupReadOnly(e){let t;try{t=a.statSync(e).mode,a.chmodSync(e,292)}catch(e){return getDatabaseLogger().warn(`Could not make backup read-only: ${e instanceof Error?e.message:String(e)}`),()=>{}}return()=>{if(t!==void 0)try{a.chmodSync(e,t)}catch{}}}function restoreTablesFromBackup(e,t,n=Ae){let r={},i=new Set,a=makeBackupReadOnly(t);try{e.prepare(`ATTACH DATABASE ? AS ${Y}`).run(t)}catch(e){return getDatabaseLogger().warn(`Failed to attach corrupt backup: ${e instanceof Error?e.message:String(e)}`),a(),{counts:r,restoredSessionIds:i}}try{i=readBackupSessionIds(e);let t=Date.now();for(let i of n)r[i]=restoreSingleTable(e,i,t)}finally{try{e.prepare(`DETACH DATABASE ${Y}`).run()}catch(e){getDatabaseLogger().warn(`Failed to detach corrupt backup: ${e instanceof Error?e.message:String(e)}`)}a()}return{counts:r,restoredSessionIds:i}}var je=`.recovery-pending`;function manifestPath(e){return e+je}function writeRecoveryManifest(e,t){let n={schemaVersion:1,state:t.state,createdAt:new Date().toISOString(),timestamp:t.timestamp,backupFiles:t.backupFiles,originalError:t.originalError,diagnosis:t.diagnosis,attemptCount:t.attemptCount??0,walReplayed:t.walReplayed??null};try{a.writeFileSync(manifestPath(e),JSON.stringify(n,null,2))}catch(e){getDatabaseLogger().warn(`Failed to write recovery manifest: ${e instanceof Error?e.message:String(e)}`)}}function readRecoveryManifest(e){let t=manifestPath(e);try{if(!a.existsSync(t))return;let e=JSON.parse(a.readFileSync(t,`utf-8`));if(e.schemaVersion!==1){getDatabaseLogger().warn(`Ignoring recovery manifest with unsupported schemaVersion=${String(e.schemaVersion)}`);return}if(!e.state||!e.timestamp||!e.backupFiles?.db){getDatabaseLogger().warn(`Ignoring recovery manifest with missing required fields`);return}return{schemaVersion:e.schemaVersion,state:e.state,createdAt:e.createdAt??new Date(0).toISOString(),timestamp:e.timestamp,backupFiles:e.backupFiles,originalError:e.originalError,diagnosis:e.diagnosis,attemptCount:e.attemptCount??0,walReplayed:e.walReplayed??null}}catch(e){getDatabaseLogger().warn(`Failed to read recovery manifest: ${e instanceof Error?e.message:String(e)}`);return}}function clearRecoveryManifest(e){try{a.unlinkSync(manifestPath(e))}catch(e){let t=e.code;t!==`ENOENT`&&getDatabaseLogger().warn(`Failed to clear recovery manifest: ${String(t??e)}`)}}var X={INTERRUPTED:`interrupted`,RESTART_INTERRUPTED:`restart_interrupted`,SESSION_ENDED:`session-ended`,FINALIZATION_TIMEOUT:`finalization-timeout`,SESSION_STUCK:`session-stuck`},Z=`automation-run-failed`,Me=`automation-run-interrupted`,Q=`automation-session-ended`,Ne={"zh-CN":`\u4EFB\u52A1\u6267\u884C\u4E2D\u65AD\uFF0C\u5DF2\u5B8C\u6210\u7684\u5185\u5BB9\u5DF2\u4FDD\u5B58\uFF0C\u53EF\u5148\u67E5\u770B\u3002`,"en-US":`The task was interrupted. Completed content has been saved and is available to view.`};function resolveAutomationPartialDeliveredText(e){return Ne[e]}var Pe={"zh-CN":{"automation-auth-unavailable":`\u767B\u5F55\u72B6\u6001\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u3002`,"automation-connector-unavailable":`\u4EFB\u52A1\u9700\u8981\u7684\u6570\u636E\u6E90\u672A\u8FDE\u63A5\uFF0C\u8BF7\u68C0\u67E5\u76F8\u5173\u8FDE\u63A5\u7684\u6388\u6743\u72B6\u6001\u540E\u91CD\u8BD5\u3002`,"automation-context-limit-exceeded":`\u4EFB\u52A1\u5185\u5BB9\u6216\u751F\u6210\u7ED3\u679C\u8D85\u51FA\u9650\u5236\uFF0C\u8BF7\u7F29\u77ED\u5185\u5BB9\u6216\u62C6\u5206\u6210\u591A\u4E2A\u4EFB\u52A1\u540E\u91CD\u8BD5\u3002`,"automation-empty-result":`\u4EFB\u52A1\u5DF2\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u4EA7\u51FA\u53EF\u67E5\u770B\u7684\u5185\u5BB9\u6216\u660E\u786E\u7684\u7ED3\u679C\u3002`,"automation-environment-not-ready":`\u8FD0\u884C\u73AF\u5883\u5C1A\u672A\u5C31\u7EEA\uFF0C\u672C\u6B21\u4EFB\u52A1\u6CA1\u6709\u5F00\u59CB\u6267\u884C\u3002`,[Z]:`\u4EFB\u52A1\u6267\u884C\u5F02\u5E38\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u5982\u6301\u7EED\u5931\u8D25\uFF0C\u8BF7\u63D0\u4EA4\u53CD\u9988\u3002`,"automation-finalization-timeout":`\u4EFB\u52A1\u5DF2\u6267\u884C\uFF0C\u4F46\u7ED3\u679C\u6CA1\u6709\u53CA\u65F6\u6C47\u603B\uFF0C\u8BF7\u67E5\u770B\u5173\u8054\u4F1A\u8BDD\u786E\u8BA4\u3002`,[Me]:`\u4EFB\u52A1\u6267\u884C\u4E2D\u65AD\uFF0C\u672C\u6B21\u672A\u751F\u6210\u7ED3\u679C\u3002`,"automation-model-config-failed":`\u6240\u9009\u6A21\u578B\u5F53\u524D\u4E0D\u53EF\u7528\u6216\u8BBE\u7F6E\u6709\u95EE\u9898\uFF0C\u8BF7\u66F4\u6362\u6A21\u578B\u6216\u7A0D\u540E\u518D\u8BD5\u3002`,"automation-network-unavailable":`\u7F51\u7EDC\u8FDE\u63A5\u5F02\u5E38\uFF0C\u4EFB\u52A1\u672A\u80FD\u5F00\u59CB\u6267\u884C\uFF0C\u8BF7\u5728\u7F51\u7EDC\u6062\u590D\u540E\u91CD\u8BD5\u3002`,"automation-rate-limited":`\u8BF7\u6C42\u592A\u9891\u7E41\uFF0C\u7CFB\u7EDF\u91CD\u8BD5\u540E\u4ECD\u672A\u6062\u590D\uFF0C\u8BF7\u7A0D\u540E\u3002`,"automation-recovery-failed":`\u539F\u5B9A\u65F6\u95F4\u8BBE\u5907\u672A\u5728\u7EBF\uFF0C\u91CD\u8BD5\u4ECD\u672A\u6210\u529F\u3002`,"automation-request-refused":`\u8BF7\u6C42\u88AB\u7CFB\u7EDF\u62D2\u7EDD\uFF0C\u8BF7\u68C0\u67E5\u4EFB\u52A1\u5185\u5BB9\u540E\u91CD\u8BD5\u3002`,[Q]:`\u4EFB\u52A1\u8FD0\u884C\u8FC7\u7A0B\u4E2D\u610F\u5916\u4E2D\u65AD\uFF0C\u53EF\u67E5\u770B\u76F8\u5173\u8BB0\u5F55\u540E\u91CD\u65B0\u8FD0\u884C\u3002`,"automation-session-start-failed":`\u4EFB\u52A1\u672A\u80FD\u6B63\u5E38\u542F\u52A8\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\uFF1B\u5982\u679C\u4E00\u76F4\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u6216\u68C0\u67E5\u8FD0\u884C\u73AF\u5883\u3002`,"automation-session-start-timeout":`\u4EFB\u52A1\u542F\u52A8\u7B49\u5F85\u65F6\u95F4\u8FC7\u957F\uFF0C\u672A\u80FD\u6210\u529F\u542F\u52A8\u3002`,"automation-session-stuck":`\u4EFB\u52A1\u957F\u65F6\u95F4\u672A\u7ED3\u675F\uFF0C\u7CFB\u7EDF\u5DF2\u81EA\u52A8\u505C\u6B62\u672C\u6B21\u8FD0\u884C\u3002`,"automation-run-timeout":`\u4EFB\u52A1\u8FD0\u884C\u8D85\u65F6\u5DF2\u505C\u6B62\uFF0C\u8BF7\u7F29\u5C0F\u4EFB\u52A1\u8303\u56F4\u540E\u518D\u8BD5\u3002`,"automation-turn-limit-exceeded":`\u4EFB\u52A1\u6B65\u9AA4\u8FC7\u591A\u8FD8\u6CA1\u6709\u5B8C\u6210\uFF0C\u8BF7\u7B80\u5316\u4EFB\u52A1\u540E\u91CD\u8BD5\u3002`,"automation-workspace-unavailable":`\u5DE5\u4F5C\u6587\u4EF6\u5939\u65E0\u6CD5\u6253\u5F00\u6216\u4FDD\u5B58\u5185\u5BB9\uFF0C\u8BF7\u68C0\u67E5\u8DEF\u5F84\u3001\u78C1\u76D8\u7A7A\u95F4\u548C\u7CFB\u7EDF\u6743\u9650\u3002`},"en-US":{"automation-auth-unavailable":`Your sign-in has expired. Please sign in again.`,"automation-connector-unavailable":`A required data source is not connected. Check the connector authorization and retry.`,"automation-context-limit-exceeded":`The task content or generated result exceeded the limit. Shorten the content or split it into multiple tasks before retrying.`,"automation-empty-result":`The task ended without displayable content or a confirmed operation result.`,"automation-environment-not-ready":`The runtime environment was not ready, so this task did not start.`,[Z]:`The task failed. Please try again later; if it keeps failing, please submit feedback.`,"automation-finalization-timeout":`The task ran, but its result was not summarized in time. Open the linked conversation to confirm it.`,[Me]:`The task was interrupted. No result was generated this time.`,"automation-model-config-failed":`The selected model is unavailable or has a configuration problem. Choose another model or try again later.`,"automation-network-unavailable":`Network connection failed, so the task could not start. Try again after the network recovers.`,"automation-rate-limited":`Requests were too frequent and did not recover after system retries. Please wait before trying again.`,"automation-recovery-failed":`The device was offline at the scheduled time, and the retry did not succeed.`,"automation-request-refused":`The system refused the request. Check the task content before retrying.`,[Q]:`The task was interrupted unexpectedly during execution. Review the related record before running it again.`,"automation-session-start-failed":`The task could not start normally. Try again later; if it keeps failing, sign in again or check the runtime environment.`,"automation-session-start-timeout":`The task waited too long to start and could not be launched.`,"automation-session-stuck":`The task did not finish for a long time, so the system stopped this run automatically.`,"automation-run-timeout":`The task timed out and was stopped. Reduce its scope before trying again.`,"automation-turn-limit-exceeded":`The task still did not finish after too many steps. Simplify it before retrying.`,"automation-workspace-unavailable":`The working folder cannot be opened or saved to. Check the path, disk space, and system permissions.`}},Fe=[`automation-connector-unavailable`,`automation-empty-result`,`automation-environment-not-ready`,`automation-session-start-failed`,`automation-session-start-timeout`,Q,`automation-finalization-timeout`,`automation-session-stuck`,`automation-workspace-unavailable`,`automation-model-config-failed`,`automation-context-limit-exceeded`,`automation-turn-limit-exceeded`,`automation-request-refused`,`automation-rate-limited`,`automation-run-timeout`,`automation-recovery-failed`,Z,Z];X.INTERRUPTED,X.RESTART_INTERRUPTED,X.SESSION_ENDED,X.FINALIZATION_TIMEOUT,X.SESSION_STUCK,X.INTERRUPTED,X.RESTART_INTERRUPTED;var Ie={"zh-CN":[`zh-cn`,`zh-hans`,`zh`],"en-US":[`en`,`en-us`]};function normalizeAutomationFailureCode(e){let t=e?.trim()??``,n=/^ErrorAutomation-(\d{1,2})$/i.exec(t)?.[1];return n?Fe[Number(n)-1]??Z:t}function resolveAutomationFailureReasonText(e,t){let n=Pe[t];return n[normalizeAutomationFailureCode(e)]??n[Z]}function pickAutomationServerDisplayMessage(e,t){let n=e?.terminal?.displayMsg;if(!n||typeof n!=`object`||Array.isArray(n))return;let r=new Map;for(let[e,t]of Object.entries(n)){let n=e.trim().toLowerCase();typeof t==`string`&&t.trim()&&!r.has(n)&&r.set(n,t.trim())}for(let e of Ie[t]){let t=r.get(e);if(t)return t}}var Le=[`minimal`,`low`,`medium`,`high`,`xhigh`,`max`];function isAutomationReasoningEffort(e){return typeof e==`string`&&Le.includes(e)}var Re=864e5,ze=732,Be=336,Ve=26,He=8,Ue={SU:0,MO:1,TU:2,WE:3,TH:4,FR:5,SA:6},We=[`SU`,`MO`,`TU`,`WE`,`TH`,`FR`,`SA`];function invalidRule(e){let t=Error(`invalid rrule: ${e}`);throw t.code=`INVALID_RRULE`,t}function parsePositiveInt(e,t){let n=Number.parseInt(e??``,10);return Number.isFinite(n)&&n>0?n:t}function parseClampedInt(e,t,n,r){if(e===void 0)return r;let i=Number.parseInt(e,10);return Number.isFinite(i)?Math.max(t,Math.min(n,i)):r}function parseByDay(e){if(!e)return[];let t=e.split(`,`).map(e=>e.trim().toUpperCase()).filter(Boolean).map(e=>(e in Ue||invalidRule(`unknown BYDAY=${e}`),Ue[e]));return[...new Set(t)].sort((e,t)=>e-t)}function parseIntList(e,t,n,r){if(!e)return[];let i=e.split(`,`).map(e=>e.trim()).filter(Boolean).map(e=>{let i=Number.parseInt(e,10);return(!Number.isFinite(i)||i<t||i>n)&&invalidRule(`invalid ${r}=${e}`),i});return[...new Set(i)].sort((e,t)=>e-t)}function parseRRule(e){let t=new Map;for(let n of(e??``).split(`;`)){let[e,r]=n.split(`=`);e&&r&&t.set(e.trim().toUpperCase(),r.trim().toUpperCase())}let n=t.get(`FREQ`);n||invalidRule(`missing FREQ`),n!==`HOURLY`&&n!==`DAILY`&&n!==`WEEKLY`&&n!==`MONTHLY`&&n!==`YEARLY`&&invalidRule(`unsupported FREQ=${n}`);let r=n,i=parseByDay(t.get(`BYDAY`));r===`WEEKLY`&&i.length===0&&invalidRule(`WEEKLY requires BYDAY`);let a=parseIntList(t.get(`BYMONTHDAY`),1,31,`BYMONTHDAY`),o=parseIntList(t.get(`BYMONTH`),1,12,`BYMONTH`);return r===`MONTHLY`&&a.length===0&&invalidRule(`MONTHLY requires BYMONTHDAY`),r===`YEARLY`&&(o.length===0||a.length===0)&&invalidRule(`YEARLY requires BYMONTH and BYMONTHDAY`),{freq:r,interval:parsePositiveInt(t.get(`INTERVAL`),1),byday:i.length>0?i:void 0,bymonthday:a.length>0?a:void 0,bymonth:o.length>0?o:void 0,byhour:parseClampedInt(t.get(`BYHOUR`),0,23,0),byminute:parseClampedInt(t.get(`BYMINUTE`),0,59,0)}}function parseWeekdayCodeList(e){return parseByDay(e.join(`,`))}function formatRRule(e){if(e.freq===`HOURLY`){let t=e.byday?.length?e.byday.map(e=>We[e]).join(`,`):`MO,TU,WE,TH,FR,SA,SU`;return`FREQ=HOURLY;INTERVAL=${Math.max(1,e.interval)};BYDAY=${t}`}let t=[`FREQ=${e.freq}`];return e.interval>1&&t.push(`INTERVAL=${e.interval}`),e.freq===`WEEKLY`&&e.byday?.length&&t.push(`BYDAY=${e.byday.map(e=>We[e]).join(`,`)}`),e.freq===`YEARLY`&&e.bymonth?.length&&t.push(`BYMONTH=${[...e.bymonth].sort((e,t)=>e-t).join(`,`)}`),(e.freq===`MONTHLY`||e.freq===`YEARLY`)&&e.bymonthday?.length&&t.push(`BYMONTHDAY=${[...e.bymonthday].sort((e,t)=>e-t).join(`,`)}`),t.push(`BYHOUR=${e.byhour}`,`BYMINUTE=${e.byminute}`),t.join(`;`)}function parseIso(e){if(!e)return;let t=Date.parse(e);return Number.isFinite(t)?t:void 0}function normalizeValidUntil(e){if(e===void 0)return;let t=new Date(e);return t.getHours()!==0||t.getMinutes()!==0||t.getSeconds()!==0||t.getMilliseconds()!==0?e:(t.setHours(23,59,59,999),t.getTime())}function startOfDayMs(e){let t=new Date(e);return t.setHours(0,0,0,0),t.getTime()}function startOfWeekMs(e){let t=new Date(e);t.setHours(0,0,0,0);let n=(t.getDay()+6)%7;return t.setDate(t.getDate()-n),t.getTime()}function computeNextRunAt(e,t){let n=parseIso(e.validFrom),r=normalizeValidUntil(parseIso(e.validUntil));if(n!==void 0&&r!==void 0&&n>r)return;if(e.type===`once`){let i=parseIso(e.scheduledAt);return i===void 0||i<=t||n!==void 0&&i<n||r!==void 0&&i>r?void 0:i}let i;try{i=parseRRule(e.rrule??``)}catch{return}let a=Math.max(t,n??-1/0),o;if(o=i.freq===`HOURLY`?nextHourly(i,t,a):i.freq===`MONTHLY`?nextMonthly(i,t,a):i.freq===`YEARLY`?nextYearly(i,t,a):nextDaily(i,t,a,n),o!==void 0&&!(r!==void 0&&o>r))return o}function matchesByday(e,t){return!t||t.length===0||t.includes(new Date(e).getDay())}function nextHourly(e,t,n){let r=e.interval*60*60*1e3,i=Math.max(t,n)+r;for(let r=0;r<=Be;r+=1){if(i>t&&i>=n&&matchesByday(i,e.byday))return i;i+=36e5}}function nextDaily(e,t,n,r){let i=startOfDayMs(r??t),a=startOfWeekMs(r??t),o=new Date(n);for(let r=0;r<=ze;r+=1){let s=new Date(o);s.setDate(s.getDate()+r),s.setHours(e.byhour,e.byminute,0,0);let c=s.getTime();if(!(c<=t||c<n)&&matchesByday(c,e.byday)){if(e.freq===`WEEKLY`){let t=Math.floor((startOfWeekMs(c)-a)/(Re*7));if(t<0||t%e.interval!==0)continue}else{let t=Math.floor((startOfDayMs(c)-i)/Re);if(t<0||t%e.interval!==0)continue}return c}}}function nextMonthly(e,t,n){let r=e.bymonthday&&e.bymonthday.length>0?e.bymonthday:[1],i=new Date(n),a=i.getFullYear(),o=i.getMonth();for(let i=0;i<=Ve;i+=1){let i=new Date(a,o+1,0).getDate();for(let s of r){let r=new Date(a,o,Math.min(s,i),e.byhour,e.byminute,0,0).getTime();if(r>t&&r>=n)return r}o+=1,o>11&&(o=0,a+=1)}}function nextYearly(e,t,n){let r=e.bymonth&&e.bymonth.length>0?e.bymonth:[1],i=e.bymonthday&&e.bymonthday.length>0?e.bymonthday:[1],a=new Date(n).getFullYear();for(let o=0;o<=He;o+=1){for(let o of r){let r=o-1,s=new Date(a,r+1,0).getDate();for(let o of i){let i=new Date(a,r,Math.min(o,s),e.byhour,e.byminute,0,0).getTime();if(i>t&&i>=n)return i}}a+=1}}function cloneAutomationSpec(e){return{...e,schedule:{...e.schedule},...e.execution===void 0?{}:{execution:{...e.execution}}}}var Ge=[`MO`,`TU`,`WE`,`TH`,`FR`,`SA`,`SU`];function buildIsoFromDateTimeInput(e,t){let n=new Date(`${e}T${t}:00`);if(Number.isNaN(n.getTime()))throw Error(`invalid scheduled date/time: ${e} ${t}`);return n.toISOString()}function buildValidityBoundaryIso(e,t){let n=new Date(`${e}T${t===`start`?`00:00:00.000`:`23:59:59.999`}`);if(Number.isNaN(n.getTime()))throw Error(`invalid validity date: ${e}`);return n.toISOString()}function buildRRule(e,t){return formatRRule({freq:e,interval:e===`HOURLY`?Math.max(1,t.intervalHours??1):1,byday:t.byday?.length?parseWeekdayCodeList(t.byday):e===`HOURLY`?parseWeekdayCodeList(Ge):void 0,byhour:t.byhour,byminute:t.byminute})}function recurringSchedule(e,t,n){return{type:`recurring`,rrule:e,validFrom:t?buildValidityBoundaryIso(t,`start`):void 0,validUntil:n?buildValidityBoundaryIso(n,`end`):void 0}}function onceSchedule(e,t){return{type:`once`,scheduledAt:buildIsoFromDateTimeInput(e,t)}}function defineTemplate(e,t,n,r){return{id:e,icon:t,titleKey:`${n}.title`,descriptionKey:`${n}.content`,promptKey:`${n}.prompt`,spec:r}}function cloneTemplate(e){return{...e,spec:cloneAutomationSpec(e.spec)}}var Ke=[defineTemplate(`daily-ai-news`,`news`,`automation.templates.dailyAiNews`,{name:`\u6BCF\u65E5 AI \u65B0\u95FB\u63A8\u9001`,prompt:`\u5173\u6CE8\u5F53\u5929 AI \u9886\u57DF\u7684\u91CD\u8981\u52A8\u6001\uFF0C\u4FA7\u91CD AI coding \u4E0E\u5177\u8EAB\u667A\u80FD\u65B9\u5411\u3002\u7B5B\u9009 3-5 \u6761\u6709\u4EF7\u503C\u7684\u4FE1\u606F\uFF0C\u7B80\u8981\u8BF4\u660E\u4E8B\u4EF6\u5185\u5BB9\u53CA\u503C\u5F97\u5173\u6CE8\u7684\u539F\u56E0\u3002\u7ED3\u5408 memory.md \u91CC\u4E4B\u524D\u63A8\u9001\u8FC7\u7684\u5185\u5BB9\uFF0C\u5C3D\u91CF\u4E0D\u8981\u91CD\u590D\u3002`,schedule:recurringSchedule(buildRRule(`DAILY`,{byhour:9,byminute:0}))}),defineTemplate(`daily-english-words`,`languages`,`automation.templates.dailyWords`,{name:`\u6BCF\u65E5 5 \u4E2A\u82F1\u8BED\u5355\u8BCD`,prompt:`\u6BCF\u5929\u63A8\u8350 5 \u4E2A\u5B9E\u7528\u82F1\u8BED\u5355\u8BCD\uFF0C\u4F18\u5148\u9009\u53D6\u751F\u6D3B\u548C\u804C\u573A\u4E2D\u5E38\u89C1\u8BCD\u6C47\u3002\u8F93\u51FA\u8BCD\u4E49\u3001\u97F3\u6807\u3001\u4F8B\u53E5\uFF0C\u4EE5\u53CA\u4E00\u6761\u4FBF\u4E8E\u8BB0\u5FC6\u7684\u5C0F\u63D0\u793A\u3002\u7ED3\u5408 memory.md \u91CC\u4E4B\u524D\u63A8\u8350\u8FC7\u7684\u5355\u8BCD\uFF0C\u5C3D\u91CF\u4E0D\u8981\u91CD\u590D\u3002`,schedule:recurringSchedule(buildRRule(`DAILY`,{byhour:8,byminute:30}))}),defineTemplate(`daily-bedtime-story`,`moon`,`automation.templates.bedtimeStory`,{name:`\u6BCF\u65E5\u513F\u7AE5\u7761\u524D\u6545\u4E8B`,prompt:`\u5199\u4E00\u4E2A\u9002\u5408\u513F\u7AE5\u7684\u7761\u524D\u6545\u4E8B\uFF0C\u8BED\u8A00\u6E29\u548C\u6613\u61C2\uFF0C\u9605\u8BFB\u65F6\u957F\u7EA6 3-5 \u5206\u949F\u3002\u6545\u4E8B\u9700\u6709\u5B8C\u6574\u60C5\u8282\uFF0C\u7ED3\u5C3E\u9644\u4E0A\u7B80\u77ED\u5BD3\u610F\u3002\u7ED3\u5408 memory.md \u91CC\u4E4B\u524D\u8BB2\u8FC7\u7684\u6545\u4E8B\uFF0C\u5C3D\u91CF\u4E0D\u8981\u91CD\u590D\u3002`,schedule:recurringSchedule(buildRRule(`DAILY`,{byhour:20,byminute:30}))}),defineTemplate(`weekly-work-report`,`weekly-report`,`automation.templates.weeklyReport`,{name:`\u6BCF\u5468\u5DE5\u4F5C\u5468\u62A5`,prompt:`\u68B3\u7406\u672C\u5468\u4ED3\u5E93\u4E2D\u7684 PR \u4E0E Issue \u60C5\u51B5\uFF0C\u5305\u62EC\u65B0\u589E\u3001\u5DF2\u5173\u95ED\u53CA\u91CD\u70B9\u8BA8\u8BBA\u3002\u8F93\u51FA\u4E00\u4EFD\u5468\u62A5\uFF0C\u6DB5\u76D6\u4E3B\u8981\u8FDB\u5C55\u3001\u5173\u952E\u53D8\u66F4\u548C\u5F85\u5173\u6CE8\u4E8B\u9879\u3002`,schedule:recurringSchedule(buildRRule(`WEEKLY`,{byday:[`FR`],byhour:17,byminute:0}))}),defineTemplate(`classic-movie-recommendation`,`film`,`automation.templates.classicMovie`,{name:`\u7ECF\u5178\u7535\u5F71\u63A8\u8350`,prompt:`\u7ED9\u6211\u63A8\u8350\u4E00\u90E8\u516C\u8BA4\u7684\u7ECF\u5178\u7535\u5F71\uFF08\u8BC4\u5206\u9AD8\u3001\u53E3\u7891\u597D\uFF09\uFF0C\u7B80\u898

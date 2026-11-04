@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Ticket Pipeline",
+    "description": "Work-order pipeline: detect ticket changes, locate code, verify fixes, open draft MRs, and push WeChat notifications."
+  }
+}

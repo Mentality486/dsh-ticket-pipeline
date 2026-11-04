@@ -1,0 +1,116 @@
+/**
+ * 错误分类。内核只按 `kind` 决策，绝不解析 `message`。
+ *
+ * 为什么要有这一层：适配器的错误文案会变、会被翻译、会被用户改成别的措辞。
+ * 把「能不能重试 / 要不要通知人」压在一个枚举上，内核才能稳定。
+ */
+
+/** @typedef {'auth'|'network'|'rate-limit'|'not-found'|'invalid-input'|'aborted'|'internal'} ErrorKind */
+
+/** 所有 kind 的运行时集合，用于校验。 */
+export const ERROR_KINDS = Object.freeze([
+  'auth',
+  'network',
+  'rate-limit',
+  'not-found',
+  'invalid-input',
+  'aborted',
+  'internal',
+])
+
+/** 可重试的 kind。 */
+export const RETRYABLE_KINDS = Object.freeze(new Set(['network', 'rate-limit', 'internal']))
+
+/** 直接判定失败、必须通知人的 kind。 */
+export const FATAL_KINDS = Object.freeze(new Set(['auth', 'not-found', 'invalid-input']))
+
+/**
+ * 适配器必须抛这个，不许抛裸 `Error('出错了')`。
+ */
+export class PipelineError extends Error {
+  /**
+   * @param {ErrorKind} kind
+   * @param {string} message
+   * @param {unknown} [cause]
+   * @param {number} [retryAfterMs] `kind='rate-limit'` 时服务端给的等待时间
+   */
+  constructor (kind, message, cause, retryAfterMs) {
+    super(message)
+    this.name = 'PipelineError'
+    if (!ERROR_KINDS.includes(kind)) {
+      throw new Error(`PipelineError: 未知的 kind "${kind}"，必须是 ${ERROR_KINDS.join(' / ')}`)
+    }
+    this.kind = kind
+    if (cause !== undefined) this.cause = cause
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs
+  }
+
+  get retryable () {
+    return RETRYABLE_KINDS.has(this.kind)
+  }
+}
+
+/**
+ * 把任意异常归一成 `PipelineError`。
+ *
+ * 适配器内部的第三方错误（fetch 失败、JSON 解析失败）不必逐层包装，
+ * 在内核边界统一归一即可；但**已经**是 `PipelineError` 的原样返回 —— 分类信息比外层猜测更准。
+ *
+ * @param {unknown} error
+ * @param {ErrorKind} [fallback]
+ * @returns {PipelineError}
+ */
+export function toPipelineError (error, fallback = 'internal') {
+  if (error instanceof PipelineError) return error
+  if (isAbortError(error)) return new PipelineError('aborted', '被取消', error)
+  const message = error instanceof Error ? error.message : String(error)
+  return new PipelineError(fallback, message, error)
+}
+
+/**
+ * 识别取消。`AbortSignal.reason` 在不同实现里形状不一，这里三种都认。
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isAbortError (error) {
+  if (!error) return false
+  if (error instanceof PipelineError) return error.kind === 'aborted'
+  if (typeof error === 'object' && /** @type {any} */ (error).name === 'AbortError') return true
+  if (error instanceof Error && error.message === 'ticket-timeout') return true
+  return false
+}
+
+/**
+ * 组合外部 signal 与本地 controller，返回一个会在任一方触发时 abort 的句柄。
+ *
+ * 为什么要组合：适配器拿到的是自己的 signal，而超时/人工取消来自外部。
+ * 直接把外部 signal 传下去会让适配器无法区分「我这层超时」与「整票被取消」。
+ *
+ * @param {AbortSignal} [outer]
+ * @returns {{ signal: AbortSignal, abort: (reason?: unknown) => void, dispose: () => void }}
+ */
+export function linkSignal (outer) {
+  const controller = new AbortController()
+  /** @type {undefined | (() => void)} */
+  let unlink
+
+  if (outer) {
+    if (outer.aborted) controller.abort(outer.reason)
+    else {
+      const onAbort = () => controller.abort(outer.reason)
+      outer.addEventListener('abort', onAbort, { once: true })
+      unlink = () => outer.removeEventListener('abort', onAbort)
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    abort: (reason) => {
+      if (!controller.signal.aborted) controller.abort(reason)
+    },
+    dispose: () => {
+      if (unlink) unlink()
+      unlink = undefined
+    },
+  }
+}
