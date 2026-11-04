@@ -30,6 +30,7 @@ import { TicketStore, makeDomainRepo } from './core/store.js'
 import { createScheduler } from './core/scheduler.js'
 import { recoverPending, checkWorktreeByGit } from './core/recover.js'
 import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
+import { sanitizeBranchName } from './core/branch-name.js'
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
@@ -413,7 +414,8 @@ export async function apply (ctx, config) {
       throw new Error('定位结果缺少 repoPath，无法建 worktree')
     }
 
-    const branch = `${config.branchPrefix ?? 'ticket-'}${projectId}-${recordId}-r${revisionCount}`
+    // recordId 来自工单表（外部输入），可能带空格/中文/git 拒绝的字符 —— 统一过清洗器（A5）。
+    const branch = `${config.branchPrefix ?? 'ticket-'}${sanitizeBranchName(`${projectId}-${recordId}-r${revisionCount}`)}`
 
     if (fetch) {
       const fetched = await gitRunner(['fetch', 'origin', baseRef], { cwd: repoPath })

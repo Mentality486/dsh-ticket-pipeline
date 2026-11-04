@@ -30,6 +30,7 @@ import { fingerprintOf } from '../src/contracts/types.js'
 import { validateConfig, describeConfig } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
 import { createPipelineResetTool } from '../src/tools/pipeline-reset.js'
+import { sanitizeBranchName } from '../src/core/branch-name.js'
 import { pushplusOptionsFromConfig } from '../src/adapters/push-pushplus/index.js'
 import { runFeishuChecks } from './feishu-checks.mjs'
 import { runGitlabChecks } from './gitlab-checks.mjs'
@@ -919,6 +920,22 @@ function makeFakeCtx ({ domain, registered }) {
     interval: () => () => {},
   }
 }
+
+  await check('A5：分支名清洗——recordId 带空格/中文/特殊字符也不炸 git', async () => {
+    // index.js:416 拼分支名时对 `projectId-recordId-rN` 过 sanitizeBranchName（A5 接线）。
+    const cases = [
+      ['pms', 'rec-mock-001', 1, 'pms-rec-mock-001-r1'],           // 常规：原样保留
+      ['pms', '第 3 号 bug！', 2, 'pms-3-bug-r2'],                  // 中文/空格/！全换 - 且连续 - 合并
+      ['pms', 'a  b//c', 1, 'pms-a-b//c-r1'],                      // 连续 - 合并、斜杠保留
+    ]
+    for (const [projectId, recordId, rev, expected] of cases) {
+      const seg = sanitizeBranchName(`${projectId}-${recordId}-r${rev}`)
+      assert.equal(seg, expected, `recordId=${recordId} 的片段应为 ${expected}`)
+      assert.match(seg, /^[^~^:?*[\\ ]+$/, '片段里不能有 git ref 拒绝的字符')
+      assert.ok(seg.length <= 200, '片段不能超长')
+    }
+    assert.equal(sanitizeBranchName('!!!'), 'ticket', '全非法字符时回退 ticket')
+  })
 
   section('13. 新适配器：gitlab 客户端 / qqmail 推送 / wps 工单源')
   await runGitlabChecks(check)
