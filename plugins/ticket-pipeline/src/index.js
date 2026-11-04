@@ -241,9 +241,13 @@ function makeGitRunner (ctx) {
       const quoted = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...argv]
         .map(a => /^[A-Za-z0-9@%+=:,./_-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\''`)}'`)
         .join(' ')
+      // cwd 不依赖 shell.resolve 的字段（实测宿主可能忽略它，git 落在错误目录报
+      // not a git repository），把 cd 显式编进命令，在任何宿主实现下都成立。
+      const command = opts.cwd
+        ? `cd '${String(opts.cwd).replace(/'/g, `'\''`)}' && ${quoted}`
+        : quoted
       const execution = await shell.execute(shell.resolve({
-        command: quoted,
-        cwd: opts.cwd,
+        command,
         timeoutMs: 120000,
       }))
       const result = await execution.result()
