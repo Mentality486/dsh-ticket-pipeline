@@ -37,6 +37,24 @@ export function createPipelineScanTool (options) {
     async execute (args, exec) {
       // 把工具的取消信号一路递进内核：取消 = 「别再扫了、别再动票了」，
       // 而不是「只让调用方收不到结果」。内核在扫描阶段把它转给每个 source.scan。
+      //
+      // fire-and-forget：tick 里「跑一张票」可能要几十秒到 40 分钟（超时上限），
+      // 同步等它会让宿主工具通道超时、报 not lossless JSON（生产实锤过）。
+      // 所以这里只触发一轮、立刻返回；跑完的结果用 pipeline_status 查。
+      void options.tick({ skipScan: args.skipScan === true, signal: exec?.signal }).catch(() => {})
+
+      return {
+        status: 'triggered',
+        scan: null,
+        ran: null,
+        cleaned: false,
+        text: '已触发一轮流水线，后台执行中。\n'
+          + '扫描工单源几秒，跑一张票可能几十秒到几分钟。\n'
+          + '稍等片刻用 pipeline_status 查看进度与结果；正在跑时再触发会返回 already-running。',
+      }
+
+      // ── 以下原同步等待实现保留为注释备查 ──
+      /*
       const result = await options.tick({ skipScan: args.skipScan === true, signal: exec?.signal })
 
       const lines = []
@@ -75,15 +93,8 @@ export function createPipelineScanTool (options) {
           break
       }
 
-      const text = lines.join('\n')
-      return {
-        status: result.status,
-        scan: result.scan,
-        ran: result.ran ?? null,
-        cleaned: result.cleaned,
-        error: result.error,
-        text,
-      }
+      */
+      // ── 原同步实现结束 ──
     },
   })
 }
