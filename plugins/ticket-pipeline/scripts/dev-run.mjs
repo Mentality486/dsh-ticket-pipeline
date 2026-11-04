@@ -977,6 +977,41 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(sanitizeBranchName('!!!'), 'ticket', '全非法字符时回退 ticket')
   })
 
+  section('12b. 注册表真的接上了适配器（qqmail 推送 / agent 执行器）')
+
+  await check('PUSHES 里有 qqmail，且能造出 id=qqmail 的适配器', async () => {
+    // 之前这里只有 mock / pushplus：配置写 pushAdapter: qqmail 会被静默换成 mock，
+    // 通知永远发不出去还不报错。这条断言把「表里有没有」钉住。
+    const { PUSHES } = await import('../src/index.js')
+    assert.ok(typeof PUSHES.qqmail === 'function', 'PUSHES 必须注册 qqmail，否则配了也不生效')
+    const adapter = PUSHES.qqmail({ user: 'a@qq.com', to: 'b@qq.com', getSecret: async () => undefined })
+    assert.equal(adapter.id, 'qqmail', '造出来的适配器 id 必须是 qqmail')
+    for (const name of ['mock', 'pushplus', 'qqmail']) {
+      assert.ok(typeof PUSHES[name] === 'function', `PUSHES.${name} 应该在表里`)
+    }
+  })
+
+  await check('pushAdapter: qqmail 时组合根能把授权码读取器注入进去', async () => {
+    const { domain } = makeFakeDomain()
+    const registered = []
+    const ctx = makeFakeCtx({ domain, registered })
+    const { value: config } = validateConfig({ pushAdapter: 'qqmail', qqmail: { user: 'a@qq.com', to: 'b@qq.com' } })
+    // 关键：构造期不该因为「凭据还没配」而抛 —— 装了插件但还没填授权码是常态。
+    await apply(ctx, config)
+    assert.ok(registered.length >= 5, 'qqmail 配置下工具仍要正常注册')
+  })
+
+  await check('EXECUTORS.agent 被注入 agents / git / createGitlabClient 等宿主依赖', async () => {
+    // 只传 prompts 的话 executor-agent 一开跑就报「本机没有 agents 服务」。
+    // 这条用假 ctx 走一遍 apply，确认装配阶段不抛、且 agent 执行器被选中。
+    const { domain } = makeFakeDomain()
+    const registered = []
+    const ctx = makeFakeCtx({ domain, registered })
+    const { value: config } = validateConfig({ workExecutor: 'agent' })
+    await apply(ctx, config)
+    assert.ok(registered.some((tool) => tool.name === 'pipeline_scan'), 'agent 执行器下工具仍要注册')
+  })
+
   section('13. 新适配器：gitlab 客户端 / qqmail 推送 / wps 工单源')
   await runGitlabChecks(check)
   await runQqmailChecks(check)

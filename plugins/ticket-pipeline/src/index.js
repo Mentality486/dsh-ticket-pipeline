@@ -41,6 +41,8 @@ import { createMockExecutor } from './adapters/executor-mock/index.js'
 import { createAgentExecutor } from './adapters/executor-agent/index.js'
 import { createMockPush } from './adapters/push-mock/index.js'
 import { createPushplusPush, pushplusOptionsFromConfig } from './adapters/push-pushplus/index.js'
+import { createQqmailPush, qqmailOptionsFromConfig, QQMAIL_SECRET_REF } from './adapters/push-qqmail/index.js'
+import { createGitlabClient } from './adapters/gitlab-client/index.js'
 
 import { createPipelineScanTool } from './tools/pipeline-scan.js'
 import { createPipelineStatusTool } from './tools/pipeline-status.js'
@@ -218,6 +220,7 @@ export const EXECUTORS = {
 export const PUSHES = {
   mock: (opts) => createMockPush(opts),
   pushplus: (opts) => createPushplusPush(opts),
+  qqmail: (opts) => createQqmailPush(opts),
 }
 
 /**
@@ -375,6 +378,96 @@ function makeLocalFileReader (ctx, logger) {
 }
 
 /**
+ * 弱取一个宿主服务：取不到返回 undefined，不抛。
+ *
+ * 用 `ctx.get(name)` 而不是属性访问 —— 属性访问在未声明 inject 时会抛，
+ * 而这些服务（agents / shell / fs）在部分 profile 里本来就可能缺席。
+ *
+ * @param {any} ctx
+ * @param {string} name
+ * @returns {any}
+ */
+function getService (ctx, name) {
+  try {
+    return ctx.get(name) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 造一个「跑一条命令」的函数，供 executor-agent 的 verify 用。
+ *
+ * 与 gitRunner 同一条纪律：走宿主 shell 执行链路（Windows 下裸 spawn 会被拒），
+ * 工作目录用各命令自己表达（这里只能给 shell 拼前置 cd 不安全，所以单独提供
+ * `cwd` 到 shell 的方式也不可靠）—— 因此改用 shell.execute 前先 resolve。
+ *
+ * 实现上把命令拼成单行交给宿主 shell，路径与参数统一单引号转义：
+ * 这是唯一能在 PowerShell / bash 两种宿主 shell 下都成立的写法。
+ *
+ * @param {any} ctx
+ * @returns {((input: { argv: string[], cwd: string, signal?: AbortSignal }) => Promise<{ code: number, stdout: string, stderr: string }>) | undefined}
+ */
+function makeCommandRunner (ctx) {
+  const shell = getService(ctx, 'shell')
+  if (!shell || typeof shell.execute !== 'function' || typeof shell.resolve !== 'function') {
+    return undefined
+  }
+  return async ({ argv, cwd }) => {
+    const quoted = argv.map((part) => quoteShellArg(part)).join(' ')
+    // 用 pushd/popd 不可靠（PowerShell 与 bash 语义不同），统一在子 shell 里换目录：
+    // bash 与 PowerShell 都支持 '(' ... ')' 分组吗？—— 不。所以沿用 gitRunner 的做法：
+    // 命令本身带 -C 语义做不到（verify 是 npm/npx），改为显式拼 cd 且用 ';' 分隔，
+    // PowerShell 支持 ';'，bash 也支持 ';'。
+    const command = cwd ? `cd ${quoteShellArg(cwd)}; ${quoted}` : quoted
+    const execution = await shell.execute(shell.resolve({ command }))
+    const result = await execution.result()
+    return {
+      code: Number(result?.exitCode ?? 0),
+      stdout: String(result?.stdout?.text ?? ''),
+      stderr: String(result?.stderr?.text ?? ''),
+    }
+  }
+}
+
+/**
+ * 单引号转义一个 shell 参数。
+ *
+ * PowerShell 与 bash 都认单引号字面量；PowerShell 里单引号内的单引号要写成两个。
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function quoteShellArg (value) {
+  const text = String(value ?? '')
+  if (text.length === 0) return "''"
+  return `'${text.replace(/'/g, "''")}'`
+}
+
+/**
+ * 造一个「读文本文件」的函数，供 executor-agent 取要提交的文件内容。
+ *
+ * 优先走宿主 fs 服务（同一套沙箱准入）；没有 fs 时退到 node:fs。
+ *
+ * @param {any} ctx
+ * @param {any} logger
+ * @returns {(path: string) => Promise<string>}
+ */
+function makeTextFileReader (ctx, logger) {
+  return async (path) => {
+    const fsService = getService(ctx, 'fs')
+    if (fsService && typeof fsService.readBytes === 'function') {
+      const target = await fsService.resolve(path)
+      const bytes = await fsService.readBytes(target, undefined, 8 * 1024 * 1024)
+      return Buffer.from(bytes).toString('utf8')
+    }
+    const { readFile } = await import('node:fs/promises')
+    logger.debug?.(`[ticket-pipeline] 用 node:fs 读文件 ${path}`)
+    return readFile(path, 'utf8')
+  }
+}
+
+/**
  * 组合根入口。
  *
  * 启动顺序：
@@ -449,8 +542,17 @@ export async function apply (ctx, config) {
     prompts: {
       untrustedNotice: UNTRUSTED_TICKET_NOTICE,
     },
+    // executor-agent 的宿主依赖：全部惰性/弱取，缺了就由适配器自己优雅降级或报错，
+    // 组合根不在这里按平台或执行器名做 if 分支。
+    agents: getService(ctx, 'agents'),
+    git: makeGitRunner(ctx),
+    runCommand: makeCommandRunner(ctx),
+    createGitlabClient,
+    getSecret: readSecret,
+    readFile: makeTextFileReader(ctx, logger),
+    log: (message, detail) => logger.info?.(`[ticket-pipeline] ${message}`, detail),
   })
-  const push = pushFactory(pushAdapterOptions(config, logger))
+  const push = pushFactory(pushAdapterOptions(config, logger, readSecret))
 
   // ── 3. scheduler 的宿主钩子 ───────────────────────────
   const gitRunner = makeGitRunner(ctx)
@@ -606,9 +708,17 @@ export async function apply (ctx, config) {
  * @param {any} logger
  * @returns {Record<string, unknown>}
  */
-function pushAdapterOptions (config, logger) {
+function pushAdapterOptions (config, logger, getSecret) {
   if (config.pushAdapter === 'pushplus') {
     return { ...pushplusOptionsFromConfig(config), log: logger }
+  }
+  if (config.pushAdapter === 'qqmail') {
+    // 授权码不进配置文件：构造期只给读凭据的函数，第一次真要发时才去取。
+    return {
+      ...qqmailOptionsFromConfig(config),
+      getSecret: (ref) => getSecret(ref ?? QQMAIL_SECRET_REF),
+      log: logger,
+    }
   }
   return {}
 }
