@@ -743,14 +743,21 @@ export function createFeishuSource (options = {}) {
       const candidates = await normalizeAppToken(signal)
       // 逐个候选试列表层：第一个能列出表的胜出（旧版 wiki base 用 obj_token，新版直接吃 wiki token）。
       let lastError = null
+      const attempts = []
       for (const candidate of candidates) {
         try {
           const found = await resolveTableWithAppToken(candidate, signal)
           tableCache = found
           return tableCache
         } catch (error) {
+          attempts.push(`${candidate.slice(0, 12)}…: ${error instanceof Error ? error.message : String(error)}`)
           lastError = error
         }
+      }
+      if (attempts.length > 1) {
+        // 多候选都失败时把每次尝试列出来，别只报最后一个 —— 用户能看出两个 token 都试过。
+        throw new PipelineError(lastError?.kind ?? 'internal', `飞书读表失败，共试了 ${attempts.length} 个 app_token 候选。`
+          + attempts.map((a) => `\n- ${a}`).join(''))
       }
       throw lastError ?? new PipelineError('invalid-input', `appToken ${String(appToken)} 无法定位多维表格`)
     }
