@@ -712,7 +712,14 @@ export function createFeishuSource (options = {}) {
       signal,
     })
     const node = payload?.data?.node
+    const objType = String(node?.obj_type ?? '')
     const objToken = String(node?.obj_token ?? '')
+    if (objType && objType !== 'bitable') {
+      throw new PipelineError(
+        'invalid-input',
+        `wiki 节点 ${token} 不是多维表格，实际类型是 ${objType}（docx=文档、sheet=电子表格、mindnote=思维笔记）。请在飞书里确认工单表是一张「多维表格」，把那张表的链接填进 appToken。`,
+      )
+    }
     if (!objToken) {
       throw new PipelineError(
         'invalid-input',
