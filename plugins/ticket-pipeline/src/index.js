@@ -34,6 +34,7 @@ import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
 import { createWpsSource } from './adapters/source-wps/index.js'
+import { createWebformSource } from './adapters/source-webform/index.js'
 import { createTableLocator } from './adapters/locator-table/index.js'
 import { createMockExecutor } from './adapters/executor-mock/index.js'
 import { createAgentExecutor } from './adapters/executor-agent/index.js'
@@ -201,6 +202,8 @@ export const SOURCES = {
   },
   // wps 还没实现，先不声明能力：真接上时按需往里加。
   wps: { capabilities: [], factory: (opts) => createWpsSource(opts) },
+  // webform：演示平台（内存表单源），验证「加平台只加目录 + 两行表」。
+  webform: { capabilities: [], factory: (opts) => createWebformSource(opts) },
 }
 
 /** @type {Record<string, (opts: any) => import('./contracts/work-executor.js').WorkExecutor>} */

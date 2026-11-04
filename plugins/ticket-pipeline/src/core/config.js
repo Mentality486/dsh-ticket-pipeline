@@ -298,7 +298,7 @@ function flatten (source, prefix, out) {
  *
  * @type {readonly string[]}
  */
-export const PLATFORMS = Object.freeze(['feishu', 'wps', 'mock'])
+export const PLATFORMS = Object.freeze(['feishu', 'wps', 'mock', 'webform'])
 
 /** 报错文案用的平台清单（「只能是 a / b / c」），从表里拼出来，免得两处各写一遍。 */
 const PLATFORM_HINT = PLATFORMS.join(' / ')
