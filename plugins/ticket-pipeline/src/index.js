@@ -49,6 +49,7 @@ import { createPipelineStatusTool } from './tools/pipeline-status.js'
 import { createPipelineCancelTool } from './tools/pipeline-cancel.js'
 import { createPipelineResetTool } from './tools/pipeline-reset.js'
 import { createPipelineDoctorTool } from './tools/pipeline-doctor.js'
+import { TicketPipelineRemote, mountTicketPipelineRemote } from './remote/host.js'
 
 export const name = 'ticket-pipeline'
 
@@ -739,14 +740,31 @@ export async function apply (ctx, config) {
   // 人工重开：store.resetByHuman 早就实现了却没有入口，文档承诺的「再跑一次」在生产里走不通。
   ctx.tools.register(createPipelineResetTool({ store }))
   // 环境体检：把「跑票时才炸」的环境问题（git 链路、仓库、凭据、mock 状态）提前到装完就能看到。
-  ctx.tools.register(createPipelineDoctorTool({
+  //
+  // 同一份 `doctorOptions` 给两个调用方：agent 侧的 `pipeline_doctor` 工具，和
+  // GUI 侧（设置页「立即体检」按钮）的宿主 Remote。两边必须看到同一份结论，
+  // 所以这里只构造一次、不各写一份。
+  const doctorOptions = {
     gitRunner,
     getConfig: () => config,
     credentials: makeCredentialsDescriber(ctx),
     // 基准分支猜错 = fetch 直接失败（fatal: couldn't find remote ref main），
     // 所以体检时就把「实际会用的分支」显出来，而不是等第一张票跑挂。
     detectBaseBranch: (runner, repoPath) => detectBaseBranch(runner, repoPath, log),
-  }))
+  }
+  ctx.tools.register(createPipelineDoctorTool(doctorOptions))
+
+  // 宿主 Remote：让插件的设置页能自己触发体检、读配置快照。
+  // `typert` 服务缺席时静默跳过（插件其余部分照常工作，工具侧体检不受影响）。
+  try {
+    const mounted = mountTicketPipelineRemote(ctx, new TicketPipelineRemote({
+      getConfig: () => config,
+      doctorOptions,
+    }))
+    if (mounted) log('已挂载 ticketPipeline Remote（设置页可用）')
+  } catch (error) {
+    log('挂载 Remote 失败（设置页的体检按钮将不可用）', error)
+  }
 
   // ── 5. 启动恢复 ───────────────────────────────────────
   try {

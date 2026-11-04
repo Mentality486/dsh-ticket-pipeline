@@ -260,6 +260,113 @@ export const CONFIG_FIELDS = Object.freeze({
   },
 })
 
+/**
+ * 设置面板的分组与字段标签。
+ *
+ * 分组只列键名（不重复字段声明本身），顺序即面板顺序；组内顺序也按这里的顺序走。
+ * 键名必须与 `CONFIG_FIELDS` 一一对应 —— 漏写会让字段在面板里落到「其他」组，
+ * `assertGroupCoverage()` 在离线自测里会把漏写直接报出来。
+ *
+ * @type {ReadonlyArray<{ id: string, label: string, fields: ReadonlyArray<readonly [string, string]> }>}
+ */
+export const CONFIG_GROUPS = Object.freeze([
+  Object.freeze({
+    id: 'scan',
+    label: '扫描与队列',
+    fields: Object.freeze([
+      Object.freeze(['pollIntervalMinutes', '轮询间隔（分钟）']),
+      Object.freeze(['safePageRun', '安全翻页条数']),
+      Object.freeze(['goneAfterScans', '判失联轮数']),
+      Object.freeze(['concurrency', '并发数']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'lease',
+    label: '租约与重试',
+    fields: Object.freeze([
+      Object.freeze(['leaseTtlMinutes', '租约存活（分钟）']),
+      Object.freeze(['leaseHeartbeatSeconds', '租约心跳（秒）']),
+      Object.freeze(['maxAttempts', '最大重试次数']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'work',
+    label: '执行',
+    fields: Object.freeze([
+      Object.freeze(['workExecutor', '执行器']),
+      Object.freeze(['ticketTimeoutMinutes', '单票超时（分钟）']),
+      Object.freeze(['fetchBeforeCreate', '切 worktree 前先 fetch']),
+      Object.freeze(['branchPrefix', '分支名前缀']),
+      Object.freeze(['worktreeRetentionHours', 'worktree 保留（小时）']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'model',
+    label: 'agent 与模型',
+    fields: Object.freeze([
+      Object.freeze(['provider', '模型 provider']),
+      Object.freeze(['model', '模型名']),
+      Object.freeze(['maxTokens', '最大输出 token']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'notify',
+    label: '通知',
+    fields: Object.freeze([
+      Object.freeze(['pushAdapter', '通知适配器']),
+      Object.freeze(['pushplus.token', 'PushPlus token']),
+      Object.freeze(['pushplus.channel', 'PushPlus 渠道']),
+      Object.freeze(['pushplus.template', 'PushPlus 模板']),
+      Object.freeze(['qqmail.host', 'SMTP 主机']),
+      Object.freeze(['qqmail.port', 'SMTP 端口']),
+      Object.freeze(['qqmail.secure', 'SMTP 直接 TLS']),
+      Object.freeze(['qqmail.user', '发件邮箱']),
+      Object.freeze(['qqmail.to', '收件邮箱']),
+      Object.freeze(['pushplus.callbackUrl', '送达回执地址']),
+      Object.freeze(['notifyOn', '发通知的 phase']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'misc',
+    label: '杂项',
+    fields: Object.freeze([
+      Object.freeze(['enabled', '总开关']),
+      Object.freeze(['logLevel', '日志级别']),
+    ]),
+  }),
+])
+
+/** 分组缺失时的兜底组名（正常不该出现，出现了说明 `CONFIG_GROUPS` 漏写）。 */
+export const FALLBACK_GROUP_LABEL = '其他'
+
+/** 每个字段的分组 / 标签 / 面板顺序，全部由 `CONFIG_GROUPS` 派生。 */
+const FIELD_PRESENTATION = (() => {
+  /** @type {Record<string, { label: string, group: string, order: number }>} */
+  const table = {}
+  let order = 0
+  for (const group of CONFIG_GROUPS) {
+    for (const [key, label] of group.fields) {
+      table[key] = { label, group: group.label, order: order++ }
+    }
+  }
+  return Object.freeze(table)
+})()
+
+/**
+ * 自测用：确认 `CONFIG_GROUPS` 与 `CONFIG_FIELDS` 完全对齐。
+ * @returns {string[]} 问题清单，空数组表示对齐
+ */
+export function assertGroupCoverage () {
+  const problems = []
+  for (const key of Object.keys(CONFIG_FIELDS)) {
+    if (FIELD_PRESENTATION[key] === undefined) problems.push(`CONFIG_GROUPS 缺少字段 ${key}`)
+  }
+  for (const key of Object.keys(FIELD_PRESENTATION)) {
+    if (CONFIG_FIELDS[key] === undefined) problems.push(`CONFIG_GROUPS 多出字段 ${key}`)
+  }
+  return problems
+}
+
 /** 扁平键名 → `{ pushplus: { token } }` 这种嵌套形状。 */
 function assignPath (target, path, value) {
   const parts = path.split('.')
@@ -491,19 +598,133 @@ export function validateConfig (raw) {
   return { value: nested }
 }
 
+// ── 设置面板的 schema 形状（descriptor）────────────────────────
+//
+// `dsh-settings` 暴露设置项的唯一门槛是「`Config` 上有 `toJSON()`，且至少一处
+// `meta.volatile === true`」。它不看 `instanceof`（鸭子类型），所以下面手写的
+// 纯 JSON 形状完全够用 —— 不需要 `schemastery` 依赖。
+//
+// 几个必须遵守的细节（对着 `dsh-settings/lib/index.js` 抄的）：
+//
+// 1. **每一个节点**都要带 `toJSON()`，不只是根节点：`plainSchema()` 第一步就是
+//    `new z(schema.toJSON())`，对子节点也会调用。
+// 2. `toJSON()` 必须返回**纯 JSON**（不能带函数），因为结果会被再序列化一次。
+// 3. 叶子要标 `meta.volatile = true`，否则 `volatileForm()` 会把整条设置项吞掉
+//    （静默消失、不报错，最难查）。
+// 4. 只标叶子、不标中间对象：中间对象保持 `meta: {}`，`volatileForm()` 会逐键筛，
+//    这样 `projects` 这类**不该在面板里编辑**的键自然被排除。
+// 5. 面板需要的元信息全放 `meta` 里（`label` / `description` / `default` /
+//    `min` / `max` / `enum`）——实测这些自定义键能原样穿过 schemastery 重建。
+
 /**
- * standard-schema 形状的 `Config`，直接给 cordis 的 `resolveConfig` 用。
- *
- * `version: 1` 与 `vendor` 是规范要求的标识；`vendor` 故意写本插件名而不是
- * `schemastery`，免得 loader 误判成 schemastery 后去取它没有的元数据。
+ * 把 descriptor 节点转成可递归 `toJSON()` 的普通对象。
+ * @param {any} node
+ * @returns {any}
  */
-export const Config = {
+function descriptorNode (node) {
+  /** @type {any} */
+  const out = { type: node.type, meta: { ...(node.meta ?? {}) } }
+  if (node.inner) out.inner = descriptorNode(node.inner)
+  if (node.dict) out.dict = Object.fromEntries(Object.entries(node.dict).map(([key, child]) => [key, descriptorNode(child)]))
+  out.toJSON = function toJSON () {
+    return JSON.parse(JSON.stringify({ ...this, toJSON: undefined }))
+  }
+  return out
+}
+
+/**
+ * 把一项 `CONFIG_FIELDS` 声明变成 descriptor 叶子。
+ *
+ * `label` / `group` 不进 `CONFIG_FIELDS`（那是校验用的表，改动它会影响
+ * `validateConfig` 与 `describeConfig`），而是由 `CONFIG_GROUPS` 派生后塞进
+ * `meta` —— 浏览器 bundle 只拿得到 schema 树，分组信息只能从 meta 走。
+ *
+ * @param {ConfigField} field
+ * @param {string} label
+ * @param {string} group
+ */
+function descriptorLeaf (field, label, group) {
+  /** @type {Record<string, unknown>} */
+  const meta = {
+    volatile: true,
+    label,
+    group,
+    description: field.description,
+  }
+  if (field.default !== undefined) meta.default = field.default
+  if (field.min !== undefined) meta.min = field.min
+  if (field.max !== undefined) meta.max = field.max
+  if (field.enum !== undefined) meta.enum = [...field.enum]
+
+  if (field.type === 'string-array') {
+    return descriptorNode({ type: 'array', meta, inner: { type: 'string', meta: {} } })
+  }
+  if (field.type === 'boolean') return descriptorNode({ type: 'boolean', meta })
+  if (field.type === 'number' || field.type === 'integer') return descriptorNode({ type: 'number', meta })
+  return descriptorNode({ type: 'string', meta })
+}
+
+/**
+ * 由 `CONFIG_FIELDS` 造出给设置面板用的 schema 树。
+ *
+ * 点号键（`pushplus.token`）按 `.` 逐层拆成嵌套 object，和配置的真实形状一致：
+ * `{ pushplus: { token } }`。
+ */
+function buildConfigDescriptor () {
+  /** @type {any} */
+  const root = descriptorNode({ type: 'object', meta: {}, dict: {} })
+
+  for (const [key, field] of Object.entries(CONFIG_FIELDS)) {
+    const presentation = FIELD_PRESENTATION[key]
+    const label = presentation?.label ?? key
+    const group = presentation?.group ?? FALLBACK_GROUP_LABEL
+    /** @type {any} */
+    const leaf = descriptorLeaf(field, label, group)
+
+    const parts = key.split('.')
+    let cursor = root
+    for (const part of parts.slice(0, -1)) {
+      cursor.dict[part] ??= descriptorNode({ type: 'object', meta: {}, dict: {} })
+      cursor = cursor.dict[part]
+    }
+    const last = parts[parts.length - 1]
+    if (last !== undefined) cursor.dict[last] = leaf
+  }
+
+  return root
+}
+
+/** 设置面板用的 schema 树（惰性造一次，被 `Config` 与自测共用）。 */
+let configDescriptor = null
+
+/** @returns {any} */
+export function getConfigDescriptor () {
+  if (configDescriptor === null) configDescriptor = buildConfigDescriptor()
+  return configDescriptor
+}
+
+/**
+ * `Config`：既是 cordis 校验用的 standard-schema，又是设置面板用的 descriptor 树。
+ *
+ * 两件事必须同时成立：
+ *
+ * 1. `'~standard'.validate` **同步**返回 `{ value } | { issues }` —— cordis 的
+ *    `resolveConfig` 只认这个（异步会抛 `Async config validation is not supported`）。
+ * 2. `type` / `meta` / `dict` / `toJSON()` 都在**根节点上** —— `dsh-settings` 是把
+ *    `Config` 本身当 schema 传给 `volatileForm()` 的，只挂 `toJSON` 不够。
+ *
+ * `vendor` 故意写本插件名而不是 `schemastery`：`isSchemastery()` 严格比较 vendor
+ * 字符串，冒充 schemastery 会让 loader 去取它没有的元数据，然后设置面板静默变空。
+ * 代价是 loader 不认「volatile 字段热更新」，改配置会重启插件实例 —— 对这个插件
+ * 无所谓（改的本来就是轮询间隔、凭据这类启动期参数）。
+ */
+export const Config = Object.assign(getConfigDescriptor(), {
   '~standard': {
     version: 1,
     vendor: 'ticket-pipeline',
     validate: (value) => validateConfig(value),
   },
-}
+})
 
 /** 给离线自测与工具输出用：把校验后的配置里的敏感项打码。 */
 export function describeConfig (config) {
