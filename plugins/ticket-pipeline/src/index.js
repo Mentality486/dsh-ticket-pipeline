@@ -259,6 +259,37 @@ export function fullAccessSandboxPolicy (cwd) {
 }
 
 /**
+ * 猜一个基准分支：配置没写 `repo.baseBranch` 时用。
+ *
+ * 以前这里硬编码 `'main'`，而实际项目主干常叫别的名字（本机 pms 仓库是 `v2.x`）——
+ * 猜错一个名字就让 `git fetch origin main` 直接失败
+ * （`fatal: couldn't find remote ref main`），票全挂在第一步，错误里还看不出
+ * 是「分支名猜错了」，人会去查权限、查网络，查半天。
+ *
+ * 顺序：① remote 的 HEAD 指向哪个分支（`git symbolic-ref --short refs/remotes/origin/HEAD`，
+ * 克隆时自动带上，最权威）；② 本地当前分支；③ 都拿不到才退回 `main` 并留一条日志。
+ *
+ * @param {(argv: string[], opts?: { cwd?: string }) => Promise<{ code: number, stdout: string, stderr: string }>} gitRunner
+ * @param {string} repoPath
+ * @param {(msg: string, detail?: unknown) => void} [log]
+ * @returns {Promise<string>}
+ */
+export async function detectBaseBranch (gitRunner, repoPath, log) {
+  const fromRemote = await gitRunner(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { cwd: repoPath })
+  if (fromRemote.code === 0) {
+    const name = String(fromRemote.stdout ?? '').trim().replace(/^origin\//, '')
+    if (name.length > 0) return name
+  }
+  const fromLocal = await gitRunner(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath })
+  if (fromLocal.code === 0) {
+    const name = String(fromLocal.stdout ?? '').trim()
+    if (name.length > 0 && name !== 'HEAD') return name
+  }
+  log?.('无法自动判断基准分支，退回 main；建议在项目配置里显式写 repo.baseBranch', { repoPath })
+  return 'main'
+}
+
+/**
  * 从 ctx 造一个「能跑 git 命令」的函数，供 `prepareWorkspace` / `removeWorktree` /
  * `checkWorktreeByGit` 用。`subprocess` 服务若不存在则返回 null。
  *
@@ -619,10 +650,10 @@ export async function apply (ctx, config) {
 
     const { located, projectId, recordId, revisionCount, fetch } = opts
     const repoPath = located?.repoPath
-    const baseRef = located?.baseBranch ?? 'main'
     if (!repoPath) {
       throw new Error('定位结果缺少 repoPath，无法建 worktree')
     }
+    const baseRef = located?.baseBranch ?? await detectBaseBranch(gitRunner, repoPath, log)
 
     // recordId 来自工单表（外部输入），可能带空格/中文/git 拒绝的字符 —— 统一过清洗器（A5）。
     const branch = `${config.branchPrefix ?? 'ticket-'}${sanitizeBranchName(`${projectId}-${recordId}-r${revisionCount}`)}`

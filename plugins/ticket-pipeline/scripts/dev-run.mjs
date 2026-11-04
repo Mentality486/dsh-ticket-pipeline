@@ -37,7 +37,7 @@ import { runFeishuChecks } from './feishu-checks.mjs'
 import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
-import { apply, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy } from '../src/index.js'
+import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy } from '../src/index.js'
 
 // ── 小工具 ────────────────────────────────────────────────
 
@@ -1069,6 +1069,45 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(request.sandboxPolicy, 'verify 也会写 node_modules 缓存，同样要带策略')
     assert.equal(request.sandboxPolicy.mode, 'danger-full-access')
     assert.equal(request.sandboxPolicy.workspaceRoot, 'D:/some/repo')
+  })
+
+  await check('detectBaseBranch 优先用 remote HEAD，不猜 main', async () => {
+    // 本机 pms 仓库的主干叫 v2.x；以前硬编码 'main' 会让 fetch 直接失败。
+    const calls = []
+    const git = async (argv, opts) => {
+      calls.push([argv.join(' '), opts?.cwd])
+      if (argv[0] === 'symbolic-ref') return { code: 0, stdout: 'origin/v2.x\n', stderr: '' }
+      return { code: 0, stdout: 'v2.x\n', stderr: '' }
+    }
+    const base = await detectBaseBranch(git, 'D:/repo')
+    assert.equal(base, 'v2.x', '应该剥掉 origin/ 前缀后返回 v2.x')
+    assert.equal(calls[0][1], 'D:/repo', '查分支也要带 cwd')
+  })
+
+  await check('detectBaseBranch：拿不到 remote HEAD 时退本地分支，再退 main', async () => {
+    const localOnly = async (argv) => {
+      if (argv[0] === 'symbolic-ref') return { code: 128, stdout: '', stderr: 'not a symbolic ref' }
+      return { code: 0, stdout: 'develop\n', stderr: '' }
+    }
+    assert.equal(await detectBaseBranch(localOnly, 'D:/repo'), 'develop', '退到本地当前分支')
+
+    const nothing = async () => ({ code: 128, stdout: '', stderr: '' })
+    assert.equal(await detectBaseBranch(nothing, 'D:/repo'), 'main', '全拿不到才退回 main')
+  })
+
+  await check('真实仓库上 detectBaseBranch 认得出 v2.x', async () => {
+    // 用真的 git（走 bash 链路），守护「remote HEAD 能读出来」这条事实。
+    const { execFileSync } = await import('node:child_process')
+    const repo = '.repos/mgiot-pms'
+    let exists = true
+    try { execFileSync('git', ['-C', repo, 'rev-parse', '--git-dir'], { stdio: 'ignore' }) } catch { exists = false }
+    if (!exists) return // 没克隆过就跳过，别让离线机器红
+    const git = async (argv, opts = {}) => {
+      const out = execFileSync('git', ['-C', String(opts.cwd), ...argv], { encoding: 'utf8' })
+      return { code: 0, stdout: out, stderr: '' }
+    }
+    const base = await detectBaseBranch(git, repo)
+    assert.ok(['v2.x', 'master'].includes(base), `真实仓库的主干应该认出来，实际 ${base}`)
   })
 
   section('13. 新适配器：gitlab 客户端 / qqmail 推送 / wps 工单源')
