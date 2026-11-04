@@ -37,9 +37,28 @@ src/
     push-mock/       假通知（记内存）
     push-pushplus/   PushPlus 真实现
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
-  tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset 四个工具
+  tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_doctor 五个工具
+  remote/            浏览器端可调的自建 Remote（ticketPipeline/doctor、ticketPipeline/config）
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
+lib/
+  client.js          浏览器端 bundle：插件设置页（填配置 + 凭据 + 立即体检）
 ```
+
+## 设置页
+
+插件详情页里本插件那一行有「配置」按钮，点进去是一整页：
+
+- **环境体检**：「立即体检」按钮跑 `runDoctor`（与对话里的 `pipeline_doctor` 同一份逻辑），
+  结果按「必须修复 / 提醒」分段显示。
+- **凭据**：飞书 App ID / App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token，
+  只写不读回（写入走 `ctx.remote.credentials`，界面只显示「已配置 / 未配置」）。
+- **配置**：按分组渲染 28 个字段，保存走 `ctx.remote.settings.mutate`（写 profile 的
+  `cordis.patch.yml`，重启后仍在）。`projects[]` 是结构化数组，不在这张表单里，仍需手改配置（见使用手册 §3）。
+
+表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
+（每个节点带 `toJSON`、叶子带 `meta.volatile`），宿主 `dsh-settings` 用它投影出可写字段。
+**没挂 descriptor 时宿主会静默跳过整条设置项** —— 加字段后记得同步 `CONFIG_GROUPS`，
+`node scripts/client-check.mjs` 会检查这一点。
 
 ## 三个可替换件
 
@@ -135,6 +154,19 @@ node scripts/chain-smoke.mjs
 
 11 项断言：真扫描 → 定位 → 截图入消息 → 执行器 → 通知的完整链路，
 含「截图取不到 → needs-info + 通知」「saveImage 返回空 → 跳过图块」等边界。
+
+浏览器端那一半（`lib/client.js`）不进 `dev-run`，有独立两个脚本：
+
+```bash
+node scripts/client-check.mjs        # 静态一致性：bundle 里的 Remote 描述符 vs src/remote/descriptors.js
+node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 slot、渲染表单、保存、体检
+```
+
+`client-check` 守的是「bundle 不能 import 宿主源码、只能手抄一份」这条约束 ——
+改了 `src/remote/descriptors.js` 忘了改 `lib/client.js` 会**静默无响应**（点了体检没反应、
+宿主也不报错），所以这个检查必须跑。它还校验 `require()` 的白名单（只允许
+`react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）与 `dsh.client.platform === 'web'`
+（platform 写错宿主会静默跳过整个 bundle）。
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

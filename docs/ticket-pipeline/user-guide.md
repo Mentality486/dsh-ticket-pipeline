@@ -102,7 +102,19 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 ## 3. 配置插件
 
-装好重启后，在插件设置里填配置。完整示例（可直接抄，改三个地方）：
+装好重启后，打开**侧栏 Plugins → 找到「工单流水线」→ 点那一行的「配置」**，是一整页：
+
+| 区块 | 干什么 |
+|---|---|
+| 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知），结果按「必须修复」「提醒」分段 |
+| 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
+| 配置 | 28 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在 |
+| 项目清单 | `projects[]` 是结构化数组，**不在表单里**，仍按下文手改配置 |
+
+> 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
+> 确认插件活着，再看 §6 的排查。
+
+`projects[]` 与其余字段的等价 JSON 写法（想手改配置时用，可直接抄，改三个地方）：
 
 ```json
 {
@@ -143,7 +155,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `workExecutor` | — | `mock`（离线验证）/ `agent`（真执行） |
 | `pushAdapter` | — | `mock` / `pushplus` / `qqmail` |
 | `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
-| `maxAttempts` | `3` | 可重试错误的自动重试上限 |
+| `maxAttempts` | `2` | 可重试错误的自动重试上限 |
 | `branchPrefix` | `ticket-` | 工作分支前缀 |
 | `worktreeRetentionHours` | `24` | 终态票的 worktree 保留时长 |
 | `leaseTtlMinutes` | `10` | 租约时长（多进程防双跑） |
@@ -254,14 +266,23 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
 | 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
+| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置 / 项目清单 |
+| 设置页体检 | 该页点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
+| 设置页保存 | 改任一字段 → 保存 | 提示「已保存」；重启后值还在 |
+| 浏览器端一致性 | `node scripts/client-check.mjs`（开发目录） | `✅ client-check 通过` |
+| 浏览器端冒烟 | `node scripts/client-smoke.mjs`（开发目录） | `✅ client-smoke 通过` |
 
 > **排查：启动时看到 `cannot get property "X" without inject` + `did not activate`？**
 > 这是插件声明的 `inject` 与实际用到的宿主服务不匹配（v0.1.0-test.1 曾因缺 `'timer'` 崩过，已修）。
 > 自检：`src/index.js` 的 `inject` 数组必须覆盖 `ctx.interval`（timer）等全部硬依赖；
 > 弱依赖一律走 `ctx.get(name)` 而不是 `ctx.<name>` 直接属性访问。
 
-> 注意：`scripts/` 不进安装包（发布白名单只含 src/locale/icon/patch），
+> 注意：`scripts/` 不进安装包（发布白名单只含 src/lib/locale/icon/patch），
 > 自测命令要在**开发目录** `D:/WorkSpace/dsh-ticket-pipeline/plugins/ticket-pipeline` 下跑。
+>
+> `client-check` 守的是「浏览器 bundle 只能手抄一份宿主侧描述符」这条约束：
+> 改了 `src/remote/descriptors.js` 忘了改 `lib/client.js`，表现是**点体检没反应、宿主也不报错**，
+> 所以发版前必跑。
 
 ---
 
@@ -290,6 +311,25 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 **Q：`pipeline_status` 报 `value is not lossless JSON` 怎么办？**
 同样是旧版本的 bug（工具输出里残留 `undefined`，宿主判整次调用失败）。最新版已在
 `defineTool` 层统一剥掉 `undefined`，更新并重启即可。
+
+**Q：插件页里那一行没有「配置」按钮？**
+「配置」按钮只在这一行注册了 `plugins.row.config`（key 为 `@local/ticket-pipeline#ticket-pipeline`）
+且 `package.json` 声明了 `dsh.client.platform: "web"` 时出现。装的是旧副本（安装目录里的
+`lib/client.js` 不存在）就看不到 —— 重装插件并**完全重启宿主**（刷新页面不算）。
+
+**Q：设置页空白 / 打开是「暂无配置项」？**
+说明宿主的设置服务没把本插件列为可配 —— `src/core/config.js` 里 `Config` 上那棵 schema
+descriptor 没挂上，或字段没标 `meta.volatile`。宿主对这种情况是**静默跳过**（不报错）。
+自检：`node scripts/client-check.mjs` 会核对 descriptor 与分组表是否对齐。
+
+**Q：在设置页填了 QQ 邮箱授权码，为什么配置里看不到？**
+凭据从不回写配置文件、也不回传明文，界面只显示「已配置」。真要核对，看「立即体检」的
+凭据段（`QQMAIL_AUTH_CODE` 不在体检清单里，体检只查 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` /
+`GITLAB_TOKEN`）；发信失败时看通知日志里的错误码。
+
+**Q：在设置页改了配置，为什么行为没立刻变？**
+本插件 `~standard.vendor` 不是 `schemastery`，loader 判定为「整对象换掉」而非按 volatile 字段热更，
+所以保存后插件会重新加载一次。跑票中途保存不影响已经发出的那次 tick。
 
 ---
 
