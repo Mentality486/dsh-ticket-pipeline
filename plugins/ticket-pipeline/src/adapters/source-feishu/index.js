@@ -707,10 +707,19 @@ export function createFeishuSource (options = {}) {
    */
   async function normalizeAppToken (signal) {
     let token = String(appToken ?? '').trim()
-    // 完整 URL：/wiki/<token> 或 /base/<token> —— 直接抠出 token。
-    const urlMatch = token.match(/(?:\/wiki\/|\/base\/)([A-Za-z0-9]+)/)
-    if (urlMatch) token = urlMatch[1]
-    if (!/^wiki/i.test(token)) return [token] // 原生 app_token，原样返回
+    // 完整 URL：/wiki/<token> 或 /base/<token> —— 直接抠出 token，并记住来源形态。
+    // 注意：wiki 节点的 token 不一定以 wiki 开头（如 RXEP…），所以不能只看前缀判断，
+    // 必须看它是不是从 /wiki/ URL 里抠出来的。
+    const wikiUrlMatch = token.match(/\/wiki\/([A-Za-z0-9]+)/)
+    const baseToken = token.match(/\/base\/([A-Za-z0-9]+)/)
+    if (baseToken) return [baseToken[1]] // /base/ URL → 原生 app_token，直接用
+    if (wikiUrlMatch) token = wikiUrlMatch[1]
+    else {
+      const bareMatch = token.match(/^([A-Za-z0-9]+)$/)
+      token = bareMatch ? bareMatch[1] : token
+    }
+    const fromWiki = Boolean(wikiUrlMatch) || /^wiki/i.test(token)
+    if (!fromWiki) return [token] // 原生 app_token（含 /base/ 抠出的），原样返回
     const payload = await apiCall('/open-apis/wiki/v2/spaces/get_node', {
       query: { token, obj_type: 'bitable' },
       signal,

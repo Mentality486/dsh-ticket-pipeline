@@ -484,6 +484,25 @@ export async function runFeishuChecks (check) {
     )
   })
 
+  await check('wiki URL 的 token 不以 wiki 开头（如 RXEP…）也必须走换算 —— 真实用户场景回归', async () => {
+    const server = createFakeServer({
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://vcn6ijgss3oy.feishu.cn/wiki/RXEPwwUePiyV7zkeo6hc5nQinfh?fromScene=spaceOverview',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    const nodeRequest = server.requests.find((r) => r.url.includes('/wiki/v2/spaces/get_node'))
+    assert.ok(nodeRequest, '非 wiki 前缀的 wiki URL token 也要调 get_node')
+    assert.ok(nodeRequest.url.includes('token=RXEPwwUePiyV7zkeo6hc5nQinfh'), '应该把 RXEP… token 传给 get_node')
+    const tablesRequest = server.requests.find((r) => /\/bitable\/v1\/apps\/[^/]+\/tables\?/.test(r.url))
+    assert.ok(tablesRequest?.url.includes('btplNormal-RXEPwwUePiyV7zkeo6hc5nQinfh'), '应该用 obj_token 访问表')
+  })
+
   await check('wiki 链接形式的 appToken 会先换算成 obj_token 再访问表', async () => {
     const server = createFakeServer({
       tables: [{ table_id: 'tbl-a', name: '工单表' }],
