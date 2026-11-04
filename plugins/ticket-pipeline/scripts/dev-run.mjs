@@ -31,6 +31,8 @@ import { validateConfig, describeConfig } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
 import { createPipelineResetTool } from '../src/tools/pipeline-reset.js'
 import { createPipelineDoctorTool } from '../src/tools/pipeline-doctor.js'
+import { createPipelineStatusTool } from '../src/tools/pipeline-status.js'
+import { stripUndefined } from '../src/tools/define.js'
 import { sanitizeBranchName } from '../src/core/branch-name.js'
 import { pushplusOptionsFromConfig } from '../src/adapters/push-pushplus/index.js'
 import { runFeishuChecks } from './feishu-checks.mjs'
@@ -1006,6 +1008,52 @@ function makeFakeCtx ({ domain, registered }) {
       assert.ok(seg.length <= 200, '片段不能超长')
     }
     assert.equal(sanitizeBranchName('!!!'), 'ticket', '全非法字符时回退 ticket')
+  })
+
+  section('12d. 工具输出必须是 lossless JSON（undefined 会让宿主判整次调用失败）')
+
+  await check('工具输出里任何一层都不能残留 undefined', async () => {
+    // 真实现象：pipeline_status 在「有失败票」时报
+    //   tool "pipeline_status" returned invalid output: value is not lossless JSON
+    // 在「全是干净票」时又正常 —— 因为票行投影里 lastError/testDetail 是可选的，
+    // 干净票没有这两个键，值就是 undefined。undefined 不是合法 JSON 值，
+    // 宿主于是把一次成功的调用判成工具坏了。
+    const rows = [
+      // 干净票：lastError / testDetail 天然不存在
+      { key: k('r1'), projectId: DEMO, recordId: 'r1', phase: 'done', problemSummary: '干净', attempt: 0 },
+      // 失败票：反过来，mr / worktreePath 不存在
+      { key: k('r2'), projectId: DEMO, recordId: 'r2', phase: 'failed', lastError: 'internal: 假的', attempt: 2 },
+    ]
+    const tool = createPipelineStatusTool({
+      store: { listTickets: () => rows },
+      getConfig: () => validateConfig({}).value,
+    })
+    const out = await tool.execute({ includeDone: true }, {})
+
+    // JSON.stringify 会把 undefined 悄悄丢掉，所以不能靠它验证 ——
+    // 要真走一遍宿主那条「lossless JSON」判据：递归找 undefined。
+    const offenders = []
+    const walk = (value, path) => {
+      if (value === undefined) { offenders.push(path || '<root>'); return }
+      if (Array.isArray(value)) { value.forEach((item, i) => walk(item, `${path}[${i}]`)); return }
+      if (value !== null && typeof value === 'object') {
+        for (const [key, item] of Object.entries(value)) walk(item, path ? `${path}.${key}` : key)
+      }
+    }
+    walk(out, '')
+    assert.deepEqual(offenders, [], `输出里还有 undefined：${offenders.join(', ')}`)
+    assert.equal(out.tickets.length, 2, '两张票都要在')
+  })
+
+  await check('stripUndefined 保留 false / 0 / 空字符串，只去掉 undefined', async () => {
+    // 这个函数是「删 undefined」，很容易顺手写成「删假值」——
+    // 那样 enabled:false 变没有、attempt:0 变没有、changedFiles:[] 也会被误解。
+    assert.deepEqual(
+      stripUndefined({ a: 1, b: undefined, c: false, d: 0, e: '', f: null, g: [], h: {} }),
+      { a: 1, c: false, d: 0, e: '', f: null, g: [], h: {} },
+    )
+    // 数组里的 undefined 要变 null 而不是被删 —— 删了会改变长度、下标全错位。
+    assert.deepEqual(stripUndefined({ list: [1, undefined, 3] }), { list: [1, null, 3] })
   })
 
   section('12b. 注册表真的接上了适配器（qqmail 推送 / agent 执行器）')

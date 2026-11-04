@@ -177,6 +177,36 @@ function assertArgs (toolName, parameters, args) {
 }
 
 /**
+ * 深拷贝并丢掉值为 `undefined` 的键。
+ *
+ * 为什么必需：宿主的工具通道要求返回值是 **lossless JSON**。`undefined` 不是合法 JSON 值，
+ * 只要返回值里任何一层藏着 `undefined`，整次工具调用在宿主那边直接失败，报
+ * `tool "xxx" returned invalid output: value is not lossless JSON` ——
+ * **人看到的是「工具坏了」，而工具本身跑得好好的**。
+ *
+ * 这不是假想问题：`pipeline_status` 的票行是手写投影（`lastError`/`testDetail` 这类
+ * 可选字段在没失败、没跑测试时天然不存在），于是它长期在「有失败票」时报错、
+ * 在「全是干净票」时又正常 —— 表现成随机坏。
+ *
+ * 修在这一层而不是每个工具里：任何工具的输出都会经过 `defineTool`，
+ * 以后新加工具也不必记得这条规则。
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+export function stripUndefined (value) {
+  if (Array.isArray(value)) return value.map((item) => (item === undefined ? null : stripUndefined(item)))
+  if (value === null || typeof value !== 'object') return value
+  /** @type {Record<string, unknown>} */
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (item === undefined) continue
+    out[key] = stripUndefined(item)
+  }
+  return out
+}
+
+/**
  * 造一个工具定义，形状与 `defineTool` 的产物一致，可直接交给
  * `ctx.tools.register()`。
  *
@@ -222,7 +252,8 @@ export function defineTool (options) {
     async execute (args, exec) {
       const safeArgs = args && typeof args === 'object' ? args : {}
       assertArgs(name, parameters, safeArgs)
-      return execute(safeArgs, exec ?? {})
+      // 见 stripUndefined 的注释：undefined 会让宿主判整个工具输出非法。
+      return /** @type {Record<string, unknown>} */ (stripUndefined(await execute(safeArgs, exec ?? {})))
     },
   }
 
