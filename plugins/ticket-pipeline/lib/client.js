@@ -56,6 +56,16 @@ window.__ModuleLoader__.load({
      * 不能 import 宿主侧文件（模块表里没有它），仓库又没有构建步骤。
      * `scripts/client-check.mjs` 会比对两边是否一致，改一处必须改两处。
      */
+    /**
+     * ⚠️ 每个 result codec 都必须带 `create()`。
+     *
+     * `dsh-typert-registry` 的 `validateCodec` 连 result 也校验：
+     * `if (typeof codec.create !== "function") throw new Error("typert: … result strict codec has no create() factory")`。
+     * 只有 `mode` + `typeSymbol` 的 result codec 会让 `ctx.remote.$mount()` 整个被拒，
+     * 表现是「体检按钮点了没反应，控制台只有一条 remote-mount-failed」。
+     * 返回值的结构由宿主侧 `runDoctor()` / `describeConfig()` 保证，这里透传。
+     * 写成字面量里的内联函数（不引用外层变量），这样整段能被脚本原样抠出来求值。
+     */
     var TICKET_PIPELINE_REMOTE = {
       package: '@local/ticket-pipeline',
       descriptors: [
@@ -65,7 +75,7 @@ window.__ModuleLoader__.load({
           namespace: 'ticketPipeline',
           method: 'doctor',
           invocation: { kind: 'direct' },
-          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#DoctorReport' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#DoctorReport', create: function () { return { parse: function (value) { return value } } } },
           parameters: [],
         },
         {
@@ -74,7 +84,7 @@ window.__ModuleLoader__.load({
           namespace: 'ticketPipeline',
           method: 'config',
           invocation: { kind: 'direct' },
-          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ConfigSnapshot' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ConfigSnapshot', create: function () { return { parse: function (value) { return value } } } },
           parameters: [],
         },
       ],

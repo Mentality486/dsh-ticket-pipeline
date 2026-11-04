@@ -57,7 +57,13 @@ function sliceJsonObject (source, startIndex) {
   return undefined
 }
 
-/** 把描述符剥成只含「跨端必须一致」的字段。 */
+/**
+ * 把描述符剥成只含「跨端必须一致」的字段。
+ *
+ * 函数不能比相等，所以 codec 只比「有没有 create」这个布尔位 —— 但这一位恰恰是
+ * 最容易漏的：`dsh-typert-registry` 的 `validateCodec` 会在 `$mount` 时校验 result
+ * codec 有没有 create()，漏了整份贡献物被拒，界面上只表现为「按钮没反应」。
+ */
 function normalizeDescriptor (descriptor) {
   return {
     id: descriptor.id,
@@ -65,10 +71,34 @@ function normalizeDescriptor (descriptor) {
     namespace: descriptor.namespace,
     method: descriptor.method,
     invocation: descriptor.invocation,
-    result: descriptor.result ? { mode: descriptor.result.mode, typeSymbol: descriptor.result.typeSymbol } : undefined,
+    result: descriptor.result
+      ? {
+          mode: descriptor.result.mode,
+          typeSymbol: descriptor.result.typeSymbol,
+          hasCreate: typeof descriptor.result.create === 'function',
+        }
+      : undefined,
     parameters: (descriptor.parameters ?? []).map(function (parameter) {
       return { name: parameter.name, wire: parameter.wire, source: parameter.source }
     }),
+  }
+}
+
+/** 每个 result codec 必须能满足 typert 的 validateCodec 要求。 */
+function checkResultCodecs (label, descriptors) {
+  for (const descriptor of descriptors) {
+    const result = descriptor.result
+    if (result === undefined) {
+      fail(label + ' 的 ' + descriptor.id + ' 没有 result codec')
+      continue
+    }
+    if (result.mode !== 'strict') continue
+    if (typeof result.typeSymbol !== 'string' || result.typeSymbol.length === 0) {
+      fail(label + ' 的 ' + descriptor.id + ' 的 result.typeSymbol 为空')
+    }
+    if (typeof result.create !== 'function') {
+      fail(label + ' 的 ' + descriptor.id + ' 的 result codec 没有 create() —— typert 的 validateCodec 会拒掉整份贡献物（ctx.remote.$mount 失败）')
+    }
   }
 }
 
@@ -77,6 +107,7 @@ async function readHostRemote () {
   const module = await import(pathToFileURL(join(root, 'src/remote/descriptors.js')).href)
   return {
     package: module.TICKET_PIPELINE_REMOTE.package,
+    raw: module.TICKET_PIPELINE_REMOTE.descriptors,
     descriptors: module.TICKET_PIPELINE_REMOTE.descriptors.map(normalizeDescriptor),
   }
 }
@@ -104,6 +135,7 @@ async function readClientRemote () {
   }
   return {
     package: parsed.package,
+    raw: parsed.descriptors,
     descriptors: parsed.descriptors.map(normalizeDescriptor),
   }
 }
@@ -271,6 +303,8 @@ async function main () {
   const host = await readHostRemote()
   const client = await readClientRemote()
   if (host !== undefined && client !== undefined) {
+    checkResultCodecs('宿主侧 src/remote/descriptors.js', host.raw)
+    checkResultCodecs('浏览器侧 lib/client.js', client.raw)
     if (host.package !== client.package) {
       fail('包名不一致：宿主 ' + host.package + ' vs 浏览器 ' + client.package)
     }
