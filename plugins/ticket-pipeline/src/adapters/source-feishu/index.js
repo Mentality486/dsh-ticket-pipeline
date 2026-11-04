@@ -914,7 +914,7 @@ export function createFeishuSource (options = {}) {
       } catch (error) {
         // 有些表不允许按自动字段排序。去掉 sort 重试一次，宁可多翻几页也别整轮失败。
         const message = error instanceof Error ? error.message : String(error)
-        if (error instanceof PipelineError && error.kind === 'invalid-input' && /sort/i.test(message)) {
+        if (error instanceof PipelineError && /sort/i.test(message)) {
           delete body.sort
           payload = await apiCall(
             `/open-apis/bitable/v1/apps/${table.appToken}/tables/${table.tableId}/records/search`,

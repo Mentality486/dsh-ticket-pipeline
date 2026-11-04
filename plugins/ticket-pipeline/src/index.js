@@ -242,6 +242,8 @@ function makeGitRunner (ctx) {
       cwd: opts.cwd,
       env: { GIT_TERMINAL_PROMPT: '0' },
       stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } },
+      // 宿主 validateSubprocessSpec 要求 graceMs 必须是正有限数（无默认兜底），缺了直接抛。
+      graceMs: 3000,
     })
     const result = await child.done
     const stdout = child.collected?.stdout?.readFrom(0)?.toString?.() ?? ''
