@@ -375,6 +375,9 @@ async function main () {
   }
 
   // ③ 点「立即体检」→ 调自建 Remote。
+  // apply 里就该把命名空间挂好（面板一打开按钮就能点），不该靠组件 effect 兜底。
+  check('apply 里挂载了 ticketPipeline 命名空间（只挂一次）', ctx.calls.mounted === 1, String(ctx.calls.mounted))
+  check('apply 之后命名空间已就绪', ctx.remote.ticketPipeline !== undefined)
   tree = await render(Panel, { view: 'page' })
   const doctor = findButton(tree, '立即体检')
   check('体检按钮可用', doctor.props.disabled === false, String(doctor.props.disabled))

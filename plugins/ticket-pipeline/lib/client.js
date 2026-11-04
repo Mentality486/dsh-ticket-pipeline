@@ -539,15 +539,13 @@ window.__ModuleLoader__.load({
         setLoading(true)
         loadSettings()
         loadCredentials()
-        if (remote && typeof remote['$mount'] === 'function') {
-          remote['$mount'](TICKET_PIPELINE_REMOTE).then(function () {
-            setMounted(true)
-            setDoctorError('')
-          }, function (error) {
-            setMounted(false)
-            setDoctorError('挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
-          })
-        }
+        ensureMounted(remote).then(function () {
+          setMounted(true)
+          setDoctorError('')
+        }, function (error) {
+          setMounted(false)
+          setDoctorError('挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
+        })
       }, [])
 
       var leaves = useMemo(function () {
@@ -778,6 +776,32 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 体检通道（`ticketPipeline` 命名空间）的挂载。
+     *
+     * 只挂一次：同一个 namespace 二次 `$mount` 会被客户端 gateway 拒绝，而
+     * apply 在重载 / HMR 时可能再跑一遍。用模块级 Promise 去重。
+     *
+     * 放在 apply 里而不是组件里：面板一打开按钮就该能点，不该先闪一下
+     * 「Remote 没挂上」再等组件 effect 跑完。
+     */
+    var mountedPromise = null
+
+    function ensureMounted (remote) {
+      if (remote === undefined || remote === null) {
+        return Promise.reject(new Error('remote 服务缺席（ctx.remote 拿不到）'))
+      }
+      if (remote.ticketPipeline !== undefined) return Promise.resolve(undefined)
+      if (mountedPromise !== null) return mountedPromise
+      if (typeof remote['$mount'] !== 'function') {
+        return Promise.reject(new Error('remote.$mount 缺席'))
+      }
+      mountedPromise = Promise.resolve()
+        .then(function () { return remote['$mount'](TICKET_PIPELINE_REMOTE) })
+        .then(function () { return undefined })
+      return mountedPromise
+    }
+
     function apply (ctx) {
       // 样式表：挂在 document.head，插件卸载时由 ctx.effect 收回。
       ctx.effect(function () {
@@ -787,6 +811,11 @@ window.__ModuleLoader__.load({
         document.head.append(style)
         return function () { style.remove() }
       }, 'ticket-pipeline: settings styles')
+
+      // 体检通道尽早挂上；失败只记日志，不能让设置表单跟着挂掉。
+      ensureMounted(ctx.remote).catch(function (error) {
+        console.error('[ticket-pipeline] 挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
+      })
 
       var panel = function (props) {
         return h(TicketPipelinePanel, Object.assign({}, props, { remote: ctx.remote }))
