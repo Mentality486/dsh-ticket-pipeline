@@ -27,7 +27,10 @@ import {
   filterSensitiveFiles,
   isAllowedGitCommand,
   isSensitivePath,
+  normalizeActions,
   parseGitRemote,
+  parseNameStatus,
+  parsePorcelainChanges,
   resolveGitlab,
   splitCommand,
 } from '../src/adapters/executor-agent/index.js'
@@ -215,6 +218,36 @@ const TICKET = Object.freeze({
  * @param {{ files?: string[], verify?: any, gitStatusOutput?: string, agentOptions?: any, runCommandImpl?: any }} [options]
  * @returns {any}
  */
+/**
+ * 把 {path, status, from} 渲染成 `git diff --name-status` 的输出。
+ *
+ * @param {Array<{ path: string, status: string, from?: string }>} changes
+ * @returns {string}
+ */
+function renderNameStatus (changes) {
+  const letters = { create: 'A', update: 'M', delete: 'D', move: 'R100' }
+  return changes.map((change) => {
+    const letter = letters[change.status] ?? 'M'
+    if (letter === 'R100') return `R100\t${change.from ?? change.path}\t${change.path}`
+    return `${letter}\t${change.path}`
+  }).join('\n')
+}
+
+/**
+ * 把 {path, status, from} 渲染成 `git status --porcelain` 的输出。
+ *
+ * @param {Array<{ path: string, status: string, from?: string }>} changes
+ * @returns {string}
+ */
+function renderPorcelain (changes) {
+  const codes = { create: '??', update: ' M', delete: ' D', move: 'R ' }
+  return changes.map((change) => {
+    const code = codes[change.status] ?? ' M'
+    if (code === 'R ') return `R  ${change.from ?? change.path} -> ${change.path}`
+    return `${code} ${change.path}`
+  }).join('\n')
+}
+
 function makeRunEnv (options = {}) {
   const gitServer = createFakeGitlab({ existingBranches: options.existingBranches ?? [] })
   /** @type {string[][]} */
@@ -226,6 +259,8 @@ function makeRunEnv (options = {}) {
   const phases = []
   const files = options.files ?? ['src/login.js', 'src/helper.js']
   const contents = options.contents ?? {}
+  // git 视角的改动清单：默认全是「改现有文件」（M），要测新增/删除/重命名就传 changes。
+  const changes = options.changes ?? files.map((path) => ({ path, status: 'update' }))
 
   // 宿主的 setup 是「publish 之前」调用的：这里照样在返回 agent 之前 await 它，
   // 这样断言能看到 preset 挂载与会话策略事件的真实顺序。
@@ -240,8 +275,9 @@ function makeRunEnv (options = {}) {
 
   const git = async (argv, _opts) => {
     gitCalls.push(argv)
+    if (argv[0] === 'diff' && argv[1] === '--name-status') return { code: 0, stdout: renderNameStatus(changes), stderr: '' }
     if (argv[0] === 'diff' && argv[1] === '--name-only') return { code: 0, stdout: files.join('\n'), stderr: '' }
-    if (argv[0] === 'status') return { code: 0, stdout: options.gitStatusOutput ?? '', stderr: '' }
+    if (argv[0] === 'status') return { code: 0, stdout: options.gitStatusOutput ?? renderPorcelain(changes), stderr: '' }
     if (argv[0] === 'add') return { code: 0, stdout: '', stderr: '' }
     if (argv[0] === 'show') {
       const path = String(argv[1]).replace(/^:0:/, '')
@@ -287,7 +323,7 @@ function makeRunEnv (options = {}) {
     onPhase: async (phase) => { phases.push(phase) },
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, gitCalls, gitServer, setupState, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, phases, gitCalls, gitServer, setupState, changes, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -528,6 +564,84 @@ export async function runGitlabChecks (check) {
     assert.ok(mr.body.title.startsWith('Draft:'), `MR 标题必须 Draft: 开头：${mr.body.title}`)
   })
 
+  await check('执行器：新增文件用 action=create，删除用 delete 且不带 content', async () => {
+    // 为什么：一律 update 时，新文件在远端不存在 → 400「A file with this name doesn't exist」；
+    // 被删的文件用 update + 空 content → 远端文件被清空。两种都是静默的数据事故。
+    const env = makeRunEnv({
+      files: ['src/new-page.vue', 'src/old-page.vue', 'src/login.js'],
+      changes: [
+        { path: 'src/new-page.vue', status: 'create' },
+        { path: 'src/old-page.vue', status: 'delete' },
+        { path: 'src/login.js', status: 'update' },
+      ],
+    })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    const commit = env.gitServer.requests.find((r) => r.url.endsWith('/repository/commits'))
+    const byPath = new Map(commit.body.actions.map((action) => [action.file_path, action]))
+    assert.equal(byPath.get('src/new-page.vue').action, 'create')
+    assert.equal(byPath.get('src/old-page.vue').action, 'delete')
+    assert.equal('content' in byPath.get('src/old-page.vue'), false, 'delete 不能带 content，带了等于把文件写回空')
+    assert.equal(byPath.get('src/login.js').action, 'update')
+    assert.equal(byPath.get('src/login.js').content, 'content of src/login.js')
+    // MR 描述里也要标出新增/删除：review 时「删了一个文件」比「改了几行」重要得多。
+    const mr = env.gitServer.requests.find((request) => request.url.endsWith('/merge_requests'))
+    assert.ok(mr.body.description.includes('src/new-page.vue（新增）'), mr.body.description)
+    assert.ok(mr.body.description.includes('src/old-page.vue（删除）'), mr.body.description)
+    assert.ok(mr.body.description.includes('src/login.js（修改）'), mr.body.description)
+  })
+
+  await check('执行器：重命名用 action=move 且带 previous_path', async () => {
+    const env = makeRunEnv({
+      files: ['src/renamed.js'],
+      changes: [{ path: 'src/renamed.js', status: 'move', from: 'src/before.js' }],
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    const commit = env.gitServer.requests.find((r) => r.url.endsWith('/repository/commits'))
+    assert.equal(commit.body.actions[0].action, 'move')
+    assert.equal(commit.body.actions[0].file_path, 'src/renamed.js')
+    assert.equal(commit.body.actions[0].previous_path, 'src/before.js', '缺 previous_path 会变成「新建一个 + 留一个孤儿」')
+  })
+
+  await check('执行器：git 状态解析 —— name-status 与 porcelain 都给出 create/update/delete/move', async () => {
+    assert.deepEqual(parseNameStatus('A\tsrc/a.js\nM\tsrc/b.js\nD\tsrc/c.js\nR100\tsrc/d.js\tsrc/e.js'), [
+      { path: 'src/a.js', status: 'create' },
+      { path: 'src/b.js', status: 'update' },
+      { path: 'src/c.js', status: 'delete' },
+      { path: 'src/e.js', status: 'move', from: 'src/d.js' },
+    ])
+    assert.deepEqual(parsePorcelainChanges('?? src/a.js\n M src/b.js\n D src/c.js\nR  src/d.js -> src/e.js'), [
+      { path: 'src/a.js', status: 'create' },
+      { path: 'src/b.js', status: 'update' },
+      { path: 'src/c.js', status: 'delete' },
+      { path: 'src/e.js', status: 'move', from: 'src/d.js' },
+    ])
+    // 没有状态（老调用方只传 files）就退回 update：这是唯一安全假设。
+    assert.deepEqual(normalizeActions(['src/x.js'], undefined), [{ path: 'src/x.js', status: 'update' }])
+    assert.deepEqual(normalizeActions(['src/x.js'], [{ path: 'src/x.js', status: 'weird' }]), [{ path: 'src/x.js', status: 'update' }])
+  })
+
+  await check('执行器：提交内容按 worktree 拼路径读，不读会话工作区里的同名文件', async () => {
+    // 为什么：readFile 是按进程 cwd 解析的，git 给的是仓库相对路径。
+    // 不拼 worktree 就可能把工作区里另一个仓库的同名文件提交上去。
+    const read = []
+    const env = makeRunEnv({ files: ['src/login.js'] })
+    const executor = createAgentExecutor({
+      agents: { create: async (input) => { await input.setup?.({ get: () => undefined }, env.agent); return { agent: env.agent } } },
+      git: async (argv) => { if (argv[0] === 'diff') return { code: 0, stdout: 'M\tsrc/login.js', stderr: '' }; return { code: 0, stdout: '', stderr: '' } },
+      readFile: async (path) => { read.push(path); return 'x' },
+      runCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
+      getSecret: async () => 'glpat-test',
+      createGitlabClient: async (cfg) => createGitlabClient({ ...cfg, fetch: env.gitServer.fetchImpl }),
+      prompts: { untrustedNotice: NOTICE },
+    })
+    await executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(read.length, 1)
+    // Windows 上 path.join 会输出反斜杠，统一成正斜杠再断言。
+    const normalized = read[0].replace(/\\/g, '/')
+    assert.ok(normalized.includes('.agents/worktrees/ticket-demo-rec-9-r1'), `必须拼上 worktree 根，实际 ${read[0]}`)
+    assert.ok(!normalized.endsWith('/repo/src/login.js'), '不能直接拿仓库相对路径去读')
+  })
   await check('执行器：敏感文件不提交，并写进 MR 描述', async () => {
     const env = makeRunEnv({ files: ['src/login.js', 'application.yml', '.env.local', 'config/prod.pem'] })
     const result = await env.executor.run(env.ticket, env.target, env.ctx)

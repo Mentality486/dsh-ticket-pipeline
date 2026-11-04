@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { isAbsolute, join } from 'node:path'
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
 import { assertWorkExecutor, makeExecResult } from '../../contracts/work-executor.js'
@@ -84,10 +85,7 @@ export function isAllowedGitCommand (argv) {
   if (command === 'status') return rest.length === 1 && rest[0] === '--porcelain'
   if (command === 'add') return rest.length === 1 && rest[0] === '-A'
   if (command === 'commit') return true // 只允许本地提交，push 不在白名单里
-  if (command === 'diff') {
-    if (!rest.includes('--name-only')) return true
-    return true
-  }
+  if (command === 'diff') return true
   return false
 }
 
@@ -199,8 +197,12 @@ export function createAgentExecutor (options = {}) {
         await waitForAgentIdle(agent, signal, cancelAgent)
 
         // ── 4. 收集改动 ────────────────────────────────────
+        // 不只是「改了哪些文件」，还要知道每个文件是新增 / 修改 / 删除：
+        // GitLab Commits API 的 action 必须对得上，否则新文件报「已存在」、
+        // 被删的文件还会被当成 update 提交空内容（等于把远端文件清空）。
         const collected = await collectChanges(options, { cwd: worktreePath, baseCommit: ctx.baseCommit, signal })
-        const committable = filterSensitiveFiles(collected.files)
+        const committableChanges = collected.changes.filter((change) => !isSensitivePath(change.path) && !isSensitivePath(change.from ?? ''))
+        const committable = committableChanges.map((change) => change.path)
         const blocked = collected.files.filter((file) => !committable.includes(file))
         if (blocked.length > 0) {
           // 不抛错：业务代码可能已经改对了，抛了人只看到「失败」，看不到「哪几个文件被拦」。
@@ -231,6 +233,7 @@ export function createAgentExecutor (options = {}) {
         const mr = await openDraftMr(options, {
           ticket, target, ctx, project,
           files: committable,
+          changes: committableChanges,
           blocked,
           verification,
         })
@@ -577,19 +580,53 @@ export async function collectChanges (options, input) {
   const baseCommit = typeof input.baseCommit === 'string' ? input.baseCommit.trim() : ''
   /** @type {{ code: number, stdout: string, stderr: string }} */
   let result
+  let changes
   if (baseCommit.length > 0) {
-    result = await runGit(['diff', '--name-only', baseCommit])
+    // `--name-status` 而不是 `--name-only`：前者带 A/M/D/R 状态，后者只给路径。
+    // 状态决定 Commits API 的 action，缺了就只能一律按 update 提交，新增文件会 400。
+    result = await runGit(['diff', '--name-status', baseCommit])
     if (result.code !== 0) {
-      throw new PipelineError('internal', `收集改动失败：git diff --name-only ${baseCommit} 返回 ${result.code}：${tail(result.stderr)}`)
+      throw new PipelineError('internal', `收集改动失败：git diff --name-status ${baseCommit} 返回 ${result.code}：${tail(result.stderr)}`)
     }
-    return { files: splitLines(result.stdout) }
+    changes = parseNameStatus(result.stdout)
+  } else {
+    result = await runGit(['status', '--porcelain'])
+    if (result.code !== 0) {
+      throw new PipelineError('internal', `收集改动失败：git status 返回 ${result.code}：${tail(result.stderr)}`)
+    }
+    changes = parsePorcelainChanges(result.stdout)
   }
+  return { files: changes.map((change) => change.path), changes }
+}
 
-  result = await runGit(['status', '--porcelain'])
-  if (result.code !== 0) {
-    throw new PipelineError('internal', `收集改动失败：git status 返回 ${result.code}：${tail(result.stderr)}`)
+/**
+ * 解析 `git diff --name-status`。
+ *
+ * 一行一条：`<状态>\t<路径>`；重命名/复制是 `R100\t旧路径\t新路径`。
+ * 状态字母只取首字母：GitLab 的 action 只认 create / update / delete / move。
+ *
+ * @param {string} stdout
+ * @returns {Array<{ path: string, status: 'create'|'update'|'delete'|'move', from?: string }>}
+ */
+export function parseNameStatus (stdout) {
+  /** @type {Array<{ path: string, status: string, from?: string }>} */
+  const changes = []
+  for (const line of String(stdout ?? '').split(/\r?\n/)) {
+    if (line.trim().length === 0) continue
+    const parts = line.split('\t').map((part) => part.trim()).filter((part) => part.length > 0)
+    if (parts.length < 2) continue
+    const letter = String(parts[0]).charAt(0).toUpperCase()
+    if ((letter === 'R' || letter === 'C') && parts.length >= 3) {
+      const status = letter === 'R' ? 'move' : 'create'
+      const change = { path: parts[2], status }
+      if (letter === 'R') change.from = parts[1]
+      changes.push(change)
+      continue
+    }
+    const status = letter === 'A' ? 'create' : letter === 'D' ? 'delete' : 'update'
+    changes.push({ path: parts[1], status })
   }
-  return { files: parsePorcelain(result.stdout) }
+  return changes
 }
 
 /**
@@ -602,15 +639,43 @@ export async function collectChanges (options, input) {
  * @returns {string[]}
  */
 export function parsePorcelain (stdout) {
-  const files = []
+  return parsePorcelainChanges(stdout).map((change) => change.path)
+}
+
+/**
+ * 解析 `git status --porcelain` 并带上状态。
+ *
+ * 格式是固定的两列状态 + 一个空格 + 路径：
+ * - `??` = 未跟踪 → create
+ * - 首列或次列出现 `D` → delete（首列是暂存区、次列是工作区，任一为删除都算删）
+ * - 首列为 `R` → move，路径写成 `旧路径 -> 新路径`，只取新路径（Commits API 需要落点）
+ * - 其余 → update
+ *
+ * @param {string} stdout
+ * @returns {Array<{ path: string, status: 'create'|'update'|'delete'|'move', from?: string }>}
+ */
+export function parsePorcelainChanges (stdout) {
+  /** @type {Array<{ path: string, status: string, from?: string }>} */
+  const changes = []
   for (const line of String(stdout ?? '').split(/\r?\n/)) {
     if (line.length < 4) continue
-    const path = line.slice(3).trim()
+    const code = line.slice(0, 2)
+    const raw = line.slice(3).trim()
+    if (raw.length === 0) continue
+    const arrow = raw.lastIndexOf(' -> ')
+    const path = arrow >= 0 ? raw.slice(arrow + 4).trim() : raw
     if (path.length === 0) continue
-    const arrow = path.lastIndexOf(' -> ')
-    files.push(arrow >= 0 ? path.slice(arrow + 4).trim() : path)
+    /** @type {'create'|'update'|'delete'|'move'} */
+    let status = 'update'
+    if (code === '??' || code === '!!') status = 'create'
+    else if (arrow >= 0 || code.charAt(0) === 'R') status = 'move'
+    else if (code.charAt(0) === 'D' || code.charAt(1) === 'D') status = 'delete'
+    else if (code.charAt(0) === 'A') status = 'create'
+    const change = { path, status }
+    if (status === 'move' && arrow >= 0) change.from = raw.slice(0, arrow).trim()
+    changes.push(change)
   }
-  return files
+  return changes
 }
 
 /**
@@ -708,7 +773,7 @@ export function splitCommand (command) {
  * 再一次性把文件提交上去，最后开 MR。任何一步失败都往上抛，由 run 的 catch 归成 failed。
  *
  * @param {any} options
- * @param {{ ticket: any, target: any, ctx: any, project: any, files: string[], blocked: string[], verification: { outcome: string, detail: string } }} input
+ * @param {{ ticket: any, target: any, ctx: any, project: any, files: string[], changes?: Array<{ path: string, status: string, from?: string }>, blocked: string[], verification: { outcome: string, detail: string } }} input
  * @returns {Promise<{ iid: number, url: string, draft: true }>}
  */
 async function openDraftMr (options, input) {
@@ -738,16 +803,31 @@ async function openDraftMr (options, input) {
 
   await client.ensureBranch({ branch: sourceBranch, ref: baseRef, signal: ctx.signal })
 
-  // 一个 action 一条：全部按 update 提交。GitLab 的 update 对已存在的文件成立，
-  // 新文件用 create 才对得上；这里按「本地这份内容覆盖远端那份」，语义是覆盖而不是新增，
-  // 所以走 create 会在文件已存在时 400。用 update 更稳。
-  const actions = files.map((file) => ({ action: 'update', file_path: file, content: null }))
+  // action 必须与 git 给的状态对上：
+  // - create：新文件用 update 会 404（远端没有这个文件）
+  // - delete：不能带 content，带了等于「删掉又写回空文件」
+  // - move：必须带 previous_path，否则远端看到的是「新建一个 + 留一个孤儿」
+  // 一律 update 是能跑通最常见的「改现有文件」，但只要 agent 新增或删除文件就会静默出错。
+  const planned = normalizeActions(files, input.changes)
+  const actions = planned.map((change) => {
+    /** @type {any} */
+    const action = { action: change.status, file_path: change.path }
+    if (change.status === 'delete') return action
+    if (change.status === 'move') action.previous_path = change.from
+    action.content = null
+    return action
+  })
   // 读内容要真读本地文件 —— 这一层没有 fs 服务可用（插件的 fs 是宿主的），
   // 所以内容读取走 options.readFile，缺了就退到 git show :0:<path>（暂存区里那份）。
-  const withContent = await fillContents(options, ctx, files)
-  for (const [index, action] of actions.entries()) {
-    action.content = withContent.get(action.file_path) ?? ''
-    void index
+  const needContent = actions.filter((action) => action.action !== 'delete')
+  const withContent = await fillContents(options, ctx, needContent.map((action) => action.file_path))
+  for (const action of actions) {
+    if (action.action === 'delete') continue
+    const text = withContent.get(action.file_path)
+    if (typeof text !== 'string') {
+      throw new PipelineError('internal', `读不到 ${action.file_path} 的内容，拒绝提交空文件`)
+    }
+    action.content = text
   }
 
   await client.commitFiles({
@@ -761,10 +841,56 @@ async function openDraftMr (options, input) {
     sourceBranch,
     targetBranch,
     title: buildMrTitle(ticket),
-    description: buildMrDescription({ ticket, files, blocked, verification, ctx }),
+    description: buildMrDescription({ ticket, files, changes: input.changes, blocked, verification, ctx }),
     signal: ctx.signal,
   })
 }
+
+/**
+ * 把「要提交的文件」与「git 给的状态」对齐。
+ *
+ * 有状态就用状态（create / update / delete / move 都要如实告诉 GitLab）；
+ * 没有状态（老调用方只传 files）就退回一律 update —— 这是唯一安全假设，
+ * 因为大部分改动都是「改现有文件」。
+ *
+ * @param {string[]} files
+ * @param {Array<{ path: string, status: string, from?: string }>} [changes]
+ * @returns {Array<{ path: string, status: 'create'|'update'|'delete'|'move', from?: string }>}
+ */
+export function normalizeActions (files, changes) {
+  const list = Array.isArray(files) ? files : []
+  const known = new Map()
+  for (const change of Array.isArray(changes) ? changes : []) {
+    if (!change || typeof change.path !== 'string') continue
+    known.set(change.path, change)
+  }
+  return list.map((file) => {
+    const change = known.get(file)
+    if (!change) return { path: file, status: 'update' }
+    /** @type {'create'|'update'|'delete'|'move'} */
+    const status = ['create', 'update', 'delete', 'move'].includes(change.status) ? change.status : 'update'
+    return status === 'move' ? { path: file, status, from: change.from } : { path: file, status }
+  })
+}
+
+/**
+ * 把仓库相对路径拼到 worktree 根上。
+ *
+ * git 给的路径永远是仓库相对路径；而 options.readFile 是按进程 cwd 解析的。
+ * 不拼就会读到会话工作区里同名的另一个文件 —— 那等于把别人的代码提交到 PR 里。
+ *
+ * @param {string} worktreePath
+ * @param {string} file
+ * @returns {string}
+ */
+export function joinWorktreePath (worktreePath, file) {
+  const root = String(worktreePath ?? '')
+  const name = String(file ?? '')
+  if (root.length === 0) return name
+  if (isAbsolute(name)) return name
+  return join(root, name)
+}
+
 /**
  * 把工作区的每个改动文件的内容读出来，供 Commits API 使用。
  *
@@ -784,16 +910,18 @@ async function openDraftMr (options, input) {
 async function fillContents (options, ctx, files) {
   /** @type {Map<string, string>} */
   const contents = new Map()
+  const cwd = String(ctx.worktreePath ?? '')
   if (typeof options.readFile === 'function') {
     for (const file of files) {
-      const text = await options.readFile(file)
+      // git 给的是相对仓库根的路径（src/login.js），而 readFile 是按进程 cwd 解析的绝对读法，
+      // 不拼 worktree 就会读到工作区里同名的另一个文件 —— 那是把别人的代码提交上去。
+      const text = await options.readFile(joinWorktreePath(cwd, file))
       contents.set(file, String(text ?? ''))
     }
     return contents
   }
 
   const git = options.git
-  const cwd = ctx.worktreePath
   const added = await git(['add', '-A'], { cwd })
   if (added.code !== 0) {
     throw new PipelineError('internal', `提交前 git add -A 失败：${tail(added.stderr)}`)
@@ -908,11 +1036,25 @@ export function buildCommitMessage (ticket) {
  * 尤其是「验证没跑」与「敏感文件被拦」两段 —— 它们决定了这个 MR 能不能直接合，
  * 埋在日志里等于没写。
  *
- * @param {{ ticket: any, files: string[], blocked: string[], verification: { outcome: string, detail: string }, ctx: any }} input
+ * @param {{ ticket: any, files: string[], changes?: Array<{ path: string, status: string, from?: string }>, blocked: string[], verification: { outcome: string, detail: string }, ctx: any }} input
  * @returns {string}
  */
 export function buildMrDescription (input) {
   const { ticket, files, blocked, verification, ctx } = input
+  // 改动的性质（新增 / 修改 / 删除 / 重命名）决定了 review 的重点：
+  // 删文件与改文件名比「改几行」危险得多，必须在描述里先看见。
+  const statuses = new Map()
+  for (const change of Array.isArray(input.changes) ? input.changes : []) {
+    if (change && typeof change.path === 'string') statuses.set(change.path, change)
+  }
+  const labels = { create: '新增', update: '修改', delete: '删除', move: '重命名' }
+  const renderFile = (file) => {
+    const change = statuses.get(file)
+    const label = change ? labels[change.status] : undefined
+    if (label === undefined) return `- ${file}`
+    if (change.status === 'move' && change.from) return `- ${file}（重命名，原路径 ${change.from}）`
+    return `- ${file}（${label}）`
+  }
   const lines = [
     '## 来源',
     '',
@@ -922,7 +1064,7 @@ export function buildMrDescription (input) {
     '',
     '## 改动的文件',
     '',
-    ...(files.length > 0 ? files.map((file) => `- ${file}`) : ['- （无）']),
+    ...(files.length > 0 ? files.map(renderFile) : ['- （无）']),
     '',
     '## 验证',
     '',
@@ -956,12 +1098,3 @@ function tail (value) {
   return parts.slice(-8).join('\n').slice(-2000)
 }
 
-/**
- * 按行切、去空行。`git diff --name-only` 的输出就是这么个形状。
- *
- * @param {unknown} value
- * @returns {string[]}
- */
-function splitLines (value) {
-  return String(value ?? '').split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)
-}
