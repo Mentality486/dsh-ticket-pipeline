@@ -227,6 +227,34 @@ export const PUSHES = {
  * @returns {(argv: string[], opts?: { cwd?: string }) => Promise<{ code: number, stdout: string, stderr: string }> | null}
  */
 function makeGitRunner (ctx) {
+  // 首选 `ctx.shell`（宿主 bash 执行器）：它走 bash -c 链路，是 Windows 沙箱下唯一
+  // 实际能落地的执行路径；直接 subprocess.spawn 裸 exe 会被本机策略拒（EPERM/ENOENT）。
+  let shell = null
+  try {
+    shell = ctx.get('shell') ?? null
+  } catch {
+    shell = null
+  }
+  if (shell && typeof shell.execute === 'function' && typeof shell.resolve === 'function') {
+    return async (argv, opts = {}) => {
+      const quoted = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...argv]
+        .map(a => /^[A-Za-z0-9@%+=:,./_-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\''`)}'`)
+        .join(' ')
+      const execution = await shell.execute(shell.resolve({
+        command: quoted,
+        cwd: opts.cwd,
+        timeoutMs: 120000,
+      }))
+      const result = await execution.result()
+      return {
+        code: result.exitCode ?? 1,
+        stdout: result.stdout?.text ?? '',
+        stderr: result.stderr?.text ?? '',
+      }
+    }
+  }
+
+  // 兜底：老宿主没有 shell 能力时退回 subprocess.spawn（需要 graceMs 必填）。
   let subprocess = null
   try {
     subprocess = ctx.get('subprocess')
