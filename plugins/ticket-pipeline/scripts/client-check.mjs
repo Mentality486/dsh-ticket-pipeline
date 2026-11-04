@@ -249,10 +249,16 @@ async function checkSlotInjection () {
   if (direct) {
     fail('lib/client.js 里还有绕过 slots.inject 的 ctx.slots.register(...) 调用')
   }
-  for (const name of ['plugins.row.config', 'plugins.bundle.config']) {
+  for (const name of ['settings.section', 'settings.plugins.tab', 'plugins.row.config', 'plugins.bundle.config']) {
     if (!source.includes("'" + name + "'")) {
       fail('lib/client.js 没有注册 ' + name)
     }
+  }
+  // remote 不能进 inject：dsh-api-gateway 自己还要等 typert/connection，
+  // 一旦它没就绪，我们的 fiber 就永远停在 waiting for activation，apply 一次都不跑。
+  const injectMatch = source.match(/var inject = \[([^\]]*)\]/)
+  if (injectMatch !== null && injectMatch[1].includes("'remote'")) {
+    fail("lib/client.js 的 inject 里不能有 'remote'（会让 apply 永不执行），改走 ctx.get('remote')")
   }
 }
 

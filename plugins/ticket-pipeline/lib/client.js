@@ -749,29 +749,85 @@ window.__ModuleLoader__.load({
             '，或让 agent 帮你改。改完重启 DSH 生效。')))
     }
 
-    var inject = ['slots', 'remote']
+    // 硬依赖只有 slots —— 它由 dsh-client-ui-renderer 启动时就 provide，不存在「等不到」。
+    //
+    // remote（dsh-api-gateway 提供）**不能**写进 inject：它自己还要等 typert / connection，
+    // 只要它在某个部署里停在非 ACTIVE，我们的 fiber 就会永远挂在「waiting for
+    // activation」，apply 一次都不执行 —— 表现就是设置页里静默地什么都没有。
+    // 所以 remote 走 ctx.get('remote') 惰性取：拿得到就挂体检通道，拿不到就只禁用那个按钮。
+    var inject = ['slots']
 
-    // slot 是 plugin-manager 在运行时用 register({children}) 声明出来的，加载顺序不可控：
-    // 声明还没出现时直接 register 会抛 slot is not declared，整块 apply 就炸了。
-    // 正确做法是 slots.inject(name, cb)：声明存在时立刻跑 cb，不存在就挂起等声明
-    // （官方 dsh-ops 就是这么写的）。cb 里再 register，返回值是 disposer，由调用方 fiber 回收。
-    function serveSlot (ctx, name, key, component) {
-      var options = { name: name }
-      if (key !== undefined) options.key = key
+    /** 诊断面包屑：最近一次加载走到了哪一步，写进 localStorage 的 `ticket-pipeline:diag`。 */
+    var DIAG_KEY = 'ticket-pipeline:diag'
+
+    function diag (stage, extra) {
+      try {
+        if (typeof localStorage === 'undefined') return
+        var previous = null
+        try { previous = JSON.parse(localStorage.getItem(DIAG_KEY) || 'null') } catch (error) { previous = null }
+        var next = previous !== null && typeof previous === 'object' ? previous : {}
+        var stages = next.stages !== null && typeof next.stages === 'object' && next.stages !== undefined ? next.stages : {}
+        stages[stage] = extra === undefined ? true : extra
+        next.at = new Date().toISOString()
+        next.stages = stages
+        localStorage.setItem(DIAG_KEY, JSON.stringify(next))
+      } catch (error) {
+        // 取证失败无所谓，绝不影响 UI。
+      }
+    }
+
+    /** 惰性取 remote：没声明进 inject 时属性访问会抛，所以先 ctx.get，再退到属性访问兜底。 */
+    function remoteOf (ctx) {
+      if (ctx !== undefined && ctx !== null && typeof ctx.get === 'function') {
+        try {
+          var found = ctx.get('remote')
+          if (found !== undefined && found !== null) return found
+        } catch (error) {
+          // 落到下面的兜底
+        }
+      }
+      try {
+        return ctx === undefined || ctx === null ? undefined : ctx.remote
+      } catch (error) {
+        return undefined
+      }
+    }
+
+    /**
+     * 挂一个 slot。
+     *
+     * slot 是 plugin-manager / settings-general 在运行时用 register({children}) 声明出来的，
+     * 加载顺序不可控：声明还没出现时直接 register 会抛 `slot is not declared`。
+     * 正确做法是 slots.inject(name, cb)：声明已存在就立刻跑 cb，否则挂起等声明出现。
+     * register 本身也包一层 try/catch —— 注册失败只该少一块 UI，不该炸掉整个 apply。
+     */
+    function serveSlot (ctx, options, component) {
+      var name = options.name
+      var label = options.key !== undefined ? options.key : (options.id === undefined ? '' : '#' + options.id)
 
       var contribute = function () {
-        return ctx.slots.register(options, component)
+        try {
+          var dispose = ctx.slots.register(options, component)
+          diag('slot:' + name + (label.length > 0 ? (options.key !== undefined ? ':' : '') + label : ''))
+          return dispose
+        } catch (error) {
+          var message = error && error.message ? error.message : String(error)
+          diag('slot-error:' + name + label, message)
+          console.error('[ticket-pipeline] 无法注册 ' + name + '：' + message)
+          return null
+        }
       }
 
-      if (ctx.slots !== undefined && typeof ctx.slots.inject === 'function') {
-        return ctx.slots.inject(name, contribute)
-      }
-
-      // 老版本没有 slots.inject：只能直接注册；失败只记一笔，不影响别处。
       try {
+        if (ctx.slots !== undefined && typeof ctx.slots.inject === 'function') {
+          return ctx.slots.inject(name, contribute)
+        }
+        // 老版本没有 slots.inject：只能直接注册。
         return contribute()
       } catch (error) {
-        console.error('[ticket-pipeline] 无法注册 ' + name + '：' + (error && error.message ? error.message : String(error)))
+        var message = error && error.message ? error.message : String(error)
+        diag('slot-inject-error:' + name, message)
+        console.error('[ticket-pipeline] 无法挂 ' + name + '：' + message)
         return null
       }
     }
@@ -812,6 +868,8 @@ window.__ModuleLoader__.load({
     }
 
     function apply (ctx) {
+      diag('apply')
+
       // 样式表：挂在 document.head，插件卸载时由 ctx.effect 收回。
       ctx.effect(function () {
         var style = document.createElement('style')
@@ -825,25 +883,61 @@ window.__ModuleLoader__.load({
       // 但模块级 Promise 还在 —— 不清掉的话下一次打开面板会以为「已挂上」而实际没有。
       ctx.effect(function () { return resetMounted }, 'ticket-pipeline: reset remote mount')
 
+      var remote = remoteOf(ctx)
+      diag('remote', remote === undefined || remote === null ? 'absent' : 'present')
+
       // 体检通道尽早挂上；失败只记日志，不能让设置表单跟着挂掉。
-      ensureMounted(ctx.remote).catch(function (error) {
-        console.error('[ticket-pipeline] 挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
+      ensureMounted(remote).then(function () {
+        diag('remote-mounted')
+      }, function (error) {
+        var message = error && error.message ? error.message : String(error)
+        diag('remote-mount-failed', message)
+        console.error('[ticket-pipeline] 挂载体检通道失败：' + message)
       })
 
       var panel = function (props) {
-        return h(TicketPipelinePanel, Object.assign({}, props, { remote: ctx.remote }))
+        return h(TicketPipelinePanel, Object.assign({}, props, { remote: remote }))
       }
 
-      // 行级卡片：key = 包名 + '#' + row id（plugin-manager 的 rowConfigKey）。
+      // ① 设置对话框里的一节（设置 → 左侧「工单流水线」）。
+      //
+      // settings.section 由 dsh-client-ui-settings-general 在注册 shell 时就声明好了，
+      // 不依赖 plugin-manager 是否装载 —— 这是本版本里最稳的配置入口。
+      // label 可以是函数（resolveSlotLabel 会调用它），所以这里不需要 locale 服务。
+      serveSlot(ctx, {
+        name: 'settings.section',
+        id: 'ticket-pipeline',
+        order: 60,
+        label: function () { return '工单流水线' },
+      }, panel)
+
+      // ② 设置 → 插件 → 「工单流水线」页签（settings.plugins.tab 由 ui-settings-plugins 声明）。
+      serveSlot(ctx, {
+        name: 'settings.plugins.tab',
+        id: 'ticket-pipeline',
+        order: 20,
+        label: function () { return '工单流水线' },
+      }, panel)
+
+      // ③ 插件页 → 本包详情页 → 该行的「配置」（key = 包名 + '#' + row id）。
       // row id 来自 cordis.patch.yml 的 insert 行 id，就是 ticket-pipeline。
-      serveSlot(ctx, 'plugins.row.config', PACKAGE + '#' + ROW_ID, panel)
+      serveSlot(ctx, {
+        name: 'plugins.row.config',
+        key: PACKAGE + '#' + ROW_ID,
+      }, panel)
 
       // 兜底拼写：不同版本的 plugin-manager 对 key 的构造方式不完全一样，
       // 对不上就静默不渲染（连报错都没有），所以多注册几种常见形态。
-      serveSlot(ctx, 'plugins.row.config', PACKAGE, panel)
+      serveSlot(ctx, {
+        name: 'plugins.row.config',
+        key: PACKAGE,
+      }, panel)
 
-      // bundle 级卡片：包名作 key。
-      serveSlot(ctx, 'plugins.bundle.config', PACKAGE, panel)
+      // ④ 插件页 → 本包详情页顶部那一块（key = 包名）。
+      serveSlot(ctx, {
+        name: 'plugins.bundle.config',
+        key: PACKAGE,
+      }, panel)
     }
 
     return {

@@ -301,16 +301,21 @@ async function main () {
   if (exports === undefined) return finish()
 
   check('导出 name', exports.name === 'ticket-pipeline-settings', exports.name)
-  check('inject 含 slots 与 remote', Array.isArray(exports.inject) &&
-    exports.inject.indexOf('slots') >= 0 && exports.inject.indexOf('remote') >= 0, JSON.stringify(exports.inject))
+  // 硬依赖只留 slots：remote 由 dsh-api-gateway 提供，它自己还要等 typert / connection，
+  // 写进 inject 会让本 fiber 停在 waiting for activation，apply 一次都不执行。
+  check('inject 只硬依赖 slots', Array.isArray(exports.inject) &&
+    exports.inject.indexOf('slots') >= 0 && exports.inject.indexOf('remote') < 0, JSON.stringify(exports.inject))
 
   // 收集 apply 注册的 slot。真宿主里 slot 是 plugin-manager 运行时声明的，
   // 声明没出现时 register 会抛错，所以插件必须走 slots.inject（声明出现才注册）。
   const registrations = []
   const injects = []
   const dispose = []
+  const services = { remote: makeHost().remote }
   const ctx = {
-    remote: makeHost().remote,
+    // 真宿主里 ctx.get('remote') 是惰性取服务；这里给出同样的形状。
+    get (name) { return services[name] },
+    remote: services.remote,
     effect (fn) { dispose.push(fn()); return () => {} },
     slots: {
       inject (name, callback) {
@@ -324,15 +329,27 @@ async function main () {
       },
     },
   }
-  ;({ remote: ctx.remote, calls: ctx.calls } = makeHost())
+  const host = makeHost()
+  services.remote = host.remote
+  ctx.remote = host.remote
+  ctx.calls = host.calls
   await exports.apply(ctx)
 
-  check('apply 走 slots.inject 而不是裸 register（3 次）', injects.length === 3, injects.join(' | '))
-  check('注册了 3 个 slot', registrations.length === 3, String(registrations.length))
-  const rowKey = registrations.map((r) => r.options.name + ':' + r.options.key)
-  check('注册了 plugins.row.config#包名#rowId', rowKey.indexOf('plugins.row.config:@local/ticket-pipeline#ticket-pipeline') >= 0, rowKey.join(' | '))
-  check('注册了 plugins.bundle.config#包名', rowKey.indexOf('plugins.bundle.config:@local/ticket-pipeline') >= 0, rowKey.join(' | '))
-  check('所有 slot 都有 key', registrations.every((r) => typeof r.options.key === 'string' && r.options.key.length > 0))
+  // 5 个入口：settings.section / settings.plugins.tab / plugins.row.config ×2 / plugins.bundle.config
+  check('apply 走 slots.inject 而不是裸 register（5 次）', injects.length === 5, injects.join(' | '))
+  check('注册了 5 个 slot', registrations.length === 5, String(registrations.length))
+  const slotId = registrations.map((r) => r.options.name + ':' + (r.options.key !== undefined ? r.options.key : '#' + r.options.id))
+  check('注册了 plugins.row.config#包名#rowId',
+    slotId.indexOf('plugins.row.config:@local/ticket-pipeline#ticket-pipeline') >= 0, slotId.join(' | '))
+  check('注册了 plugins.bundle.config#包名',
+    slotId.indexOf('plugins.bundle.config:@local/ticket-pipeline') >= 0, slotId.join(' | '))
+  check('注册了 settings.section', slotId.indexOf('settings.section:#ticket-pipeline') >= 0, slotId.join(' | '))
+  check('注册了 settings.plugins.tab', slotId.indexOf('settings.plugins.tab:#ticket-pipeline') >= 0, slotId.join(' | '))
+  check('所有 slot 都有 key 或 id', registrations.every((r) => {
+    const keyed = typeof r.options.key === 'string' && r.options.key.length > 0
+    const listed = typeof r.options.id === 'string' && r.options.id.length > 0
+    return keyed || listed
+  }))
 
   const Panel = registrations.find((r) => r.options.name === 'plugins.row.config').component
 
