@@ -790,7 +790,7 @@ const PUSHES    = { mock: createMockPush, pushplus: createPushplus }
 > 删掉 `src/adapters/source-feishu/` 整个目录 + `src/index.js` 里那个 import 和表里那一行，
 > 插件仍能构建、仍能用 `projects: [{ name:'demo', match:{ platform:'mock' }, repo:{ path:'...' } }]` 跑通整条链路。
 
-> 静态注册表背后的取舍写在 [ADR 0001：平台适配层可插拔](../adr/0001-平台适配层可插拔.md)；错误模型见 [ADR 0002：PipelineError 错误模型](../adr/0002-PipelineError错误模型.md)；工单正文不可信的边界见 [ADR 0003：工单正文不可信](../adr/0003-工单正文不可信.md)。术语表在仓库根 [GLOSSARY.md](../../GLOSSARY.md)。
+> 静态注册表背后的取舍写在 [ADR 0001：平台适配层可插拔](../adr/0001-平台适配层可插拔.md)；错误模型见 [ADR 0002：PipelineError 错误模型](../adr/0002-PipelineError错误模型.md)；工单正文不可信的边界见 [ADR 0003：工单正文不可信](../adr/0003-工单正文不可信.md)；插件为何要给 git/verify 显式申请完整文件权限见 [ADR 0004](../adr/0004-插件git需要完整文件权限.md)。术语表在仓库根 [GLOSSARY.md](../../GLOSSARY.md)。
 
 做不到就说明边界漏了 —— 有内核代码直接引用了飞书的细节，或者适配器之间互相 import 了。
 
