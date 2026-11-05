@@ -1174,6 +1174,59 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(request.sandboxPolicy.workspaceRoot, 'D:/some/repo')
   })
 
+  await check('commandRunner：命令名不能加引号（PowerShell 里 \'node\' 是字符串字面量，会 ParserError）', async () => {
+    // 真实事故：verify 命令被拼成 cd 'x'; 'node' 'scripts/check-consistency.mjs'，
+    // 宿主 shell 是 PowerShell，直接 ParserError（UnexpectedToken）——
+    // 票于是被判成「验证失败」，可代码其实改对了、MR 也开了。
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const run = makeCommandRunner(ctx)
+    await run({ argv: ['node', 'scripts/check-consistency.mjs'], cwd: 'D:/some/repo' })
+    const command = String(shell.requests[0].command)
+    assert.ok(command.includes('node scripts/check-consistency.mjs'), `命令名不该被引号包起来：${command}`)
+    assert.ok(!command.includes("'node'"), `命令名加引号在 PowerShell 下是语法错误：${command}`)
+    assert.ok(command.includes("cd 'D:/some/repo'"), `工作目录用 cd 表达：${command}`)
+  })
+
+  await check('commandRunner：参数照旧单引号转义（路径含空格也不破）', async () => {
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const run = makeCommandRunner(ctx)
+    await run({ argv: ['npm', 'run', 'build', '--', 'my folder'], cwd: 'D:/some/repo' })
+    const command = String(shell.requests[0].command)
+    assert.ok(command.includes("'my folder'"), `带空格的参数要转义：${command}`)
+    assert.ok(command.includes('npm run build'), `普通参数不该被引号包起来：${command}`)
+  })
+
+  await check('commandRunner：程序名含空格/特殊字符时报 invalid-input（跨 shell 没法安全转义）', async () => {
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const run = makeCommandRunner(ctx)
+    let error = null
+    try {
+      await run({ argv: ['C:/Program Files/node.exe', 'x.mjs'], cwd: 'D:/some/repo' })
+    } catch (err) {
+      error = err
+    }
+    assert.ok(error, '必须报错而不是把命令拼出去')
+    assert.equal(error.kind, 'invalid-input')
+    assert.ok(error.message.includes('node'), '错误里要给出可用的替代写法')
+  })
+
+  await check('commandRunner：空命令报 invalid-input', async () => {
+    const shell = makeFakeShell()
+    const ctx = { get: (name) => (name === 'shell' ? shell : undefined) }
+    const run = makeCommandRunner(ctx)
+    let error = null
+    try {
+      await run({ argv: [], cwd: 'D:/some/repo' })
+    } catch (err) {
+      error = err
+    }
+    assert.ok(error, '空命令必须报错')
+    assert.equal(error.kind, 'invalid-input')
+  })
+
   await check('detectBaseBranch 优先用 remote HEAD，不猜 main', async () => {
     // 本机 pms 仓库的主干叫 v2.x；以前硬编码 'main' 会让 fetch 直接失败。
     const calls = []

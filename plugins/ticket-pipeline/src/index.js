@@ -31,6 +31,7 @@ import { createScheduler } from './core/scheduler.js'
 import { recoverPending, checkWorktreeByGit } from './core/recover.js'
 import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
 import { sanitizeBranchName } from './core/branch-name.js'
+import { PipelineError } from './contracts/errors.js'
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
@@ -483,7 +484,20 @@ export function makeCommandRunner (ctx) {
     return undefined
   }
   return async ({ argv, cwd }) => {
-    const quoted = argv.map((part) => quoteShellArg(part)).join(' ')
+    const [program, ...rest] = argv.map((part) => String(part ?? ''))
+    if (!program) {
+      throw new PipelineError('invalid-input', '验证命令为空：项目配置里的 verify.build / verify.test 需要写成「命令 参数」的形式。')
+    }
+    // 命令名（argv[0]）不能加引号：
+    // PowerShell 里 'node' 是一段字符串字面量，不是可执行命令，
+    // 写成 cd 'x'; 'node' 'y.mjs' 会直接 ParserError（UnexpectedToken）——
+    // 这正是上一张票「验证失败（退出码 1）」的真实原因：代码改对了，命令根本没跑起来。
+    if (!isPlainShellToken(program)) {
+      throw new PipelineError('invalid-input', `验证命令的程序名「${program}」含空格或特殊字符，跨 shell（PowerShell / bash）无法安全转义。请改成 PATH 里可直接调用的命令名（如 node、npm、npx、mvn）。`)
+    }
+    // 参数也只在必要时加引号：安全 token 原样传，跨 shell 语义一致；
+    // 带空格/特殊字符的才单引号包起来（PowerShell 与 bash 都把单引号里的内容当字面量）。
+    const quoted = [program, ...rest.map((part) => (isPlainShellToken(part) ? part : quoteShellArg(part)))].join(' ')
     // 用 pushd/popd 不可靠（PowerShell 与 bash 语义不同），统一在子 shell 里换目录：
     // bash 与 PowerShell 都支持 '(' ... ')' 分组吗？—— 不。所以沿用 gitRunner 的做法：
     // 命令本身带 -C 语义做不到（verify 是 npm/npx），改为显式拼 cd 且用 ';' 分隔，
@@ -516,6 +530,19 @@ function quoteShellArg (value) {
   const text = String(value ?? '')
   if (text.length === 0) return "''"
   return `'${text.replace(/'/g, "''")}'`
+}
+
+/**
+ * 判断一个 token 能否原样交给 shell（不加引号）。
+ *
+ * 只放行「字母数字与少量安全符号」，这类 token 在 PowerShell 与 bash 下语义一致。
+ * 命令名必须走这条路径：PowerShell 里 'node' 是字符串字面量，不是可执行命令。
+ *
+ * @param {string} value
+ * @returns {boolean}
+ */
+function isPlainShellToken (value) {
+  return /^[A-Za-z0-9@%+=:,./_-]+$/.test(String(value ?? ''))
 }
 
 /**
