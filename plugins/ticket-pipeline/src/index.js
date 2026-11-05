@@ -651,6 +651,9 @@ export async function apply (ctx, config) {
     // executor-agent 的宿主依赖：全部惰性/弱取，缺了就由适配器自己优雅降级或报错，
     // 组合根不在这里按平台或执行器名做 if 分支。
     agents: getService(ctx, 'agents'),
+    // 宿主当前默认模型。配置里 provider/model 留空是常态，缺了 model 宿主会在
+    // {{model}} 模板上崩（票全变成「没有产生任何文件改动」），所以必须能读到它。
+    agentDefaultModel: getService(ctx, 'agentDefaultModel'),
     git: makeGitRunner(ctx),
     runCommand: makeCommandRunner(ctx),
     createGitlabClient,

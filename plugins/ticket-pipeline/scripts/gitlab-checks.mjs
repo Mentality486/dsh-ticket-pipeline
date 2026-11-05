@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import { createGitlabClient, ensureDraftTitle } from '../src/adapters/gitlab-client/index.js'
 import {
   agentOptionsFromConfig,
+  resolveAgentOptions,
   buildMessages,
   buildMrDescription,
   buildMrTitle,
@@ -632,6 +633,67 @@ export async function runGitlabChecks (check) {
     assert.equal(agentOptionsFromConfig({ provider: 'workbuddy', model: 'x' }).provider, 'workbuddy')
   })
 
+  await check('执行器：配置留空时用宿主默认模型补齐，缺了 model 宿主会在 {{model}} 上崩', async () => {
+    // 为什么必须补：宿主渲染系统提示时把 {{model}} 换成 agent.options.model，
+    // 配置里 model 留空就真的不下发 → 渲染时抛
+    // `prompt variable "{{model}}" has no value for this assembly`，
+    // 票全变成「agent 没有产生任何文件改动」。真实工单上撞过（sandbox rec-mock-002/003）。
+    const host = { currentSelection: () => ({ provider: 'workbuddy', model: 'space-bunny', reasoningEffort: 'xhigh' }) }
+    const opts = resolveAgentOptions({ provider: '', model: '', maxTokens: 4096 }, { agentDefaultModel: host })
+    assert.equal(opts.provider, 'workbuddy', '宿主默认 provider 必须补上')
+    assert.equal(opts.model, 'space-bunny', '宿主默认 model 必须补上，否则 {{model}} 没值')
+    assert.equal(opts.maxTokens, 4096)
+
+    // 显式配置永远赢，不去问宿主。
+    let asked = 0
+    const spy = { currentSelection: () => { asked += 1; return { provider: 'p', model: 'm' } } }
+    const explicit = resolveAgentOptions({ provider: 'workbuddy', model: 'mine' }, { agentDefaultModel: spy })
+    assert.equal(explicit.model, 'mine')
+    assert.equal(asked, 0, '配置齐全时不该再去问宿主')
+
+    // 只配了 provider：model 仍要从宿主补，两项必须成对。
+    const partial = resolveAgentOptions({ provider: 'workbuddy', model: '' }, { agentDefaultModel: host })
+    assert.equal(partial.model, 'space-bunny', '只配 provider 时 model 也要补齐')
+
+    // 没有宿主服务（离线自测 / 裁剪过的 profile）：保持配置原样，不凭空编模型名。
+    const offline = resolveAgentOptions({ provider: '', model: '' }, {})
+    assert.equal('model' in offline, false, '没有宿主服务时不能编一个模型名出来')
+
+    // 有服务但拿不到值：必须明确报错，而不是让宿主在模板渲染处给一条看不懂的错。
+    await assert.rejects(
+      () => Promise.resolve().then(() => resolveAgentOptions({}, { agentDefaultModel: { currentSelection: () => ({}) } })),
+      /provider=\$?\{?|没有给 provider\/model/,
+      '宿主也给不出模型时必须自己报清楚',
+    )
+  })
+
+  await check('执行器：本机没有 agentPresets 服务时报 invalid-input，不能静默起一个没工具的 agent', async () => {
+    // 为什么：少了 preset 的 agent 一个工具都没有，读不到也改不了文件，
+    // 最后只会落到「agent 没有产生任何文件改动」，真因被埋掉、还白烧一轮 token。
+    const env = makeRunEnv()
+    env.ctx.config.agentPreset = 'ptc'
+    const executor = createAgentExecutor({
+      agents: {
+        create: async (input) => {
+          await input.setup?.({ get: () => undefined }, env.agent)
+          return { agent: env.agent }
+        },
+      },
+      git: async () => ({ code: 0, stdout: '', stderr: '' }),
+      getSecret: async () => 'x',
+      createGitlabClient: async () => { throw new Error('不该走到这里') },
+    })
+    await assert.rejects(
+      () => executor.run(env.ticket, env.target, env.ctx),
+      (error) => {
+        assert.equal(error.kind, 'invalid-input', '缺 preset 服务是环境/配置问题，不该重试')
+        assert.match(error.message, /没有 agentPresets 服务/)
+        assert.match(error.message, /改动必为空/)
+        return true
+      },
+    )
+  })
+
   await check('执行器：setup 里挂 preset —— 不挂的话 agent 没有任何工具，改动必为空', async () => {
     // 这是「切到 agent 执行器后票永远 failed」的根因：setup 曾经只打一行日志。
     // 宿主自己的子 agent 走 presets.mount（dsh-subagent:applyChildComposition），
@@ -774,6 +836,9 @@ export async function runGitlabChecks (check) {
     // 不拼 worktree 就可能把工作区里另一个仓库的同名文件提交上去。
     const read = []
     const env = makeRunEnv({ files: ['src/login.js'] })
+    // 这条用例只验「读文件拼 worktree 根」，刻意给一个没有 agentPresets 的 ctx；
+    // 因此把 agentPreset 留空（=不挂 preset），否则会被「缺 preset 服务」的新闸门拦住。
+    env.ctx.config.agentPreset = ''
     const executor = createAgentExecutor({
       agents: { create: async (input) => { await input.setup?.({ get: () => undefined }, env.agent); return { agent: env.agent } } },
       git: async (argv) => { if (argv[0] === 'diff') return { code: 0, stdout: 'M\tsrc/login.js', stderr: '' }; return { code: 0, stdout: '', stderr: '' } },
@@ -990,12 +1055,22 @@ export async function runGitlabChecks (check) {
     assert.equal(resolveGitlab({ repo: { path: '/r' } }, {}), null, '没有 GitLab 坐标时要返回 null，而不是编一个')
   })
 
-  await check('执行器：命令串只按空白切，不偷偷解释 shell 语法', async () => {
+  await check('执行器：命令串认引号（Windows 路径有空格），但仍不解释 shell 语法', async () => {
     assert.deepEqual(splitCommand('npm run build'), ['npm', 'run', 'build'])
     assert.deepEqual(splitCommand('  mvn   -o test  '), ['mvn', '-o', 'test'])
-    // `&&` 会变成独立的 argv 元素送给子进程，而不是被拼成 shell 复合命令。
-    assert.deepEqual(splitCommand('a && b'), ['a', '&&', 'b'])
     assert.deepEqual(splitCommand(''), [])
+    // 引号内的空格不切分：Windows 上 `C:\Program Files\...` 是常态。
+    assert.deepEqual(
+      splitCommand('node "C:\\Program Files\\x\\check.mjs" --fast'),
+      ['node', 'C:\\Program Files\\x\\check.mjs', '--fast'],
+    )
+    assert.deepEqual(splitCommand("node 'a b/c.mjs'"), ['node', 'a b/c.mjs'])
+    // 空引号是一个"空参数"，不能丢：丢了就变成少传一个参数。
+    assert.deepEqual(splitCommand('node ""'), ['node', ''])
+    // `&&` 仍原样留着 —— 配置项不该成为 shell 注入面。
+    assert.deepEqual(splitCommand('a && b'), ['a', '&&', 'b'])
+    // 引号没闭合：报 invalid-input，而不是当成"参数里带了个引号"。
+    assert.throws(() => splitCommand('node "unterminated'), /引号没有闭合/)
   })
 
   await check('执行器：MR 标题与描述带上工单溯源信息', async () => {

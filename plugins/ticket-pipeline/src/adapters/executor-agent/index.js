@@ -161,7 +161,9 @@ export function createAgentExecutor (options = {}) {
         // cwd 必须是 worktree：agent 的读写工具按这个目录解析相对路径，
         // 指到别处就会在人的主目录里改代码。
         meta: { cwd: worktreePath },
-        agentOptions: agentOptionsFromConfig(config),
+        // 模型参数：配置优先，缺的用宿主当前默认补齐。缺了 model 宿主会在
+        // {{model}} 模板上崩，票全变成「没有产生任何文件改动」。
+        agentOptions: resolveAgentOptions(config, { agentDefaultModel: options.agentDefaultModel, log }),
         // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
         // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
         // 起来是个没有任何工具的壳，改不出任何文件。
@@ -212,6 +214,7 @@ export function createAgentExecutor (options = {}) {
         const blocked = collected.files.filter((file) => !committable.includes(file))
         if (blocked.length > 0) {
           // 不抛错：业务代码可能已经改对了，抛了人只看到「失败」，看不到「哪几个文件被拦」。
+          // 但不能只写日志 —— 插件日志人平时不看，最后只会在 MR 里发现「少改了一个文件」。
           ctx.log?.(`executor-agent：${blocked.length} 个敏感文件不会提交`, { files: blocked })
         }
 
@@ -256,7 +259,17 @@ export function createAgentExecutor (options = {}) {
           verification,
         })
 
+        // 验证失败（命令跑了、退出码非零）才是 skipped —— 代码有问题，不能算「完成」。
+        // 没配验证 / 起不来仍算 done：契约里 skipped 是合法成功路径（改动已开 MR 待人审），
+        // 但 plan.summary 必须把「未跑过测试」写在最前面，不能让「完成」这个字眼
+        // 替人默认测试过了 —— 工单需求里「完成后对问题功能进行测试」是硬要求。
         const phase = verification.outcome === 'failed' ? 'skipped' : 'done'
+        const blockedNote = blocked.length > 0
+          ? `；另有 ${blocked.length} 个敏感文件按约定未提交（${blocked.join('、')}）`
+          : ''
+        const verifyNote = verification.outcome === 'passed'
+          ? `验证通过：${verification.detail}`
+          : `⚠ 未通过验证（${verification.outcome}）：${verification.detail}`
         return makeExecResult({
           phase,
           changedFiles: committable,
@@ -264,7 +277,7 @@ export function createAgentExecutor (options = {}) {
           testDetail: verification.detail,
           mr,
           plan: {
-            summary: `按工单改动了 ${committable.length} 个文件`,
+            summary: `按工单改动了 ${committable.length} 个文件；${verifyNote}${blockedNote}`,
             targetPaths: committable,
             approach: verification.detail,
           },
@@ -369,7 +382,13 @@ export function buildMessages (ticket, ctx, untrustedNotice) {
 }
 
 /**
- * agent 的模型参数。留空则跟随宿主当前选择（headless 就是这么做的）。
+ * agent 的模型参数，只按配置表组装（纯函数，不碰宿主服务）。
+ *
+ * 注意：**光有这个函数是不够的**。宿主给 agent 组装系统提示时要把 {{model}} 替换成
+ * `agent.options.model`，没给 model 就会抛
+ * `prompt variable "{{model}}" has no value for this assembly`。
+ * 配置里 model 留空是常态（表示「跟随宿主默认」），真正把默认值填进去的是
+ * `resolveAgentOptions`，它才有机会读宿主服务。
  *
  * @param {Record<string, any>} config
  * @returns {{ provider?: string, model?: string, maxTokens?: number }}
@@ -384,6 +403,62 @@ export function agentOptionsFromConfig (config) {
   if (model.length > 0) agentOptions.model = model
   const maxTokens = Number(config?.maxTokens)
   if (Number.isFinite(maxTokens) && maxTokens > 0) agentOptions.maxTokens = Math.floor(maxTokens)
+  return agentOptions
+}
+
+/**
+ * 真正下发给宿主的模型参数：配置优先，缺的用宿主当前默认补齐。
+ *
+ * 为什么必须补齐：宿主组装系统提示时要渲染 `{{model}}` 模板，取值是
+ * `context.agent?.options.model`（宿主 dsh-agent-loop 里 systemPrompt.variable('model', ...)）。
+ * 配置里 model 留空就真的不下发 model → 模板无值 → 每一轮都在 publish 阶段崩掉，
+ * 票全部变成「agent 没有产生任何文件改动」。这条链路在 2026-11-05 的真实工单上撞过。
+ *
+ * 宿主服务接口是 `currentSelection() -> { provider, model, reasoningEffort? }`，
+ * 与 dsh-headless 的用法一致（它也是把这两项成对下发）。
+ *
+ * @param {Record<string, any>} config
+ * @param {{ agentDefaultModel?: { currentSelection?: () => any }, log?: (msg: string, detail?: unknown) => void }} [options]
+ * @returns {{ provider?: string, model?: string, maxTokens?: number }}
+ */
+export function resolveAgentOptions (config, options = {}) {
+  const agentOptions = agentOptionsFromConfig(config)
+  const log = typeof options.log === 'function' ? options.log : () => {}
+
+  // 配置里两项都给了就不必问宿主：显式配置永远赢。
+  if (agentOptions.provider && agentOptions.model) return agentOptions
+
+  const service = options.agentDefaultModel
+  if (!service || typeof service.currentSelection !== 'function') {
+    // 没有这个服务（离线自测、裁剪过的 profile）—— 保持配置原样，让宿主的报错原文暴露出来，
+    // 不要在这里凭空编一个模型名去猜。
+    log('executor-agent：本机没有 agentDefaultModel 服务，模型参数只能按配置下发', {
+      provider: agentOptions.provider ?? null,
+      model: agentOptions.model ?? null,
+    })
+    return agentOptions
+  }
+
+  /** @type {any} */
+  let selection
+  try {
+    selection = service.currentSelection()
+  } catch (error) {
+    throw new PipelineError('internal', `executor-agent：读取宿主默认模型失败：${error instanceof Error ? error.message : String(error)}`, error)
+  }
+  const provider = typeof selection?.provider === 'string' ? selection.provider.trim() : ''
+  const model = typeof selection?.model === 'string' ? selection.model.trim() : ''
+  if (provider.length === 0 || model.length === 0) {
+    // 两项必须成对下发：只给 provider 不给 model，宿主照样在 {{model}} 上崩。
+    throw new PipelineError(
+      'internal',
+      'executor-agent：配置里没有给 provider/model，宿主也没报出当前默认模型' +
+      `（拿到的是 provider=${JSON.stringify(selection?.provider ?? null)} model=${JSON.stringify(selection?.model ?? null)}）` +
+      '。请在插件配置里显式写 provider 与 model，或在宿主里先选一个默认模型。',
+    )
+  }
+  agentOptions.provider = agentOptions.provider ?? provider
+  agentOptions.model = agentOptions.model ?? model
   return agentOptions
 }
 
@@ -505,8 +580,15 @@ export async function setupAgent (options, input) {
     const presets = agentCtx?.get?.('agentPresets')
     if (!presets || typeof presets.mount !== 'function') {
       // 没装 agent-preset-registry 的 profile（如 headless）没有这个服务。
-      // 这时候起出来的 agent 没有工具，改动一定为空 —— 说明白，别让人猜。
-      log('executor-agent：本机没有 agentPresets 服务，agent 不会有任何工具（改动必为空）', { sessionId, presetId })
+      // 这时起出来的 agent 是个没有任何工具的壳：它读不到文件也改不了文件，
+      // 最后必然落到「agent 没有产生任何文件改动」，真因被埋掉、还白烧一轮 token。
+      // 必须在这里就失败，并且报成 invalid-input（重试不会有帮助）。
+      throw new PipelineError(
+        'invalid-input',
+        `executor-agent：本机没有 agentPresets 服务，无法给 agent 挂 preset "${presetId}"，` +
+        '这样的 agent 一个工具都没有（改动必为空）。请确认宿主装了 agent-preset-registry ' +
+        '（桌面版自带），或把配置项 agentPreset 留空改为不挂 preset。',
+      )
     } else {
       try {
         const mounted = await presets.mount(agentCtx, presetId)
@@ -762,7 +844,21 @@ export async function runVerification (options, verify, cwd, signal) {
   const passed = []
   for (const item of commands) {
     if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：验证阶段被取消')
-    const argv = splitCommand(item.command)
+    /** @type {string[]} */
+    let argv
+    try {
+      argv = splitCommand(item.command)
+    } catch (error) {
+      // 配置写坏了（引号没闭合）：这是配置问题，不是代码问题。
+      // 判 skipped 并写清楚，人去看 testDetail 就能改对；判 failed 会让人以为改的代码有问题。
+      return {
+        outcome: 'skipped',
+        detail: `验证命令解析不了（${item.label}: ${item.command}）：${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+    if (argv.length === 0) {
+      return { outcome: 'skipped', detail: `验证命令是空的（${item.label}），没有跑验证` }
+    }
     let result
     try {
       result = await options.runCommand({ argv, cwd, signal })
@@ -791,15 +887,58 @@ export async function runVerification (options, verify, cwd, signal) {
 /**
  * 把 `npm run build` 这种配置串切成 argv。
  *
- * 只按空白切，**不认识引号与管道** —— 这是刻意的：配置里写 `a && b` 或带引号的参数
- * 会被原样当成一个奇怪的可执行文件名，立刻报错，而不是被悄悄解释成 shell 组合命令。
- * 真需要 shell 语法时应当在项目里写个脚本，别把 shell 注入面开进配置。
+ * 认**引号**（单引号与双引号都认，引号内的空格不切分），因为 Windows 路径里
+ * 空格是常态：`node "C:\\Program Files\\x\\check.mjs"` 必须切出两个参数。
+ *
+ * 但**故意不认管道、重定向、&& 之类的 shell 语法**：它们会被原样留在一个参数里，
+ * 于是执行时立刻失败并报出「命令起不来」，而不是被悄悄解释成 shell 组合命令。
+ * 配置项不该成为 shell 注入面 —— 真需要组合命令请在项目里写个脚本。
  *
  * @param {string} command
  * @returns {string[]}
  */
 export function splitCommand (command) {
-  return String(command ?? '').trim().split(/\s+/).filter((part) => part.length > 0)
+  const text = String(command ?? '')
+  /** @type {string[]} */
+  const argv = []
+  let current = ''
+  let quote = ''
+  let started = false
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i]
+    if (quote.length > 0) {
+      if (char === quote) {
+        quote = ''
+      } else {
+        // 引号里**不给反斜杠任何特殊含义**：Windows 路径 `"C:\Program Files\x"`
+        // 里的反斜杠是字面量，当成转义符会把路径吃掉（C:Program Filesx）。
+        // 代价是引号内写不出引号本身 —— 配置项里也没有这种需求。
+        current += char
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      started = true
+      continue
+    }
+    if (/\s/.test(char)) {
+      if (started || current.length > 0) {
+        argv.push(current)
+        current = ''
+        started = false
+      }
+      continue
+    }
+    current += char
+    started = true
+  }
+  // 引号没闭合：宁可报错也别把它当成「参数里带了个引号」—— 那会让人以为跑通了。
+  if (quote.length > 0) {
+    throw new PipelineError('invalid-input', `验证命令的引号没有闭合：${text}`)
+  }
+  if (started || current.length > 0) argv.push(current)
+  return argv
 }
 
 /**

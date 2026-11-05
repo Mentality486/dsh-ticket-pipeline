@@ -545,6 +545,20 @@ function validateProject (raw, index) {
   if (typeof repo.baseBranch === 'string' && repo.baseBranch.length > 0) value.repo.baseBranch = repo.baseBranch
   if (typeof repo.targetBranch === 'string' && repo.targetBranch.length > 0) value.repo.targetBranch = repo.targetBranch
 
+  // repo.gitlab 是自建站点 / 子组路径的唯一表达方式（执行器 resolveGitlab 会以它为准）。
+  // 不在这里透传就等于把人的配置吞掉：URL 解析不出来时只会得到一句
+  // 「项目没有配置 GitLab」，而配置里明明写着。
+  if (repo.gitlab && typeof repo.gitlab === 'object' && !Array.isArray(repo.gitlab)) {
+    /** @type {any} */
+    const gitlab = {}
+    if (typeof repo.gitlab.baseUrl === 'string' && repo.gitlab.baseUrl.trim().length > 0) gitlab.baseUrl = repo.gitlab.baseUrl.trim()
+    if (typeof repo.gitlab.remote === 'string' && repo.gitlab.remote.trim().length > 0) gitlab.remote = repo.gitlab.remote.trim()
+    const gid = repo.gitlab.projectId
+    if (typeof gid === 'number' && Number.isFinite(gid)) gitlab.projectId = gid
+    else if (typeof gid === 'string' && gid.trim().length > 0) gitlab.projectId = gid.trim()
+    if (Object.keys(gitlab).length > 0) value.repo.gitlab = gitlab
+  }
+
   if (p.verify && typeof p.verify === 'object' && !Array.isArray(p.verify)) {
     const verify = {}
     if (typeof p.verify.build === 'string' && p.verify.build.length > 0) verify.build = p.verify.build
