@@ -183,8 +183,8 @@ export const CONFIG_FIELDS = Object.freeze({
   },
   model: {
     type: 'string',
-    default: 'deepseek-v4.1-flash',
-    description: '跑任务书的模型名，留空则跟随当前会话默认',
+    default: '',
+    description: '跑任务书的模型名，留空则跟随当前会话默认（推荐留空：钉死某个模型会在它被限流时让整条流水线全灭）',
   },
   maxTokens: {
     type: 'integer',

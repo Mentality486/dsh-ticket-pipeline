@@ -700,7 +700,7 @@ export const Config = {
   maxAttempts: number,           // 默认 2，1..5
 
   // ── 执行 ────────────────────────────────────────────
-  workExecutor: 'mock' | 'agent', // 默认 mock（agent 未实现）
+  workExecutor: 'mock' | 'agent', // 默认 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 开 draft MR）
   ticketTimeoutMinutes: number,  // 默认 40，5..180
   fetchBeforeCreate: boolean,    // 默认 true
   branchPrefix: string,          // 默认 'ticket-'，后接 <projectId>-<recordId>-r<修订号>
@@ -708,11 +708,11 @@ export const Config = {
 
   // ── agent 与模型 ────────────────────────────────────
   provider: string,              // 默认 'workbuddy'
-  model: string,                 // 默认 'deepseek-v4.1-flash'
+  model: string,                 // 默认 ''（留空 = 跟随会话默认模型；钉死某个模型会在它被限流时让流水线全灭）
   maxTokens: number,             // 默认 32000
 
   // ── 通知 ────────────────────────────────────────────
-  pushAdapter: 'mock' | 'pushplus', // 默认 pushplus
+  pushAdapter: 'mock' | 'pushplus' | 'qqmail', // 默认 pushplus
   pushplus: { token, channel, template },
   notifyOn: string[],            // 默认 ['done','skipped','failed','needs-info']
 

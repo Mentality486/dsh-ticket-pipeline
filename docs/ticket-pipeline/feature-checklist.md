@@ -169,9 +169,9 @@
 | `fetchBeforeCreate` | true | 布尔 | ✅ |
 | `branchPrefix` | 'ticket-' | 字符串 | ✅ |
 | `worktreeRetentionHours` | 24 | 0–720 | ✅ |
-| `provider` | 'workbuddy' | 字符串 | ❌ **死配置** |
-| `model` | 'deepseek-v4.1-flash' | 字符串 | ❌ **死配置** |
-| `maxTokens` | 32000 | 1024–200000 | ❌ **死配置** |
+| `provider` | 'workbuddy' | 字符串 | ✅ 已接线：非空才下发模型参数，留空跟随会话默认 |
+| `model` | ''（跟随会话默认） | 字符串 | ✅ 已接线：**默认留空**，避免钉死某个被限流的模型导致流水线全灭 |
+| `maxTokens` | 32000 | 1024–200000 | ✅ 已接线：>0 才下发 |
 | `pushAdapter` | 'pushplus' | 字符串 | ✅ |
 | `pushplus.token` | '' | 字符串 | ✅ |
 | `pushplus.channel` | 'clawbot' | 字符串 | ✅ |

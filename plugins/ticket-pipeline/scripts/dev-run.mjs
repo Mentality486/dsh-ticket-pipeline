@@ -1150,6 +1150,14 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(registered.some((tool) => tool.name === 'pipeline_scan'), 'agent 执行器下工具仍要注册')
   })
 
+  await check('model 默认留空（跟随会话默认模型），不钉死某个会被限流的模型', async () => {
+    // 真实事故：插件把 model 钉成 deepseek-v4.1-flash，那天上游配额耗尽，
+    // 整条流水线每一张票都死在「模型调用失败」上。留空 = 跟随宿主当前选择。
+    const { value: config } = validateConfig({})
+    assert.equal(config.model, '', 'model 默认应当是空串（空串在执行器里表示「不下发模型参数」）')
+    assert.equal(config.provider, 'workbuddy', 'provider 默认与 profile 一致')
+  })
+
   section('12e. 平台可插拔：状态值可配 + 金山文档真的接进组合根')
 
   await check('statusValues 进得了配置（配成「否」就按「否」收票）', async () => {
