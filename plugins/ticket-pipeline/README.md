@@ -60,6 +60,14 @@ lib/
 **没挂 descriptor 时宿主会静默跳过整条设置项** —— 加字段后记得同步 `CONFIG_GROUPS`，
 `node scripts/client-check.mjs` 会检查这一点。
 
+descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`，
+`refs` 里 `dict`/`inner`/`list` 的值是 **uid 数字**（引用），不能是内联对象。
+两处都会 `new z(...)` 重建：宿主 `dsh-settings` 与浏览器 `dsh-client-ui-settings`。
+引用一旦断了，数组字段的 `inner` 在浏览器里变成 `undefined`，校验抛
+`Cannot read properties of undefined (reading 'meta')`，又被客户端的 `catch` 静默吞掉 ——
+**整块设置面板永远停在 loading，什么也不显示，也不报错**。
+`scripts/client-check.mjs` 的 `checkSchemaEnvelope()` 就是守这一条的（改坏了它会红）。
+
 ## 三个可替换件
 
 | 接口 | 注册表键 | 现状 |
@@ -105,6 +113,10 @@ lib/
    所以 `core/config.js` 手写了 standard-schema、`core/domain.js` 手写 domain spec、
    `tools/define.js` 手写了 `defineTool` 等价物。代价：设置面板拿不到 schemastery
    的结构化 diff，退化成整体替换。校验、默认值、持久化不受影响。
+   注意「手写 standard-schema」不等于「手写形状」：设置面板要的是 schemastery 的
+   **信封格式** `{ uid, refs }`，所以 `core/config.js` 里的 `descriptorEnvelope()`
+   按 uid 引用把整棵树重新打包 —— 详见上面「设置面板」那段与
+   `scripts/client-check.mjs` 的 `checkSchemaEnvelope()`。
 2. **本机 `npm install` / `npm view` 不可用**（`npm-cache/_logs` 目录不可写），
    无法联网查版本、无法装依赖 —— 所有依赖都在 DSH 宿主或 profile 里，本包零 npm 依赖。
 3. **`git push` 在本机不可能**（沙箱禁止给 `git-receive-pack` 建 stdin 管道），

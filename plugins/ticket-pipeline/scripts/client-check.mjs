@@ -198,6 +198,199 @@ async function checkDescriptorMeta () {
   notes.push('descriptor 叶子 ' + leaves.length + ' 个，分组 ' + CONFIG_GROUPS.length + ' 组，meta 齐全')
 }
 
+/**
+ * 设置面板要的是 schemastery 的「信封」格式：`{ uid, refs }`，refs 里 dict/inner/list
+ * 的值是 uid 数字（引用），不是内联对象。
+ *
+ * 这条链一旦不对，症状极其隐蔽：宿主 `dsh-settings` 重建之后 form.toJSON() 里的数组
+ * 节点 inner 不是 uid，浏览器 `new Schema(envelope)` 后 inner === undefined，数组
+ * resolver 去读 `inner.meta` 抛
+ * `TypeError: Cannot read properties of undefined (reading 'meta')`，
+ * 而 `dsh-client-ui-settings` 的 decode() 把这个异常静默 catch 掉 —— 于是整个
+ * namespace 的表单永远停在 loading，界面上什么都不显示，也不报错。
+ *
+ * 这里手抄一遍宿主与浏览器两边真正走的那几行（两边都是手抄的，改一处记得改另一处）：
+ *   宿主 dsh-settings/lib/index.js:103-117  plainSchema  → new z(schema.toJSON())
+ *   宿主 dsh-settings/lib/index.js:122-131  volatileForm
+ *   浏览器 dsh-client-ui-settings/lib/client.js:289-300  new Schema(serialized)
+ *   浏览器 dsh-client-ui-settings/lib/client.js:773-777  数组 resolver 读 inner.meta
+ */
+function rehydrateEnvelope (serialized) {
+  const refs = {}
+  for (const key of Object.keys(serialized.refs ?? {})) {
+    const raw = serialized.refs[key]
+    const node = { type: raw.type, meta: { ...(raw.meta ?? {}) } }
+    if (raw.dict) node.dict = { ...raw.dict }
+    if (raw.inner !== undefined) node.inner = raw.inner
+    if (raw.list) node.list = raw.list.slice()
+    if (raw.sKey !== undefined) node.sKey = raw.sKey
+    refs[key] = node
+  }
+  const getRef = (uid) => (uid === undefined ? undefined : refs[String(uid)])
+  for (const key of Object.keys(refs)) {
+    const node = refs[key]
+    node.sKey = getRef(node.sKey)
+    node.inner = getRef(node.inner)
+    node.list = node.list && node.list.map(getRef)
+    node.dict = node.dict && Object.fromEntries(Object.entries(node.dict).map(([k, v]) => [k, getRef(v)]))
+  }
+  return { refs, root: refs[String(serialized.uid)] }
+}
+
+/**
+ * 按浏览器 schemastery 的 resolver 走一遍树，专门盯住会把表单整块打挂的那两处。
+ */
+function walkLikeBrowser (node, path, found) {
+  if (!node || typeof node !== 'object') return
+  if (node.type === 'object') {
+    for (const [key, child] of Object.entries(node.dict ?? {})) {
+      if (child === undefined) {
+        found.push('对象字段 ' + path.concat([key]).join('.') + ' 的 dict 引用解析成了 undefined')
+        continue
+      }
+      walkLikeBrowser(child, path.concat([key]), found)
+    }
+    return
+  }
+  if (node.type === 'array') {
+    const inner = node.inner
+    if (inner === undefined || inner === null) {
+      found.push('数组字段 ' + path.join('.') + ' 的 inner 解析成了 undefined —— 浏览器会抛 TypeError: Cannot read properties of undefined (reading \'meta\')')
+      return
+    }
+    if (typeof inner.meta !== 'object' || inner.meta === null) {
+      found.push('数组字段 ' + path.join('.') + ' 的 inner.meta 不是对象 —— 浏览器会抛 TypeError')
+    }
+  }
+}
+
+async function checkSchemaEnvelope () {
+  const configModule = await import(pathToFileURL(join(root, 'src/core/config.js')).href)
+  const { CONFIG_FIELDS, Config, getConfigDescriptor } = configModule
+
+  // 1) 宿主 dsh-settings 的 describe() 会对 Config 调一次 toJSON()，算出 revision 哈希。
+  //    两次生成必须逐字节相同，否则每次保存都会撞 SETTINGS_CONFLICT。
+  const first = JSON.stringify(Config.toJSON())
+  const second = JSON.stringify(Config.toJSON())
+  if (first !== second) {
+    fail('Config.toJSON() 两次生成不一致 —— 宿主 describe() 的 revision 哈希会漂移，每次保存都会撞 SETTINGS_CONFLICT')
+  }
+
+  const envelope = Config.toJSON()
+  if (typeof envelope.uid !== 'number' || envelope.refs === undefined) {
+    fail('Config.toJSON() 没返回 { uid, refs } 信封 —— 宿主 new z(schema.toJSON()) 与浏览器 new Schema(envelope) 都重建不出来')
+    return
+  }
+
+  // 2) refs 里每条记录都要能被 getRef 命中；dict/inner/list 的值必须是 uid 数字。
+  for (const [key, ref] of Object.entries(envelope.refs)) {
+    if (typeof ref.type !== 'string' || ref.type.length === 0) {
+      fail('信封 refs[' + key + '] 没有 type —— schemastery 重建时会抛 unsupported type')
+    }
+    for (const field of ['dict', 'inner', 'list', 'sKey']) {
+      const value = ref[field]
+      if (value === undefined) continue
+      if (field === 'dict') {
+        for (const [childKey, uid] of Object.entries(value)) {
+          if (typeof uid !== 'number') {
+            fail('信封 refs[' + key + '].dict.' + childKey + ' 不是 uid 数字（是 ' + typeof uid + '）')
+          } else if (envelope.refs[String(uid)] === undefined) {
+            fail('信封 refs[' + key + '].dict.' + childKey + ' 指向的 uid ' + uid + ' 不存在')
+          }
+        }
+        continue
+      }
+      if (field === 'list') {
+        for (const [index, uid] of value.entries()) {
+          if (typeof uid !== 'number' || envelope.refs[String(uid)] === undefined) {
+            fail('信封 refs[' + key + '].list[' + index + '] 不是有效 uid')
+          }
+        }
+        continue
+      }
+      if (typeof value !== 'number') {
+        fail('信封 refs[' + key + '].' + field + ' 不是 uid 数字（是 ' + typeof value + '）')
+      } else if (envelope.refs[String(value)] === undefined) {
+        fail('信封 refs[' + key + '].' + field + ' 指向的 uid ' + value + ' 不存在')
+      }
+    }
+  }
+  if (envelope.refs[String(envelope.uid)] === undefined) {
+    fail('信封根 uid ' + envelope.uid + ' 不在 refs 里 —— new z(envelope) 会静默返回 undefined，整个条目不会进设置面板')
+    return
+  }
+
+  // 3) 走一遍浏览器的重建与 resolver，重点是数组的 inner。
+  const { root: rootNode } = rehydrateEnvelope(envelope)
+  const found = []
+  walkLikeBrowser(rootNode, [], found)
+  for (const message of found) fail('信封重建后 ' + message)
+
+  // 4) 信封摊出来的叶子必须与源树、CONFIG_FIELDS 三方一致，面板才知道每个字段叫什么、在哪一组。
+  const sourceLeaves = []
+  const sourceMeta = new Map()
+  const collectSource = (node, path) => {
+    if (node === null || typeof node !== 'object') return
+    if (node.dict && typeof node.dict === 'object') {
+      for (const [key, child] of Object.entries(node.dict)) collectSource(child, path.concat([key]))
+      return
+    }
+    sourceLeaves.push(path.join('.'))
+    sourceMeta.set(path.join('.'), node.meta)
+  }
+  collectSource(getConfigDescriptor(), [])
+
+  const envelopeLeaves = []
+  const collectEnvelope = (node, path) => {
+    if (!node || typeof node !== 'object') return
+    if (node.dict && typeof node.dict === 'object') {
+      for (const [key, child] of Object.entries(node.dict)) collectEnvelope(child, path.concat([key]))
+      return
+    }
+    envelopeLeaves.push({ key: path.join('.'), meta: node.meta ?? {} })
+  }
+  collectEnvelope(rootNode, [])
+
+  const expected = Object.keys(CONFIG_FIELDS).sort()
+  const fromSource = sourceLeaves.slice().sort()
+  const fromEnvelope = envelopeLeaves.map((leaf) => leaf.key).sort()
+  if (JSON.stringify(expected) !== JSON.stringify(fromSource)) {
+    fail('源树的叶子与 CONFIG_FIELDS 对不上')
+  }
+  if (JSON.stringify(expected) !== JSON.stringify(fromEnvelope)) {
+    fail('信封摊出来的叶子与 CONFIG_FIELDS 对不上：\n  声明：' + expected.join(', ') + '\n  实际：' + fromEnvelope.join(', '))
+  }
+  for (const leaf of envelopeLeaves) {
+    if (typeof leaf.meta.label !== 'string' || leaf.meta.label.length === 0) {
+      fail('信封里字段 ' + leaf.key + ' 没有 meta.label —— 面板里会显示裸键名')
+    }
+    if (typeof leaf.meta.group !== 'string' || leaf.meta.group.length === 0) {
+      fail('信封里字段 ' + leaf.key + ' 没有 meta.group —— 面板里会落到「其他」组')
+    }
+  }
+
+  // 5) 宿主 plainSchema 的 walk() 会 delete node.meta.volatile，而它重建出来的 Schema
+  //    与信封里的 meta 是同一个对象引用。toJSON() 必须给出 meta 的副本，否则源树上的
+  //    volatile 标记会被抹掉，之后所有写入都被拒（Config field "..." is not volatile）。
+  for (const leaf of envelopeLeaves) {
+    const source = sourceMeta.get(leaf.key)
+    if (source !== undefined && leaf.meta === source) {
+      fail('信封里字段 ' + leaf.key + ' 的 meta 与源树共用同一个对象 —— 宿主重建时 delete meta.volatile 会抹掉源树的 volatile 标记，写入会被拒')
+      break
+    }
+  }
+  for (const leaf of envelopeLeaves) {
+    const source = sourceMeta.get(leaf.key)
+    if (source === undefined) continue
+    if (source.volatile !== true) {
+      fail('源树字段 ' + leaf.key + ' 没有 meta.volatile —— 宿主的 volatileForm() 会把整个条目从设置面板里吞掉')
+      break
+    }
+  }
+
+  notes.push('schema 信封 ' + Object.keys(envelope.refs).length + ' 个节点，' + envelopeLeaves.length + ' 个叶子，三方一致')
+}
+
 async function checkPackageJson () {
   const text = await readFile(join(root, 'package.json'), 'utf8')
   let pkg
@@ -299,6 +492,7 @@ async function main () {
   await checkClientShell()
   await checkSlotInjection()
   await checkDescriptorMeta()
+  await checkSchemaEnvelope()
 
   const host = await readHostRemote()
   const client = await readClientRemote()

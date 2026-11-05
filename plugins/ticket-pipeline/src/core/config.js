@@ -11,6 +11,19 @@
  *    `{ value }` 或 `{ issues: [...] }`。这就是 standard-schema 规范本身，
  *    手写一个等价实现即可，不依赖任何包。
  *
+ * 但**设置面板要的不是「自造形状」，而是 schemastery 的线上格式**。宿主
+ * `dsh-settings` 拿到 `Config` 后做 `new z(schema.toJSON())`；浏览器再对宿主
+ * 重建出来的信封做一次 `new z(envelope)`。两处都要求 `toJSON()` 返回
+ * `{ uid, refs }` 这种**信封**，且 `refs` 里 `dict` / `inner` / `list` 的值
+ * 必须是 **uid 数字**（引用），不能是内联对象 —— 否则数组字段的 `inner`
+ * 在浏览器里会变成 `undefined`，校验直接抛
+ * `Cannot read properties of undefined (reading 'meta')`，被宿主客户端的
+ * `catch` 静默吞掉 ⇒ **整块设置面板停在 loading，什么也不显示**。
+ *
+ * 所以这里手写「信封」而不是手写「树」：`descriptorNode` 造出的每个节点都带
+ * `toJSON()`，产出以自己为根的 `{ uid, refs }`（uid 按遍历顺序确定性编号，
+ * 保证 `describe()` 的 revision 哈希稳定）。
+ *
  * 代价：loader 的 `isSchemastery()` 判定为 false，设置面板拿不到 schemastery
  * 的结构化 diff（退化成整体替换）。校验、默认值、持久化都不受影响。
  * 这一点写在 README 的「已知约束」里，等以后能装依赖了再换成 schemastery。
@@ -667,9 +680,64 @@ export function validateConfig (raw) {
 //    这样 `projects` 这类**不该在面板里编辑**的键自然被排除。
 // 5. 面板需要的元信息全放 `meta` 里（`label` / `description` / `default` /
 //    `min` / `max` / `enum`）——实测这些自定义键能原样穿过 schemastery 重建。
+// 6. `toJSON()` 返回的必须是 **schemastery 信封** `{ uid, refs }`：`refs` 里
+//    `dict` / `inner` / `list` 的值是 **uid 数字**（引用），不是内联对象。
+//    宿主和浏览器都做 `new z(...)` 重建；内联的 `inner` 在重建后会变成
+//    `undefined`，数组字段一校验就抛
+//    `Cannot read properties of undefined (reading 'meta')`，
+//    再被浏览器端 `catch` 静默吞掉 ⇒ 面板永远停在 loading。
+
+/**
+ * 给 descriptor 树造一个 **schemastery 线上格式的信封**。
+ *
+ * 宿主 `dsh-settings` 和浏览器读 schema 用的是同一套格式：`{ uid, refs }`，
+ * `refs` 里每个节点一条记录，`dict` / `inner` / `list` 的值是 **uid 数字**
+ * （指向别的记录），不是内联对象。重建方（`new z(envelope)`）靠这些引用把
+ * `inner` 换成真正的子 schema；引用断了，数组字段就会在
+ * `inner.meta` 上炸掉。
+ *
+ * uid 按 **先序遍历** 确定性编号：同一棵树每次都得到同一个信封。宿主
+ * `describe()` 用 `JSON.stringify(schema.toJSON())` 算 revision，uid 抖动
+ * 会让 revision 一直涨（写设置时每回都撞上 `SETTINGS_CONFLICT`）。
+ *
+ * @param {any} root 子树根节点
+ * @returns {{ uid: number, refs: Record<string, any> }}
+ */
+function descriptorEnvelope (root) {
+  /** @type {Record<string, any>} */
+  const refs = {}
+  /** @type {Map<any, number>} */
+  const uids = new Map()
+  let next = 0
+
+  const visit = (node) => {
+    const known = uids.get(node)
+    if (known !== undefined) return known
+    const uid = ++next
+    uids.set(node, uid)
+    /** @type {any} */
+    const entry = { type: node.type, meta: { ...(node.meta ?? {}) } }
+    refs[String(uid)] = entry
+    if (node.dict) {
+      /** @type {Record<string, number>} */
+      const dict = {}
+      for (const [key, child] of Object.entries(node.dict)) dict[key] = visit(child)
+      entry.dict = dict
+    }
+    if (node.inner) entry.inner = visit(node.inner)
+    return uid
+  }
+
+  const uid = visit(root)
+  return { uid, refs }
+}
 
 /**
  * 把 descriptor 节点转成可递归 `toJSON()` 的普通对象。
+ *
+ * `toJSON()` 产出的是**信封**（见 `descriptorEnvelope`），不是节点自己的
+ * 形状 —— 宿主和浏览器都按信封重建，内联的子节点会被丢掉。
+ *
  * @param {any} node
  * @returns {any}
  */
@@ -679,7 +747,7 @@ function descriptorNode (node) {
   if (node.inner) out.inner = descriptorNode(node.inner)
   if (node.dict) out.dict = Object.fromEntries(Object.entries(node.dict).map(([key, child]) => [key, descriptorNode(child)]))
   out.toJSON = function toJSON () {
-    return JSON.parse(JSON.stringify({ ...this, toJSON: undefined }))
+    return descriptorEnvelope(out)
   }
   return out
 }
