@@ -473,7 +473,12 @@ window.__ModuleLoader__.load({
      * 调 `settings` Remote，语义稳定、错在哪一眼看得出。
      */
     function TicketPipelinePanel (props) {
-      var remote = props.remote
+      // remote 不能在 apply 时抓一次：浏览器侧 gateway 的 `remote` 要等
+      // typert / connection 就绪才出现，常常比我们晚。每次用时现取。
+      var getRemote = props.getRemote
+      var getNamespace = props.getNamespace
+      var ensureRemoteMounted = props.ensureRemoteMounted
+      var remote = getRemote()
       var [snapshot, setSnapshot] = useState(null)
       var [loading, setLoading] = useState(true)
       var [loadError, setLoadError] = useState('')
@@ -496,13 +501,14 @@ window.__ModuleLoader__.load({
 
       var isPage = props.view !== 'summary'
 
-      var loadSettings = useCallback(function () {
-        if (!remote || !remote.settings) {
+      var loadSettings = useCallback(function (target) {
+        var ns = target !== undefined ? target : getNamespace('settings')
+        if (!ns) {
           setLoading(false)
-          setLoadError('settings 服务不可用（ctx.remote.settings 缺席）。')
+          setLoadError('settings 服务不可用（宿主 remote.settings 命名空间没挂上）。')
           return Promise.resolve()
         }
-        return remote.settings.describe().then(function (response) {
+        return ns.describe().then(function (response) {
           if (!response || !response.ok) {
             setLoading(false)
             setLoadError('读取设置失败：' + ((response && response.error && response.error.message) || '未知错误'))
@@ -534,28 +540,62 @@ window.__ModuleLoader__.load({
           setLoading(false)
           setLoadError('读取设置失败：' + (error && error.message ? error.message : String(error)))
         })
-      }, [remote])
+      }, [getNamespace])
 
-      var loadCredentials = useCallback(function () {
-        if (!remote || !remote.credentials) return Promise.resolve()
+      var loadCredentials = useCallback(function (target) {
+        var ns = target !== undefined ? target : getNamespace('credentials')
+        if (!ns) return Promise.resolve()
         var refs = CREDENTIAL_REFS.map(function (item) { return item.ref })
-        return remote.credentials.describe(refs).then(function (response) {
+        return ns.describe(refs).then(function (response) {
           if (response && response.ok) setCreds(response.value || {})
         }, function () {})
-      }, [remote])
+      }, [getNamespace])
 
       useEffect(function () {
         if (!isPage) return
+        var cancelled = false
+        var attempts = 0
         setLoading(true)
-        loadSettings()
-        loadCredentials()
-        ensureMounted(remote).then(function () {
-          setMounted(true)
-          setDoctorError('')
-        }, function (error) {
-          setMounted(false)
-          setDoctorError('挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
-        })
+
+        // remote 通道可能比我们晚就绪（要等 typert + connection）。每 500ms 试一次，
+        // 最多 40 次（20 秒）；期间面板显示「通道连接中」而不是直接报错。
+        function attempt () {
+          if (cancelled) return
+          attempts += 1
+          var r = getRemote()
+          if (!r) {
+            if (attempts < 40) { setTimeout(attempt, 500); return }
+            setLoading(false)
+            setLoadError('浏览器侧 remote 通道一直没就绪（等了 20 秒）。可以刷新页面重试。')
+            setMounted(false)
+            setDoctorError('挂载体检通道失败：remote 服务缺席（ctx.remote 拿不到）')
+            return
+          }
+          // settings 命名空间是宿主挂的，可能比 remote 服务晚到位。等到它再读表单，
+          // 否则会读到「命名空间缺席」的假错误。
+          if (!getNamespace('settings')) {
+            if (attempts < 40) { setTimeout(attempt, 500); return }
+            setLoading(false)
+            setLoadError('宿主没提供 remote.settings 命名空间（等了 20 秒）。可以刷新页面重试。')
+            return
+          }
+          ensureRemoteMounted().then(function () {
+            if (cancelled) return
+            setMounted(true)
+            setDoctorError('')
+          }, function (error) {
+            if (cancelled) return
+            setMounted(false)
+            setDoctorError('挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
+          })
+          loadSettings().then(function () {
+            if (!cancelled) loadCredentials()
+          })
+          diag('panel-remote', attempts)
+        }
+
+        attempt()
+        return function () { cancelled = true }
       }, [])
 
       var leaves = useMemo(function () {
@@ -585,7 +625,8 @@ window.__ModuleLoader__.load({
 
       function onSave () {
         var view = findNamespace(snapshot)
-        if (!view || !remote || !remote.settings) return
+        var ns = getNamespace('settings')
+        if (!view || !ns) return
         var ops = []
         for (var i = 0; i < leaves.length; i += 1) {
           var leaf = leaves[i]
@@ -607,7 +648,7 @@ window.__ModuleLoader__.load({
         setSaving(true)
         setSaveError('')
         setSaveMessage('')
-        remote.settings.mutate(NAMESPACE, ops, view.revision).then(function (response) {
+        ns.mutate(NAMESPACE, ops, view.revision).then(function (response) {
           setSaving(false)
           if (!response || !response.ok) {
             var detail = response && response.error ? response.error : {}
@@ -634,11 +675,12 @@ window.__ModuleLoader__.load({
       }
 
       function onCredSave (ref) {
-        if (!remote || !remote.credentials) return
+        var ns = getNamespace('credentials')
+        if (!ns) return
         var value = String(credDraft[ref] || '').trim()
         if (value.length === 0) return
         setCredBusy(ref)
-        remote.credentials.set(ref, value).then(function (response) {
+        ns.set(ref, value).then(function (response) {
           setCredBusy('')
           if (!response || !response.ok) {
             setCredMessage('保存 ' + ref + ' 失败：' + ((response && response.error && response.error.message) || '未知错误'))
@@ -658,9 +700,10 @@ window.__ModuleLoader__.load({
       }
 
       function onCredClear (ref) {
-        if (!remote || !remote.credentials) return
+        var ns = getNamespace('credentials')
+        if (!ns) return
         setCredBusy(ref)
-        remote.credentials.unset(ref).then(function (response) {
+        ns.unset(ref).then(function (response) {
           setCredBusy('')
           if (!response || !response.ok) {
             setCredMessage('清除 ' + ref + ' 失败：' + ((response && response.error && response.error.message) || '未知错误'))
@@ -675,10 +718,14 @@ window.__ModuleLoader__.load({
       }
 
       function onDoctor () {
-        if (!remote || !remote.ticketPipeline) return
+        var ns = getNamespace('ticketPipeline')
+        if (!ns) {
+          setDoctorError('体检通道没挂上（remote.ticketPipeline 命名空间缺席）。')
+          return
+        }
         setDoctorBusy(true)
         setDoctorError('')
-        remote.ticketPipeline.doctor().then(function (response) {
+        ns.doctor().then(function (response) {
           setDoctorBusy(false)
           if (!response || !response.ok) {
             setDoctorError('体检失败：' + ((response && response.error && response.error.message) || '未知错误'))
@@ -804,6 +851,53 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 取一个 Remote 命名空间服务（`settings` / `credentials` / `ticketPipeline`）。
+     *
+     * ## 为什么不能写 `ctx.remote.settings`
+     *
+     * cordis 的属性访问走 ReflectService.handler.get（cordis/lib/index.js:1253+）：
+     * 属性没命中时它沿 **fiber 链向上** 找 provide 过该名字的 fiber。
+     * 而命名空间服务是 **兄弟 fiber** 提供的 —— dsh-api-gateway 在自己的 fiber 下
+     * `ownerCtx.plugin({ name: 'remote.<ns>' })` 建了一根独立 fiber（见
+     * dsh-api-gateway/lib/client.browser.js 的 createNamespace），它不是我们的祖先。
+     * 属性访问沿链找不到 ⇒ 抛 `cannot get property "remote.<ns>" without inject`。
+     *
+     * ## 为什么也不能写进 inject
+     *
+     * `ticketPipeline` 命名空间是 **我们自己** 通过 `remote.$mount()` 建的。
+     * 写进 inject 就等于「等自己把命名空间建出来」⇒ 我们的 fiber 永远不激活，
+     * apply 一次都不执行（表现：设置页里静默什么都没有）。
+     *
+     * ## 正确做法
+     *
+     * `ctx.get(name)` 不查 inject、不沿 fiber 链找，只在全局服务 store 里按名字取
+     *（cordis/lib/index.js:1347-1356）。兄弟 fiber provide 的服务照样取得到。
+     */
+    function namespaceOf (ctx, name) {
+      if (ctx === undefined || ctx === null) return undefined
+      var key = 'remote.' + name
+      if (typeof ctx.get === 'function') {
+        try {
+          var found = ctx.get(key)
+          if (found !== undefined && found !== null) return found
+        } catch (error) {
+          // 落到下面的兜底
+        }
+      }
+      // 兜底：gateway 服务自己维护着 namespaces 表（namespace → { service }）。
+      var gateway = remoteOf(ctx)
+      if (gateway && gateway.namespaces && typeof gateway.namespaces.get === 'function') {
+        try {
+          var entry = gateway.namespaces.get(name)
+          if (entry && entry.service) return entry.service
+        } catch (error) {
+          // 忽略
+        }
+      }
+      return undefined
+    }
+
+    /**
      * 挂一个 slot。
      *
      * slot 是 plugin-manager / settings-general 在运行时用 register({children}) 声明出来的，
@@ -853,11 +947,12 @@ window.__ModuleLoader__.load({
      */
     var mountedPromise = null
 
-    function ensureMounted (remote) {
+    function ensureMounted (ctx, remote) {
       if (remote === undefined || remote === null) {
         return Promise.reject(new Error('remote 服务缺席（ctx.remote 拿不到）'))
       }
-      if (remote.ticketPipeline !== undefined) return Promise.resolve(undefined)
+      // 已经挂过了（同名命名空间二次 $mount 会被 gateway 拒绝）⇒ 不用再挂。
+      if (namespaceOf(ctx, 'ticketPipeline')) return Promise.resolve(undefined)
       if (mountedPromise !== null) return mountedPromise
       if (typeof remote['$mount'] !== 'function') {
         return Promise.reject(new Error('remote.$mount 缺席'))
@@ -893,20 +988,49 @@ window.__ModuleLoader__.load({
       // 但模块级 Promise 还在 —— 不清掉的话下一次打开面板会以为「已挂上」而实际没有。
       ctx.effect(function () { return resetMounted }, 'ticket-pipeline: reset remote mount')
 
-      var remote = remoteOf(ctx)
-      diag('remote', remote === undefined || remote === null ? 'absent' : 'present')
+      // remote 不在 apply 时抓成常量：浏览器侧 gateway 的 `remote` 要等
+      // typert + connection 就绪才 provide，常常晚于我们；抓一次就等于永远拿不到。
+      var getRemote = function () { return remoteOf(ctx) }
+
+      // 取命名空间服务。属性式（ctx.remote.settings）在兄弟 fiber 提供的场景下会抛
+      // "cannot get property ... without inject"，必须走 ctx.get。
+      var getNamespace = function (name) { return namespaceOf(ctx, name) }
+
+      // 挂体检通道（幂等）。
+      var ensureRemoteMounted = function () { return ensureMounted(ctx, getRemote()) }
+
+      var initialRemote = getRemote()
+      diag('remote', initialRemote === undefined || initialRemote === null ? 'absent' : 'present')
 
       // 体检通道尽早挂上；失败只记日志，不能让设置表单跟着挂掉。
-      ensureMounted(remote).then(function () {
-        diag('remote-mounted')
-      }, function (error) {
-        var message = error && error.message ? error.message : String(error)
-        diag('remote-mount-failed', message)
-        console.error('[ticket-pipeline] 挂载体检通道失败：' + message)
-      })
+      // remote 缺席时轮询等待（每 500ms，最多 60 次 = 30 秒），拿到就挂。
+      var attempts = 0
+      function tryMount () {
+        attempts += 1
+        var remote = getRemote()
+        if (remote === undefined || remote === null) {
+          if (attempts < 60) { diag('remote-wait', attempts); setTimeout(tryMount, 500); return }
+          diag('remote-absent')
+          console.error('[ticket-pipeline] 挂载体检通道失败：remote 服务缺席（ctx.remote 拿不到）')
+          return
+        }
+        if (attempts > 1) diag('remote-late', attempts)
+        ensureRemoteMounted().then(function () {
+          diag('remote-mounted')
+        }, function (error) {
+          var message = error && error.message ? error.message : String(error)
+          diag('remote-mount-failed', message)
+          console.error('[ticket-pipeline] 挂载体检通道失败：' + message)
+        })
+      }
+      tryMount()
 
       var panel = function (props) {
-        return h(TicketPipelinePanel, Object.assign({}, props, { remote: remote }))
+        return h(TicketPipelinePanel, Object.assign({}, props, {
+          getRemote: getRemote,
+          getNamespace: getNamespace,
+          ensureRemoteMounted: ensureRemoteMounted,
+        }))
       }
 
       // ① 设置对话框里的一节（设置 → 左侧「工单流水线」）。

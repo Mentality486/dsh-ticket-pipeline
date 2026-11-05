@@ -153,39 +153,77 @@ function makeSettingsResponse () {
 
 // ── 假宿主 ────────────────────────────────────────────────────
 
+/**
+ * 假宿主。
+ *
+ * 关键点：**照抄真实 cordis 的服务模型**，不能想当然。
+ *
+ * - 命名空间服务（settings / credentials / ticketPipeline）在真实宿主里不是
+ *   `remote` 对象的属性，而是**兄弟 fiber** 上 provide 的独立服务，服务名叫
+ *   `remote.<ns>`（dsh-api-gateway 的 createNamespace）。
+ * - cordis 的属性访问沿 fiber 链**向上**找 provide 过该名字的 fiber，找不到兄弟 ⇒
+ *   抛 `cannot get property "remote.<ns>" without inject`。真实宿主里官方 bundle
+ *   之所以能写 `ctx.remote.settings`，是因为它们在 inject 里声明了那个名字，
+ *   让 reflect.props 登记过，属性访问才会被转发。
+ * - 插件走的是 `ctx.get('remote.<ns>')`：ctx.get 查全局服务 store，不查 inject、
+ *   不沿 fiber 链 ⇒ 兄弟 fiber provide 的服务照样取得到。
+ *
+ * 所以这里的假宿主必须用 `ctx.get(name)` 能按 'remote.<ns>' 取到服务，
+ * 属性式 `ctx.remote.settings` 反而要**取不到**（取到就说明插件又退回了坏写法）。
+ */
 function makeHost () {
   const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0 }
+  // ctx.get(name) 查的「全局服务 store」。
+  const services = Object.create(null)
+  // gateway 服务自己维护的命名空间表（namespace → { service }）。
+  const namespaces = new Map()
+
+  const settingsNamespace = {
+    describe: async () => makeSettingsResponse(),
+    mutate: async (ns, ops, revision) => {
+      calls.mutate.push({ ns, ops, revision })
+      return { ok: true, value: undefined }
+    },
+  }
+  const credentialsNamespace = {
+    describe: async (refs) => ({
+      ok: true,
+      value: Object.fromEntries(refs.map((ref) => [ref, { configured: ref === 'FEISHU_APP_ID', writable: true }])),
+    }),
+    set: async (ref, value) => { calls.credentialSet.push({ ref, value }); return { ok: true } },
+    unset: async (ref) => { calls.credentialUnset.push(ref); return { ok: true } },
+  }
+
+  // 宿主 dsh-settings-controller 提供的两个命名空间（与插件无关，先就在那儿）。
+  services['remote.settings'] = settingsNamespace
+  services['remote.credentials'] = credentialsNamespace
+
   const remote = {
-    settings: {
-      describe: async () => makeSettingsResponse(),
-      mutate: async (ns, ops, revision) => {
-        calls.mutate.push({ ns, ops, revision })
-        return { ok: true, value: undefined }
-      },
-    },
-    credentials: {
-      describe: async (refs) => ({
-        ok: true,
-        value: Object.fromEntries(refs.map((ref) => [ref, { configured: ref === 'FEISHU_APP_ID', writable: true }])),
-      }),
-      set: async (ref, value) => { calls.credentialSet.push({ ref, value }); return { ok: true } },
-      unset: async (ref) => { calls.credentialUnset.push(ref); return { ok: true } },
-    },
+    namespaces,
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
       check('$mount 收到两个描述符', contribution.descriptors.length === 2, String(contribution.descriptors.length))
-      remote.ticketPipeline = {
+      // 真实 gateway：$mount 会按 namespace 建一根兄弟 fiber，把命名空间服务
+      // provide 成 'remote.ticketPipeline'，并记进自己的 namespaces 表。
+      const service = {
         doctor: async () => {
           calls.doctor += 1
           return { ok: true, value: { ok: true, problems: [], warnings: ['mock 执行器'], text: '【环境体检】通过\n✅ git：可用' } }
         },
         config: async () => ({ ok: true, value: { config: {}, projects: 1 } }),
       }
-      return async () => {}
+      namespaces.set('ticketPipeline', { service })
+      services['remote.ticketPipeline'] = service
+      return async () => {
+        namespaces.delete('ticketPipeline')
+        delete services['remote.ticketPipeline']
+      }
     },
   }
-  return { remote, calls }
+  services.remote = remote
+
+  return { remote, calls, services }
 }
 
 /** 把 bundle 加载进一个受限的 vm 上下文，返回它注册的模块出口。 */
@@ -203,6 +241,9 @@ async function loadBundle () {
       head: { append () {} },
     },
     console,
+    // 插件会等宿主通道就绪（每 500ms 轮询一次），沙箱里没有定时器会直接 ReferenceError。
+    setTimeout,
+    clearTimeout,
   }
   context.globalThis = context
   vm.createContext(context)
@@ -311,11 +352,11 @@ async function main () {
   const registrations = []
   const injects = []
   const dispose = []
-  const services = { remote: makeHost().remote }
   const ctx = {
-    // 真宿主里 ctx.get('remote') 是惰性取服务；这里给出同样的形状。
+    // 真宿主里 ctx.get(name) 查的是全局服务 store：命名空间服务挂在 'remote.<ns>' 下，
+    // 由兄弟 fiber provide。属性式 ctx.remote.settings 在真实宿主里取不到
+    // （兄弟 fiber 不在祖先链上），这里也不提供，避免插件退回坏写法。
     get (name) { return services[name] },
-    remote: services.remote,
     effect (fn) { dispose.push(fn()); return () => {} },
     slots: {
       inject (name, callback) {
@@ -330,8 +371,7 @@ async function main () {
     },
   }
   const host = makeHost()
-  services.remote = host.remote
-  ctx.remote = host.remote
+  const services = host.services
   ctx.calls = host.calls
   await exports.apply(ctx)
 
@@ -394,7 +434,7 @@ async function main () {
   // ③ 点「立即体检」→ 调自建 Remote。
   // apply 里就该把命名空间挂好（面板一打开按钮就能点），不该靠组件 effect 兜底。
   check('apply 里挂载了 ticketPipeline 命名空间（只挂一次）', ctx.calls.mounted === 1, String(ctx.calls.mounted))
-  check('apply 之后命名空间已就绪', ctx.remote.ticketPipeline !== undefined)
+  check('apply 之后命名空间已就绪', services['remote.ticketPipeline'] !== undefined)
   tree = await render(Panel, { view: 'page' })
   const doctor = findButton(tree, '立即体检')
   check('体检按钮可用', doctor.props.disabled === false, String(doctor.props.disabled))
