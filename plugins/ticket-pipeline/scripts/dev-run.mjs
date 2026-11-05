@@ -1241,6 +1241,82 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(opts.statusValues, ['否'], '配置里的状态值集合必须真的到适配器手上')
   })
 
+  await check('recordIds 进得了配置（只处理指定几张工单）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', recordIds: ['rec-a', 'rec-b'] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    assert.deepEqual(result.value.projects[0].match.recordIds, ['rec-a', 'rec-b'])
+  })
+
+  await check('recordIds 写成单字符串也认，且归一成数组', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', recordIds: 'rec-a' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    assert.deepEqual(result.value.projects[0].match.recordIds, ['rec-a'])
+  })
+
+  await check('recordIds 配成空数组要报错（它字面意思是「挑零张」，不能当成「不收窄」）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', recordIds: [] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.issues, '空数组必须被拦下')
+    assert.match(JSON.stringify(result.issues), /recordIds/)
+  })
+
+  await check('不配 recordIds 就别塞进配置（保持适配器缺省不被顶掉）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value)
+    assert.equal(result.value.projects[0].match.recordIds, undefined)
+  })
+
+  await check('buildSourceOptions：飞书项目的 recordIds 一路透到适配器', async () => {
+    const { SOURCES, buildSourceOptions } = await import('../src/index.js')
+    const opts = buildSourceOptions(SOURCES.feishu, {
+      project: {
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', recordIds: ['rec-a'] },
+      },
+      store: { getWatermark: async () => null, saveWatermark: async () => {} },
+      readSecret: async () => 'secret',
+      readLocalFile: async () => ({ data: new Uint8Array() }),
+      config: { safePageRun: 20, goneAfterScans: 3 },
+      log: silent,
+    })
+    assert.deepEqual(opts.recordIds, ['rec-a'], '配置里的收窄名单必须真的到适配器手上')
+  })
+
+  await check('describeConfig 会把收窄名单透出来（排障时先看这一轮在处理哪几张票）', async () => {
+    const { describeConfig } = await import('../src/core/config.js')
+    const described = describeConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', recordIds: ['rec-a'] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.deepEqual(described.projects[0].match.recordIds, ['rec-a'])
+  })
+
   section('12c. 走宿主 shell 时必须显式带 sandboxPolicy（否则无 session 调用拿不到写授权）')
 
   /** 造一个假 shell 服务，记录每次 resolve 收到的请求。 */

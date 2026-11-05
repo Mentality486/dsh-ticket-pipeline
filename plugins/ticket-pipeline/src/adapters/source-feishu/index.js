@@ -23,6 +23,7 @@
  */
 
 import { PipelineError } from '../../contracts/errors.js'
+import { createRecordFilter, resolveRecordIds } from '../../contracts/record-filter.js'
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
 import { IMAGE_MEDIA_TYPES } from '../../contracts/types.js'
 
@@ -255,6 +256,7 @@ function toMillis (value) {
  * @param {(path: string, signal?: AbortSignal) => Promise<{ data: Uint8Array, name?: string }>} [options.readLocalFile] 读本地文件（路径形态截图用）
  * @param {number} [options.safePageRun] 连续多少条已知未变就停（默认 20）
  * @param {number} [options.goneAfterScans] 连续多少轮没出现就退役（默认 3）
+ * @param {string[]|string} [options.recordIds] 只处理这几条工单（收窄开关；不给 = 整张表）
  * @param {() => number} [options.now]
  * @param {string} [options.appIdRef]
  * @param {string} [options.appSecretRef]
@@ -270,6 +272,10 @@ export function createFeishuSource (options = {}) {
   // 常见有「处理中」「否」「待处理」「未处理」……写死一个值，配置写得再对也一张票都收不到。
   // 这里接受一组值（命中任意一个即算「在处理中」），缺省仍是老的那一个，保持既有行为。
   const statusValues = resolveStatusValues(options.statusValues)
+  // 收窄开关：新接一个平台时先挑一单试点，不必一次吃掉整张表。
+  // 名单外的行整行跳过（不收票、不算这轮还在、也不累加「连续没出现」），
+  // 免得把没打算动的旧票误判成已删除。语义见 contracts/record-filter.js。
+  const recordFilter = createRecordFilter(options.recordIds, '飞书工单源 recordIds')
   const getSecret = typeof options.getSecret === 'function' ? options.getSecret : null
   const fetchImpl = typeof options.fetch === 'function' ? options.fetch : globalThis.fetch
   const getWatermark = typeof options.getWatermark === 'function' ? options.getWatermark : null
@@ -307,6 +313,9 @@ export function createFeishuSource (options = {}) {
   // 但页面数量异常时人还是会怀疑参数没生效，因此在建实例时留一行可对账的日志。
   if (typeof options.log === 'function') {
     options.log('feishu 早停阈值生效值', { sourceId, safePageRun: safePageRunLimit })
+  }
+  if (recordFilter.enabled && typeof options.log === 'function') {
+    options.log('飞书 工单收窄生效', { sourceId, recordIds: recordFilter.ids })
   }
 
   if (typeof fetchImpl !== 'function') {
@@ -961,6 +970,9 @@ export function createFeishuSource (options = {}) {
       for (const item of items) {
         const recordId = String(item?.record_id ?? '')
         if (!recordId) continue
+        // 收窄开关：名单外的行整行跳过。必须在 live.add 之前 ——
+        // 名单外的行这一轮「没出现」，但它不是被删了，只是这轮不收它。
+        if (!recordFilter.allows(recordId)) continue
         live.add(recordId)
 
         const fields = item?.fields ?? {}
@@ -1041,6 +1053,9 @@ export function createFeishuSource (options = {}) {
     if (!stopped) {
       for (const [recordId, state] of Object.entries(seen)) {
         if (live.has(recordId)) continue
+        // 收窄名单外的行不参与退役判定：收窄期间它们只是「没被看」，
+        // 累加「连续没出现」会把它们误判成已删除（票被收尾）。
+        if (!recordFilter.allows(recordId)) continue
         state.missingScans = (state.missingScans ?? 0) + 1
         if (state.missingScans >= goneAfterScans) {
           if (!disappeared.includes(recordId)) disappeared.push(recordId)
@@ -1225,7 +1240,7 @@ export function createFeishuSource (options = {}) {
 /**
  * 从项目条目的 `match` 里摘出本适配器用得到的值。
  * @param {any} match 项目条目的 `match` 字段
- * @returns {{ appToken: string, tableId: string, viewId: string, docNamePattern: string, statusValues?: string[] }}
+ * @returns {{ appToken: string, tableId: string, viewId: string, docNamePattern: string, statusValues?: string[], recordIds?: string[] }}
  */
 export function feishuOptionsFromMatch (match) {
   const m = match ?? {}
@@ -1240,6 +1255,10 @@ export function feishuOptionsFromMatch (match) {
   // 免得「空数组」这种空配置反过来把缺省也顶掉。
   if (m.statusValues !== undefined && m.statusValues !== null && m.statusValues !== '') {
     options.statusValues = resolveStatusValues(m.statusValues)
+  }
+  // 收窄开关同理：不写就不透传（空数组是配置错误，由配置层先拦下）。
+  if (m.recordIds !== undefined && m.recordIds !== null && m.recordIds !== '') {
+    options.recordIds = resolveRecordIds(m.recordIds)
   }
   return /** @type {any} */ (options)
 }

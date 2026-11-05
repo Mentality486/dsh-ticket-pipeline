@@ -16,6 +16,8 @@
  * 这一点写在 README 的「已知约束」里，等以后能装依赖了再换成 schemastery。
  */
 
+import { resolveRecordIds } from '../contracts/record-filter.js'
+
 /**
  * 一项配置的声明。
  *
@@ -57,6 +59,10 @@
  * @property {string} [statusColumn] 「是否处理」列名（wps 平台）
  * @property {string} [statusValue] 收票的状态值（wps 平台单值形态；飞书用 statusValues）
  * @property {string} [mediaPrefix] 截图 fileToken 的前缀（wps 平台）
+ * @property {string[]|string} [recordIds] 只处理这几条工单（收窄开关）。
+ *   写一个或一组 record_id，适配器只收名单里的行；名单外的行整轮跳过，
+ *   连「连续几轮没出现」都不累加，所以不会把没打算动的旧票误判成已删除。
+ *   不给 = 收整张表（既有行为）。空数组是配置错误（会被拦下），不是「不收窄」。
  */
 
 /**
@@ -505,6 +511,17 @@ function validateProject (raw, index) {
     }
   }
 
+  // 收窄开关：只处理指定几张工单。空数组必须报错 —— 它字面意思是「挑零张」，
+  // 若当成「不收窄」等于把闸门反锁（收下整张表）。
+  if (match.recordIds !== undefined && match.recordIds !== null) {
+    try {
+      const ids = resolveRecordIds(match.recordIds)
+      if (Array.isArray(ids) && ids.length > 0) value.match.recordIds = ids
+    } catch (error) {
+      fail('match.recordIds', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   // 金山文档（wps）专属的定位字段：组合根不认识它们，由适配器自己翻译（ADR-0001）。
   for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
     const item = match[key]
@@ -784,6 +801,8 @@ export function describeConfig (config) {
     if (typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0) out.match.docNamePattern = match.docNamePattern
     // 状态值集合要透出来：排障时先看「到底按哪些值收票」，再看别的。
     if (Array.isArray(match.statusValues) && match.statusValues.length > 0) out.match.statusValues = match.statusValues
+    // 收窄名单同样要透出来：排障时先确认「这一轮到底在处理哪几张票」。
+    if (Array.isArray(match.recordIds) && match.recordIds.length > 0) out.match.recordIds = match.recordIds
     // 金山文档的定位字段（非敏感，直接给）
     for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
       if (typeof match[key] === 'string' && match[key].length > 0) out.match[key] = match[key]

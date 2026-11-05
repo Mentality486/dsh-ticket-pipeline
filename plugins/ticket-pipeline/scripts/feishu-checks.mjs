@@ -255,6 +255,8 @@ function makeSource (server, options = {}) {
     // 状态值集合：不同表的约定不一样（「处理中」「否」「待处理」都有），
     // 所以它是可配的；不传就走适配器缺省（IN_PROGRESS_VALUE）。
     statusValues: options.statusValues,
+    // 收窄开关：只收名单里的行。
+    recordIds: options.recordIds,
     getSecret: options.getSecret ?? (async (ref) => (ref === 'FEISHU_APP_ID' ? 'cli_test' : 'secret_test')),
     // 允许用例在 createFakeServer 之外再包一层（比如注入挂起不返回的 fetch 来测超时）。
     fetch: options.fetch ?? server.fetchImpl,
@@ -382,6 +384,96 @@ export async function runFeishuChecks (check) {
     const result = await source.scan(new AbortController().signal)
     assert.equal(result.created.length, 1, '只该收默认的「处理中」那一行')
     assert.equal(result.created[0].recordId, 'rec-progress')
+  })
+
+  await check('收窄开关：只收名单里的行，名单外的整行不进来', async () => {
+    const server = createFakeServer({
+      rows: [
+        makeRow('rec-a'),
+        makeRow('rec-b'),
+        makeRow('rec-c'),
+      ],
+    })
+    const { source } = makeSource(server, { recordIds: ['rec-b'] })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '只有名单里那一行该进来')
+    assert.equal(result.created[0].recordId, 'rec-b')
+  })
+
+  await check('收窄开关：单值形态（写一个字符串）也认', async () => {
+    const server = createFakeServer({ rows: [makeRow('rec-a'), makeRow('rec-b')] })
+    const { source } = makeSource(server, { recordIds: 'rec-a' })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.equal(result.created[0].recordId, 'rec-a')
+  })
+
+  await check('收窄开关：不给就等于不收窄（整张表照收，不回归旧行为）', async () => {
+    const server = createFakeServer({ rows: [makeRow('rec-a'), makeRow('rec-b')] })
+    const { source } = makeSource(server)
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 2, '没配收窄就该收下整张表')
+  })
+
+  await check('收窄开关：名单外的行不进水位，也不会被误判成「已删除」', async () => {
+    // 为什么：收窄期间名单外的行这一轮「没出现」，但它不是被删了。
+    // 若照样累加 missingScans，扫过 goneAfterScans 轮后它会被标成 gone（票被收尾），
+    // 而人根本没打算动它。
+    const server = createFakeServer({ rows: [makeRow('rec-keep'), makeRow('rec-other')] })
+    const { source, watermark } = makeSource(server, { recordIds: ['rec-keep'], goneAfterScans: 2 })
+    const signal = new AbortController().signal
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 1)
+    assert.equal(first.disappeared.length, 0)
+    assert.equal(watermark.seen['rec-other'], undefined, '名单外的行整轮跳过，不进水位')
+
+    // 第二轮起：名单外的行不再返回（模拟它在表里被移走），但名单里的还在。
+    server.state.rows = server.state.rows.filter((row) => row.record_id === 'rec-keep')
+    const second = await source.scan(signal)
+    assert.equal(second.disappeared.length, 0, '名单外的行不该被退役')
+    const third = await source.scan(signal)
+    assert.equal(third.disappeared.length, 0, '连续多轮也不该退役')
+  })
+
+  await check('收窄开关：先不收窄建好水位、再打开收窄，旧的名单外票不会被收尾', async () => {
+    // 为什么：收窄通常是「先跑一阵子，再挑一单试点」时才打开的。
+    // 这时水位里已经有别的票了；若收窄让它们开始累积「连续没出现」，
+    // 几轮之后那些根本没打算动的票会被标成 gone（票被收尾，等于被人悄悄处理掉了）。
+    const server = createFakeServer({ rows: [makeRow('rec-keep'), makeRow('rec-other')] })
+    const watermark = { seen: {}, lastScanAt: 0 }
+    const signal = new AbortController().signal
+
+    const wide = makeSource(server, { watermark, goneAfterScans: 2 })
+    await wide.source.scan(signal)
+    assert.ok(watermark.seen['rec-other'], '不收窄时，别的行也要记进水位')
+
+    server.state.rows = server.state.rows.filter((row) => row.record_id === 'rec-keep')
+    const narrow = makeSource(server, { watermark, recordIds: ['rec-keep'], goneAfterScans: 2 })
+    const second = await narrow.source.scan(signal)
+    assert.equal(second.disappeared.length, 0, '收窄期间，名单外的旧票不该被退役')
+    const third = await narrow.source.scan(signal)
+    assert.equal(third.disappeared.length, 0, '连续多轮也不该退役')
+    assert.ok(watermark.seen['rec-other'], '名单外的旧票还留在水位里，没被收尾')
+  })
+
+  await check('收窄开关：名单里的行真被删了，照样会退役', async () => {
+    const server = createFakeServer({ rows: [makeRow('rec-keep')] })
+    const { source } = makeSource(server, { recordIds: ['rec-keep'], goneAfterScans: 2 })
+    const signal = new AbortController().signal
+    await source.scan(signal)
+    server.state.rows = []
+    const second = await source.scan(signal)
+    assert.equal(second.disappeared.length, 0, '第一轮只算一次')
+    const third = await source.scan(signal)
+    assert.deepEqual(third.disappeared, ['rec-keep'], '连续两轮不见就该退役')
+  })
+
+  await check('收窄开关：空数组是配置错误，不能当成「不收窄」把整张表收下', async () => {
+    const server = createFakeServer({ rows: [makeRow('rec-a')] })
+    assert.throws(
+      () => makeSource(server, { recordIds: [] }),
+      (error) => error.kind === 'invalid-input' && /recordIds/.test(error.message),
+    )
   })
 
   await check('水位推进：没变不重复入队，变了才算修订', async () => {
