@@ -51,8 +51,8 @@ lib/
 - **环境体检**：「立即体检」按钮跑 `runDoctor`（与对话里的 `pipeline_doctor` 同一份逻辑），
   结果按「必须修复 / 提醒」分段显示。
 - **凭据**：飞书 App ID / App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token，
-  只写不读回（写入走 `ctx.remote.credentials`，界面只显示「已配置 / 未配置」）。
-- **配置**：按分组渲染 29 个字段，保存走 `ctx.remote.settings.mutate`（写 profile 的
+  只写不读回（写入走 `ctx.get('remote.credentials')`，界面只显示「已配置 / 未配置」）。
+- **配置**：按分组渲染 29 个字段，保存走 `ctx.get('remote.settings').mutate`（写 profile 的
   `cordis.patch.yml`，重启后仍在）。`projects[]` 是结构化数组，不在这张表单里，仍需手改配置（见使用手册 §3）。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
@@ -67,6 +67,17 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 `Cannot read properties of undefined (reading 'meta')`，又被客户端的 `catch` 静默吞掉 ——
 **整块设置面板永远停在 loading，什么也不显示，也不报错**。
 `scripts/client-check.mjs` 的 `checkSchemaEnvelope()` 就是守这一条的（改坏了它会红）。
+
+**命名空间服务一律走 `ctx.get('remote.<ns>')`，不能写 `ctx.remote.<ns>`。**
+`settings` / `credentials` / `ticketPipeline` 三个命名空间是 gateway 装在**兄弟 fiber** 上的
+独立服务（服务名 `remote.<ns>`），不是 `remote` 对象的属性 —— cordis 的属性访问沿 fiber 链
+**向上**找 provide，兄弟不是祖先 ⇒ 抛 `cannot get property "remote.settings" without inject`，
+错误边界把面板接住 ⇒ **整页空白，控制台还只有一行用户看不懂的报错**。
+`ctx.get(name)` 查的是全局服务 store，不查 inject、不沿 fiber 链，兄弟 fiber 提供的服务照样取得到。
+
+反过来，**不能把 `ticketPipeline` 写进 `inject`**：它是我们自己用 `remote.$mount()` 建的，
+写进 inject 等于「等自己把命名空间建出来」⇒ fiber 永远不激活、`apply` 一次都不执行
+（表现：配置页静默全空，「配置」按钮都不出现）。所以 `inject` 里只留 `['slots']`。
 
 ## 三个可替换件
 

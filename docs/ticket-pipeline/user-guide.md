@@ -308,21 +308,33 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 230 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 242 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
 | 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
-| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置 / 项目清单 |
+| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置（29 个字段，6 个分组） |
 | 设置页体检 | 该页点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
 | 设置页保存 | 改任一字段 → 保存 | 提示「已保存」；重启后值还在 |
 | 浏览器端一致性 | `node scripts/client-check.mjs`（开发目录） | `✅ client-check 通过` |
 | 浏览器端冒烟 | `node scripts/client-smoke.mjs`（开发目录） | `✅ client-smoke 通过` |
 
-> **排查：启动时看到 `cannot get property "X" without inject` + `did not activate`？**
-> 这是插件声明的 `inject` 与实际用到的宿主服务不匹配（v0.1.0-test.1 曾因缺 `'timer'` 崩过，已修）。
-> 自检：`src/index.js` 的 `inject` 数组必须覆盖 `ctx.interval`（timer）等全部硬依赖；
-> 弱依赖一律走 `ctx.get(name)` 而不是 `ctx.<name>` 直接属性访问。
+> **排查：看到 `cannot get property "X" without inject`？**
+> 两种成因，处理方式不同：
+>
+> 1. **宿主侧硬依赖没声明**（例如缺 `'timer'`）：`src/index.js` 的 `inject` 数组必须覆盖
+>    `ctx.interval` 等全部硬依赖；漏了会出现 `did not activate ticket-pipeline`。
+> 2. **客户端侧命名空间服务用属性访问**：宿主给的 `settings` / `credentials` / `ticketPipeline`
+>    命名空间服务是**兄弟 fiber** 上的独立服务（服务名 `remote.<ns>`），不是 `remote` 对象的属性。
+>    属性访问沿 fiber 链**向上**找 provide，兄弟不是祖先 ⇒ 抛这个错 ⇒ 配置页被错误边界接住，
+>    **整页空白、控制台只有一行看不懂的报错**。正确写法是一律 `ctx.get('remote.<ns>')`
+>    （查全局服务 store，不查 inject、不沿 fiber 链）。
+>
+> 另外：命名空间服务**不要写进 `inject`** —— 我们自己的 `ticketPipeline` 是用 `remote.$mount()`
+> 建的，写进 inject 等于等自己把它建出来，fiber 永远不激活、配置页静默全空。
+>
+> 自检：`node scripts/client-smoke.mjs` 的假宿主照抄了真实 cordis 的服务模型
+> （`ctx.get('remote.<ns>')` 取得到、属性式 `ctx.remote.<ns>` 取不到），退回坏写法会当场红。
 
 > 注意：`scripts/` 不进安装包（发布白名单只含 src/lib/locale/icon/patch），
 > 自测命令要在**开发目录** `D:/WorkSpace/dsh-ticket-pipeline/plugins/ticket-pipeline` 下跑。
