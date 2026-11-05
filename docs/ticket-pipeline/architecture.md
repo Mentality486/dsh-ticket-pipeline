@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
-> 状态：设计定稿（对应地图票 #10）；§12A 安全与权限边界按 2026-11-04 的代码状态补写
-> 日期：2026-11-03（§4 / §7.2 / §12A 于 2026-11-04 按实现回填）
+> 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填
+> 日期：2026-11-03（最近一次按实现校准：2026-11-05，基线 HEAD `26f0391`）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -43,10 +43,10 @@
 |---|---|---|
 | 运行形态 | DSH Host 插件常驻，不写独立守护进程 | 地图 Notes |
 | 工单表 | **只读**，绝不回写任何列 | 地图 Decisions（用户 2026-11-03） |
-| 收票信号 | `是否处理 = 处理中`（下拉三值是 / 否 / 处理中） | 地图 Decisions |
+| 收票信号 | 「是否处理」列取值命中 `match.statusValues`（**缺省 `['处理中']`**；真实表用的是「否」，见 §9）。下拉三值是 / 否 / 处理中 | 地图 Decisions + 实表核实 |
 | 代码仓库 | 项目清单维护在 `projects[]` 配置，每项目一个仓库 | 地图 Decisions |
 | MR | 只开 draft，绝不自动合并；基准/目标分支由项目 `repo.baseBranch`/`repo.targetBranch` 决定 | 票 `04` + 用户拍板 |
-| 通知 | `PushAdapter` 可替换，默认 PushPlus `channel=clawbot` | 票 `07` |
+| 通知 | `PushAdapter` 可替换：PushPlus（`channel=clawbot` 中继微信）/ QQ 邮箱 SMTP 直发 / mock；默认 PushPlus | 票 `07` + 实现补充 |
 | 并发 | 串行，并发恒为 1 | 票 `08` |
 | 超时 | 超时只报给人，**不自动重试** | 票 `08` |
 
@@ -66,8 +66,8 @@
               │TicketSource│ │RepoLocator│ │WorkExec│ │PushAdapter│
               └─────┬──────┘ └─────┬─────┘ └──┬─────┘ └┬──────────┘
                     │              │          │        │
-              飞书 / WPS         projects[]   agent    PushPlus
-              / mock             查表         + MR      / mock
+          飞书 / WPS / webform   projects[]   agent    PushPlus
+              / mock             查表         + MR      / qqmail / mock
 ```
 
 内核**四个接口都要用，一个都不实现**。它不知道飞书长什么样、不知道 GitLab 的 URL 怎么拼、不知道该改哪个文件。它只知道：拿到票 → 建工作区 → 让执行器干活 → 把结果推出去 → 记住进度。
@@ -123,13 +123,20 @@ export async function apply (ctx, config) {
 
 所有注册都用 `ctx.effect()` / 返回 disposer 的形式 —— 插件卸载时定时器、监听器、agent 句柄一起收干净。
 
-**`inject` 为什么只有两个**（见 [`src/index.js:61`](../../plugins/ticket-pipeline/src/index.js)）：
+**`inject` 为什么只有三个**（`export const inject = ['tools', 'storageDomain', 'timer']`，
+见 [`src/index.js:71`](../../plugins/ticket-pipeline/src/index.js)）：
 
 | 宿主服务 | 取法 | 为什么 |
 |---|---|---|
-| `tools` | `inject` | 注册四个工具，缺了插件没有入口 |
+| `tools` | `inject` | 注册五个工具，缺了插件没有入口 |
 | `storageDomain` | `inject` | 票据 / 水位 / 租约三张表都在这上面 |
-| `subprocess` | `ctx.get('subprocess')` | 只有「要跑 git」时才需要；取不到就跳过建工作区、不挂清理 |
+| `timer` | `inject` | `ctx.interval` 是唯一的默认入口；**宿主 sandbox 的白名单只放行 TIMER_VERBS**，不声明 timer 插件一激活就崩 |
+| `subprocess` | `ctx.get('subprocess')` | 老宿主上跑 git 的兜底；现在首选 `shell` |
+| `shell` | `ctx.get('shell')` | git 与 verify 命令走它（能带 sandboxPolicy），缺了退回 `subprocess` |
+| `agents` | `ctx.get('agents')` | `workExecutor: 'agent'` 才需要 |
+| `agentDefaultModel` | `ctx.get('agentDefaultModel')` | 配置里没写 provider/model 时，用它补齐（否则宿主 persona 的 `{{model}}` 没值直接崩） |
+| `agentPresets` | `agentCtx.get('agentPresets')`（在 setup 回调里） | 给 agent 挂 preset；缺了就是「agent 一个工具都没有」，现在直接抛 invalid-input |
+| `logger` | `ctx.get('logger')` | 弱取，拿不到就用 console |
 | `credentials` | `ctx.get('credentials')` | 凭据可能还没配，缺了应该让飞书那一路报 `auth`，不该让整个插件挂载失败 |
 | `fs` | `ctx.get('fs')` | 只有路径形态的截图要读本地字节 |
 | `attachments` | `ctx.get('attachments')` | 离线自测没有附件库，`saveImage` 要能降级成 `undefined` |
@@ -171,7 +178,7 @@ async function tick () {
 - 内存布尔 `running` —— 防同进程内定时器重入
 - 存储层租约 —— 防多个 Harness 窗口抢同一张票（见 §6.5）
 
-**四个工具**（都注册在 `apply` 里，见 [`src/index.js`](../../plugins/ticket-pipeline/src/index.js)）：
+**五个工具**（都注册在 `apply` 里，见 [`src/index.js`](../../plugins/ticket-pipeline/src/index.js)）：
 
 | 工具 | 作用 | 关键边界 |
 |---|---|---|
@@ -179,8 +186,9 @@ async function tick () {
 | `pipeline_status` | 只读查队列与历史 | 不改任何状态 |
 | `pipeline_cancel` | 取消当前在跑的那一票 | 落 `failed` + `lastError='cancelled by user'`，**不通知**，工作区保留；空闲时返回 `cancelled:false` |
 | `pipeline_reset` | 人工重开一张卡住的票 | 只对 `failed` / `needs-info` / `gone` 生效；同名 recordId 冲突时要求补 `projectId`，不猜 |
+| `pipeline_doctor` | 环境体检（只读） | 查 git 链路 / 每个项目仓库能否 `ls-remote` / 凭据有没有 / 执行器与通知器配的是哪个；不改任何东西 |
 
-`pipeline_reset` 与「把表格里『是否处理』拨走再拨回『处理中』」是**同一个底层动作**（`store.resetByHuman`），区别只在于一个在表格里做、一个在插件里做。
+`pipeline_reset` 与「把表格里『是否处理』拨走再拨回 `statusValues` 里的值」是**同一个底层动作**（`store.resetByHuman`），区别只在于一个在表格里做、一个在插件里做。
 
 ---
 
@@ -345,6 +353,13 @@ export type ExecResult = {
 
 **`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然开 draft MR，但**必须把原因写进 MR 描述**，不能默默略过 —— 人看到 draft MR 才知道「这个改动没被真跑过」。
 
+**`onPhase` 的第二个参数是给人看的说明，不是落库补丁**：`scheduler` 只对对象形态的参数调
+`store.setPhase(phase, patch)`；字符串会被当成 detail 写进日志。踩过的坑：早先 `scheduler` 把字符串
+原样传给 `setPhase`，而 `setPhase` 用 `Object.entries(patch)` 展开 → 字符串被摊成 `{0:'跑',1:'项',…}`
+写进票据行（存储里多出 18 个数字键字段）。现在 `store.setPhase` 第一行就拒绝非对象补丁。
+
+**「值得重试的外部失败必须抛，不要包成 `phase:'failed'` 结果」** —— 理由见 §8.4。
+
 ### 5.5 `PushAdapter` — 消息怎么送出去
 
 ```ts
@@ -377,6 +392,14 @@ export type PushReceipt = {
 
 **为什么只有 `send` 一个方法**：通知是单向的。人在微信里回复「这个不对」属于**双向通道**，明确在 `## Out of scope` 之外（见地图 `Not yet specified`）。
 
+**三种实现怎么填 `accepted` / `traceId`**：
+
+| 实现 | `accepted` | `traceId` |
+|---|---|---|
+| `pushplus` | HTTP 200 且 `code===200`（只是受理） | PushPlus 的流水号 |
+| `qqmail` | SMTP 的 `250` 受理（对端 `accepted:true`） | 服务端返回的消息号（`<...@qq.com>` 形态），出问题时拿它查日志 |
+| `mock` | 恒 true | 本地生成，自测用来断言「确实推了」 |
+
 ---
 
 ## 6. 数据契约
@@ -386,6 +409,7 @@ export type PushReceipt = {
 内核只读，由 `TicketSource` 构造。
 
 ```ts
+// 说明：本文件里字段顺序与 src/contracts/types.js 的 typedef 一致，改代码时同步改这里。
 export type Ticket = {
   recordId: string           // 平台侧稳定标识（飞书 = recXXXXXXXX）。**平台内唯一**，跨项目靠 projectId 复合
   projectId: string          // 所属项目（对应 projects[].name），复合主键的一半
@@ -396,6 +420,8 @@ export type Ticket = {
   description: string        // 问题描述（必需，空则票无效）
   foundAt?: string           // 发现日期（ISO 日期串，不带时区）
   module?: string            // 模块（平台原值，不参与定位，仅进指纹与 prompt）
+  targetProject?: string     // 工单里写的「待修改项目」原值（表格列），仅进 prompt
+                             // **不能顶掉 projectId**：那是存储主键的一半，而这一列是人手填的自由文本
   flow?: string              // 操作流程
   screenshots: ScreenshotRef[]
   priority?: 'high' | 'medium' | 'low'
@@ -565,7 +591,7 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 **回退路径**（`recover.js`，§7.6）：`worktreePath` 不在时优先退到 `worktree-ready`；
 若当前 phase 不允许（实际不会发生，上表每个中间态都允许），再退一步回 `pending` 并清掉工作区坐标。
 
-**人工重开有两个入口、同一个动作**（`store.resetByHuman`）：表格里「是否处理」由非处理中 → 处理中，
+**人工重开有两个入口、同一个动作**（`store.resetByHuman`）：表格里「是否处理」由非收票值 → 收票值，
 或直接调 `pipeline_reset` 工具（§4.3）。
 
 ### 7.3 非法转移（实现时必须拒绝并记日志）
@@ -592,7 +618,8 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 同一 `recordId` 下一轮扫描见 `phase = failed` → **直接跳过**，不再入队。
 
-**唯一的重开路径**是人工重置：人把表格里「是否处理」从别的值拨回 `处理中`。内核据此把 `attempt` 归零、回到队列。这条路径的存在让「不自动重试」不会变成死局。
+**唯一的重开路径**是人工重置：人把表格里「是否处理」从别的值拨回 `statusValues` 里的值（缺省 `处理中`），
+或在插件里调 `pipeline_reset`。内核据此把 `attempt` 归零、回到队列。这条路径的存在让「不自动重试」不会变成死局。
 
 ### 7.5 人工中断
 
@@ -609,7 +636,7 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 1. 读 `TicketRecordRow` 里 `phase ∉ TERMINAL` 的全部记录
 2. 对每条：
    - `worktreePath` 存在且 `git -C <path> rev-parse --is-inside-work-tree` 通过 → 从当前 phase 接着走
-   - `worktreePath` 不存在 → 重新 `worktrees.create`，phase 回退到 `worktree-ready`（不可复用脏状态）
+   - `worktreePath` 不存在 → 重新 `git worktree add`（组合根的 `prepareWorkspace`），phase 回退到 `worktree-ready`（不可复用脏状态）
    - 分支已被删 / 已被改 → 重建，不重用
 3. **不从头重跑**：已经改过的文件不重改，已经开过的 MR 不重开（先查 `merge_requests?source_branch=X&state=opened`）
 
@@ -656,6 +683,27 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 `level` 约定：`info` = done/skipped，`warn` = 超时 / needs-info / 需人介入，`error` = failed。
 
+### 8.4 重试只认「抛出的错误」（实现约束，改代码前必读）
+
+`scheduler` 的重试分档**只走 catch 分支**：
+
+1. 租约丢了 → 回 `pending`，不通知；
+2. `aborted` / 超时 → `failed`（超时才通知）；
+3. 其它 → `attempt + 1`；`retryable && attempt < maxAttempts` 时回 `pending` +
+   `enqueuedAt = now + backoff`，否则 `failed` + 通知。
+
+**执行器「返回一个 `phase: 'failed'` 的结果」不经过这套分档** —— 那只是「这票做不了」，直接被 `setPhase(failed)` + 通知，不进退避队列。
+
+所以 `executor-agent` 必须把「值得重试的外部失败」**抛出去**，而不是包成结果返回。已知的那一条就踩过坑：上游模型 429 配额耗尽被误报成「agent 没有产生任何文件改动」且标 `retryable:false`，于是票直接判死、也不会退避重试。现在的做法是：
+
+- `agent-failure.js` 从 `agent.ctx.on('agent/error')` 与 `agent.session.log` 里最后一条
+  `turn/end` 的 `reason.error` 读出真实失败（`code` ∈ `RATE_LIMIT` / `QUOTA` / … 或文案命中
+  429 / quota_exceeded / 被限流）；
+- 判定为限流 → `throw PipelineError('rate-limit')`（退避重试）；其余 → `internal`；
+- 「最后一轮不是 error」时**不翻旧账**，避免拿上一次失败冤枉这一轮。
+
+改动这一块时的验收：`scripts/gitlab-checks.mjs` 里有「最后一轮成功就不该被更早那轮的失败冤枉」与「限流要抛而不是返回 failed」两组断言。
+
 ---
 
 ## 9. `Config` 全量
@@ -670,18 +718,36 @@ export const Config = {
   projects: Array<{
     name: string               // 项目唯一标识 = ticket.projectId
     description?: string       // 项目描述，进 agent 定位提示
-    match: {                   // 工单表怎么定位（表级绑定）
-      platform: 'feishu' | 'wps' | 'mock'
+    match: {                   // 工单表怎么定位（表级绑定）；各平台专有键见下
+      platform: 'feishu' | 'wps' | 'mock' | 'webform'
+      // ── 飞书 ──
       appToken?: string        // 飞书多维表格 app_token（显式绑定）
       tableId?: string         // 飞书数据表 id（与 appToken 一起用）
       viewId?: string          // 可选：只扫某个视图
       docNamePattern?: string  // 文件名模糊匹配（无显式绑定时的兜底）
+      // ── 收票语义（飞书 / WPS 共用）──
+      statusValues?: string[]  // 「在处理中」的状态取值集合，默认 ['处理中']
+                               // 真实表下拉是 是/否/处理中，试点时配 ['否']
+      recordIds?: string[]     // 收窄到指定工单（缺省=不收窄）。空数组是配置错误
+                               // 语义：名单外的行整行跳过，不收票也不进水位
+      allowedImageHosts?: string[] // url 形态截图的主机白名单；缺省为空 = 一律拒绝
+      // ── 金山文档 ──
+      sheetUrl?: string        // 共享链接，适配器会用全局 fetch 直接下 xlsx（大概率要登录态）
+      sheetName?: string
+      statusColumn?: string    // 状态列列名，默认「是否处理」
+      statusValue?: string     // 单值形态的 statusValues（等价写法）
+      mediaPrefix?: string     // 截图表里相对路径的前缀
     },
     repo: {
       path: string             // 本地 git 检出根目录（必填）
       remote?: string          // GitLab remote URL（开 MR 用）
       baseBranch?: string      // 切 worktree 的基准分支（不填则自动识别：origin/HEAD → 当前分支 → main）
       targetBranch?: string    // draft MR 目标分支（默认同 baseBranch）
+      gitlab?: {               // 自建站点坐标（不填则从 remote URL 里解析）
+        baseUrl?: string       // 例如 http://gitlab.example.com
+        remote?: string        // 可覆盖 repo.remote
+        projectId?: number | string // 数字优先，其次是 group/sub/repo 路径
+      },
     },
     verify?: {
       build?: string           // 构建命令（如 npm run build），空串跳过
@@ -697,6 +763,7 @@ export const Config = {
 
   // ── 租约与重试 ──────────────────────────────────────
   leaseTtlMinutes: number,       // 默认 10，1..60
+  leaseHeartbeatSeconds: number, // 默认 60，1..1800（跑票期间续租的间隔）
   maxAttempts: number,           // 默认 2，1..5
 
   // ── 执行 ────────────────────────────────────────────
@@ -709,11 +776,19 @@ export const Config = {
   // ── agent 与模型 ────────────────────────────────────
   provider: string,              // 默认 'workbuddy'
   model: string,                 // 默认 ''（留空 = 跟随会话默认模型；钉死某个模型会在它被限流时让流水线全灭）
-  maxTokens: number,             // 默认 32000
+  maxTokens: number,             // 默认 32000，1024..200000
+  agentPreset: string,           // 默认 'ptc'；空串 = 不挂 preset（agent 会一个工具都没有）
 
   // ── 通知 ────────────────────────────────────────────
   pushAdapter: 'mock' | 'pushplus' | 'qqmail', // 默认 pushplus
-  pushplus: { token, channel, template },
+  pushplus: { token, channel, template, callbackUrl },
+  qqmail: {                      // QQ 邮箱 SMTP 直发；授权码走 credentials 的 QQMAIL_AUTH_CODE
+    host: string,                // 默认 'smtp.qq.com'
+    port: number,                // 默认 465，1..65535
+    secure: boolean,             // 默认 true（465 走隐式 TLS；587 要设 false）
+    user: string,                // 发件邮箱，例如 3488029716@qq.com
+    to: string,                  // 收件地址（可逗号分隔），微信推送一般用 QQ 邮箱→微信提醒
+  },
   notifyOn: string[],            // 默认 ['done','skipped','failed','needs-info']
 
   // ── 杂项 ────────────────────────────────────────────
@@ -734,48 +809,83 @@ export const Config = {
 ```
 src/
 ├── core/                          ← 内核：换平台时一行不改
-│   ├── scheduler.js               ← tick、单飞、队列、超时、清理
+│   ├── scheduler.js               ← tick、单飞、队列、租约续期、超时、清理
 │   ├── store.js                   ← storageDomain 封装、phase 转移、租约
 │   ├── recover.js                 ← 启动恢复（扫未完成票）
-│   └── prompt.js                  ← 给 agent 的 task 文案拼装
+│   ├── config.js                  ← Config 校验（CONFIG_FIELDS + projects[]）
+│   ├── domain.js                  ← 平台无关的小工具（ID 归一、时间等）
+│   ├── branch-name.js             ← 分支名 sanitize
+│   ├── prompt.js                  ← 给 agent 的 task 文案拼装（纯文本 + 图片块）
+│   └── prompts.js                 ← 插件自带的提示词片段（面板/工具文案）
 ├── contracts/                     ← 只有类型与错误类，不 import 任何东西
 │   ├── errors.js                  ← PipelineError + ErrorKind
-│   ├── ticket-source.js           ← TicketSource / ScanResult
+│   ├── ticket-source.js           ← TicketSource / ScanResult / makeTicket
 │   ├── repo-locator.js            ← RepoLocator / LocateResult
 │   ├── work-executor.js           ← WorkExecutor / ExecCtx / ExecResult / Plan
 │   ├── push-adapter.js            ← PushAdapter / NotifyMessage / PushReceipt
-│   └── types.js                   ← Ticket / ScreenshotRef / Phase
+│   ├── record-filter.js           ← recordIds 收窄开关（resolve/create）
+│   └── types.js                   ← Ticket / ScreenshotRef / Phase / 状态机
 ├── adapters/                      ← 唯一允许按平台改的地方
 │   ├── source-mock/               ← 内存里造票，用于开发与自测
-│   ├── source-feishu/             ← 飞书多维表格（票 12）
-│   ├── source-wps/                ← 金山文档（第二平台，暂不实现）
+│   ├── source-feishu/             ← 飞书多维表格（分页 + 水位 + 指纹 + 截图）
+│   ├── source-wps/                ← 金山文档（xlsx/zip 自解析 + 可选 sheetUrl 取数）
+│   │   ├── index.js               ← 平台适配（扫表、收票、截图归一）
+│   │   ├── xlsx.js                ← 零依赖 xlsx 解析（表头定位、列别名、行号 recordId）
+│   │   └── zip.js                 ← 零依赖 zip 解包
+│   ├── source-webform/            ← 网页表单（内存 records，最小实现）
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
-│   ├── executor-agent/            ← agent 驱动 + 构建 / 单测 / 起后端 + 开 MR（目前是占位实现）
-│   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端（executor-agent 落地时使用）
-│   └── push-pushplus/             ← PushPlus channel=clawbot
+│   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 用 Commits API 开 draft MR
+│   │   ├── index.js               ← 主流程（起 agent、preset、collect、verify、MR）
+│   │   └── agent-failure.js       ← 从 session.log / agent/error 里读真实失败原因
+│   ├── executor-mock/             ← 不发真改动的执行器，自测用
+│   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端
+│   ├── push-pushplus/             ← PushPlus channel=clawbot
+│   ├── push-qqmail/               ← 零依赖手写 SMTP（QQ 邮箱直发）
+│   └── push-mock/                 ← 记录推送内容的假适配器
+├── remote/                        ← 面板侧调用宿主工具的薄壳
+│   ├── descriptors.js
+│   └── host.js
 ├── tools/
 │   ├── pipeline-scan.js           ← 工具 pipeline_scan
 │   ├── pipeline-status.js         ← 工具 pipeline_status（只读查询队列与历史）
 │   ├── pipeline-cancel.js         ← 工具 pipeline_cancel（人工取消在跑的那一票）
 │   ├── pipeline-reset.js          ← 工具 pipeline_reset（人工重开 failed / needs-info / gone）
+│   ├── pipeline-doctor.js         ← 工具 pipeline_doctor（环境体检：git / 仓库 / 凭据 / 通知）
 │   └── define.js                  ← 工具定义的最小封装（名字校验、文本块渲染）
-└── index.js                       ← 组合根：注册表 + apply
+└── index.js                       ← 组合根：三张注册表 + 能力装配器 + apply
 ```
 
 ### 注册表（`src/index.js`）
 
 ```js
-import { createMockSource }     from './adapters/source-mock/index.js'
-import { createFeishuSource }   from './adapters/source-feishu/index.js'
-import { createTableLocator }   from './adapters/locator-table/index.js'
-import { createAgentExecutor }  from './adapters/executor-agent/index.js'
-import { createPushplus }       from './adapters/push-pushplus/index.js'
+// 1) 能力装配器：内核能代办的通用能力，适配器只用字符串声明自己要不要
+export const CAPABILITY_ASSEMBLERS = {
+  watermark:  (deps) => ({ getWatermark, saveWatermark }),        // 水位落盘
+  secret:     (deps) => ({ getSecret: deps.readSecret }),          // 密钥现取
+  localFile:  (deps) => ({ readLocalFile: deps.readLocalFile }),   // 路径形态截图
+  scanTuning: (deps) => ({ safePageRun, goneAfterScans }),         // 扫描节流两个数
+}
 
-const SOURCES   = { mock: createMockSource, feishu: createFeishuSource }
-const EXECUTORS = { mock: createMockExecutor, agent: createAgentExecutor }
-const PUSHES    = { mock: createMockPush, pushplus: createPushplus }
+// 2) 绑定参数装配器：怎么从 projects[].match 里摘「这个平台怎么定位那张表」
+//    缺省用飞书那套键；新平台字段名不同就在自己那一行写 match 覆盖。
+export const DEFAULT_MATCH_OPTIONS = { build: (match) => feishuOptionsFromMatch(match) }
+
+// 3) 三张静态注册表
+export const SOURCES = {
+  mock:    { capabilities: [], factory: createMockSource },
+  feishu:  { capabilities: ['watermark','secret','localFile','scanTuning'], factory: createFeishuSource },
+  wps:     { capabilities: ['watermark','scanTuning'], factory: createWpsSource,
+             match: { build: (match) => wpsOptionsFromMatch(match) } },
+  webform: { capabilities: [], factory: createWebformSource },
+}
+export const EXECUTORS = { mock: createMockExecutor, agent: createAgentExecutor }
+export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, qqmail: createQqmailPush }
 // 仓库定位器只有 table 一种实现，不是可替换表：直接 createTableLocator({ projects })
 ```
+
+`buildSourceOptions(entry, deps)` 按 `capabilities` 逐个调装配器拼出构造参数：
+**没声明的能力一律不注入**（多余注入只会让「这平台到底依赖什么」变糊，还会把读本地文件、
+读密钥这类宿主能力顺手递给不需要的适配器）。能力名写错只记日志跳过，不拖垮插件。
 
 **为什么是静态表而不是目录自动发现**：
 
@@ -798,7 +908,7 @@ const PUSHES    = { mock: createMockPush, pushplus: createPushplus }
 
 ## 11. 一次完整跑的时序
 
-以「飞书出现一条 `是否处理 = 处理中` 的新行」为例：
+以「飞书出现一条命中 `match.statusValues`（缺省即 `是否处理 = 处理中`）的新行」为例：
 
 ```
 T+0:00  timer.interval 触发 tick()
@@ -814,13 +924,9 @@ T+0:01  drainOne() 取出票A（并发 1，一轮只跑一票）
         ├─ locate = locator.locate(票A)  → { repoPath, baseBranch, targetBranch,
         │                                    candidatePaths:[], ambiguous:false }
         ├─ 若 fetchBeforeCreate → git fetch <项目 baseBranch>
-        ├─ [executor-agent 实现时使用，当前 scheduler 里不存在]
-        │    agent = ctx.agents.create({ sessionId, meta:{cwd: repoPath} })
-        │    wt = await ctx.worktrees.create(agent, { name:'<branchPrefix><projectId>-<recordId>-r1',
-        │                                            from:'<项目 baseBranch>' })
-        │    副作用：**这个 agent 的 cwd** 被切到 wt.path（不是主会话）
-        ├─ 当前实现：组合根的 prepareWorkspace 跑 git fetch + git worktree add，
+        ├─ 组合根的 prepareWorkspace 跑 git fetch + git worktree add，
         │    落到 `<repoPath>/.agents/worktrees/<branch>`；没有 subprocess 时返回 {}，阶段照走
+        │    （早先设想的 ctx.worktrees.create 路子在当前宿主上没有，已改用这条）
         └─ onPhase('worktree-ready') 记 worktreePath/branch/baseCommit（先回填进 ws 再落库，执行器读 ws）
 
 T+0:02  onPhase('planning')，起超时定时器（40 min）
@@ -831,8 +937,10 @@ T+0:02  onPhase('planning')，起超时定时器（40 min）
         ├─ 调 executor.run(ticket, located, ctx)
         │    ctx 里 prompt / content / images 三个都给：老适配器只读 prompt，
         │    新适配器按 content 才看得见图；falsy 的图在 content 里被跳过
-        └─ [executor-agent 实现时使用，当前 scheduler 里不存在] agent.followup(msg)
+        └─ executor-agent 内部：agents.create({ sessionId, meta:{cwd: worktreePath},
+              agentOptions: resolveAgentOptions(config), setup }) → agent.followup(msg)
               ← 必须 followup（inject 不唤醒 agent）
+             setup 里做三件事：挂 preset、追加 sandbox/mode 与 approval/policy、钉 workingDirectory
 
 T+0:03  … agent 在 wt.path 里读代码、定位、规划
         └─ 报「定位完成」→ onPhase('editing')，存 Plan
@@ -953,9 +1061,12 @@ fatal: unable to fork
 
 | 项 | 影响 | 何时定 |
 |---|---|---|
-| Web UI 面板 | 不影响架构，纯增量 | 有人真的想看队列时 |
+| Web UI 面板 | 不影响架构，纯增量（`lib/client.js` 已有设置页三处挂载点） | 有人真的想看队列时 |
 | 多张工单指向同一模块的冲突 | 当前靠串行天然规避，但是「时间换安全」 | 出现真冲突时 |
-| 处理人绑定规则 | 当前不绑（只看 `是否处理`） | 有人抱怨「谁都能被派活」时 |
+| 处理人绑定规则 | 当前不绑（只看 `statusValues`） | 有人抱怨「谁都能被派活」时 |
+| 金山文档的开放平台取数通道 | 现在只能靠 `match.sheetUrl` + 全局 fetch（大概率要登录态），或宿主注入 `fetchSheet` | 要真跑多张金山表时 |
+| 上游模型限流后的自动重试 | 执行器已能识别 429/QUOTA 并抛 `rate-limit`，但重试仍受 `maxAttempts`（默认 2）限制，配额窗口比这长 | 出现连续被限流时 |
+| `recordIds` 是否该进内核 | 现在是适配器层各自实现（飞书/WPS/mock/webform），内核不认识白名单 | 再来两个平台时 |
 | 微信双向回复 | `PushAdapter` 只有单向 `send` | 明确不做，除非需求变了 |
 | 高优先级是否动手前问人 | 当前所有票一视同仁 | 出现高风险票时 |
 | token / 时间预算 | 当前只有总超时，没有 token 上限 | 发现烧太多时 |
@@ -970,7 +1081,7 @@ fatal: unable to fork
 
 ### 12.7 飞书适配器的落地细节（票 `12` 已实现）
 
-实现文件：`plugins/ticket-pipeline/src/adapters/source-feishu/index.js`（790 行）。离线自测在
+实现文件：`plugins/ticket-pipeline/src/adapters/source-feishu/index.js`（1000+ 行）。离线自测在
 `plugins/ticket-pipeline/scripts/feishu-checks.mjs`，跑 `node scripts/dev-run.mjs` 第 9 节。
 
 **认证**：`POST /open-apis/auth/v3/tenant_access_token/internal`，`{app_id, app_secret}`。
@@ -992,12 +1103,14 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 **变更判定用内容指纹，不用 mtime**。指纹只含工单内容（问题描述 / 模块 / 操作流程 / 截图 / 优先级 /
 发现部门），**不含** `是否处理` / 处理人 / 处理结果 / 处理日期 —— 否则人改一次处理人就触发一次修订。
 
-**收票**只认 `是否处理 = 处理中`，不叠加任何别的条件。下拉字段的返回形状不固定（裸字符串 /
+**收票**只认「是否处理」列值命中 `match.statusValues`（缺省 `['处理中']`，真实表是 `['否']`），
+不叠加任何别的条件。`match.recordIds` 是另一层收窄：名单外的行整行跳过、不进水位。
+下拉字段的返回形状不固定（裸字符串 /
 `{text}` / `[{text}]`），**必须先 `normalizeCellText()` 归一再判等**。
 
 **退役有两条路**：①人把 `是否处理` 改成别的值（`否` = 待认领、`是` = 已闭环）→ 立刻退役；
 ②行被删了 → 连续 `goneAfterScans`（默认 3）轮没扫到才退役，静默、不通知、不删历史。
-反过来，人把状态从 `否`/`是` 拨回 `处理中` = 手动重置 → 重新收票。
+反过来，人把状态拨回 `statusValues` 里的值（缺省就是 `处理中`）= 手动重置 → 重新收票。
 
 **绑定工单表有三条路**，任何一步命中 0 张或 >1 张都当**配置错误**（宁可报错让人改配置，
 也不要扫错表把别人的表当工单表）：
@@ -1016,7 +1129,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 |---|---|
 | `attachment{fileToken}` | `GET /open-apis/drive/v1/medias/:file_token/download`（Bearer tenant token） |
 | `path{path}` | `ctx.fs.resolve()` + `ctx.fs.readBytes()`（由组合根注入 `readLocalFile`） |
-| `url{url}` | 裸 `fetch`（**不能**用 `ctx.web.fetch` —— 它带不了凭据） |
+| `url{url}` | 裸 `fetch`，但**先过 `match.allowedImageHosts` 白名单**：缺省为空 = 一律拒绝（截图地址是外部输入，不设白名单等于让填表的人替服务器发任意请求） |
 | `unknown{raw}` | 抛 `invalid-input`，内核标 `needs-info` 让人补图，不阻塞排队 |
 
 取到的字节统一走 `ctx.attachments.saveImage({data, mediaType, name})` → `ImageBlock` → `agent.followup()`。
@@ -1035,6 +1148,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 **绝不写回**：本文件里没有任何对记录的写操作。自测里有一条断言专门盯着这件事 ——
 扫描全程只允许出现 `GET` / `POST /auth/...` / `POST /records/search` 三种请求，
 一旦出现 `records/update|batch_update|delete|create` 就失败。
+（实测过：当前飞书应用对该表只有读权限，写回会返回 `code 91403 Forbidden` ——刚好与「只读」的设计一致。）
 
 ### 12.8 飞书凭据与授权前置
 
@@ -1068,7 +1182,38 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 `app_token` / `table_id`（或一个能唯一匹配到它的 `docNamePattern`）。
 没有这些，自测只能停在打桩层（第 9 节）—— 打桩证明**逻辑**对，不证明**权限通**。
 
----
+### 12.9 金山文档适配器的落地细节（已接线，取数通道待接）
+
+实现文件：`plugins/ticket-pipeline/src/adapters/source-wps/`，三个文件分工明确 ——
+
+| 文件 | 职责 |
+|---|---|
+| `index.js` | 平台适配：扫表、收票、截图归一、水位、`recordIds` 收窄 |
+| `xlsx.js` | 零依赖 xlsx 解析：zip 解包 → 表头定位 → 列别名 → 行号 recordId |
+| `zip.js` | 零依赖 zip 解包（押 `zlib.inflateRawSync`） |
+
+**为什么自己解析 xlsx**：宿主的表格能力不保证在插件进程可用，而金山这条路的输入
+就是「一张导出的 xlsx 字节」。自己解的好处是离线可测、不依赖外部服务。
+
+**取数通道有两个，都靠注入**：
+
+1. `match.sheetUrl` → 适配器用全局 `fetch` 直接下 xlsx。共享链接大概率要登录态，
+   非 2xx 时抛 `invalid-input` 并明确提示「请改用注入 `fetchSheet` 的方式接入」。
+2. 宿主注入 `options.fetchSheet()` 返回字节（或 `{bytes}`），整个替换掉下载这一层。
+
+两者都没有时抛 `MISSING_FETCH_SHEET`（`invalid-input`），**不会静默扫出一张空表**。
+
+**资源标识是行号**：`buildRecordId(rowIndex)` → `'r' + rowIndex`。这是唯一跨轮次稳定、
+又不需要额外状态的东西；代价是插行会让同一条工单换身份（已知缺陷，写在代码注释里）。
+
+**「待修改项目」列进 `ticket.targetProject`，不顶 `projectId`**：`xlsx.js` 的列别名表
+（`['待修改项目','所属项目','项目','系统']`）已经把值读进 `record.projectId`，但那是**表格里
+人手填的自由文本**，而 `Ticket.projectId` 是配置里的项目名、是存储主键的一半。硬顶上去会让
+同一张表的票散到不同主键下，还让「项目 → 本地仓库」的绑定失效。所以它单独走 `targetProject`，
+只进任务书供模型参考。
+
+**能力声明**：`capabilities = ['watermark', 'scanTuning']` —— 金山这条路不需要密钥，也不读本地文件；
+水位必须落盘（否则重启后整张表当新票重收），扫描节流两个数来自全局配置。
 
 ## 13. 事实来源
 
@@ -1084,3 +1229,8 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | 微信推送（WorkBuddy 排除 / PushPlus） | `.scratch/ticket-pipeline/research/wechat-push.md`（784 行） |
 | `worktrees` 服务契约 | `.scratch/_reference/worktree-README.md`（从 asar 抽出） |
 | 所有决策与用户拍板 | `.scratch/ticket-pipeline/map.md` 的 `## Decisions so far` |
+| QQ 邮箱 SMTP 直发（真实发信已验） | `plugins/ticket-pipeline/src/adapters/push-qqmail/index.js`；自测 `scripts/push-qqmail-checks.mjs` |
+| 宿主 shell / 沙箱 / agent 装配链（asar 解包实读） | `.scratch/_asar/`（`dsh-agent-loop` / `dsh-headless` / `dsh-subagent` / `api-session-controller` 等） |
+| 真实飞书工单表结构与状态分布 | 表 `RZZQbY4SkaY6z0shZaBcVpQCnhh` / `tblWhRSGf0osJqrE`，79 条；「是否处理」分布 是:71 / 否:6 / 处理中:1 / 空:1 |
+| 真实跑通记录（沙盒票 → 真 MR） | `sandbox|rec-mock-001` → GitLab MR !1（draft，source `ticket-sandbox-rec-mock-001-r1` → `main`） |
+| 上游模型限流真因（不是插件缺陷） | agent 会话 `session.v4.jsonl.zstd` 里的 `turn/end` reason：HTTP 429 / `quota_exceeded` |

@@ -1,8 +1,8 @@
 # 工单流水线插件 · 功能清单与完成度
 
 > 生成日期：2026-11-05
-> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 51 次提交，HEAD `5b94a17`），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-05 晚，`5b94a17` 修完 agent 侧四项（模型补齐 / preset 硬闸 / repo.gitlab 透传 / verify 命令引号），自测 230/230 全绿
+> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 53 次提交，HEAD `26f0391`），插件目录 `plugins/ticket-pipeline`
+> 最近一次更新：2026-11-05 晚，`26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配；连同 `5b94a17` 的 agent 侧四项，自测 242/242 全绿
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -11,15 +11,16 @@
 
 骨架和主链路已经成型：**飞书工单表 → 解析工单四要素 → 本地 worktree 改码 → 跑验证 → 开 GitLab draft MR → QQ 邮箱 / PushPlus 通知** 这条链在沙盒项目上真跑通过一次（真实 MR !1，不是假对象）。
 
-但**真实业务项目（mgiot-pms）的工单还没有完整跑绿一次**。截至 `5b94a17`，agent 侧四个挡路的雷已排掉（模型默认补齐、preset 缺服务硬失败、`repo.gitlab` 透传、verify 命令引号），剩下的是：**上游模型配额**（workbuddy 429，非插件缺陷）、**飞书截图白名单没有配置键**、**金山文档源缺开放平台取数通道**、**工单四要素里「待修改项目」在飞书源上没有对应列、在金山源上值被丢弃**。
+但**真实业务项目（mgiot-pms）的工单还没有完整跑绿一次**。截至 `26f0391`，轮子上的雷基本排干净了：agent 侧四项（模型默认补齐、preset 缺服务硬失败、`repo.gitlab` 透传、verify 命令引号）在 `5b94a17` 修完；收窄开关推广到四个源、「待修改项目」列不再被丢弃、飞书截图白名单可配 在 `26f0391` 修完。**剩下真正挡路的只有三样**：**上游模型配额**（workbuddy 429，非插件缺陷）、**金山文档源缺开放平台取数通道**（需金山账号与管理员审批）、**飞书表本身没有「待修改项目」这一列**（平台事实，不是代码缺陷 —— 真实表的列只有序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）。
 
 > 已修（`5b94a17` 入树）：agent 侧四个最挡路的雷 —— ① `{{model}}` 模板崩（新增 `resolveAgentOptions`，配置缺的从宿主 `agentDefaultModel.currentSelection()` 补齐，两项成对下发）② preset 服务缺失只记日志（改为**硬失败** `invalid-input`，把真因暴露出来）③ `repo.gitlab` 被配置校验层吞掉（透传 baseUrl/remote/projectId）④ verify 命令只按空白切（认引号，引号内反斜杠当字面量）。
+> 已修（`26f0391` 入树）：① 收窄开关 `match.recordIds` 从飞书一源推广到**飞书 / 金山 / mock / webform 四个源**（名单外的行整行跳过，不收票也不进水位）② 金山表「待修改项目」列的值不再丢（进 `Ticket.targetProject`，进任务书，但**不顶 `projectId`**）③ 飞书截图外链白名单有了配置键 `match.allowedImageHosts`（缺省依旧全拒，只放行人点名的主机名）。
 
 | 口径 | 完成度 |
 | --- | --- |
 | 按用户 6 条需求逐条算 | 4 条可用 / 2 条部分可用 / 0 条空白 |
 | 按工程完成度（代码 + 自测 + 文档） | 约 75% |
-| 按「能直接上生产接真实工单」算 | 约 55%（agent 侧四个雷已排；剩飞书截图白名单配置键、金山取数通道、「待修改项目」列，以及上游模型配额这种外部因素） |
+| 按「能直接上生产接真实工单」算 | 约 60%（agent 侧四个雷 + 三个源收窄 + 「待修改项目」列 + 截图白名单，共 8 处已修；剩金山取数通道、上游模型配额两项外部依赖，以及真实 pms 票尚未复跑成功一次） |
 | 架构骨架完成度 | 约 85% |
 
 **不需要推倒重来。** 内核（契约 / 存储 / 调度 / 错误模型）已经是零平台知识的干净分层，重构代价远大于补齐缺口。详见第 10 章。
@@ -32,7 +33,7 @@
 | --- | --- | --- | --- | --- |
 | ① | AI 同时监控多个平台（金山共享 Excel、飞书）上的工单表，检测内容变化 | **✅ 可用** | 飞书源 1264 行，已接真实表（appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条记录实测）；金山源 1340 行（xlsx/zip 自解 OOXML）；webform/mock 演示源 | 金山缺开放平台取数通道，只能用注入的 `fetchSheet`；飞书「收票状态值」与真实表语义不一致，已做成可配（`statusValues`） |
 | ② | 可以在插件中配置对应工单的项目本地仓库地址 | **✅ 可用** | `projects[].repo.path` / `remote` / `baseBranch` / `targetBranch` / `gitlab`（baseUrl / projectId / remote），由 `locator-table`（187 行）把工单 projectId 映射到仓库；`repo.gitlab` 已能在配置校验层存活（`5b94a17`） | 无（这项已补齐） |
-| ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `FEISHU_COLUMNS`（描述/操作流程/截图/模块/优先级/发现日期等）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② 金山表该列的值被丢弃，只留在 `raw.cells`；③ URL 形态截图默认全拒（无白名单配置键） |
+| ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `FEISHU_COLUMNS`（描述/操作流程/截图/模块/优先级/发现日期等）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② ~~金山表该列的值被丢弃~~ → **已修（`26f0391`）**：金山表该列的值现在进 `ticket.targetProject` 并写进任务书（不顶 `projectId` —— 那是存储主键的一半，而这一列是人手填的自由文本）；③ ~~URL 形态截图默认全拒、无配置键~~ → **已修（`26f0391`）**：新增 `match.allowedImageHosts` 白名单配置键（缺省仍为空 = 一律拒绝，安全闸门只有人能打开） |
 | ④ | 自主规划并执行修复 | **⚠️ 部分** | `executor-agent` 真实现：`agents.create` + followup + 挂 preset + 钉 cwd + `git diff --name-status` 收集改动 + 敏感文件过滤；沙盒票 `sandbox\|rec-mock-001` 已由 agent 真改出 `src/pagination.js` 并开成 MR !1 | 真实业务票（pms）只在配额上卡过一次；两处宿主侧雷已修（`5b94a17`：`{{model}}` 补齐、preset 缺服务硬失败），但**尚未在真实 pms 票上完整跑绿一次**（上游 workbuddy 429 配额限制，非插件缺陷） |
 | ⑤ | 完成后对问题功能进行测试，自动提交 PR | **✅ 基本可用** | 真跑出 GitLab draft MR `http://gitlab.example.com/mk/end/ticket-pipeline-sandbox/-/merge_requests/1`（sha `634777aa…`，changes_count=1，源分支 `ticket-sandbox-rec-mock-001-r1`）；验证命令从 `projects[].verify.build/test` 注入，`verify.test` 真跑出 exit 0 | 没配验证命令时 `phase` 仍是 `done`（契约里 `skipped` 是合法成功路径），现在把验证结论写在 `plan.summary` 最前面以免误读（`5b94a17`）；要彻底区分得新增 phase，属契约变更 |
 | ⑥ | 通过微信 Clawbot 推送或 QQ 邮箱推送（先实现）完成通知，收到后看 PR 详情，人工验证后手动合并 | **✅ QQ 邮箱可用；微信走中继** | QQ 邮箱零依赖 SMTP 适配器（574 行）已真实发信成功（traceId `<mw319ltk.47861f8c479221d3@qq.com>`）；PushPlus 适配器 171 行 | 插件**不直连微信**：微信消息经 PushPlus 的 `clawbot` 渠道中继，需配 `pushplus.token`；PushPlus 回执未消费 |
@@ -64,24 +65,24 @@
 
 ## 2. 代码清单
 
-`src/` 共 **38 个 .js / 11 717 行**；`scripts/` 共 8 个 .mjs / 6 154 行；`lib/client.js` 959 行（浏览器端设置面板）。
+`src/` 共 **38 个 .js / 11 977 行**；`scripts/` 共 8 个 .mjs / 6 427 行；`lib/client.js` 1 083 行（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 970 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js` |
-| `src/core/` | 2 716 | `scheduler.js`（调度核心）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符）、`recover.js`（启动恢复）、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 5 978 | 见下表 |
+| `src/contracts/` | 974 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js` |
+| `src/core/` | 2 780 | `scheduler.js`（调度核心）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符）、`recover.js`（启动恢复）、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 6 167 | 见下表 |
 | `src/tools/` | 1 038 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
 | `src/remote/` | 151 | `descriptors.js`、`host.js`（宿主 Remote 通道） |
-| 根 | 864 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询） |
+| 根 | 867 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `source-feishu/` | 1 264 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态 |
-| `source-wps/` | 1 340 | **解析可用，取数待接** | `index.js` 401 + `xlsx.js` 750 + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；取数走注入的 `fetchSheet` |
-| `source-webform/` | 97 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」 |
-| `source-mock/` | 257 | 测试 | 离线源 |
-| `executor-agent/` | 1 387 | **真实实现（有 P0）** | 真 agent 改码、收集改动、跑验证、开 draft MR；含 `agent-failure.js` 失败原因识别 |
+| `source-feishu/` | 1 274 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单 |
+| `source-wps/` | 1 360 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet` |
+| `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
+| `source-mock/` | 267 | 测试 | 离线源；也接 recordIds |
+| `executor-agent/` | 1 527 | **真实实现** | 真 agent 改码、收集改动、跑验证、开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 141 | 测试 | 只演不动真格 |
 | `gitlab-client/` | 495 | **真实可用** | Commits API + MR API；源分支已有开放 MR 时复用而不撞 409 |
 | `push-qqmail/` | 574 | **真实可用** | 零依赖手写 SMTP（`node:net` / `node:tls` / `node:crypto`），已实发成功 |
@@ -190,7 +191,8 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` / `tableId` / `viewId` / `docNamePattern` | 飞书表定位 |
 | `match.statusValues` | 收票状态值集合（**可配**：真实表用「否」，缺省「处理中」） |
-| `match.recordIds` | 只处理指定几张工单（收窄开关，**目前只有飞书接了**） |
+| `match.recordIds` | 只处理指定几张工单（收窄开关，**四个源（飞书 / 金山 / mock / webform）都接了**；名单外的行整行跳过，不收票也不进水位） |
+| `match.allowedImageHosts` | URL 形态截图的允许主机名（缺省为空 = 一律拒绝，见 9.1 第 6 条） |
 | `match.sheetUrl` / `sheetName` / `statusColumn` / `statusValue` / `mediaPrefix` | 金山表定位 |
 | `repo.path` | **本地仓库路径**（需求②） |
 | `repo.remote` / `baseBranch` / `targetBranch` | 基准分支与目标分支 |
@@ -287,10 +289,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 边界 | 现状 |
 | --- | --- |
-| 密钥 | 飞书 / GitLab / QQ 授权码走 `ctx.get(credentials)` 现取（`src/index.js:386/408/622`），**不落明文配置**；但 `pushplus.token` 仍是明文配置项（task-17 P1-10） |
+| 密钥 | 飞书 / GitLab / QQ 授权码走 `ctx.get(credentials)` 现取（`src/index.js:386/408/622`），**不落明文配置**；但 `pushplus.token` 仍是明文配置项（见 9.2 第 13 条） |
 | 工单正文不可信 | `core/prompts.js` `UNTRUSTED_TICKET_NOTICE` 拼在消息最前，要求模型把正文当数据、遇到指令就判 `needs-info`（`docs/adr/0003`） |
 | git 写权限 | git / verify 走 `fullAccessSandboxPolicy`（`src/index.js:233-266`），理由见 `docs/adr/0004`：Windows ACL 缺 sessionId 时子进程只读，git 写 `.git/FETCH_HEAD` 会 Permission denied |
-| 截图外链 | URL 形态截图默认**一律拒**（`source-feishu/index.js:302-308`）：截图地址是外部输入，不设白名单等于让填表的人替服务器发任意请求。代价：没有配置键可以放开（见 9.1 第 6 条） |
+| 截图外链 | URL 形态截图默认**一律拒**（`source-feishu/index.js:302-308`）：截图地址是外部输入，不设白名单等于让填表的人替服务器发任意请求。`26f0391` 起可由 `match.allowedImageHosts` 显式放行（**只放行点名的主机名，缺省依旧全拒**） |
 | 仓库定位 | `locator-table` 只做「工单 projectId → 配置里的项目条目」查表，**不做任何「模块名 → 代码路径」的推断**（那类知识装不进通用插件），代码定位交给 agent 现场读仓库 |
 | 坏项目隔离 | `locator-table` 构造期只把坏条目记进 `brokenProjects`、不抛 —— 一个项目配错不会让整条流水线起不来 |
 | 敏感文件 | `executor-agent` 有 `SENSITIVE_FILE_PATTERNS` 白名单过滤，被拦文件**不提交但仍开 MR**；`5b94a17` 起被拦文件名会写进 `plan.summary`（之前只有一行日志） |
@@ -303,7 +305,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **230** | 通过 230，失败 0（2026-11-05 实跑；早期那条受 `spawnSync git EPERM` 限制的用例已随 git 链路改走宿主 shell 而消失） |
+| `node scripts/dev-run.mjs` | **242** | 通过 242，失败 0（2026-11-05 实跑；早期那条受 `spawnSync git EPERM` 限制的用例已随 git 链路改走宿主 shell 而消失） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
 `dev-run.mjs` 分 16 个小节：
@@ -359,7 +361,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 ## 9. 未完成与缺陷清单
 
-下面每一条都定位到了具体文件位置。**「已修（`<commit>`）」= 代码已提交；「已缓解」= 症状减轻但仍非根治；「待修」= 还没人动手。** 所有结论均对照 2026-11-05 工作区源码（HEAD `5b94a17`）核实。
+下面每一条都定位到了具体文件位置。**「已修（`<commit>`）」= 代码已提交；「已缓解」= 症状减轻但仍非根治；「待修」= 还没人动手。** 所有结论均对照 2026-11-05 工作区源码（HEAD `26f0391`）核实。
 
 ### 9.1 P0 —— 挡住真实工单端到端
 
@@ -369,8 +371,8 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 2 | **找不到 agentPresets 服务只记日志继续跑**：agent 起来了但是零工具，改不出任何文件，最后报「没有产生任何文件改动」，真因被埋 | `src/adapters/executor-agent/index.js`（`setupAgent`） | headless profile 必现；桌面 profile 也可能缺 | **已修（`5b94a17`）**：改为抛 `invalid-input` 硬失败并列出该配什么（重试没用，是环境问题） |
 | 3 | **金山文档无开放平台取数通道**：`wpsOptionsFromMatch` 只支持 `sheetUrl` 全局 fetch 下载，缺登录态大概率失败；无开放平台网关接入 | `src/adapters/source-wps/index.js:371-399` | 需求①的「金山」只有解析能力，没有取数能力 | **待修**（需金山账号 + 管理员审批建应用，或注入 `fetchSheet`） |
 | 4 | **`repo.gitlab` 配置被校验层吞掉**：`validateProject` 只复制 `repo.remote/baseBranch/targetBranch`，而 `resolveGitlab` 优先读 `repo.gitlab.baseUrl/projectId` | `src/core/config.js`（`validateProject`） | 自建 GitLab / 子组路径配了也不生效 | **已修（`5b94a17`）**：透传 `baseUrl` / `remote` / `projectId` |
-| 5 | **金山表「待修改项目」列的值被丢弃**：`toTickets` 用的 `projectId` 是源实例项目名，`makeTicket` 不接收该列的值，表格里那列只留在 `raw.cells` | `src/adapters/source-wps/index.js:156-169` | 需求③「待修改项目」在金山侧拿不到 | **待修** |
-| 6 | **飞书 / 金山截图白名单没有配置键**：适配器读 `options.allowedImageHosts`（`source-feishu/index.js:306`），但 `CONFIG_FIELDS` 无此键、`feishuOptionsFromMatch` / `wpsOptionsFromMatch` 都不透传 | `src/adapters/source-feishu/index.js:306`、`src/core/config.js`、`source-wps/index.js:371` | 真实表的截图是文本链接形态 → 取不到图 → 整票转 needs-info（缺省一律拒，且无法从配置放开） | **待修（配置层缺口）** |
+| 5 | ~~**金山表「待修改项目」列的值被丢弃**~~：`toTickets` 用的 `projectId` 是源实例项目名，`makeTicket` 不接收该列的值，表格里那列只留在 `raw.cells` | `src/adapters/source-wps/index.js`（`toTickets` → `targetProject`）、`src/contracts/ticket-source.js` | 需求③「待修改项目」在金山侧拿不到 | **已修（`26f0391`）**：新增 `Ticket.targetProject`，金山该列原值进 `targetProject` 并渲染进任务书；**刻意不顶 `projectId`**（存储主键一半，且该列是人手填的自由文本），任务书里也明确写「不要拿它当目录名直接去改」 |
+| 6 | ~~**飞书 / 金山截图白名单没有配置键**~~：适配器读 `options.allowedImageHosts`（`source-feishu/index.js:306`），但 `CONFIG_FIELDS` 无此键、`feishuOptionsFromMatch` 都不透传 | `src/core/config.js`（`validateProject` / `describeConfig`）、`src/adapters/source-feishu/index.js`（`feishuOptionsFromMatch`） | 真实表的截图是文本链接形态 → 取不到图 → 整票转 needs-info（缺省一律拒，且无法从配置放开） | **已修（`26f0391`）**：新增 `match.allowedImageHosts`，校验层归一化（trim + 小写 + 去重、空集合报错）并透传到适配器；**不给缺省值** —— 安全闸门只有人能打开 |
 
 ### 9.2 P1 —— 影响正确性与可运维性
 
@@ -380,7 +382,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 8 | **没配验证命令却报 done**：「未经验证」和「验证通过」在票面上看不出区别 | `src/adapters/executor-agent/index.js`（`run()` 末尾 `plan.summary`） | 人容易把「完成」误读成「测试过了」 | **已缓解（`5b94a17`）**：`phase` 语义按契约保持不变（`skipped` 是合法成功路径），改为把验证结论写在 `plan.summary` 最前面——通过写「验证通过：…」，没跑/失败写「⚠ 未通过验证（skipped）：…」。彻底区分需要新增 phase，属于契约变更，本轮不做 |
 | 9 | **敏感文件只拦不报**：检出敏感文件改动后票仍按成功开 MR，且只写一行日志 | `src/adapters/executor-agent/index.js`（`run()` 末尾 `plan.summary`） | 人最后只会在 MR 里发现「少改了一个文件」 | **已修（`5b94a17`）**：被拦文件数与文件名写进 `plan.summary`（MR 描述里也带） |
 | 10 | **verify 命令只按空白切**：不识别引号 | `src/adapters/executor-agent/index.js`（`splitCommand`） | Windows 下 `node "C:\Program Files\x\check.mjs"` 起不来 | **已修（`5b94a17`）**：认单双引号；引号内反斜杠一律当字面量（否则路径被吃成 `C:Program Filesx`）；未闭合引号报 `invalid-input` 并降级 `skipped` 而不是 `failed`。仍然**不解释** `&&` / 管道 / 重定向（配置项不该成为 shell 注入面） |
-| 11 | **recordIds 收窄只有飞书接了**：`createRecordFilter` 只被 `source-feishu` 使用 | `src/contracts/record-filter.js` | 金山 / mock / webform 源无法收窄 | **待修** |
+| 11 | ~~**recordIds 收窄只有飞书接了**~~：`createRecordFilter` 只被 `source-feishu` 使用 | `src/contracts/record-filter.js` 及四个源的 `scan` 循环 | 金山 / mock / webform 源无法收窄 | **已修（`26f0391`）**：`createRecordFilter` 推广到金山 / mock / webform，名单外行在 `live.add` 之前跳过（不收票、不进水位、不参与退役计数）；`wpsOptionsFromMatch` 也翻译 `recordIds` |
 | 12 | **金山 recordId 用行号**：表格插一行会让同一张票换身份 | `src/adapters/source-wps/xlsx.js:611-613` | 插行后旧票变新票 + 旧票退役 | **待修** |
 | 13 | **`pushplus.token` 走明文配置**，与 config 层描述「建议走 ctx.credentials」矛盾 | `src/adapters/push-pushplus/index.js:163-171` | 令牌落在 cordis.patch.yml | 待修 |
 | 14 | **死配置**：`logLevel` 与 `concurrency` 只出现在配置定义里，代码无任何消费点 | `src/core/config.js:126/287/312/367` | 改它们不生效 | 待修 |
@@ -413,7 +415,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 7 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | 230 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | 242 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -422,13 +424,13 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 建议 | 理由 | 代价 |
 | --- | --- | --- |
 | 把 `scheduler` 里「执行器返回结果」与「执行器抛异常」两条失败通路合并成一条 | 现在可重试性判断被分裂在两处，行为不一致（9.2 第 7 条） | 中，要动调度器核心 + 补测试 |
-| 把 `src/index.js`（864 行）按「装配 / 工具注册 / 轮询」拆三块 | 文件偏大，但拆了也不改变行为 | 低，收益也一般，**不建议本轮做** |
+| 把 `src/index.js`（867 行）按「装配 / 工具注册 / 轮询」拆三块 | 文件偏大，但拆了也不改变行为 | 低，收益也一般，**不建议本轮做** |
 
 ### 10.3 建议的推进顺序
 
 | 阶段 | 内容 | 判据 |
 | --- | --- | --- |
-| 第一步（本轮） | 修 9.1 的 6 条 P0 + 9.2 里的 5 条 | 沙盒 002/003 与真实飞书票能跑过 agent 段 |
-| 第二步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
-| 第三步 | 真实飞书票跑通全链路（改码 → 验证 → draft MR → QQ 邮件） | 收到真邮件、点开是真 MR |
+| 第一步（`5b94a17` + `26f0391`，**已完成**） | 9.1 的 P0 里除金山取数通道外全部关掉；9.2 的 5 条关掉；收窄开关推广到四个源 | ✅ 自测 242/242；沙盒 001 已真跑出 MR !1 |
+| 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、点开是真 draft MR、`verify.test` 真跑过 |
+| 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |
