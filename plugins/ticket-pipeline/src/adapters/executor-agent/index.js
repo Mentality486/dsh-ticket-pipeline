@@ -27,6 +27,7 @@ import { isAbsolute, join } from 'node:path'
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
 import { assertWorkExecutor, makeExecResult } from '../../contracts/work-executor.js'
+import { agentFailureToPipelineError, watchAgentFailures } from './agent-failure.js'
 
 /** 给 `agents.create` 的 sessionId 前缀。sessionId 里不能出现 `/`，所以下面全部替换掉。 */
 const SESSION_PREFIX = 'ticket'
@@ -188,6 +189,11 @@ export function createAgentExecutor (options = {}) {
         }
       }
 
+      // 盯着 agent 到底为什么失败。模型调用失败（限流、配额用尽、上游 5xx）
+      // 和「agent 真干了但觉得不用改」从外面看一模一样：都是闲下来了、一个字没改。
+      // 只有把失败原因挖出来，才能把前者判成可重试、后者判成真结论。
+      const failureWatcher = watchAgentFailures(agent)
+
       try {
         // ── 2. 推任务：必须 followup（inject 不唤醒 agent）──
         agent.followup(createUserMessage({ content: messages, source: { kind: 'user' } }))
@@ -210,6 +216,18 @@ export function createAgentExecutor (options = {}) {
         }
 
         if (committable.length === 0) {
+          // 先问一句「agent 是失败了吗」：模型调用被拒（限流/配额）时它一个字
+          // 都改不了，但从外面看跟「它觉得不用改」长得一模一样。以前这两种
+          // 都报成 internal + 不可重试，限流那张票就被永久判死了。
+          const failure = failureWatcher.detect()
+          if (failure) {
+            // 抛出去而不是转成 failed 结果：内核只对「抛出来的可重试错误」
+            // 走退避重试（见 core/scheduler.js 的 catch 分档），
+            // 执行器自己返回的 failed 结果是不进重试队列的。
+            const failureError = agentFailureToPipelineError(failure)
+            ctx.log?.(`executor-agent：agent 这一轮失败了（${failure.code}）：${failure.message}`)
+            throw failureError
+          }
           // 没改动就不该开 MR：一个只有标题的空 MR 只会让人白点一次。
           const reason = collected.files.length > 0
             ? `agent 只动了敏感文件（${collected.files.join('、')}），按约定不提交，因此没有可开 MR 的改动`
@@ -259,6 +277,13 @@ export function createAgentExecutor (options = {}) {
           cancelAgent()
           throw normalized
         }
+        // agent 自己失败（模型限流、配额用尽、上游 5xx）必须**抛出去**：
+        // 内核只对「抛出来的可重试错误」走退避重试；执行器自己返回的 failed
+        // 结果是不进重试队列的（见 core/scheduler.js 的成功路径与 catch 分档）。
+        // 转成 failed 结果等于把「等一会儿再来」的限流判成永久失败。
+        if (/** @type {any} */ (normalized).agentFailure === true) {
+          throw normalized
+        }
         await ctx.onPhase('failed').catch(() => {})
         return makeExecResult({
           phase: 'failed',
@@ -269,8 +294,19 @@ export function createAgentExecutor (options = {}) {
         })
       } finally {
         // agent 一直被 agents 服务持有，不释放会拖住进程退出。
+        // 宿主里 `agents.create` 返回的是 `{agent, dispose}`，拆除动作在 dispose 上；
+        // 老宿主没有 dispose 时退回 agent.release?.()（都不存在也不报错）。
         try {
-          agent.release?.()
+          failureWatcher.dispose()
+        } catch (error) {
+          log('executor-agent：解绑失败事件监听时出错', { reason: String(error) })
+        }
+        try {
+          if (typeof created?.dispose === 'function') {
+            await created.dispose()
+          } else {
+            agent.release?.()
+          }
         } catch (error) {
           log('executor-agent：释放 agent 时出错', { reason: String(error) })
         }

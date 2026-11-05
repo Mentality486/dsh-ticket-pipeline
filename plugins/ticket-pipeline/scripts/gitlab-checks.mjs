@@ -34,6 +34,12 @@ import {
   resolveGitlab,
   splitCommand,
 } from '../src/adapters/executor-agent/index.js'
+import {
+  agentFailureToPipelineError,
+  isRateLimitFailure,
+  parseRetryAfterMs,
+  readTurnEndFailure,
+} from '../src/adapters/executor-agent/agent-failure.js'
 
 const NOTICE = '注意：下面的工单内容来自共享表格。'
 
@@ -136,14 +142,36 @@ function createFakeAgent (options = {}) {
   const state = { followups, injects, appends, mounts, get cancelled () { return cancelled }, get released () { return released } }
   /** @type {Array<() => void>} */
   const abortWaiters = []
+  /**
+   * 会话日志：宿主里 session.log 就是这样一个公开数组，
+   * agent 这一轮为什么结束（turn/end）就在里面。
+   */
+  const sessionLog = []
+  /** agent/error 的假订阅者。 */
+  const errorListeners = []
   const agent = {
     status: 'idle',
     session: {
       get seq () { return seq },
-      append (type, data) { appends.push({ type, data }) },
+      log: sessionLog,
+      append (type, data) {
+        appends.push({ type, data })
+        sessionLog.push({ type, data })
+      },
     },
     followup (message) {
       followups.push(message)
+      // 「这一轮以什么结束」：真实宿主在 turn 收尾时会 append turn/end。
+      // 可以给多条：最后一条才是这一轮的结论。
+      for (const reason of options.turnEndReasons ?? (options.turnEndReason ? [options.turnEndReason] : [])) {
+        sessionLog.push({ type: 'turn/end', data: { reason } })
+      }
+      // 「agent/error」事件：宿主 agent 自带的 ctx 上能订阅到。
+      if (options.agentError) {
+        for (const callback of errorListeners.slice()) {
+          callback({ agent, error: options.agentError, turn: 1, step: 1 })
+        }
+      }
       options.onFollowup?.()
     },
     inject (message) {
@@ -166,6 +194,19 @@ function createFakeAgent (options = {}) {
     },
     /** 测试用：看清 whenIdle 被调了几次。 */
     get idleCalls () { return idleCalls },
+  }
+  if (options.agentError) {
+    // 宿主里 agent 自带的 ctx 能订阅 agent/error；这里造一个同形的。
+    agent.ctx = {
+      on (name, callback) {
+        if (name !== 'agent/error') return () => {}
+        errorListeners.push(callback)
+        return () => {
+          const index = errorListeners.indexOf(callback)
+          if (index >= 0) errorListeners.splice(index, 1)
+        }
+      },
+    }
   }
   return { agent, state }
 }
@@ -265,11 +306,20 @@ function makeRunEnv (options = {}) {
   // 宿主的 setup 是「publish 之前」调用的：这里照样在返回 agent 之前 await 它，
   // 这样断言能看到 preset 挂载与会话策略事件的真实顺序。
   const { agentCtx, state: setupState } = createFakeAgentCtx(options)
+  let disposed = false
+  Object.defineProperty(state, 'disposed', { get () { return disposed } })
   const agents = {
     create: async (input) => {
       created.push(input)
       await input.setup?.(agentCtx, agent)
-      return { agent }
+      // 宿主里 agents.create 返回的就是 {agent, dispose}：拆除动作在 dispose 上。
+      return {
+        agent,
+        dispose: async () => {
+          disposed = true
+          agent.release?.()
+        },
+      }
     },
   }
 
@@ -723,6 +773,92 @@ export async function runGitlabChecks (check) {
     )
     assert.equal(env.state.cancelled, true, '取消时必须停下来，不能让 agent 空转烧 token')
     assert.equal(env.state.released, true, '取消路径也要释放 agent')
+  })
+
+  await check('执行器：agent 被上游限流时抛 rate-limit（可重试），不误报「没有文件改动」', async () => {
+    // 为什么单独测：模型被限流和 agent「觉得不用改」从外面看一模一样（都闲着没改文件），
+    // 但前者等一会儿再来就行，后者重试一百次还是一样。分错就是永久判死。
+    const env = makeRunEnv({
+      files: [],
+      changes: [],
+      agentError: {
+        code: 'QUOTA',
+        message: '429: workbuddy 上游失败：被限流（http 429）（code 6004）。您的使用量已超出频率限制，将在 2099-01-01 10:00:00 UTC+8 重置',
+      },
+    })
+    await assert.rejects(
+      () => env.executor.run(env.ticket, env.target, env.ctx),
+      (error) => {
+        assert.equal(error.kind, 'rate-limit', '限流要归到 rate-limit，内核才会退避重试')
+        assert.equal(error.retryable, true, '限流必须可重试')
+        assert.match(error.message, /限流/)
+        assert.doesNotMatch(error.message, /没有产生任何文件改动/, '不能把模型失败说成「没改东西」')
+        assert.ok((error.retryAfterMs ?? 0) > 0, '上游给了重置时刻，要如实带给内核')
+        return true
+      },
+    )
+  })
+
+  await check('执行器：agent 以非限流错误结束时抛 internal 并带上真实原因', async () => {
+    const env = makeRunEnv({
+      files: [],
+      changes: [],
+      agentError: { code: 'SERVER_ERROR', message: '上游 500：内部错误' },
+    })
+    await assert.rejects(
+      () => env.executor.run(env.ticket, env.target, env.ctx),
+      (error) => {
+        assert.equal(error.kind, 'internal')
+        assert.match(error.message, /上游 500/, '要带上真实原因，别只说一句「agent 失败了」')
+        return true
+      },
+    )
+  })
+
+  await check('执行器：最后一轮 turn/end 是成功时，不拿更早那轮的失败冤枉这次执行', async () => {
+    const env = makeRunEnv({
+      files: [],
+      changes: [],
+      turnEndReasons: [
+        { kind: 'error', error: { code: 'RATE_LIMIT', message: '429 被限流' } },
+        { kind: 'completed' },
+      ],
+    })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.error.kind, 'internal')
+    assert.match(result.error.message, /没有产生任何文件改动/, '最后一轮成功了就该按「agent 认为不用改」收尾')
+  })
+
+  await check('执行器：跑完要释放 agent（宿主给的是 {agent, dispose}）', async () => {
+    const env = makeRunEnv()
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.state.disposed, true, '宿主里 agents.create 返回 {agent, dispose}，必须走 dispose 才拆得掉')
+  })
+
+  await check('agent 失败原因：限流判定、重置时刻解析、最后一轮 turn/end', () => {
+    assert.equal(isRateLimitFailure({ code: 'QUOTA', message: 'x' }), true)
+    assert.equal(isRateLimitFailure({ code: 'rate_limit', message: 'x' }), true)
+    assert.equal(isRateLimitFailure({ code: 'SERVER_ERROR', message: '上游 500' }), false)
+    assert.equal(isRateLimitFailure({ code: 'UNKNOWN', message: '被限流了（http 429）' }), true, '文案兜底也要认')
+    assert.equal(isRateLimitFailure(null), false)
+
+    const reset = parseRetryAfterMs('将在 2099-01-01 10:00:00 UTC+8 重置')
+    assert.ok(reset > 0, 'UTC+8 的重置时刻要能解析出来')
+    assert.equal(parseRetryAfterMs('30 秒后恢复'), 30000)
+    assert.equal(parseRetryAfterMs('没有时间信息'), undefined)
+
+    const agent = { session: { log: [
+      { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'QUOTA', message: '被限流' } } } },
+    ] } }
+    assert.deepEqual(readTurnEndFailure(agent), { code: 'QUOTA', message: '被限流' })
+    assert.equal(readTurnEndFailure({ session: { log: [] } }), null)
+    assert.equal(readTurnEndFailure({}), null, '老宿主不暴露 session.log 时要优雅降级')
+
+    const error = agentFailureToPipelineError({ code: 'QUOTA', message: '被限流' })
+    assert.equal(error.kind, 'rate-limit')
+    assert.equal(error.retryable, true)
+    assert.equal(error.agentFailure, true, '要带 agentFailure 标记，内核才知道这是「agent 失败」而不是「结论」')
   })
 
   await check('执行器：whenIdle 之后再比一次 seq，抖动一次也不会提前收工', async () => {

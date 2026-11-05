@@ -25,6 +25,7 @@ import { createMockExecutor } from '../src/adapters/executor-mock/index.js'
 import { createMockPush } from '../src/adapters/push-mock/index.js'
 import { createTableLocator } from '../src/adapters/locator-table/index.js'
 import { makeExecResult } from '../src/contracts/work-executor.js'
+import { PipelineError } from '../src/contracts/errors.js'
 import { canTransition } from '../src/contracts/types.js'
 import { fingerprintOf } from '../src/contracts/types.js'
 import { validateConfig, describeConfig } from '../src/core/config.js'
@@ -319,6 +320,40 @@ async function main () {
     await scheduler.tick()
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'done', '活已经干完了，通知失败不能回滚状态')
+  })
+
+  await check('执行器抛可重试错误 → 票回 pending 退避重试，不判死也不发通知', async () => {
+    // 为什么：模型限流、上游 5xx 这类故障是「等一会儿再来」，
+    // 判成 failed 就等于永久放弃这张票，人却只看到一句失败通知。
+    const failing = {
+      id: 'boom',
+      async run () {
+        throw new PipelineError('rate-limit', '上游限流了，稍后再来', undefined, 1234)
+      },
+    }
+    const { scheduler, store, push } = harness({ executor: failing })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'pending', '可重试错误要让票留在队列里，不能判死')
+    assert.equal(row.attempt, 1)
+    assert.match(row.lastError ?? '', /rate-limit/)
+    assert.ok((row.enqueuedAt ?? 0) > 0, '要写退避后的入队时间')
+    assert.equal(push.messages.length, 0, '还没最终失败，不用打扰人')
+  })
+
+  await check('执行器抛不可重试错误 → failed + 通知', async () => {
+    const failing = {
+      id: 'boom',
+      async run () {
+        throw new PipelineError('invalid-input', '这活没法干：配置缺了')
+      },
+    }
+    const { scheduler, store, push } = harness({ executor: failing })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed')
+    assert.equal(push.messages.length, 1)
+    assert.match(push.messages[0].title, /失败/)
   })
 
   section('5. 修订、退役与人工重置')
