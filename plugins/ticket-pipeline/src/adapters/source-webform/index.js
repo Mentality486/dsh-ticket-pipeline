@@ -10,6 +10,7 @@
 // 每轮 scan 直接从数组读当前状态 —— 内容改了指纹就变，删除了就退役。
 
 import { PipelineError } from '../../contracts/errors.js'
+import { createRecordFilter } from '../../contracts/record-filter.js'
 import { assertTicketSource } from '../../contracts/ticket-source.js'
 
 // 平台能力：零依赖、无凭据、无截图，水位用适配器自带的内存兜底。
@@ -19,6 +20,7 @@ export const capabilities = Object.freeze([])
  * @param {{
  *   projectId?: string,
  *   records?: Array<{ id: string, title?: string, description?: string, module?: string }>,
+ *   recordIds?: string[] | string,
  *   now?: () => number,
  *   log?: any,
  * }} opts
@@ -30,6 +32,9 @@ export function createWebformSource (opts = {}) {
 
   // 内存水位（capabilities 为空，宿主不会注入持久化水位 —— 语义见 source-wps 同款兜底）
   const memoryWatermark = new Map()
+
+  // 收窄开关：三个平台的语义必须完全一致，否则「试点一单」在换源时行为就变了。
+  const recordFilter = createRecordFilter(opts.recordIds, 'webform 工单源 recordIds')
 
   return assertTicketSource({
     id: 'webform:' + projectId,
@@ -49,6 +54,8 @@ export function createWebformSource (opts = {}) {
       for (const record of records) {
         const recordId = String(record?.id ?? '').trim()
         if (!recordId) continue
+        // 名单外整行跳过，且在 live.add 之前：它这一轮既不收票，也不算「还在」。
+        if (!recordFilter.allows(recordId)) continue
         live.add(recordId)
         const description = String(record?.description ?? record?.title ?? '').trim()
         // 指纹只含内容字段：标题/描述/模块任何一处变了都算修订。
@@ -79,6 +86,7 @@ export function createWebformSource (opts = {}) {
 
       // 掉出快照的行：退役（webform 是数组直配，删了就是删了，无需宽限期）。
       for (const recordId of Object.keys(watermark.seen)) {
+        if (!recordFilter.allows(recordId)) continue
         if (!live.has(recordId)) {
           disappeared.push(recordId)
           delete watermark.seen[recordId]

@@ -535,6 +535,24 @@ function validateProject (raw, index) {
     }
   }
 
+  // 截图链接的主机白名单。截图地址来自工单表，是**外部输入**：不设白名单就等于让填表的人
+  // 替服务器发任意请求（内网探测 / 云元数据 / 打穿本地服务）。适配器缺省一律拒绝，
+  // 所以这里必须能把人写的域名原样送到适配器手里 —— 少这一处，配了也等于没配。
+  // 空数组按配置错误处理：写了这个键却一个域名都不给，字面意思就是「什么都别放行」，
+  // 那和默认行为一样，人写它必然是想放行某几个，写错才是原因。
+  if (match.allowedImageHosts !== undefined && match.allowedImageHosts !== null) {
+    const rawHosts = Array.isArray(match.allowedImageHosts) ? match.allowedImageHosts : [match.allowedImageHosts]
+    const hosts = rawHosts
+      .filter((item) => typeof item === 'string')
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => item.length > 0)
+    if (hosts.length === 0) {
+      fail('match.allowedImageHosts', '必须是非空字符串或字符串数组（截图链接允许的主机名，例如 cdn.example.com）')
+    } else {
+      value.match.allowedImageHosts = Array.from(new Set(hosts))
+    }
+  }
+
   // 金山文档（wps）专属的定位字段：组合根不认识它们，由适配器自己翻译（ADR-0001）。
   for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
     const item = match[key]
@@ -885,6 +903,8 @@ export function describeConfig (config) {
     if (Array.isArray(match.statusValues) && match.statusValues.length > 0) out.match.statusValues = match.statusValues
     // 收窄名单同样要透出来：排障时先确认「这一轮到底在处理哪几张票」。
     if (Array.isArray(match.recordIds) && match.recordIds.length > 0) out.match.recordIds = match.recordIds
+    // 白名单必须透出来：截图取不到时，第一个要确认的就是「这个域名到底放行了没有」。
+    if (Array.isArray(match.allowedImageHosts) && match.allowedImageHosts.length > 0) out.match.allowedImageHosts = match.allowedImageHosts
     // 金山文档的定位字段（非敏感，直接给）
     for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
       if (typeof match[key] === 'string' && match[key].length > 0) out.match[key] = match[key]

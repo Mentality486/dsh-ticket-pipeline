@@ -20,6 +20,7 @@
  */
 
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
+import { createRecordFilter } from '../../contracts/record-filter.js'
 import { PipelineError } from '../../contracts/errors.js'
 
 /**
@@ -40,6 +41,7 @@ const MINIMAL_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
  * @property {string} description
  * @property {string} [foundAt]
  * @property {string} [module]
+ * @property {string} [targetProject] 工单原文里的「待修改项目」列（只给模型参考，不参与主键）
  * @property {string} [flow]
  * @property {{ kind: 'path', path: string } | { kind: 'url', url: string } | { kind: 'attachment', fileToken: string }} [screenshot]
  * @property {'high'|'medium'|'low'} [priority]
@@ -122,6 +124,10 @@ export function createMockSource (options = {}) {
   /** mock 的「删除行需连续几轮」—— 固定 3，与 `Config.goneAfterScans` 默认值一致。 */
   const GONE_AFTER_SCANS = 3
 
+  // 收窄开关：mock 也要认，否则「先拿 mock 试跑单张票」这条最常用的验收路径走不通。
+  // 语义与真实适配器完全一致（名单外整行跳过，语义见 contracts/record-filter.js）。
+  const recordFilter = createRecordFilter(options.recordIds, 'mock 工单源 recordIds')
+
   /**
    * @param {MockTicketSeed} seed
    * @returns {import('../../contracts/types.js').Ticket}
@@ -139,6 +145,7 @@ export function createMockSource (options = {}) {
       department: seed.department,
       foundAt: seed.foundAt,
       module: seed.module,
+      targetProject: seed.targetProject,
       flow: seed.flow,
       priority: seed.priority,
       status: seed.status,
@@ -169,6 +176,9 @@ export function createMockSource (options = {}) {
       const live = new Set()
 
       for (const seed of seeds) {
+        // 名单外整行跳过，且**必须在 live.add 之前**：否则它会被算成「这轮还在」，
+        // 而它本来就该完全退出这一轮的所有判定。
+        if (!recordFilter.allows(seed.recordId)) continue
         const ticket = toTicket(seed)
         live.add(seed.recordId)
         const previous = seen.get(seed.recordId)

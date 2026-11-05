@@ -1260,5 +1260,15 @@ export function feishuOptionsFromMatch (match) {
   if (m.recordIds !== undefined && m.recordIds !== null && m.recordIds !== '') {
     options.recordIds = resolveRecordIds(m.recordIds)
   }
+  // 截图链接白名单：**不写就保持空**（适配器对 url 形态截图缺省一律拒绝）。
+  // 这里不能给缺省值：白名单是安全闸门，只有人能打开它。
+  if (m.allowedImageHosts !== undefined && m.allowedImageHosts !== null && m.allowedImageHosts !== '') {
+    const list = Array.isArray(m.allowedImageHosts) ? m.allowedImageHosts : [m.allowedImageHosts]
+    const hosts = list
+      .filter((item) => typeof item === 'string')
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => item.length > 0)
+    if (hosts.length > 0) options.allowedImageHosts = Array.from(new Set(hosts))
+  }
   return /** @type {any} */ (options)
 }

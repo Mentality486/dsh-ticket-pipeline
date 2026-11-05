@@ -755,6 +755,7 @@ function rowToTicket (row) {
     department: row.department,
     foundAt: row.foundAt,
     module: row.module,
+    targetProject: row.targetProject,
     flow: row.flow,
     priority: row.priority,
     status: row.status,

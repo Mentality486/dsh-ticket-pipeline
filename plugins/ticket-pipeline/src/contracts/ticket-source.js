@@ -109,6 +109,7 @@ export function makeTicket (input, options = {}) {
   if (input.department !== undefined && input.department !== '') ticket.department = String(input.department)
   if (input.foundAt !== undefined && input.foundAt !== '') ticket.foundAt = String(input.foundAt)
   if (input.module !== undefined && input.module !== '') ticket.module = String(input.module)
+  if (input.targetProject !== undefined && input.targetProject !== '') ticket.targetProject = String(input.targetProject)
   if (input.flow !== undefined && input.flow !== '') ticket.flow = String(input.flow)
   if (input.status !== undefined && input.status !== '') ticket.status = String(input.status)
   if (input.priority === 'high' || input.priority === 'medium' || input.priority === 'low') {

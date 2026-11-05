@@ -669,6 +669,30 @@ async function main () {
     assert.equal(seenCtx.content[0].text, seenCtx.prompt, 'content 的正文块必须与 prompt 一字不差，否则两条通路会看到两份任务书')
   })
 
+  await check('任务书里带「待修改项目」原文，并明确告诉模型别拿它当目录名', async () => {
+    // 真实工单的「模块」「待修改项目」两列都是人随手写的，常与代码里的目录/路由名对不上。
+    // 不把这一列交给模型，等于让它拿一个猜的名字去找文件。
+    const source = createMockSource()
+    source.seeds[0].targetProject = '日报系统'
+    source.seeds[0].module = '问题管理'
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler } = harness({ source, executor })
+    await scheduler.tick()
+    assert.match(seenCtx.prompt, /待修改项目（工单原文）：日报系统/)
+    assert.match(seenCtx.prompt, /模块（工单原文）：问题管理/)
+    assert.match(seenCtx.prompt, /不要拿它们当目录名直接去改/)
+  })
+
   await check('saveImage 什么都没返回时跳过空图块，不塞进 content', async () => {
     // 离线 mock 的 saveImage 就是返回 undefined：空引用塞进 content 会让适配器组装消息时炸掉。
     const source = createMockSource()
@@ -1389,6 +1413,90 @@ function makeFakeCtx ({ domain, registered }) {
       log: silent,
     })
     assert.deepEqual(opts.recordIds, ['rec-a'], '配置里的收窄名单必须真的到适配器手上')
+  })
+
+  await check('allowedImageHosts 进得了配置：归一成小写去重（截图链接是外部输入，白名单只有人能开）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', allowedImageHosts: ['CDN.Example.com', ' cdn.example.com ', 'img.example.com'] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    assert.deepEqual(result.value.projects[0].match.allowedImageHosts, ['cdn.example.com', 'img.example.com'],
+      '大小写与空白要归一，重复的要去掉')
+  })
+
+  await check('allowedImageHosts 写成单字符串也认', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', allowedImageHosts: 'cdn.example.com' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value)
+    assert.deepEqual(result.value.projects[0].match.allowedImageHosts, ['cdn.example.com'])
+  })
+
+  await check('allowedImageHosts 写成空集合要报错（写了键却一个域名不给 = 配了等于没配）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', allowedImageHosts: [] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.issues, '空集合必须被拦下')
+    assert.match(JSON.stringify(result.issues), /allowedImageHosts/)
+  })
+
+  await check('不配 allowedImageHosts 就别塞进配置（缺省是一律拒绝，不能被顶掉）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value)
+    assert.equal(result.value.projects[0].match.allowedImageHosts, undefined)
+  })
+
+  await check('buildSourceOptions：飞书项目的 allowedImageHosts 一路透到适配器', async () => {
+    const { SOURCES, buildSourceOptions } = await import('../src/index.js')
+    const opts = buildSourceOptions(SOURCES.feishu, {
+      project: {
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', allowedImageHosts: ['cdn.example.com'] },
+      },
+      store: { getWatermark: async () => null, saveWatermark: async () => {} },
+      readSecret: async () => 'secret',
+      readLocalFile: async () => ({ data: new Uint8Array() }),
+      config: { safePageRun: 20, goneAfterScans: 3 },
+      log: silent,
+    })
+    assert.deepEqual(opts.allowedImageHosts, ['cdn.example.com'], '白名单必须真的到适配器手上，否则截图永远取不到')
+  })
+
+  await check('mock 源也认 recordIds（试点单票最常用的路径就是它）', async () => {
+    const source = createMockSource({ recordIds: ['rec-mock-002'] })
+    const round = await source.scan(new AbortController().signal)
+    assert.deepEqual(round.created.map((ticket) => ticket.recordId), ['rec-mock-002'], '只该收点名的那张')
+  })
+
+  await check('webform 源也认 recordIds，且名单外的记录不会被判成「已删除」', async () => {
+    const { createWebformSource } = await import('../src/adapters/source-webform/index.js')
+    const source = createWebformSource({
+      projectId: 'wf',
+      recordIds: ['b'],
+      records: [{ id: 'a', description: '不处理' }, { id: 'b', description: '要处理' }],
+    })
+    const first = await source.scan()
+    assert.deepEqual(first.created.map((ticket) => ticket.recordId), ['b'])
+    const second = await source.scan()
+    assert.deepEqual(second.disappeared, [], '名单外的 a 从来就没进水位，不该报退役')
   })
 
   await check('describeConfig 会把收窄名单透出来（排障时先看这一轮在处理哪几张票）', async () => {

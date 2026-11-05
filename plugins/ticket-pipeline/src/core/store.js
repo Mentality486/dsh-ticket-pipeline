@@ -62,6 +62,7 @@ export const TABLES = Object.freeze({
  * @property {'high'|'medium'|'low'} [priority]
  * @property {string} [foundAt]
  * @property {string} [module]
+ * @property {string} [targetProject] 工单原文里的「待修改项目」列（只给模型参考，不参与主键）
  * @property {string} [department]
  * @property {string} [seq]
  * @property {number} [enqueuedAt]
@@ -160,6 +161,7 @@ export class TicketStore {
     if (ticket.priority) row.priority = ticket.priority
     if (ticket.foundAt) row.foundAt = ticket.foundAt
     if (ticket.module) row.module = ticket.module
+    if (ticket.targetProject) row.targetProject = ticket.targetProject
     if (ticket.department) row.department = ticket.department
     if (ticket.seq) row.seq = ticket.seq
 
@@ -219,6 +221,7 @@ export class TicketStore {
     if (ticket.priority) row.priority = ticket.priority
     if (ticket.foundAt) row.foundAt = ticket.foundAt
     if (ticket.module) row.module = ticket.module
+    if (ticket.targetProject) row.targetProject = ticket.targetProject
     if (ticket.department) row.department = ticket.department
     if (ticket.seq) row.seq = ticket.seq
 

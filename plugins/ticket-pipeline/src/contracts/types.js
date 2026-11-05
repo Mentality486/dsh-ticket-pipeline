@@ -166,6 +166,9 @@ export function normalizeUrl (u) {
  * @property {string} description 问题描述
  * @property {string} [foundAt] 发现日期（ISO 日期串）
  * @property {string} [module] 模块（可能是旧称）
+ * @property {string} [targetProject] 工单正文里写的「待修改项目」原值（表格列），**仅供模型参考**：
+ *   它和 `projectId` 很可能不是一回事 —— `projectId` 是配置里的项目名（存储主键的一部分），
+ *   而这一列是人手填的自由文本。硬拿它去顶 `projectId` 会让同一张表里的票散到不同主键下。
  * @property {string} [flow] 操作流程
  * @property {ScreenshotRef[]} screenshots
  * @property {'high'|'medium'|'low'} [priority]

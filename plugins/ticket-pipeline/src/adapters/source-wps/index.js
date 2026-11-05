@@ -26,6 +26,7 @@
  */
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
+import { createRecordFilter, resolveRecordIds } from '../../contracts/record-filter.js'
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
 import {
   DEFAULT_MEDIA_PREFIX,
@@ -94,7 +95,14 @@ export function createWpsSource (options = {}) {
   const readWatermark = getWatermark ?? (async (id) => memoryWatermark.get(id))
   const writeWatermark = saveWatermark ?? (async (id, value) => { memoryWatermark.set(id, value) })
   const now = typeof options.now === 'function' ? options.now : () => Date.now()
+  // 收窄开关：与飞书源同一套语义（见 contracts/record-filter.js）。
+  // 名单外的行整行跳过 —— 不收票、不算「这轮还在」、也不累加 missingScans，
+  // 否则试点期间会把没打算动的旧票误判成「已删除」。
+  const recordFilter = createRecordFilter(options.recordIds, '金山文档源 recordIds')
   const goneAfterScans = Math.max(1, Math.min(20, Number(options.goneAfterScans ?? 3) || 3))
+  if (recordFilter.enabled && typeof options.log === 'function') {
+    options.log('金山文档 工单收窄生效', { sourceId, recordIds: recordFilter.ids })
+  }
 
   /**
    * 取数通道。默认实现**抛错而不是返回空**：空数组会被内核当成「这一轮表里没有工单」，
@@ -153,9 +161,14 @@ export function createWpsSource (options = {}) {
         else screenshots.push({ kind: 'path', path: text })
       }
 
+      // 「待修改项目」列不能顶掉 projectId：那是配置里的项目名，也是存储复合主键的一部分。
+      // 这一列是人手填的自由文本（可能写成「日报系统」，也可能是别的项目名），
+      // 顶上去只会让同一张表的票散到不同主键下，还让「项目 → 本地仓库」的对应关系失效。
+      // 所以它进 targetProject，跟任务书一起交给模型参考（见 core/prompt.js）。
       tickets.push(makeTicket({
         recordId: record.recordId,
         projectId,
+        targetProject: record.projectId,
         description: record.description,
         screenshots,
         seq: record.seq,
@@ -207,6 +220,9 @@ export function createWpsSource (options = {}) {
 
     for (const ticket of tickets) {
       const recordId = ticket.recordId
+      // 收窄：必须在 live.add 之前跳过，否则名单外的行会被算成「这轮还在」，
+      // 而它们本来就不该参与任何存活判定。
+      if (!recordFilter.allows(recordId)) continue
       live.add(recordId)
       const inProgress = ticket.status === statusValue
       const prev = seen[recordId]
@@ -377,6 +393,10 @@ export function wpsOptionsFromMatch (match) {
   }
   if (m.projectId !== undefined) options.projectId = String(m.projectId)
   if (m.goneAfterScans !== undefined) options.goneAfterScans = Number(m.goneAfterScans)
+  // 收窄开关：不写就不透传（空数组是配置错误，配置层先拦下）。
+  if (m.recordIds !== undefined && m.recordIds !== null && m.recordIds !== '') {
+    options.recordIds = resolveRecordIds(m.recordIds)
+  }
   if (m.statusValue !== undefined) options.statusValue = String(m.statusValue)
 
   // match 里给了 sheetUrl 时，翻译结果必须自带取数通道（createWpsSource 没有它直接报错）。

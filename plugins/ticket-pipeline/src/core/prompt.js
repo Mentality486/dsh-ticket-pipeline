@@ -35,6 +35,7 @@ export function renderTicketPrompt (ticket, located) {
   if (ticket.department) lines.push(`发现部门：${ticket.department}`)
   if (ticket.foundAt) lines.push(`发现日期：${ticket.foundAt}`)
   if (ticket.priority) lines.push(`优先级：${ticket.priority}`)
+  if (ticket.targetProject) lines.push(`待修改项目（工单原文）：${ticket.targetProject}`)
   if (ticket.module) lines.push(`模块（工单原文）：${ticket.module}`)
 
   lines.push('')
@@ -49,9 +50,9 @@ export function renderTicketPrompt (ticket, located) {
 
   lines.push('')
   lines.push('## 代码定位')
-  lines.push('工单的「模块」列是用户随手写的，可能与代码里的目录/路由名对不上，')
-  lines.push('不要拿它当目录名直接去改。先读仓库结构，自己判断工单说的是哪个页面/接口，')
-  lines.push('找不到就停下来问人，不要猜。')
+  lines.push('工单的「模块」「待修改项目」两列都是用户随手写的，可能与代码里的目录/路由名对不上，')
+  lines.push('不要拿它们当目录名直接去改。当前工作目录就是本工单对应的项目仓库 —— ')
+  lines.push('先读仓库结构，自己判断工单说的是哪个页面/接口，找不到就停下来问人，不要猜。')
 
   if (located.notes) {
     lines.push('')

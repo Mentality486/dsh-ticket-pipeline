@@ -479,6 +479,44 @@ export async function runWpsChecks (check) {
     assert.equal(round.disappeared.length, 0)
   })
 
+  await check('「待修改项目」列进 targetProject，不顶掉 projectId（那是存储主键）', async () => {
+    const source = createWpsSource({
+      sourceId: 'wps-1',
+      projectId: 'p-1',
+      fetchSheet: async () => ({ bytes }),
+    })
+    const round = await source.scan({})
+    const ticket = round.created.find((item) => item.recordId === 'r3')
+    assert.equal(ticket.projectId, 'p-1', 'projectId 必须是配置里的项目名')
+    // 表格这一列是人手填的自由文本。要是拿它顶 projectId，同一张表的票会散到不同主键下，
+    // 「项目 → 本地仓库」的对应关系当场失效。
+    assert.equal(ticket.targetProject, '日报系统', '「待修改项目」要单独留着给模型参考')
+  })
+
+  await check('recordIds：只处理点名的行，名单外整行跳过（不收票、也不进水位）', async () => {
+    const source = createWpsSource({
+      sourceId: 'wps-1',
+      projectId: 'p-1',
+      recordIds: ['r4'],
+      fetchSheet: async () => ({ bytes }),
+    })
+    const round = await source.scan({})
+    assert.deepEqual(round.created.map((item) => item.recordId), ['r4'], '只该收 r4')
+    const second = await source.scan({})
+    assert.deepEqual(second.disappeared, [], '名单外的 r3 不能被算成「已删除」')
+  })
+
+  await check('recordIds 写成单字符串也认（配置里手写一个 id 是最常见的用法）', async () => {
+    const source = createWpsSource({
+      sourceId: 'wps-1',
+      projectId: 'p-1',
+      recordIds: 'r3',
+      fetchSheet: async () => ({ bytes }),
+    })
+    const round = await source.scan({})
+    assert.deepEqual(round.created.map((item) => item.recordId), ['r3'])
+  })
+
   await check('水位：同一份表连扫两轮，第二轮一条都不重复推', async () => {
     const source = createWpsSource({ sourceId: 'wps-1', fetchSheet: async () => ({ bytes }) });
     const first = await source.scan({});
@@ -588,5 +626,12 @@ export async function runWpsChecks (check) {
     assert.equal(options.projectId, 'p-1')
     assert.equal(options.goneAfterScans, 3)
     assert.equal(typeof options.fetchSheet, 'function', '翻译结果里必须带取数通道，否则 createWpsSource 直接报错');
+  })
+
+  await check('wpsOptionsFromMatch：recordIds 也翻译过去（试点单票不该只在飞书上好使）', async () => {
+    const options = wpsOptionsFromMatch({ recordIds: ['r4'] })
+    assert.deepEqual(options.recordIds, ['r4'])
+    // 没配就别塞进去，否则适配器会以为是「挑零张」
+    assert.equal('recordIds' in wpsOptionsFromMatch({}), false)
   })
 }
