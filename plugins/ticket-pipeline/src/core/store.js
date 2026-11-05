@@ -243,6 +243,13 @@ export class TicketStore {
    * @returns {Promise<TicketRecordRow | undefined>} 返回更新后的行；非法转移返回 undefined
    */
   async setPhase (key, to, patch = {}, options = {}) {
+    // 补丁必须是普通对象：字符串会被 `Object.entries` 展开成 {0:..,1:..} 写进票据行。
+    // 这种脏数据一旦落库，`{...row, ...defined}` 会把十几个垃圾字段永久带下去，
+    // 而且看存储根本猜不到它从哪来。契约里 onPhase 的第二参是字符串说明，
+    // 调用方一旦把说明直接透传到这里就会踩中，所以这道闸设在这里比设在调用点更可靠。
+    if (patch !== undefined && patch !== null && typeof patch !== 'object') {
+      throw new TypeError(`setPhase: patch 必须是对象，实际是 ${typeof patch}（字符串会被展开成数字键写进票据）`)
+    }
     const row = this.getTicket(key)
     if (!row) {
       this.log(`setPhase: 记录不存在，忽略`, { key, to })

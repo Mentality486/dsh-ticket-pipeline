@@ -274,11 +274,26 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       repoPath: row.repoPath,
     }
 
-    /** 阶段回调：写存储 + 记日志。非法转移由 `setPhase` 拒绝，不抛。 */
-    /** @type {(phase: Phase, patch?: Partial<TicketRecordRow>) => Promise<void>} */
-    const onPhase = async (phase, patch = {}) => {
+    /**
+     * 阶段回调：写存储 + 记日志。非法转移由 `setPhase` 拒绝，不抛。
+     *
+     * 第二参在契约（`contracts/work-executor.js` 的 `ExecCtx.onPhase`）里是
+     * **(phase, detail?: string)** —— 一句给人看的阶段说明，不是字段补丁。
+     * 但内核自己也要能用它补字段（例如 planning 落 plan），所以这里两种都收：
+     * 字符串 = 只记日志的说明；对象 = 落库补丁。
+     *
+     * 不区分会导致一个很难看的真实事故：字符串被当成补丁传给 `setPhase`，
+     * 而 `setPhase` 用 `Object.entries(patch)` 展开它，于是「跑项目配置里的验证命令」
+     * 这十四个字变成 `{0:'跑',1:'项',…,13:'令'}` 写进票据行，存储里多出十几个垃圾字段。
+     */
+    /** @type {(phase: Phase, detailOrPatch?: string | Partial<TicketRecordRow>) => Promise<void>} */
+    const onPhase = async (phase, detailOrPatch = {}) => {
+      const isDetail = typeof detailOrPatch === 'string'
+      const patch = isDetail ? {} : detailOrPatch
       await store.setPhase(key, phase, patch)
-      logInfo(`阶段 → ${phase}`, { projectId, recordId })
+      logInfo(`阶段 → ${phase}`, isDetail
+        ? { projectId, recordId, detail: detailOrPatch }
+        : { projectId, recordId })
     }
 
     try {

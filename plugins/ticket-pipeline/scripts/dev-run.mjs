@@ -898,6 +898,49 @@ async function main () {
     assert.equal(store.getTicket(k('rec-mock-001')).phase, 'done', '拒绝时不能把 done 票动成 pending')
   })
 
+  section('11.6 onPhase 的第二参：字符串是「说明」，不能当字段补丁写进票据')
+
+  await check('执行器用字符串描述阶段时，票据里不该多出数字键', async () => {
+    // 真实事故：executor-agent 调 ctx.onPhase('testing', '跑项目配置里的验证命令')，
+    // 而 scheduler 的 onPhase 把第二参原样当 patch 交给 store.setPhase，
+    // setPhase 用 Object.entries 展开它 —— 字符串被展开成 {0:'跑',1:'项',…}，
+    // 于是一张票的存储行里多出十几个垃圾字段，一路跟着这条记录活下去。
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing', 'agent 已接到任务书，开始改代码')
+        await ctx.onPhase('testing', '跑项目配置里的验证命令')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler, store } = harness({ executor })
+    await scheduler.tick()
+    assert.equal(typeof seenCtx.onPhase, 'function', '执行器确实拿到了 onPhase')
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done')
+    const numericKeys = Object.keys(row).filter((field) => /^\d+$/.test(field))
+    assert.deepEqual(numericKeys, [], '阶段说明被当成补丁展开了：' + numericKeys.join(','))
+    assert.equal(row['0'], undefined, '第 0 个字不该成为字段')
+  })
+
+  await check('store.setPhase 拒收非对象补丁：字符串补丁必须抛出而不是落库', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    // 把票退回 pending 才好在合法转移上试补丁校验（done 是终态，先撞的是转移表）。
+    await store.setPhase(k('rec-mock-001'), 'pending', {}, { force: true })
+    const before = store.getTicket(k('rec-mock-001'))
+    await assert.rejects(
+      () => store.setPhase(k('rec-mock-001'), 'planning', '跑项目配置里的验证命令'),
+      /patch 必须是对象/,
+    )
+    const after = store.getTicket(k('rec-mock-001'))
+    assert.equal(after.phase, before.phase, '抛错时票据一个字段都不该动')
+    assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort())
+  })
+
   section('11.5 pipeline_doctor：环境体检')
 
   await check('pipeline_doctor 全绿：git 可用 + 仓库正常 + 凭据齐', async () => {
