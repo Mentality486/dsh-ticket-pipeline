@@ -12,7 +12,7 @@
 ```
 监控工单表 → 发现「处理中」的行 → 解析问题描述/操作流程/截图
     → 在对应本地仓库切 worktree → AI 规划并改代码 → 跑构建/测试
-    → 经 GitLab API 开 Draft MR → 邮箱/微信通知你
+    → 经 GitLab API 开 Draft MR → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信）
     → 你人工验证后合并 MR，拨回工单状态
 ```
 
@@ -108,7 +108,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 |---|---|
 | 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
-| 配置 | 28 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在 |
+| 配置 | 29 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
 | 项目清单 | `projects[]` 是结构化数组，**不在表单里**，仍按下文手改配置 |
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
@@ -146,22 +146,66 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 ### 3.1 配置项速查
 
-**顶层**：
+**顶层**（全部 29 个字段，键名与 `src/core/config.js` 的 `CONFIG_FIELDS` 一一对应，按面板分组列出）：
+
+**扫描与队列（4 个）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `pollIntervalMinutes` | `3` | 扫表轮询间隔（分钟） |
+| `safePageRun` | `20` | 连续扫到多少条已知且未变的记录后停止翻页 |
+| `goneAfterScans` | `3` | 连续几轮扫不到就认定该行已被删除 |
+| `concurrency` | `1` | 并发数。当前只支持 1：一轮最多跑一票 |
+
+**租约与重试（3 个）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `leaseTtlMinutes` | `10` | 租约时长（多进程防双跑） |
+| `leaseHeartbeatSeconds` | `60` | 跑票期间续租间隔（秒），必须显著小于租约时长 |
+| `maxAttempts` | `2` | 可重试错误的自动重试上限 |
+
+**执行（5 个）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `workExecutor` | `mock` | `mock`（离线验证）/ `agent`（真执行）。agent 是真实现：起宿主 agent 改码 → 收集改动 → 跑验证 → 开 GitLab draft MR，已产出过真实 draft MR |
+| `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
+| `fetchBeforeCreate` | `true` | 切 worktree 前先 git fetch 一次基准分支 |
+| `branchPrefix` | `ticket-` | 工作分支前缀 |
+| `worktreeRetentionHours` | `24` | 终态票的 worktree 保留时长；0 = 不自动清理 |
+
+**agent 与模型（4 个）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `provider` | `workbuddy` | 跑任务书的模型 provider，留空则跟随当前会话默认 |
+| `model` | ``（空） | 模型名，留空跟随会话默认（钉死模型会在它被限流时让整条流水线全灭） |
+| `maxTokens` | `32000` | 单次模型调用的最大输出 token |
+| `agentPreset` | `ptc` | agent 执行器给子 agent 挂的 preset id（决定它有哪些工具）。留空 = 不挂 |
+
+**通知（11 个）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `pushAdapter` | `pushplus` | 通知适配器 id：`mock`（只记内存）/ `pushplus`（微信不直连，经 PushPlus 的 `clawbot` 渠道中继，需要 `pushplus.token`）/ `qqmail`（零依赖自写 SMTP，已真实发信成功，授权码走凭据 `QQMAIL_AUTH_CODE`） |
+| `pushplus.token` | ``（空） | PushPlus token，建议走凭据 |
+| `pushplus.channel` | `clawbot` | PushPlus 推送渠道，ClawBot 用 `clawbot` |
+| `pushplus.template` | `txt` | 只能用 `txt`：富模板在 ClawBot 里只显示前 50 字 |
+| `qqmail.host` | `smtp.qq.com` | QQ 邮箱 SMTP 主机（企业邮箱换成自己的） |
+| `qqmail.port` | `465` | SMTP 端口：465 = TLS 直连（推荐），587 = STARTTLS |
+| `qqmail.secure` | `true` | true = 连上就是 TLS（465）；false = 先明文 EHLO 再 STARTTLS（587） |
+| `qqmail.user` | ``（空） | 发件邮箱地址，例如 someone@qq.com |
+| `qqmail.to` | ``（空） | 收件邮箱；多个用逗号分隔 |
+| `pushplus.callbackUrl` | ``（空） | 送达回执地址（可选）。PushPlus 把 sendStatus 回吐到这里；HTTP 200 只代表受理，不代表送达 |
+| `notifyOn` | done/skipped/failed/needs-info | 哪些阶段发通知 |
+
+**杂项（2 个）**：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `false` | 总开关。配好一切前**别开** |
-| `pollIntervalMinutes` | `3` | 扫表轮询间隔（分钟） |
-| `workExecutor` | — | `mock`（离线验证）/ `agent`（真执行） |
-| `pushAdapter` | — | `mock` / `pushplus` / `qqmail` |
-| `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
-| `maxAttempts` | `2` | 可重试错误的自动重试上限 |
-| `branchPrefix` | `ticket-` | 工作分支前缀 |
-| `worktreeRetentionHours` | `24` | 终态票的 worktree 保留时长 |
-| `leaseTtlMinutes` | `10` | 租约时长（多进程防双跑） |
-| `notifyOn` | done/skipped/failed/needs-info | 哪些阶段发通知 |
-| `qqmail.user` / `qqmail.to` | — | 发件邮箱 / 收件邮箱（pushAdapter=qqmail 时） |
-| `qqmail.host` / `qqmail.port` / `qqmail.secure` | smtp.qq.com / 465 / true | SMTP 连接参数 |
+| `logLevel` | `info` | 日志级别：debug / info / warn / error |
 
 **projects[] 每项**：
 
@@ -171,6 +215,8 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐） |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
+| `match.statusValues` | 可配：状态列里哪些取值算「在处理中」（收票条件）。不填则用默认值 `处理中` |
+| `match.recordIds` | 可配：只处理这几条工单（收窄开关）。不填 = 整张表 |
 | `repo.path` | 本地 git 检出根目录（**必填**） |
 | `repo.remote` | GitLab remote URL（开 MR 用） |
 | `repo.baseBranch` | 切 worktree 的基准分支。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上 |
@@ -195,7 +241,7 @@ pipeline_status
 预期：能看到一张 `pending → worktree-ready → planning → done` 的票。
 mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机、通知全链路都已走通**。
 
-### 4.2 四个对话工具
+### 4.2 五个对话工具
 
 | 工具 | 干什么 |
 |---|---|
@@ -203,6 +249,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 | `pipeline_status` | 看所有票的当前阶段与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
+| `pipeline_doctor` | 体检：git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知，结论按「必须修复」「提醒」分段 |
 
 ### 4.3 切换真执行
 
@@ -261,7 +308,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 175 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 230 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |

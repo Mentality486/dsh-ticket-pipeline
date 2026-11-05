@@ -1,6 +1,6 @@
 # 工单流水线（ticket-pipeline）
 
-从工单表检测变化 → 定位代码 → 改动验证 → 开 draft MR → 邮箱/微信推送。一个 DSH Host 插件。
+从工单表检测变化 → 定位代码 → 改动验证 → 开 draft MR → 通知（QQ 邮箱 SMTP / PushPlus 中继微信）。一个 DSH Host 插件。
 
 > 📖 **怎么用？** 看 [使用手册](../../docs/ticket-pipeline/user-guide.md) ——
 > 从准备工单表、配凭据、装插件，到 mock 首跑、切真执行、日常循环与排障，全流程一步步讲。
@@ -16,7 +16,7 @@
                               │
                               ├──WorkExecutor──▶ worktree 改码 + 构建/测试 + draft MR
                               │
-                              └──PushAdapter──▶ 微信通知（PushPlus channel=clawbot）
+                              └──PushAdapter──▶ 通知（qqmail 直发 SMTP / pushplus 中继微信，channel=clawbot）
 ```
 
 ## 目录
@@ -28,7 +28,7 @@ src/
   adapters/
     source-mock/     内存工单源（离线跑通全链路用，每个项目一个实例）
     source-feishu/   飞书多维表格（真实实现）
-    source-wps/      金山文档共享 Excel（真实实现：零依赖手写 zip/xlsx 解析）
+    source-wps/      金山文档共享 Excel（解析已实现：零依赖手写 zip/xlsx 解析；取数需注入 fetchSheet，开放平台通道待接）
     source-webform/  演示平台（内存表单源，实证可插拔流程）
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
@@ -52,7 +52,7 @@ lib/
   结果按「必须修复 / 提醒」分段显示。
 - **凭据**：飞书 App ID / App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token，
   只写不读回（写入走 `ctx.remote.credentials`，界面只显示「已配置 / 未配置」）。
-- **配置**：按分组渲染 28 个字段，保存走 `ctx.remote.settings.mutate`（写 profile 的
+- **配置**：按分组渲染 29 个字段，保存走 `ctx.remote.settings.mutate`（写 profile 的
   `cordis.patch.yml`，重启后仍在）。`projects[]` 是结构化数组，不在这张表单里，仍需手改配置（见使用手册 §3）。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor

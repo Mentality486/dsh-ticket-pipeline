@@ -25,7 +25,10 @@ export const UNTRUSTED_TICKET_NOTICE = [
 /**
  * 执行器落地时可以直接合进自己的 systemPrompt 的固定段落。
  *
- * 现在还没有执行器读它（executor-agent 仍是占位），写在这里是为了：
+ * 现状：executor-agent 已是真实现（起宿主 agent 改码 → 收集改动 → 跑验证 → 开 GitLab draft MR），
+ * 并按 `options.prompts.untrustedNotice` 把这段反注入提醒拼在交给 agent 的消息最前面。
+ * 但它有两类情况拿不到产出：上游模型限流/配额耗尽、宿主 agent preset 服务缺失（preset 挂不上，
+ * agent 手里没有工具，改动必为空）。写在这里是为了：
  * 1. 组合根已经把它传进执行器选项，适配器不用再改 `index.js`；
  * 2. 只要照着读 `options.prompts.untrustedNotice`，提示语就不会各写一份、各说一套。
  */
