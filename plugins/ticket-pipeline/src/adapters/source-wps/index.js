@@ -42,9 +42,10 @@ import { readZipEntries, readZipEntry } from './zip.js'
  *
  * 只要 `watermark`：内核把 `getWatermark` / `saveWatermark` 接进存储，
  * 否则每次重启都会把整张表当成「全都是新票」重新入队一遍。
+ * 再要 `scanTuning`：连续几轮扫不到就退役（goneAfterScans）来自全局配置。
  * 不要 secret（token 由 `fetchSheet` 的实现自己管）、不要 localFile（截图字节在 xlsx 里，不读盘）。
  */
-export const capabilities = Object.freeze(['watermark'])
+export const capabilities = Object.freeze(['watermark', 'scanTuning'])
 
 /** 收票只看这一列的这一值。与飞书源同一句话，方便人从两边对照。 */
 export const IN_PROGRESS_VALUE = '处理中'

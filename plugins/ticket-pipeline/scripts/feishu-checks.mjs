@@ -252,6 +252,9 @@ function makeSource (server, options = {}) {
     appToken: options.appToken ?? APP_TOKEN,
     tableId: options.tableId ?? TABLE_ID,
     docNamePattern: options.docNamePattern ?? '',
+    // 状态值集合：不同表的约定不一样（「处理中」「否」「待处理」都有），
+    // 所以它是可配的；不传就走适配器缺省（IN_PROGRESS_VALUE）。
+    statusValues: options.statusValues,
     getSecret: options.getSecret ?? (async (ref) => (ref === 'FEISHU_APP_ID' ? 'cli_test' : 'secret_test')),
     // 允许用例在 createFakeServer 之外再包一层（比如注入挂起不返回的 fetch 来测超时）。
     fetch: options.fetch ?? server.fetchImpl,
@@ -334,6 +337,51 @@ export async function runFeishuChecks (check) {
     const { source } = makeSource(server)
     const result = await source.scan(new AbortController().signal)
     assert.equal(result.created.length, 1)
+  })
+
+  await check('状态值集合可配：配成「否」就只收「否」，不收「处理中」', async () => {
+    const server = createFakeServer({
+      rows: [
+        makeRow('rec-no', { status: '否' }),
+        makeRow('rec-progress', { status: IN_PROGRESS_VALUE }),
+        makeRow('rec-yes', { status: '是' }),
+      ],
+    })
+    const { source } = makeSource(server, { statusValues: ['否'] })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '只有「否」那一行该进来')
+    assert.equal(result.created[0].recordId, 'rec-no')
+  })
+
+  await check('状态值集合可配：单值形态（写一个字符串）也认', async () => {
+    const server = createFakeServer({
+      rows: [makeRow('rec-no', { status: '否' }), makeRow('rec-progress', { status: IN_PROGRESS_VALUE })],
+    })
+    const { source } = makeSource(server, { statusValues: '否' })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.equal(result.created[0].recordId, 'rec-no')
+  })
+
+  await check('状态值集合可配：多个值都算「在处理中」', async () => {
+    const server = createFakeServer({
+      rows: [
+        makeRow('rec-a', { status: '否' }),
+        makeRow('rec-b', { status: '待处理' }),
+        makeRow('rec-c', { status: '是' }),
+      ],
+    })
+    const { source } = makeSource(server, { statusValues: ['否', '待处理'] })
+    const result = await source.scan(new AbortController().signal)
+    assert.deepEqual(result.created.map((t) => t.recordId).sort(), ['rec-a', 'rec-b'])
+  })
+
+  await check('状态值集合可配：配了空集合就退回缺省，不会把整张空表收成满屏票', async () => {
+    const server = createFakeServer({ rows: [makeRow('rec-progress'), makeRow('rec-blank', { status: '' })] })
+    const { source } = makeSource(server, { statusValues: [] })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '只该收默认的「处理中」那一行')
+    assert.equal(result.created[0].recordId, 'rec-progress')
   })
 
   await check('水位推进：没变不重复入队，变了才算修订', async () => {

@@ -1115,6 +1115,132 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(registered.some((tool) => tool.name === 'pipeline_scan'), 'agent 执行器下工具仍要注册')
   })
 
+  section('12e. 平台可插拔：状态值可配 + 金山文档真的接进组合根')
+
+  await check('statusValues 进得了配置（配成「否」就按「否」收票）', async () => {
+    // 这条是真实事故：真实飞书表的「是否处理」列用的是「否」，
+    // 而适配器把状态值写死成「处理中」，于是插件一张票都收不到、看上去「一切正常」。
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', statusValues: ['否', '待处理'] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    assert.deepEqual(result.value.projects[0].match.statusValues, ['否', '待处理'])
+  })
+
+  await check('statusValues 写成单字符串也认，且归一成数组', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', statusValues: '否' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    assert.deepEqual(result.value.projects[0].match.statusValues, ['否'])
+  })
+
+  await check('statusValues 配成空集合要报错（否则整张表收不到票还没人知道）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', statusValues: [] },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.issues, '空集合必须被拦下')
+    assert.match(JSON.stringify(result.issues), /statusValues/)
+  })
+
+  await check('不配 statusValues 就别塞进配置（保持适配器缺省不被顶掉）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value)
+    assert.equal(result.value.projects[0].match.statusValues, undefined)
+  })
+
+  await check('金山文档的定位字段进得了配置（sheetUrl / sheetName / statusColumn …）', async () => {
+    const result = validateConfig({
+      projects: [{
+        name: 'wps-demo',
+        match: {
+          platform: 'wps',
+          sheetUrl: 'https://www.kdocs.cn/l/abcdef',
+          sheetName: '问题记录表',
+          statusColumn: '是否处理',
+          statusValue: '否',
+          mediaPrefix: 'wps-media',
+        },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
+    const match = result.value.projects[0].match
+    assert.equal(match.sheetUrl, 'https://www.kdocs.cn/l/abcdef')
+    assert.equal(match.sheetName, '问题记录表')
+    assert.equal(match.statusColumn, '是否处理')
+    assert.equal(match.statusValue, '否')
+    assert.equal(match.mediaPrefix, 'wps-media')
+  })
+
+  await check('SOURCES 里 wps 已接上：声明水位能力 + 有 match 翻译器', async () => {
+    // 之前 wps 那行 capabilities 是空的、也没有 match：配 platform: wps 只会得到一个
+    // 「没取数通道」的源，等于平台没接。这条把接线钉住。
+    const { SOURCES } = await import('../src/index.js')
+    assert.ok(SOURCES.wps, 'SOURCES 里必须有 wps')
+    assert.ok(SOURCES.wps.capabilities.includes('watermark'), 'wps 必须声明水位能力，否则重启后整张表重收一遍')
+    assert.equal(typeof SOURCES.wps.match?.build, 'function', 'wps 必须有自己的 match 翻译器（组合根不认识平台字段）')
+  })
+
+  await check('buildSourceOptions：wps 项目的 match 被翻译成适配器认得的参数', async () => {
+    const { SOURCES, buildSourceOptions } = await import('../src/index.js')
+    const saved = []
+    const opts = buildSourceOptions(SOURCES.wps, {
+      project: {
+        name: 'wps-demo',
+        match: { platform: 'wps', sheetName: '问题记录表', statusColumn: '是否处理', statusValue: '否' },
+      },
+      store: {
+        getWatermark: async () => null,
+        saveWatermark: async (_id, value) => { saved.push(value) },
+      },
+      readSecret: async () => undefined,
+      readLocalFile: async () => { throw new Error('不该被调用') },
+      config: { safePageRun: 20, goneAfterScans: 3 },
+      log: silent,
+    })
+    assert.equal(opts.sheetName, '问题记录表')
+    assert.equal(opts.statusColumn, '是否处理')
+    assert.equal(opts.statusValue, '否')
+    assert.equal(typeof opts.getWatermark, 'function', '声明了水位能力就要拿到水位函数')
+    assert.equal(typeof opts.saveWatermark, 'function')
+    assert.equal(opts.goneAfterScans, 3, 'scanTuning 能力要把全局配置接进来')
+  })
+
+  await check('buildSourceOptions：飞书项目的 statusValues 一路透到适配器', async () => {
+    const { SOURCES, buildSourceOptions } = await import('../src/index.js')
+    const opts = buildSourceOptions(SOURCES.feishu, {
+      project: {
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'a', tableId: 't', statusValues: ['否'] },
+      },
+      store: { getWatermark: async () => null, saveWatermark: async () => {} },
+      readSecret: async () => 'secret',
+      readLocalFile: async () => ({ data: new Uint8Array() }),
+      config: { safePageRun: 20, goneAfterScans: 3 },
+      log: silent,
+    })
+    assert.deepEqual(opts.statusValues, ['否'], '配置里的状态值集合必须真的到适配器手上')
+  })
+
   section('12c. 走宿主 shell 时必须显式带 sandboxPolicy（否则无 session 调用拿不到写授权）')
 
   /** 造一个假 shell 服务，记录每次 resolve 收到的请求。 */

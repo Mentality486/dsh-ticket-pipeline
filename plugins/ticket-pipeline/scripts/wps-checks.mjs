@@ -461,9 +461,9 @@ export async function runWpsChecks (check) {
     )
   })
 
-  await check('capabilities 只有 watermark，不多报能力', async () => {
+  await check('capabilities 只有 watermark 与 scanTuning，不多报能力', async () => {
     const source = createWpsSource({ sourceId: 'wps-1', fetchSheet: async () => ({ bytes }) })
-    assert.deepEqual(source.capabilities, ['watermark'])
+    assert.deepEqual(source.capabilities, ['watermark', 'scanTuning'])
   })
 
   await check('scan 只收「处理中」的行，认领 / 已完成的都不进流水线', async () => {

@@ -49,6 +49,14 @@
  * @property {string} [tableId] 飞书数据表 id（显式绑定，和 appToken 一起用）
  * @property {string} [viewId] 可选：只扫某个视图
  * @property {string} [docNamePattern] 文件名模糊匹配（兜底：没有显式 appToken/tableId 时用它搜文档）
+ * @property {string[]|string} [statusValues] 状态列里哪些取值算「在处理中」（收票条件）。
+ *   每张表的约定不一样（常见「处理中」「否」「待处理」），写死一个值会让插件一张票都收不到。
+ *   缺省按平台自带值（飞书「处理中」、金山「处理中」）。
+ * @property {string} [sheetUrl] 金山文档表格的分享链接（wps 平台：给了就自动用 fetch 下载导出文件）
+ * @property {string} [sheetName] 金山文档里的工作表名（wps 平台）
+ * @property {string} [statusColumn] 「是否处理」列名（wps 平台）
+ * @property {string} [statusValue] 收票的状态值（wps 平台单值形态；飞书用 statusValues）
+ * @property {string} [mediaPrefix] 截图 fileToken 的前缀（wps 平台）
  */
 
 /**
@@ -482,6 +490,27 @@ function validateProject (raw, index) {
   if (typeof match.viewId === 'string' && match.viewId.length > 0) value.match.viewId = match.viewId
   if (typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0) value.match.docNamePattern = match.docNamePattern
 
+  // 状态值：收票与否全看它。必须在这里校验 —— 配错一个空串就等于整张表收不到票，
+  // 而这种错在启动时看不出来（源照样扫得动，只是空转）。
+  if (match.statusValues !== undefined && match.statusValues !== null) {
+    const raw = Array.isArray(match.statusValues) ? match.statusValues : [match.statusValues]
+    const list = raw
+      .filter((item) => typeof item === 'string' || typeof item === 'number')
+      .map((item) => String(item).trim())
+      .filter((item) => item.length > 0)
+    if (list.length === 0) {
+      fail('match.statusValues', '必须是非空字符串或字符串数组（值是状态列里表示「在处理中」的取值）')
+    } else {
+      value.match.statusValues = Array.from(new Set(list))
+    }
+  }
+
+  // 金山文档（wps）专属的定位字段：组合根不认识它们，由适配器自己翻译（ADR-0001）。
+  for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
+    const item = match[key]
+    if (typeof item === 'string' && item.length > 0) value.match[key] = item
+  }
+
   if (typeof repo.remote === 'string' && repo.remote.length > 0) value.repo.remote = repo.remote
   if (typeof repo.baseBranch === 'string' && repo.baseBranch.length > 0) value.repo.baseBranch = repo.baseBranch
   if (typeof repo.targetBranch === 'string' && repo.targetBranch.length > 0) value.repo.targetBranch = repo.targetBranch
@@ -753,6 +782,12 @@ export function describeConfig (config) {
     if (typeof match.tableId === 'string' && match.tableId.length > 0) out.match.tableId = match.tableId
     if (typeof match.viewId === 'string' && match.viewId.length > 0) out.match.viewId = match.viewId
     if (typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0) out.match.docNamePattern = match.docNamePattern
+    // 状态值集合要透出来：排障时先看「到底按哪些值收票」，再看别的。
+    if (Array.isArray(match.statusValues) && match.statusValues.length > 0) out.match.statusValues = match.statusValues
+    // 金山文档的定位字段（非敏感，直接给）
+    for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
+      if (typeof match[key] === 'string' && match[key].length > 0) out.match[key] = match[key]
+    }
     out.repo = p?.repo ?? {}
     out.verify = p?.verify ?? {}
     return out

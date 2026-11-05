@@ -35,7 +35,7 @@ import { PipelineError } from './contracts/errors.js'
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
-import { createWpsSource } from './adapters/source-wps/index.js'
+import { createWpsSource, wpsOptionsFromMatch } from './adapters/source-wps/index.js'
 import { createWebformSource } from './adapters/source-webform/index.js'
 import { createTableLocator } from './adapters/locator-table/index.js'
 import { createMockExecutor } from './adapters/executor-mock/index.js'
@@ -206,8 +206,13 @@ export const SOURCES = {
     capabilities: ['watermark', 'secret', 'localFile', 'scanTuning'],
     factory: (opts) => createFeishuSource(opts),
   },
-  // wps 还没实现，先不声明能力：真接上时按需往里加。
-  wps: { capabilities: [], factory: (opts) => createWpsSource(opts) },
+  // 金山文档：只要水位（否则重启后整张表当成新票重收一遍）；取数通道由 match.sheetUrl
+  // 翻译出来的 fetchSheet 提供，宿主也可注入自己的实现整个替换。
+  wps: {
+    capabilities: ['watermark', 'scanTuning'],
+    factory: (opts) => createWpsSource(opts),
+    match: { build: (match) => wpsOptionsFromMatch(match) },
+  },
   // webform：演示平台（内存表单源），验证「加平台只加目录 + 两行表」。
   webform: { capabilities: [], factory: (opts) => createWebformSource(opts) },
 }

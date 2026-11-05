@@ -59,8 +59,35 @@ export const FEISHU_COLUMNS = Object.freeze({
   lastModified: '最后更新时间',
 })
 
-/** 收票只看这一列的这一值。 */
+/** 收票只看这一列的这一值（缺省值，可被 options.statusValues 覆盖）。 */
 export const IN_PROGRESS_VALUE = '处理中'
+
+/**
+ * 把「哪些状态值算在处理中」归一成字符串数组。
+ *
+ * 形态有三种，都得认：
+ * - 不给 / 给空 → 退回 IN_PROGRESS_VALUE（保持既有行为）；
+ * - 给一个字符串 → 当成单值集合（人写 statusValue: '否' 这种直觉写法别报错）；
+ * - 给数组 → 取每个非空字符串，**去重**（同一个值写两遍不算两个状态）。
+ *
+ * 空串永远不算状态：表里状态列为空的行不是「处理中」，否则会把整张空表收成满屏票。
+ *
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function resolveStatusValues (value) {
+  if (value === undefined || value === null || value === '') return [IN_PROGRESS_VALUE]
+  const list = Array.isArray(value) ? value : [value]
+  /** @type {string[]} */
+  const out = []
+  for (const item of list) {
+    if (item === undefined || item === null) continue
+    const text = String(item).trim()
+    if (text.length === 0) continue
+    if (!out.includes(text)) out.push(text)
+  }
+  return out.length > 0 ? out : [IN_PROGRESS_VALUE]
+}
 
 /** 优先级字面量 → 内部权重档位。 */
 const PRIORITY_MAP = new Map([
@@ -239,6 +266,10 @@ export function createFeishuSource (options = {}) {
   const tableId = String(options.tableId ?? '')
   const viewId = String(options.viewId ?? '')
   const docNamePattern = String(options.docNamePattern ?? '')
+  // 「这一行算不算待处理的工单」由状态列的取值决定，而这个取值**每张表不一样**：
+  // 常见有「处理中」「否」「待处理」「未处理」……写死一个值，配置写得再对也一张票都收不到。
+  // 这里接受一组值（命中任意一个即算「在处理中」），缺省仍是老的那一个，保持既有行为。
+  const statusValues = resolveStatusValues(options.statusValues)
   const getSecret = typeof options.getSecret === 'function' ? options.getSecret : null
   const fetchImpl = typeof options.fetch === 'function' ? options.fetch : globalThis.fetch
   const getWatermark = typeof options.getWatermark === 'function' ? options.getWatermark : null
@@ -934,7 +965,7 @@ export function createFeishuSource (options = {}) {
 
         const fields = item?.fields ?? {}
         const status = normalizeCellText(fields[FEISHU_COLUMNS.status])
-        const inProgress = status === IN_PROGRESS_VALUE
+        const inProgress = statusValues.includes(status)
         const mtime = pickMtime(item)
         const ticket = buildTicket(item, recordId)
         const prev = seen[recordId]
@@ -1194,14 +1225,21 @@ export function createFeishuSource (options = {}) {
 /**
  * 从项目条目的 `match` 里摘出本适配器用得到的值。
  * @param {any} match 项目条目的 `match` 字段
- * @returns {{ appToken: string, tableId: string, viewId: string, docNamePattern: string }}
+ * @returns {{ appToken: string, tableId: string, viewId: string, docNamePattern: string, statusValues?: string[] }}
  */
 export function feishuOptionsFromMatch (match) {
   const m = match ?? {}
-  return {
+  /** @type {Record<string, unknown>} */
+  const options = {
     appToken: String(m.appToken ?? ''),
     tableId: String(m.tableId ?? ''),
     viewId: String(m.viewId ?? ''),
     docNamePattern: String(m.docNamePattern ?? ''),
   }
+  // 只在配置里真的写了状态值时才透传：没写就用适配器自己的缺省值，
+  // 免得「空数组」这种空配置反过来把缺省也顶掉。
+  if (m.statusValues !== undefined && m.statusValues !== null && m.statusValues !== '') {
+    options.statusValues = resolveStatusValues(m.statusValues)
+  }
+  return /** @type {any} */ (options)
 }
