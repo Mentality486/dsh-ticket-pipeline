@@ -127,6 +127,66 @@ export function createGitlabClient (options = {}) {
     }
   }
 
+  /**
+   * 找这个源分支上已经开着的 MR。
+   *
+   * 为什么需要：GitLab 不允许同一源分支同时挂两个开放 MR，重跑同一张票时
+   * 分支名不变（ticket-<project>-<record>-r1），远端那个 MR 还在 —— 这时
+   * 再 POST 就是 409。把「已有 MR」当成「远端状态冲突」是可重试错误，
+   * 等多久都不会自己好，必须复用。
+   *
+   * @param {{ sourceBranch: string, targetBranch: string, signal?: AbortSignal }} input
+   * @returns {Promise<{ iid: number, url: string, draft: boolean } | null>}
+   */
+  async function findOpenMergeRequest ({ sourceBranch, targetBranch, signal }) {
+    const query = new URLSearchParams({
+      state: 'opened',
+      source_branch: sourceBranch,
+      target_branch: targetBranch,
+      per_page: '20',
+    })
+    let result
+    try {
+      result = await call('GET', `/projects/${projectPath}/merge_requests?${query.toString()}`, { signal })
+    } catch (error) {
+      // 列不出来就当「没有已有 MR」，让后面的 POST 去给权威答案。
+      // 吞掉这里的错误只会把真正的失败原因往后挪一步，不会制造假成功。
+      log('gitlab：查询源分支上已有的 MR 失败（继续走创建）', { sourceBranch, message: error?.message ?? String(error) })
+      return null
+    }
+    const list = Array.isArray(result.body) ? result.body : []
+    for (const item of list) {
+      const iid = Number(item?.iid)
+      const url = typeof item?.web_url === 'string' ? item.web_url : ''
+      if (!Number.isFinite(iid) || url.length === 0) continue
+      const title = typeof item?.title === 'string' ? item.title : ''
+      return { iid, url, draft: title.startsWith(DRAFT_PREFIX) || item?.draft === true }
+    }
+    return null
+  }
+
+  /**
+   * 复用已有 MR 时，把标题与描述刷新到最新 —— 票的描述与改动清单变了，MR 上要看得见。
+   *
+   * @param {{ iid: number, title: string, description?: string, signal?: AbortSignal }} input
+   * @returns {Promise<void>}
+   */
+  async function refreshMergeRequest ({ iid, title, description, signal }) {
+    try {
+      await call('PUT', `/projects/${projectPath}/merge_requests/${iid}`, {
+        body: {
+          title: ensureDraftTitle(title),
+          description: typeof description === 'string' ? description : '',
+        },
+        signal,
+      })
+    } catch (error) {
+      // 刷新只是锦上添花：标题已经带 Draft: 前缀，描述过时不影响「这是草稿、要人审」这件事。
+      // 刷新失败不该把整张票判死 —— 记录下来继续走。
+      log('gitlab：刷新已有 MR 的标题/描述失败（继续用旧内容）', { iid, message: error?.message ?? String(error) })
+    }
+  }
+
   return {
     id: 'gitlab',
     baseUrl,
@@ -213,18 +273,47 @@ export function createGitlabClient (options = {}) {
       if (typeof title !== 'string' || title.trim().length === 0) {
         throw new PipelineError('invalid-input', 'gitlab：createMergeRequest 需要标题')
       }
-      const result = await call('POST', `/projects/${projectPath}/merge_requests`, {
-        body: {
-          source_branch: sourceBranch,
-          target_branch: targetBranch,
-          title: ensureDraftTitle(title),
-          description: typeof description === 'string' ? description : '',
-          // 照发 draft:true，只为让接口形状与真实 API 一致；
-          // 真正生效的是标题前缀，代码里不要把期望寄托在这个字段上。
-          draft: true,
-        },
-        signal,
-      })
+      // 先看这个源分支上有没有已经开着的 MR。有就复用，不要再开一个 ——
+      // GitLab 对「同一源分支再开一个 MR」直接回 409，而重跑同一张票时
+      // 分支名不变（ticket-<project>-<record>-r1），远端那个 MR 还在。
+      // 把 409 当「远端状态冲突」是可重试错误，等多久都不会自己好。
+      const existing = await findOpenMergeRequest({ sourceBranch, targetBranch, signal })
+      if (existing) {
+        if (!existing.draft) {
+          throw new PipelineError('internal',
+            'gitlab：源分支 ' + sourceBranch + ' 上已有一个不是草稿的 MR（!' + existing.iid + '），不能自动复用，请人先处理')
+        }
+        log('gitlab：源分支上已有开放的 draft MR，复用它', { sourceBranch, iid: existing.iid })
+        await refreshMergeRequest({ iid: existing.iid, title, description, signal })
+        return { iid: existing.iid, url: existing.url, draft: true }
+      }
+      let result
+      try {
+        result = await call('POST', `/projects/${projectPath}/merge_requests`, {
+          body: {
+            source_branch: sourceBranch,
+            target_branch: targetBranch,
+            title: ensureDraftTitle(title),
+            description: typeof description === 'string' ? description : '',
+            // 照发 draft:true，只为让接口形状与真实 API 一致；
+            // 真正生效的是标题前缀，代码里不要把期望寄托在这个字段上。
+            draft: true,
+          },
+          signal,
+        })
+      } catch (error) {
+        // 竞态：刚才查「有没有已有 MR」和这次 POST 之间，别人（或上一次跑的那张票）
+        // 刚好开了一个。再查一次，拿到就复用；拿不到才把 409 当冲突抛出去。
+        if (error?.kind === 'internal' && /409/.test(String(error?.message ?? ''))) {
+          const raced = await findOpenMergeRequest({ sourceBranch, targetBranch, signal })
+          if (raced && raced.draft) {
+            log('gitlab：POST 撞上已有 MR，复用它', { sourceBranch, iid: raced.iid })
+            await refreshMergeRequest({ iid: raced.iid, title, description, signal })
+            return { iid: raced.iid, url: raced.url, draft: true }
+          }
+        }
+        throw error
+      }
       const body = result.body ?? {}
       const iid = Number(body.iid)
       const webUrl = typeof body.web_url === 'string' ? body.web_url : ''

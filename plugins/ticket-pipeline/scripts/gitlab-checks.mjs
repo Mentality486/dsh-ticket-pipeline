@@ -95,6 +95,24 @@ function createFakeGitlab (options = {}) {
     if (raw.endsWith('/merge_requests') && method === 'POST') {
       return respond(201, { iid: 42, web_url: 'https://gitlab.example.com/mr/42', title: body.title })
     }
+    // 列出源分支上已有的开放 MR（真实 GitLab 是 GET /merge_requests?state=opened&...）
+    if (raw.includes('/merge_requests?') && method === 'GET') {
+      const list = (options.openMergeRequests ?? []).map((item) => ({
+        iid: item.iid,
+        web_url: item.url ?? 'https://gitlab.example.com/mr/' + item.iid,
+        title: item.title ?? 'Draft: 已有 MR',
+        draft: item.draft !== false,
+      }))
+      return respond(200, list)
+    }
+    if (method === 'PUT' && /\/merge_requests\/\d+$/.test(raw)) {
+      const iid = Number(/\/merge_requests\/(\d+)$/.exec(raw)[1])
+      const put = (options.putMergeRequest ?? []).find((item) => item.iid === iid)
+      if (put && put.fail) {
+        return respond(put.status ?? 500, { message: put.message ?? '刷新失败' })
+      }
+      return respond(200, { iid, web_url: 'https://gitlab.example.com/mr/' + iid, title: body.title })
+    }
     return respond(404, { message: `桩没实现 ${method} ${raw}` })
   }
 
@@ -423,6 +441,86 @@ export async function runGitlabChecks (check) {
     assert.equal(ensureDraftTitle('修复登录'), 'Draft: 修复登录')
   })
 
+  await check('GitLab：源分支上已有开放 MR 时复用它，不重复开（重跑同一张票不能撞 409）', async () => {
+    // 为什么：重跑同一张票时分支名不变（ticket-<project>-<record>-r1），
+    // 远端那个 draft MR 还在。再 POST 就是 409，而 409 被归成可重试错误 ——
+    // 等多久都不会自己好，票会一直失败。必须复用。
+    const server = createFakeGitlab({
+      existingBranches: ['ticket-demo-rec-9-r1'],
+      openMergeRequests: [{ iid: 7, url: 'https://gitlab.example.com/mr/7', title: 'Draft: 上一轮开的' }],
+    })
+    const client = makeClient(server)
+    const mr = await client.createMergeRequest({ sourceBranch: 'ticket-demo-rec-9-r1', targetBranch: 'main', title: '修复登录' })
+    assert.equal(mr.iid, 7, '应该复用已有 MR 的 iid')
+    assert.equal(mr.url, 'https://gitlab.example.com/mr/7')
+    assert.equal(mr.draft, true)
+    const posts = server.requests.filter((r) => r.method === 'POST' && r.url.endsWith('/merge_requests'))
+    assert.equal(posts.length, 0, '不该再 POST 一个 MR，实际发了 ' + posts.length + ' 次')
+    const put = server.requests.find((r) => r.method === 'PUT')
+    assert.ok(put, '复用时应该刷新已有 MR 的标题与描述')
+    assert.ok(put.body.title.startsWith('Draft:'), '刷新后的标题也要带 Draft: 前缀')
+  })
+
+  await check('GitLab：已有 MR 不是草稿时不自动复用，要人处理', async () => {
+    // 为什么：流水线只该产出「待人审的草稿」。远端那个是正式 MR，说明人已经在处理了，
+    // 自动复用会改掉别人的东西。
+    const server = createFakeGitlab({
+      openMergeRequests: [{ iid: 9, url: 'https://gitlab.example.com/mr/9', title: '正式 MR', draft: false }],
+    })
+    const client = makeClient(server)
+    await assert.rejects(
+      () => client.createMergeRequest({ sourceBranch: 'ticket-x', targetBranch: 'main', title: '修复登录' }),
+      (error) => {
+        assert.equal(error.kind, 'internal')
+        assert.ok(/不是草稿/.test(error.message), '错误文案要说清是「不是草稿」，实际是 ' + error.message)
+        return true
+      },
+    )
+  })
+
+  await check('GitLab：POST 撞上 409 时再查一次并复用竞态出来的 MR', async () => {
+    // 为什么：查「有没有已有 MR」和 POST 之间存在窗口，别人刚好开了一个。
+    // 这时再查一次拿到就复用，不要把 409 直接抛出去。
+    let mrListCalls = 0
+    const server = createFakeGitlab({
+      overrides: {
+        'POST /merge_requests': {
+          status: 409,
+          ok: false,
+          headers: { get: () => null },
+          json: async () => ({ message: '此源分支已存在另一个开放的合并请求：!3' }),
+        },
+      },
+    })
+    const baseFetch = server.fetchImpl
+    server.fetchImpl = async (url, init) => {
+      const method = String(init?.method ?? 'GET').toUpperCase()
+      if (method === 'GET' && String(url).includes('/merge_requests?')) {
+        mrListCalls += 1
+        if (mrListCalls === 1) return { status: 200, ok: true, headers: { get: () => null }, json: async () => [] }
+        return {
+          status: 200, ok: true, headers: { get: () => null },
+          json: async () => [{ iid: 3, web_url: 'https://gitlab.example.com/mr/3', title: 'Draft: 竞态出来的' }],
+        }
+      }
+      return await baseFetch(url, init)
+    }
+    const client = makeClient(server)
+    const mr = await client.createMergeRequest({ sourceBranch: 'ticket-x', targetBranch: 'main', title: '修复登录' })
+    assert.equal(mr.iid, 3, '竞态出来的 MR 应该被复用')
+    assert.equal(mr.draft, true)
+  })
+
+  await check('GitLab：刷新已有 MR 失败不把整张票判死', async () => {
+    // 为什么：标题已经带 Draft: 前缀，描述过时不影响「这是草稿、要人审」这件事。
+    const server = createFakeGitlab({
+      openMergeRequests: [{ iid: 11, url: 'https://gitlab.example.com/mr/11' }],
+      putMergeRequest: [{ iid: 11, fail: true, status: 500 }],
+    })
+    const client = makeClient(server)
+    const mr = await client.createMergeRequest({ sourceBranch: 'ticket-x', targetBranch: 'main', title: '修复登录' })
+    assert.equal(mr.iid, 11, '刷新失败也要把已有 MR 的链接交出去')
+  })
   await check('GitLab：429 分类成 rate-limit 并带 retryAfterMs', async () => {
     // 为什么：内核靠 kind 决定「能不能重试」、靠 retryAfterMs 决定「等多久」。
     // 分类错了就会被当成 fatal 直接通知人，或者立刻重试再次撞墙。
