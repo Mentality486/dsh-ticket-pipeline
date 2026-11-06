@@ -407,10 +407,22 @@ function findInput (tree, predicate) {
   return inputs.find(predicate)
 }
 
-/** 所有分组折叠按钮（`.tp-toggle`）。 */
+/**
+ * 所有**配置分组**的折叠按钮（`.tp-group-toggle`）。
+ *
+ * 刻意只认这一种：项目卡片里的折叠（`.tp-proj-toggle`）与卡内分组在同一个页面上
+ * 共存，用 `.tp-toggle` 一把捞的话，项目一多这个数就跟着变，「每个分组都有折叠
+ * 标题」那条断言会莫名其妙地红，而且红得看不出是哪儿错了。
+ */
 function findToggles (tree) {
   return findAll(tree, (node) => node.type === 'button' &&
-    String(node.props.className || '').indexOf('tp-toggle') >= 0)
+    String(node.props.className || '').indexOf('tp-group-toggle') >= 0)
+}
+
+/** 所有项目卡片的折叠按钮（`.tp-proj-toggle`）。 */
+function findProjectToggles (tree) {
+  return findAll(tree, (node) => node.type === 'button' &&
+    String(node.props.className || '').indexOf('tp-proj-toggle') >= 0)
 }
 
 /** 把还收着的分组一一点开，返回展开后的树。 */
@@ -581,8 +593,21 @@ async function main () {
       typeof node.props.value === 'string' && node.props.value.indexOf('basc') >= 0).length === 0)
   check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
   // 21 个字段分 5 节，节标题得真的渲染出来，否则一屏全是输入框没法看。
+  // 「验证命令」整组是高级项（`advanced: true`），缺省不画 —— 要看全得勾
+  // 「显示全部字段」，所以这里连那条路径一起验。
   check('项目卡片分了「仓库」一节', textOf(tree).indexOf('仓库') >= 0)
-  check('项目卡片分了「验证」一节', textOf(tree).indexOf('验证命令') >= 0)
+  check('缺省不显示高级组「验证命令」', textOf(tree).indexOf('验证命令') < 0)
+  const advLabel = findAll(tree, (node) => node.type === 'label' &&
+    textOf(node).indexOf('显示全部字段') >= 0)[0]
+  const advToggle = advLabel === undefined
+    ? undefined
+    : findAll(advLabel, (node) => node.type === 'input')[0]
+  check('有「显示全部字段」开关', advToggle !== undefined)
+  if (advToggle !== undefined) {
+    advToggle.props.onChange({ target: { checked: true } })
+    tree = await render(Panel, { view: 'page' })
+    check('勾上后显示高级组「验证命令」', textOf(tree).indexOf('验证命令') >= 0)
+  }
 
   const repoInput = findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms')
   check('找到项目仓库路径输入框', repoInput !== undefined)
@@ -690,6 +715,33 @@ async function main () {
   const platformSelect = findAll(tree, (node) => node.type === 'select' &&
     Array.isArray(node.props.children)).map((node) => node.props.children.length)
   check('平台字段渲染成下拉框', platformSelect.length >= 1, JSON.stringify(platformSelect))
+
+  // 项目卡片可收起：收起后字段不该还渲染在树上（否则折叠只是视觉假象），
+  // 而头部的徽标（已改 / 待修）必须还在 —— 收起不能顺手把「有错」也藏了。
+  const projToggles = findProjectToggles(tree)
+  check('项目卡片有折叠开关', projToggles.length >= 1, String(projToggles.length))
+  const projToggle = projToggles[0]
+  check('项目卡片默认展开', projToggle !== undefined && projToggle.props['aria-expanded'] === 'true',
+    projToggle === undefined ? '没找到' : String(projToggle.props['aria-expanded']))
+  if (projToggle !== undefined) {
+    projToggle.props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    check('收起项目卡片后不再渲染它的字段',
+      findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms') === undefined)
+    check('收起项目卡片后仍然显示项目名', textOf(tree).indexOf('pms') >= 0)
+    check('收起后头像 aria-expanded 变 false',
+      findProjectToggles(tree)[0].props['aria-expanded'] === 'false',
+      String(findProjectToggles(tree)[0].props['aria-expanded']))
+    findProjectToggles(tree)[0].props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    check('再点一次能展开回来',
+      findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms') !== undefined)
+  }
+
+  // 卡内分组也能收：默认「验证命令」是收着的（高级组），必填组是展开的。
+  const sectionToggles = findToggles(tree).filter((node) =>
+    String(node.props.className || '').indexOf('tp-group-toggle') >= 0)
+  check('项目卡内有可折叠的分组', sectionToggles.length >= 1, String(sectionToggles.length))
 
   // 必填项清空 → 即时校验标红 + 禁用保存 + 顶部「N 项待修」。
   const nameInput = findInput(tree, (node) => node.props.value === 'pms')

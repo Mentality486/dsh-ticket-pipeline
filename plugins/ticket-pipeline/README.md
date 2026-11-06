@@ -68,6 +68,10 @@ lib/
   候选来自第四个 Remote 方法 `ticketPipeline.branches()`（一次返回**全部**项目，不按项目各发一次 git；
   `src/core/branches.js` 的 `listBranches()` 绝不抛，拿不到就 `ok:false` + 一句人话原因）。
   手改配置文件仍然有效（见使用手册 §3）。
+- **面板密度**：缺省只显示 8 个常改字段，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是
+  `wps` 时出现。项目卡片整体可收起，卡内 5 个分区也能各自收起（两套折叠类名分开，折叠状态存两个
+  localStorage 键）。**改过或有错的字段无论收起与否都会露出来** —— 折叠不能成为遮蔽错误的工具。
+  隐藏 ≠ 删字段：`PROJECT_SECTIONS` 里 21 个 path 一个没少。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
 （每个节点带 `toJSON`、叶子带 `meta.volatile`），宿主 `dsh-settings` 用它投影出可写字段。
@@ -242,7 +246,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 （platform 写错宿主会静默跳过整个 bundle），以及 **`projects` 子树的 `meta.volatile`**：
 descriptor 叶子 **33 个 / 7 组**、schema 信封 **71 节点 / 33 叶子**、Remote **4 个方法**
 （`doctor` / `config` / `projects` / `branches`）、`projects` 可写 **25 字段**、面板项目字段 **21 项**与宿主对得上。
-（`client-smoke` 真跑一遍 bundle，实跑 **85 条**断言。）
+（`client-smoke` 真跑一遍 bundle，实跑 **94 条**断言。）
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

@@ -374,13 +374,19 @@ window.__ModuleLoader__.load({
 
     var PLATFORMS = ['feishu', 'wps', 'mock', 'webform']
 
+    // 每一组、每个字段都可以标 `advanced: true`（缺省视图下收起，勾「显示全部字段」才出现）。
+    // 另有 `onlyFor: '<platform>'`：整组只在平台等于该值时出现 —— 金山那五个键对飞书项目
+    // 毫无意义，画出来只会让「我该填哪些」变成猜谜。
+    //
+    // 判断「要不要隐藏」时有一条硬约束：**改过的字段永远显示**。否则一个只在高级里
+    // 出现的字段被改过之后会从界面上消失，人看不见也就撤不回来，保存时却照样写进去。
     var PROJECT_SECTIONS = [
       {
         key: 'basic',
         label: '基本',
         fields: [
           { path: ['name'], from: 'name', label: '项目名', kind: 'text', required: true, hint: 'projectId，必须唯一；工单里的项目要靠它对上仓库。' },
-          { path: ['description'], from: 'description', label: '说明', kind: 'text' },
+          { path: ['description'], from: 'description', label: '说明', kind: 'text', advanced: true },
           { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true, hint: '决定用哪个 ticket-source 适配器收票。' },
         ],
       },
@@ -389,22 +395,23 @@ window.__ModuleLoader__.load({
         label: '工单表',
         fields: [
           { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '飞书多维表格的 table id；与 appToken 一起构成显式绑定。' },
-          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text' },
           { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 tableId 时按文件名模糊匹配（例：PMS项目管理系统工单）。' },
           { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
-          { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', hint: '逗号分隔的 record id；留空表示整张表。' },
-          { path: ['match', 'allowedImageHosts'], from: 'allowedImageHosts', label: '允许的截图主机', kind: 'list', hint: '逗号分隔的主机名白名单；截图链接来自外部输入，不放行的一律拒绝。' },
+          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true },
+          { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', advanced: true, hint: '逗号分隔的 record id；留空表示整张表。' },
+          { path: ['match', 'allowedImageHosts'], from: 'allowedImageHosts', label: '允许的截图主机', kind: 'list', advanced: true, hint: '逗号分隔的主机名白名单；截图链接来自外部输入，不放行的一律拒绝。' },
         ],
       },
       {
         key: 'wps',
-        label: '金山文档（wps 专用）',
+        label: '金山文档',
+        onlyFor: 'wps',
         fields: [
           { path: ['match', 'sheetUrl'], from: 'sheetUrl', label: '表格链接', kind: 'text' },
           { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text' },
           { path: ['match', 'statusColumn'], from: 'statusColumn', label: '状态列名', kind: 'text' },
           { path: ['match', 'statusValue'], from: 'statusValue', label: '在处理中的取值', kind: 'text' },
-          { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text' },
+          { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text', advanced: true },
         ],
       },
       {
@@ -412,15 +419,16 @@ window.__ModuleLoader__.load({
         label: '仓库',
         fields: [
           { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。' },
-          { path: ['repo', 'remote'], from: 'repoRemote', label: '远端名', kind: 'text', hint: '缺省 origin。' },
           { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
-          { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', hint: '关掉只做本地提交，不需要 GITLAB_TOKEN。' },
+          { path: ['repo', 'remote'], from: 'repoRemote', label: '远端名', kind: 'text', advanced: true, hint: '缺省 origin。' },
+          { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', advanced: true, hint: '关掉只做本地提交，不需要 GITLAB_TOKEN。' },
         ],
       },
       {
         key: 'verify',
-        label: '验证',
+        label: '验证命令',
+        advanced: true,
         fields: [
           { path: ['verify', 'build'], from: 'verifyBuild', label: '构建命令', kind: 'text', hint: '留空跳过构建。' },
           { path: ['verify', 'test'], from: 'verifyTest', label: '验证命令', kind: 'text', hint: '留空跳过验证，直接开 draft MR。' },
@@ -430,6 +438,72 @@ window.__ModuleLoader__.load({
 
     function projectKey (index, path) {
       return 'p' + index + '.' + path.join('.')
+    }
+
+    /** 这个字段现在的草稿值算不算「改过」了（相对宿主下发的当前值）。 */
+    function isFieldChanged (record, draft, index, field) {
+      var key = projectKey(index, field.path)
+      var value = hasKey(draft, key) ? draft[key] : projectDraftValue(record, field)
+      return !sameDraft(value, projectDraftValue(record, field))
+    }
+
+    function fieldIssueOf (issues, index, field) {
+      return issues === undefined || issues === null ? undefined : issues[projectKey(index, field.path)]
+    }
+
+    function isErrorIssue (issue) {
+      return issue !== undefined && issue !== null && issue.level === 'error'
+    }
+
+    /**
+     * 一组字段在当前视图下该不该露出来。
+     *
+     * 两个理由可以让它藏起来：整组标了 `advanced`（缺省视图只放常用的）或
+     * `onlyFor` 指定的平台对不上（金山那五个键对飞书项目没有意义）。
+     *
+     * 但**改过的和有错的永远露出来**：一个只在高级里出现的字段被改过之后如果
+     * 从界面上消失，人就看不见也撤不回来，保存时却照样写进去 —— 那是最糟的形态。
+     */
+    function sectionVisible (section, record, draft, issues, index, showAdvanced) {
+      // 平台要以**草稿**里的为准：人刚把 mock 改成 wps，金山那组应该立刻出现，
+      // 而不是等保存完再刷一次才看得见。
+      var platformKey = projectKey(index, ['match', 'platform'])
+      var platform = hasKey(draft, platformKey)
+        ? String(draft[platformKey])
+        : (record && record.platform ? record.platform : '')
+      var exempt = false
+      for (var f = 0; f < section.fields.length; f += 1) {
+        var field = section.fields[f]
+        if (isFieldChanged(record, draft, index, field) || isErrorIssue(fieldIssueOf(issues, index, field))) {
+          exempt = true
+          break
+        }
+      }
+      if (exempt) return true
+      if (section.advanced === true && !showAdvanced) return false
+      if (section.onlyFor !== undefined && section.onlyFor !== platform) return false
+      return true
+    }
+
+    function fieldVisible (field, record, draft, issues, index, showAdvanced) {
+      if (field.advanced !== true || showAdvanced) return true
+      return isFieldChanged(record, draft, index, field) || isErrorIssue(fieldIssueOf(issues, index, field))
+    }
+
+    /** 一个项目里当前视图下看不见的字段数（用来提示「还有 N 项没显示」）。 */
+    function hiddenProjectFieldCount (record, draft, issues, index, showAdvanced) {
+      var count = 0
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var section = PROJECT_SECTIONS[s]
+        if (!sectionVisible(section, record, draft, issues, index, showAdvanced)) {
+          count += section.fields.length
+          continue
+        }
+        for (var f = 0; f < section.fields.length; f += 1) {
+          if (!fieldVisible(section.fields[f], record, draft, issues, index, showAdvanced)) count += 1
+        }
+      }
+      return count
     }
 
     /** 扁平 describeProject 记录 → 某个字段的草稿值。 */
@@ -515,6 +589,53 @@ window.__ModuleLoader__.load({
     function isGroupOpen (map, label) {
       if (hasKey(map, label)) return map[label] !== false
       return label === DEFAULT_OPEN_GROUP
+    }
+
+    // 项目卡片的折叠状态另存一份，key 形如 `p0`（整张卡）、`p0:repo`（卡内一组）。
+    // 为什么不能复用上面那个 map：全局配置里有「仓库」「验证」这样的组名，项目卡
+    // 里也有，同一条 key 会把两边带在一起 —— 收起项目里的仓库，配置那边的仓库
+    // 也跟着收起来。
+    var PROJ_OPEN_KEY = 'ticket-pipeline:open-projects'
+
+    function readProjMap () {
+      try {
+        if (typeof localStorage === 'undefined') return {}
+        var raw = localStorage.getItem(PROJ_OPEN_KEY)
+        if (typeof raw !== 'string' || raw.length === 0) return {}
+        var parsed = JSON.parse(raw)
+        return parsed !== null && typeof parsed === 'object' ? parsed : {}
+      } catch (error) {
+        return {}
+      }
+    }
+
+    function writeProjMap (map) {
+      try {
+        if (typeof localStorage === 'undefined') return
+        localStorage.setItem(PROJ_OPEN_KEY, JSON.stringify(map))
+      } catch (error) {
+        // 存不下就算了，折叠状态丢了不影响功能。
+      }
+    }
+
+    function projectOpenKey (index) {
+      return 'p' + index
+    }
+
+    function projectSectionOpenKey (index, sectionKey) {
+      return 'p' + index + ':' + sectionKey
+    }
+
+    /**
+     * 一组在项目卡里默认展开还是收起。
+     *
+     * 缺省展开「基本 / 工单表 / 金山文档 / 仓库」，收起「验证命令」—— 后两个是
+     * 「不填也能跑」的，摊在最上面只会让必填项被挤到看不见的地方。
+     */
+    function isProjectSectionOpen (map, index, sectionKey) {
+      var key = projectSectionOpenKey(index, sectionKey)
+      if (hasKey(map, key)) return map[key] !== false
+      return sectionKey !== 'verify'
     }
 
     /**
@@ -753,13 +874,25 @@ window.__ModuleLoader__.load({
 
       // 项目卡片
       '.tp-proj{border:1px solid var(--dsw-alias-border-l3,#8883);border-radius:var(--dsw-radius-sm,8px);padding:10px 12px;margin:10px 0 0}',
+      // 收起时只留一行头：padding 不许把空卡片撑出半屏。
+      '.tp-proj.tp-collapsed{padding:8px 12px}',
+      '.tp-proj.tp-collapsed .tp-proj-head{margin:0}',
       '.tp-proj-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 4px}',
+      // 头里的按钮是折叠开关，不要它自己那套 12px/toggle 的宽度，跟徽标排一行。
+      '.tp-proj-head .tp-toggle{width:auto;flex:0 1 auto;padding:0;font-size:12px}',
       '.tp-proj-head strong{font-size:12px}',
       '.tp-proj-head .tp-spacer{margin-left:auto}',
+      '.tp-proj-body{margin-top:4px}',
+      // 卡内的组标题：比顶层的分组小一号，别和「配置」那边抢视觉层级。
+      '.tp-proj-body .tp-group .tp-toggle{font-size:12px}',
       '.tp-proj .tp-field{padding:4px 0}',
+      // 收起状态下标签用更淡的字，提示它可点。
+      '.tp-proj-head .tp-toggle[aria-expanded="false"]{color:var(--dsw-alias-label-secondary,inherit)}',
       // 分支字段：输入框占满一行，候选提示跟在下面一行。
       '.tp-branch{display:flex;flex-direction:column;gap:2px}',
       '.tp-branch .tp-help{padding-left:2px}',
+      // 有错的项目徽标：红底，收起时也看得见。
+      '.tp-badge.tp-bad{color:var(--dsw-alias-label-error,#d33);border-color:var(--dsw-alias-label-error,#d33)}',
       '.tp-empty{margin:6px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit)}',
 
       '@media(max-width:520px){.tp-field{grid-template-columns:1fr}.tp-field label{padding-top:0}}',
@@ -859,7 +992,10 @@ window.__ModuleLoader__.load({
         h('h4', null,
           h('button', {
             type: 'button',
-            className: 'tp-toggle',
+            // 三个类名各有分工：tp-toggle 只管样式；tp-group-toggle 标「这是配置分组
+            // 的折叠」，自测按它数；tp-proj- 那套在项目卡片里，两套混着数就会互相
+            // 干扰（项目一多，「每个分组都有折叠标题」那条断言就莫名地红）。
+            className: 'tp-toggle tp-group-toggle',
             'aria-expanded': open ? 'true' : 'false',
             onClick: props.onToggle,
           },
@@ -1021,15 +1157,44 @@ window.__ModuleLoader__.load({
       var changedCount = countProjectChanges(props)
 
       var title = record && record.name ? record.name : ('项目 #' + (index + 1))
+      var open = props.open !== false
+      var hiddenCount = hiddenProjectFieldCount(record, draft, issues, index, props.showAdvanced)
+
+      // 收起时也得能看出「这里有东西要修」—— 否则折叠就成了遮蔽错误的工具。
+      var errorCount = 0
+      for (var s0 = 0; s0 < PROJECT_SECTIONS.length; s0 += 1) {
+        for (var f0 = 0; f0 < PROJECT_SECTIONS[s0].fields.length; f0 += 1) {
+          if (isErrorIssue(fieldIssueOf(issues, index, PROJECT_SECTIONS[s0].fields[f0]))) errorCount += 1
+        }
+      }
+
       var head = h('div', { className: 'tp-proj-head' },
-        h('strong', null, title),
+        h('button', {
+          type: 'button',
+          // 两个类名：tp-toggle 给样式复用，tp-proj-toggle 让自测能把「项目卡片的
+          // 折叠」和「配置分组的折叠」分开数 —— 混在一起数，加一张项目卡片就会
+          // 让「每个分组都有折叠标题」那条断言莫名其妙地红。
+          className: 'tp-toggle tp-proj-toggle',
+          'aria-expanded': open ? 'true' : 'false',
+          onClick: function () { props.onToggle(index) },
+        },
+          h('span', { className: 'tp-caret' }, open ? '▾' : '▸'),
+          h('strong', null, title)),
         h('span', { className: 'tp-badge' }, record && record.platform ? record.platform : '未配置平台'),
         changedCount > 0 ? h('span', { className: 'tp-badge tp-on' }, '已改 ' + changedCount + ' 项') : null,
+        errorCount > 0 ? h('span', { className: 'tp-badge tp-bad' }, errorCount + ' 项待修') : null,
+        // 说「未显示」而不是「高级」：藏起来的原因不止一种（不给这个平台用的组、
+        // 高级字段），把它们混称「高级设置」会让人以为是同一个开关能全放出来。
+        hiddenCount > 0 && open ? h('span', { className: 'tp-badge' }, hiddenCount + ' 项未显示') : null,
         h('span', { className: 'tp-spacer' }),
         record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null)
 
-      var sections = PROJECT_SECTIONS.map(function (section) {
-        var fields = section.fields.map(function (field) {
+      var sections = PROJECT_SECTIONS.filter(function (section) {
+        return sectionVisible(section, record, draft, issues, index, props.showAdvanced)
+      }).map(function (section) {
+        var fields = section.fields.filter(function (field) {
+          return fieldVisible(field, record, draft, issues, index, props.showAdvanced)
+        }).map(function (field) {
           var key = projectKey(index, field.path)
           var value = hasKey(draft, key) ? draft[key] : projectDraftValue(record, field)
           var issue = issues ? issues[key] : undefined
@@ -1127,27 +1292,53 @@ window.__ModuleLoader__.load({
                 ? h('p', { className: issue.level === 'error' ? 'tp-field-err' : 'tp-soft' }, issue.text)
                 : null))
         })
+        // 组也能折：一个项目 5 组全摊开时，光一个项目就顶满一屏。
+        // 组内必填项与平台专属组默认展开，其余（验证命令、高级）默认收起；
+        // 用户点过就以记住的为准，和上面「配置」那堆分组同一套语义。
+        var sectionOpen = props.isSectionOpen(index, section.key)
+        var sectionChanged = 0
+        for (var sf = 0; sf < section.fields.length; sf += 1) {
+          if (isFieldChanged(record, draft, index, section.fields[sf])) sectionChanged += 1
+        }
         return h('div', { key: section.key, className: 'tp-group' },
-          h('h4', null, section.label),
-          fields)
+          h('h4', null,
+            h('button', {
+              type: 'button',
+              className: 'tp-toggle',
+              'aria-expanded': sectionOpen ? 'true' : 'false',
+              onClick: function () { props.onToggleSection(index, section.key) },
+            },
+              h('span', { className: 'tp-caret' }, sectionOpen ? '▾' : '▸'),
+              section.label,
+              sectionChanged > 0 ? h('span', { className: 'tp-badge tp-on' }, '已改 ' + sectionChanged + ' 项') : null)),
+          sectionOpen ? fields : null)
       })
 
       // appToken：宿主只下发 hasAppToken + 打码预览，明文永不出宿主。
       // 这里绝不提供输入框 —— 填了也没地方存，还会让人以为存进了凭据库。
+      // 只在飞书项目上画：这是 feishu 专属的只读状态，别的平台显示它只会添乱。
+      var platformKey = projectKey(index, ['match', 'platform'])
+      var platformNow = hasKey(draft, platformKey)
+        ? String(draft[platformKey])
+        : (record && record.platform ? record.platform : '')
       var tokenText = record && record.hasAppToken
         ? '已配置' + (record.appTokenPreview ? '（' + record.appTokenPreview + '）' : '')
         : '未配置'
-      var tokenRow = h('div', { className: 'tp-field' },
-        h('div', null,
-          h('label', null, '飞书 appToken'),
-          h('p', { className: 'tp-help' },
-            '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
-            h('code', null, 'cordis.patch.yml'),
-            '。')),
-        h('div', null,
-          h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-on' : '') }, tokenText)))
+      var tokenRow = platformNow === 'feishu'
+        ? h('div', { className: 'tp-field' },
+          h('div', null,
+            h('label', null, '飞书 appToken'),
+            h('p', { className: 'tp-help' },
+              '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
+              h('code', null, 'cordis.patch.yml'),
+              '。')),
+          h('div', null,
+            h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-on' : '') }, tokenText)))
+        : null
 
-      return h('div', { className: 'tp-proj' }, head, sections, tokenRow)
+      return h('div', { className: 'tp-proj' + (open ? '' : ' tp-collapsed') },
+        head,
+        open ? h('div', { className: 'tp-proj-body' }, sections, tokenRow) : null)
     }
 
     /** 这张卡片里有多少个字段改过（用于「已改 N 项」徽标）。 */
@@ -1209,6 +1400,11 @@ window.__ModuleLoader__.load({
             onRevert: props.onRevert,
             branchChoices: entry && Array.isArray(entry.branches) ? entry.branches : [],
             branchNote: entry && entry.ok === false && entry.reason ? entry.reason : '',
+            open: props.isProjectOpen(index),
+            showAdvanced: props.showAdvanced,
+            onToggle: props.onToggleProject,
+            isSectionOpen: props.isSectionOpen,
+            onToggleSection: props.onToggleSection,
           })
         }))
       }
@@ -1217,6 +1413,16 @@ window.__ModuleLoader__.load({
         h('h3', null, '项目清单',
           h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } },
             list.length > 0 ? h('span', { className: 'tp-ok' }, list.length + ' 个项目') : null,
+            // 高级字段开关：缺省视图只画日常要动的那些，想看全的点一下。
+            // 这是一次性的「我现在要配细节」，所以不记进 localStorage。
+            h('label', { className: 'tp-check', title: '勾上就显示「开 draft MR」「验证命令」「允许的截图主机」等不常改的字段' },
+              h('input', {
+                type: 'checkbox',
+                checked: props.showAdvanced === true,
+                disabled: props.disabled,
+                onChange: function (event) { props.onToggleAdvanced(event.target.checked) },
+              }),
+              '显示全部字段'),
             h('button', {
               type: 'button',
               className: 'tp-btn',
@@ -1224,8 +1430,8 @@ window.__ModuleLoader__.load({
               onClick: props.onReload,
             }, props.busy ? '读取中…' : '重新读取'))),
         h('p', { className: 'tp-note' },
-          '每个项目 = 一张工单表 + 一个仓库的绑定。改哪项就只写哪项（深层路径），',
-          '不会整块覆盖；appToken 明文只存在配置文件里，这里只显示配没配。'),
+          '每个项目 = 一张工单表 + 一个仓库的绑定。点项目名可以收起它；',
+          '改哪项就只写哪项（深层路径），不会整块覆盖。'),
         body,
         props.message.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, props.message) : null,
         props.saveError ? h('p', { className: 'tp-err' }, props.saveError) : null)
@@ -1283,6 +1489,13 @@ window.__ModuleLoader__.load({
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
       var [openMap, setOpenMap] = useState(readOpenMap)
       var [serverIssues, setServerIssues] = useState({})
+
+      // 项目卡片的折叠：整张卡的展开/收起、卡内每一组的展开/收起、以及
+      // 「显示全部字段」开关。整卡与卡内的开合记在 localStorage（`projMap`），
+      // 高级开关**不记** —— 它是「我现在要配细节」的一次性意图，下次进来
+      // 还全摊开反而又变回一屏放不下。
+      var [projMap, setProjMap] = useState(readProjMap)
+      var [showAdvanced, setShowAdvanced] = useState(false)
 
       var isPage = props.view !== 'summary'
 
@@ -1591,6 +1804,37 @@ window.__ModuleLoader__.load({
         })
       }
 
+      /**
+       * 整张项目卡片的开合。**缺省展开** —— 用户是来看「我该填什么」的，
+       * 一进来就全收起来等于让他先点两下才看得见路径输入框。收起来是工具，
+       * 不是默认形态。
+       */
+      function isProjectOpenOf (map, index) {
+        var key = projectOpenKey(index)
+        if (hasKey(map, key)) return map[key] !== false
+        return true
+      }
+
+      function onToggleProject (index) {
+        setProjMap(function (previous) {
+          var copy = Object.assign({}, previous)
+          var key = projectOpenKey(index)
+          copy[key] = !isProjectOpenOf(previous, index)
+          writeProjMap(copy)
+          return copy
+        })
+      }
+
+      function onToggleProjectSection (index, sectionKey) {
+        setProjMap(function (previous) {
+          var copy = Object.assign({}, previous)
+          var key = projectSectionOpenKey(index, sectionKey)
+          copy[key] = !isProjectSectionOpen(previous, index, sectionKey)
+          writeProjMap(copy)
+          return copy
+        })
+      }
+
       /** 配置项 + 项目改动合成一笔 mutate：一次 revision 检查，失败不会只写一半（整笔拒）。 */
       function collectOps () {
         var ops = []
@@ -1871,6 +2115,12 @@ window.__ModuleLoader__.load({
           onRevert: onProjectRevert,
           branchList: branchList,
           branchBusy: branchBusy,
+          showAdvanced: showAdvanced,
+          onToggleAdvanced: setShowAdvanced,
+          isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },
+          onToggleProject: onToggleProject,
+          isSectionOpen: function (index, sectionKey) { return isProjectSectionOpen(projMap, index, sectionKey) },
+          onToggleSection: onToggleProjectSection,
         }))
     }
 
