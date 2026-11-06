@@ -26,7 +26,7 @@ import { createMockPush } from '../src/adapters/push-mock/index.js'
 import { createTableLocator } from '../src/adapters/locator-table/index.js'
 import { makeExecResult } from '../src/contracts/work-executor.js'
 import { PipelineError } from '../src/contracts/errors.js'
-import { canTransition } from '../src/contracts/types.js'
+import { canTransition, TIMELINE_NODES } from '../src/contracts/types.js'
 import { fingerprintOf } from '../src/contracts/types.js'
 import { validateConfig, describeConfig } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
@@ -2940,6 +2940,207 @@ function makeFakeCtx ({ domain, registered }) {
     const { restarted } = await store.revise(revised)
     assert.equal(restarted, false, 'done 票收到修订不改 phase')
     assert.equal(store.getTicket(key).pendingEffects, undefined, '修订后不该带着上一轮的待办')
+  })
+
+  section('16c. 关键节点流程日志（时间线）')
+
+  await check('时间线：一轮跑完把主站按链路顺序记下来，节点 id 就是 phase 名', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    assert.ok(Array.isArray(timeline), 'timeline 必须是数组')
+    const nodes = timeline.map((e) => e.node)
+    // mock 执行器不报 ④（session），所以这里只钉主链路里必然出现的那几站的顺序。
+    const expectOrder = ['discover', 'locate', 'workspace', 'editing', 'testing', 'mr-opening', 'writeback', 'notify']
+    let last = -1
+    for (const n of expectOrder) {
+      const i = nodes.indexOf(n)
+      assert.ok(i > last, `${n} 应该排在前一站之后：${nodes.join(' → ')}`)
+      last = i
+    }
+    assert.ok(nodes.includes('done'), `收尾要记 done 补充站：${nodes.join(' → ')}`)
+  })
+
+  await check('时间线：每条都带写下时刻（epoch ms）与布尔成败，label 是自包含中文名', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    for (const e of store.getTicket(k('rec-mock-001')).timeline) {
+      assert.equal(typeof e.at, 'number', `${e.node} 要有 epoch 毫秒的 at`)
+      assert.equal(typeof e.ok, 'boolean', `${e.node} 的 ok 必须是布尔（不是 running 三态）`)
+      assert.equal(typeof e.label, 'string', `${e.node} 要有 label`)
+      assert.ok(e.label.length > 0, `${e.node} 的 label 不能空`)
+    }
+  })
+
+  await check('时间线：相邻两条 at 单调不减，之差就是上一站耗时', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    for (let i = 1; i < timeline.length; i += 1) {
+      assert.ok(timeline[i].at >= timeline[i - 1].at, `第 ${i} 条的 at 不能比上一条早`)
+    }
+  })
+
+  await check('时间线：执行器通过 onFlow 报上来的 ④ 会话也记进去（含模型/分支）', async () => {
+    const flowExecutor = {
+      async run (ticket, target, ctx) {
+        if (typeof ctx.onFlow === 'function') {
+          await ctx.onFlow('session', '创建会话（分支+模型）', '会话 ticket-demo-rec-mock-001-1，模型 workbuddy/deepseek-v4.1-flash，分支 v2.x，工作目录 D:/r')
+        }
+        return createMockExecutor().run(ticket, target, ctx)
+      },
+    }
+    const { scheduler, store } = harness({ executor: flowExecutor })
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    const session = timeline.find((e) => e.node === 'session')
+    assert.ok(session, `要有 ④ 会话站：${timeline.map((e) => e.node).join(' → ')}`)
+    assert.equal(session.ok, true, '成功起会话是 ✓')
+    assert.match(session.detail, /模型 workbuddy\/deepseek/, `detail 要带模型：${session.detail}`)
+  })
+
+  await check('时间线：失败票把 ✗ 站标出来，成功收尾标 ✓', async () => {
+    const { scheduler, store } = harness({ executor: createMockExecutor({ outcome: 'failed' }) })
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    const failedEntry = timeline.find((e) => e.node === 'failed')
+    assert.ok(failedEntry, `失败票要有 failed 站：${timeline.map((e) => e.node).join(' → ')}`)
+    assert.equal(failedEntry.ok, false, 'failed 站必须是 ✗')
+  })
+
+  await check('时间线：连续同节点同成败合并成一条（worktree-ready 会触发两次）', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.appendTimeline(key, 'worktree-ready', '第一次建', true)
+    await store.appendTimeline(key, 'worktree-ready', '又补了一次', true)
+    assert.equal(store.getTicket(key).timeline.length, 1, '连续同节点同 ok 要合并')
+    assert.equal(store.getTicket(key).timeline[0].detail, '又补了一次', '保留最新 detail')
+    await store.appendTimeline(key, 'worktree-ready', '这次没做成', false)
+    assert.equal(store.getTicket(key).timeline.length, 2, 'ok 不同不能合并')
+  })
+
+  await check('时间线：超过 80 条只留最近的，不无界膨胀', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    for (let i = 0; i < 90; i += 1) {
+      // 交替 ok 避免「连续同节点同 ok」被合并，才能真正测出封顶。
+      await store.appendTimeline(key, 'editing', `第${i}次`, i % 2 === 0)
+    }
+    const timeline = store.getTicket(key).timeline
+    assert.equal(timeline.length, 80, `上限是 80：${timeline.length}`)
+    assert.equal(timeline[0].detail, '第10次', '最旧的 10 条被丢掉')
+    assert.equal(timeline[79].detail, '第89次', '最新的留着')
+  })
+
+  await check('时间线：重新入队（enqueue）不抹掉上一轮的时间线', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.appendTimeline(key, 'discover', '第一轮记的')
+    await store.enqueue(ticket, { phase: 'pending', attempt: 0, enqueuedAt: Date.now() })
+    const timeline = store.getTicket(key).timeline
+    assert.ok(Array.isArray(timeline) && timeline.length >= 1, '重新入队不能把时间线清掉')
+    assert.equal(timeline[0].detail, '第一轮记的', '上一轮的记录还在')
+  })
+
+  await check('时间线：人工重置不清空历史，末尾补一条「重新入队」分隔', async () => {
+    const { scheduler, store } = harness({ executor: createMockExecutor({ outcome: 'failed' }) })
+    await scheduler.tick()
+    const key = k('rec-mock-001')
+    const before = store.getTicket(key).timeline
+    assert.ok(before.length >= 5, `失败跑完该有几站记录：${before.length}`)
+    assert.equal(await store.resetByHuman(key), true, 'failed 票能重置')
+    const after = store.getTicket(key).timeline
+    assert.ok(after.length >= before.length, '历史不能被清空')
+    const last = after[after.length - 1]
+    assert.equal(last.node, 'pending', '末尾补一条排队分隔')
+    assert.match(last.detail, /人工重置/, `要说明是人工重置：${last.detail}`)
+    assert.ok(after.slice(0, before.length).some((e) => e.node === 'editing'), '上一轮的 editing 记录还在')
+  })
+
+  await check('pipeline_status：时间线渲染出来 + 「现在停在第 N 站，已 X 分 Y 秒没动」', async () => {
+    const base = 1_000_000
+    const rows = [{
+      key: k('r-flow'), projectId: DEMO, recordId: 'r-flow', phase: 'editing', attempt: 0,
+      problemSummary: '翻页跳回',
+      timeline: [
+        { node: 'discover', label: '获取工单', at: base, ok: true },
+        { node: 'locate', label: '查找对应工单的项目', at: base + 60_000, ok: true },
+        { node: 'editing', label: '处理工单问题', at: base + 300_000, ok: true },
+      ],
+    }]
+    // 现在 = 最后一条 at 之后 95 秒，看渲染出的「已多久没动」是不是 1 分 35 秒。
+    const tool = createPipelineStatusTool({
+      store: { listTickets: () => rows },
+      getConfig: () => validateConfig({}).value,
+      now: () => base + 300_000 + 95_000,
+    })
+    const out = await tool.execute({ includeDone: true }, {})
+    assert.match(out.text, /流程日志/, '要有时间线小节')
+    assert.match(out.text, /现在停在第 ⑤ 站「处理工单问题」/, `要指出卡在第几站：${out.text}`)
+    assert.match(out.text, /已 1 分 35 秒没动/, `要说清多久没动：${out.text}`)
+  })
+
+  await check('pipeline_status：终态票说「已经收尾」，needs-info 说「在等人」', async () => {
+    const mk = (phase, node, ok) => [{
+      key: k(`r-${phase}`), projectId: DEMO, recordId: `r-${phase}`, phase, attempt: 0,
+      timeline: [{ node, label: TIMELINE_NODES[node].label, at: 5_000, ok }],
+    }]
+    const doneOut = await createPipelineStatusTool({
+      store: { listTickets: () => mk('done', 'done', true) }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ includeDone: true }, {})
+    assert.match(doneOut.text, /已经收尾/, `终态要写「已收尾」：${doneOut.text}`)
+
+    const needsOut = await createPipelineStatusTool({
+      store: { listTickets: () => mk('needs-info', 'needs-info', false) }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ includeDone: true }, {})
+    assert.match(needsOut.text, /等你补充信息/, `needs-info 要写「在等人」：${needsOut.text}`)
+    assert.match(needsOut.text, /不是插件卡死/, '要说清是等人不是卡死')
+  })
+
+  await check('pipeline_status：tickets[] 带机器可读 timeline，station/stalledForMs 算得出来', async () => {
+    const base = 1_000_000
+    const rows = [{
+      key: k('r-m'), projectId: DEMO, recordId: 'r-m', phase: 'editing', attempt: 0,
+      timeline: [
+        { node: 'discover', label: '获取工单', at: base, ok: true },
+        { node: 'editing', label: '处理工单问题', at: base + 300_000, ok: true },
+      ],
+    }]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => base + 395_000,
+    }).execute({ includeDone: true }, {})
+    assert.equal(out.tickets[0].timeline.length, 2, '返回体要带完整时间线')
+    assert.equal(typeof out.tickets[0].timeline[0].at, 'number', 'at 是 epoch ms')
+    assert.equal(out.tickets[0].station.no, '⑤', '当前站定位到 editing 的编号')
+    assert.equal(out.tickets[0].stalledForMs, 95_000, '停滞时长算得对')
+    assert.equal(out.tickets[0].lastNodeOk, true)
+  })
+
+  await check('pipeline_status：没有时间线的老票也不引入 undefined（lossless JSON）', async () => {
+    const rows = [{ key: k('r-old'), projectId: DEMO, recordId: 'r-old', phase: 'done', attempt: 0 }]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 1_000,
+    }).execute({ includeDone: true }, {})
+    const offenders = []
+    const walk = (value, path) => {
+      if (value === undefined) { offenders.push(path || '<root>'); return }
+      if (Array.isArray(value)) { value.forEach((item, i) => walk(item, `${path}[${i}]`)); return }
+      if (value !== null && typeof value === 'object') {
+        for (const [key, item] of Object.entries(value)) walk(item, path ? `${path}.${key}` : key)
+      }
+    }
+    walk(out, '')
+    assert.deepEqual(offenders, [], `新字段不能漏 undefined：${offenders.join(', ')}`)
+    assert.deepEqual(out.tickets[0].timeline, [], '没时间线就是空数组')
   })
 
   section('17. 选择分支：把检出里的分支列成下拉候选')

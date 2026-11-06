@@ -19,6 +19,7 @@
  * @property {string} worktreePath 已建好的隔离工作区绝对路径
  * @property {string} branch 已创建的分支名
  * @property {(phase: Phase, detail?: string) => Promise<void>} onPhase
+ * @property {(node: string, label: string, detail?: string, ok?: boolean) => Promise<void> | void} [onFlow] 关键节点流程日志：把「这一步刚做完、做成了什么」记到票据的时间线上。node 用小写英文 id，label 是给人看的中文名，detail 是一句中文补充，ok 缺省 true（这一站做成了）、false 表示这一站没做成。可选 —— 老调用方不传就等于不记时间线，绝不能因此炸。
  * @property {(msg: string) => void} log 写进插件日志，带 recordId 前缀
  * @property {string} [baseCommit]
  * @property {string} [repoPath]
@@ -30,6 +31,29 @@
  * @property {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图
  * @property {unknown[]} images 截图引用数组（saveImage 的返回值），content 里只用到了非空项
  * @property {Record<string, any>} config 生效中的插件配置
+ */
+
+/**
+ * `onFlow` 的 node（小写英文 id）与 label（给人看的中文名）对照表。
+ *
+ * 为什么两份都传：node 是稳定 id，落库、筛选、比对都用它；label 是文案，
+ * 直接显示在票据时间线上。让每个执行器各自编中文，时间线上会出现
+ * 「查项目」「查找项目」「定位项目」三种说法，人反而更看不明白。
+ *
+ * | node | label |
+ * |---|---|
+ * | discover | 获取工单 |
+ * | locate | 查找对应工单的项目 |
+ * | workspace | 检查工作区 |
+ * | session | 创建会话（分支+模型） |
+ * | editing | 处理工单问题 |
+ * | testing | 跑验证 |
+ * | mr-opening | 提交（本地提交 / PR） |
+ * | writeback | 回填工单表 |
+ * | notify | 发送消息 |
+ *
+ * 执行器只负责自己内部才知道的那几站（主要是 `session`：sessionId、provider/model、
+ * cwd 何时定下来，外面看不见）；其余节点由调度器在调用前后记。
  */
 
 /**

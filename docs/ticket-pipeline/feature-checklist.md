@@ -1,10 +1,12 @@
 # 工单流水线插件 · 功能清单与完成度
 
 > 生成日期：2026-11-05
-> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 71 次提交，代码基线 HEAD `678475f`；其后 `20e0369` 只改各文档的基线行，未动代码），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-06，新增**配置页 UI/UX 大改造**（Label 置顶、高级参数折叠、凭据统一走顶部保存、
+> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「关键节点流程日志（时间线）」的代码与本文同一次提交（HEAD 即本次提交），上一轮已提交代码为 `8d93478`（`b5940ce` 仅改文档）；插件目录 `plugins/ticket-pipeline`
+> 最近一次更新：2026-11-06，新增**关键节点流程日志（时间线）**（票据 `timeline` 17 节点表、9 主站 ①–⑨、
+> `pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」，见 §1.16），自测 **376/376** 全绿；
+> 此前同日新增**配置页 UI/UX 大改造**（Label 置顶、高级参数折叠、凭据统一走顶部保存、
 > 项目清单可增删、卡片化 + Switch 开关，顺手修掉 `[object Object]` 渲染 bug，见 §1.15），
-> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），自测 **363/363** 全绿；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
+> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），该轮自测 **363/363** 全绿（后补时间线，现为 376/376）；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -378,7 +380,7 @@ skipped 的首句要说「验证没跑通」。`feishu-checks.mjs` 52 → **58**
 `branches()` 与 `projects()` 用的是同一次 `config.projects` 遍历，index 一定对得上。
 
 **验收**：`dev-run` 新增 6 条断言（解析 / 排序去重 / 真跑通 / 四种失败不抛 / 游离 HEAD / 宿主 remote 按项目隔离），
-自测 **325/325** 全绿（当轮；上线加固后现为 **363/363**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
+自测 **325/325** 全绿（当轮；上线加固 + 时间线后现为 **376/376**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
 真机验证 `listBranches` 在 `D:/WorkSpace/mgiot-pms`（当前 `v2.x`，候选 `v2.x`/`master`/`workbuddy/v2-x-8ef29a33`/`main`）、
 本仓库（`v0.0.1`/`main`）、`.repos/tp-sandbox`（`main` + 3 个 worktree 分支）上都返回正确清单，
 不存在的路径返回 `fatal: cannot change to ...`。
@@ -405,7 +407,7 @@ skipped 的首句要说「验证没跑通」。`feishu-checks.mjs` 52 → **58**
 `.tp-toggle` 一把捞、断言「配置分组有 3 个折叠标题」；项目卡片与卡内分组加进来后变成 7 条，
 断言就红了，而且红得看不出是哪儿错。各认自己的类名，断言才能稳定表达「配置分组有 3 个」。
 
-**验收**：`dev-run` 363/363、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
+**验收**：`dev-run` 363/363（当轮；时间线后现为 376/376）、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
 `client-smoke` **85 → 94 条**（新增「卡片有折叠开关 / 默认展开 / 收起后不再渲染字段 / 收起后仍显示项目名 /
 aria-expanded 变 false / 再点一次展开回来 / 卡内有可折叠分组」7 条）。
 
@@ -436,7 +438,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 `ask` 在无头场景 fail-closed，会让 agent 的每一步工具调用都失败。所以只能退回 `never` 并打一条 warn
 （`executor-agent/index.js:1152`）。兜底只有 git 白名单 + 提交前篡改自检，**不是硬隔离**。
 
-**新增断言**：`dev-run` 325 → **363/363**（第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条）；
+**新增断言**：`dev-run` 325 → **363/363**（当轮；第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条；时间线后现为 376/376）；
 `gitlab-checks` 78 → **86**（敏感名单覆盖与不误伤、`.git/hooks` 与 `cordis.patch.yml` 篡改判失败、无 `readFile` 跳过、
 白名单放行自检要用的 `rev-parse` 形态、`blockedFiles` 可见、受保护路径边界）；
 `wps-checks` 25 → **34**（下载通道超时/取消/字节上限/逐跳重定向校验、`scan` 传 signal）；
@@ -465,22 +467,54 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 **自测**：`client-smoke` 94 → **105 条**（新增：凭据每行不再有「保存」按钮、清单无 `[object Object]`、
 「+ 添加项目」/「删除」按钮、`role="switch"` 语义、布尔不落回原生 checkbox、全页只一颗主按钮）；
-`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**、`chain-smoke` **11** 全绿。
+`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**（当轮；时间线后现为 376）、`chain-smoke` **11** 全绿。
+
+---
+
+### 1.16 关键节点流程日志（时间线）（2026-11-06）
+
+**要解决什么**：用户要「完整的关键节点的流程日志，不然我不知道哪里有问题了或者卡在哪里了」——
+覆盖「获取工单 → 查找对应工单的项目 → 检查是否存在工作区 → 创建会话选择分支和模型 → 处理工单问题
+→ 处理完成后提交 → 发消息给我」这条整链。以前只有按时间散落的插件日志，看到「阶段 → testing」
+之后迟迟没有下一条，说不清是卡在跑验证里、还是已经死了、还是差一步发通知。
+
+**做法**：
+
+| 环 | 落点 |
+| --- | --- |
+| 17 节点表 | `contracts/types.js:63 TIMELINE_NODES`：9 主站带 ①–⑨（discover / locate / workspace / session / editing / testing / mr-opening / writeback / notify）+ 8 补充站用 `no:'·'`（worktree-ready / planning / pending / needs-info / done / skipped / failed / gone）。**节点 id = phase 名**，⑤⑥⑦ 与终态由 `onPhase` 直接查表打点，不维护反查表 |
+| 记录结构 | `TimelineEntry = {node,label,at,ok,detail?}`；`at` = 写下时刻 epoch ms（相邻 `at` 差 = 上一站耗时，现在 − 最后 `at` = 距最后动静多久）；`ok` 只有布尔 true/false（✓ / ✗），没有「进行中」三态 |
+| 持久化 | `core/store.js appendTimeline(key,node,detail,ok,label)`：连续同 node 同 ok 合并成一条（保留最新 `at`/`detail`，`worktree-ready` 会连触发两次）、上限 80 条丢最旧。**刻意不走 `setPhase`**（它会重写 `finishedAt` 且要过阶段转移校验，而记日志可发生在任何阶段含终态） |
+| 唯一写入口 | `core/scheduler.js markNode(...)` 包 `try/catch`（**记日志绝不能把票带崩**）；`markExtra(...)` 给补充站查表补 `label`。扫描入队记 ①、定位仓库记 ②、工作区新建/复用/陈旧重建记 ③、`executor.run` ctx 加 `onFlow` 让真 agent 报 ④、成功收尾记 ⑧⑨、各失败分支（超时/取消/退避/不可重试/needs-info/租约丢失）记 ✗、`replayPendingEffects` 补做标「补做」 |
+| ④ 会话详情 | `adapters/executor-agent/index.js reportFlow(ctx,log,node,label,detail,ok)` 通过 `ctx.onFlow` 上报会话 id、provider+model、分支、工作目录；`resolveAgentOptions(...)` 上提保证与实际下发的一致；`executor-mock` 不调 `onFlow`（合法） |
+| 历史不清空 | `timeline` 是历史不是本轮状态：`enqueue` 的 `if(existing)` 显式继承、`revise` 用 `{...existing}` 自然保留、`resetByHuman` 也不清空、只在末尾补一条 `pending` 分隔记录「人工重置，重新入队」 |
+| 渲染 | `tools/pipeline-status.js describeFlow(row,now)` 倒序找最后主站、算 `stalledForMs` / `station` / `lastNodeOk`；`renderTimeline(row,now)` 排成 `11-06 20:14:58  ⑥ ✓ 跑验证 —— 开始跑验证命令（上一站 5 秒）` + `▶ 现在停在第 ⑥ 站「跑验证」，已 3 分 25 秒没动。`；needs-info 特别写「这一站在等人，不是插件卡死」，终态写「已经收尾」。固定 UTC+8 纯算术换算、`now` 可注入（整次查询用同一个「现在」） |
+| 机器可读 | 返回体 `tickets[]` 加 `timeline` / `stalledForMs` / `station` / `lastNodeOk`；`stripUndefined` 会删掉 undefined 键，老票无时间线时 `timeline` 恒为 `[]`、不引入 `undefined` |
+
+**为什么不做「进行中」三态**：「最后一条记录落在哪个节点 + 距今多久」已经能回答「卡在哪」；
+多一种状态就要多维护一处「谁把 running 改成 ok」的更新点，反而容易漏、容易骗人。
+
+**验收**：`dev-run` 第 **16c** 节 13 条断言全绿（主站顺序 / `at`/`ok`/`label` 合法性 / 相邻 `at` 单调 /
+`onFlow` 报的 ④ 进时间线 / 失败站记 ✗ / 连续合并 / 80 条封顶 / 重新入队继承 / 人工重置不清空 /
+`pipeline_status` 渲染「已 1 分 35 秒没动」/ 终态与 needs-info 文案 / 返回体四字段 / 老票无 undefined）；
+累计 **376/376**，26 小节。真实链路探针跑一轮 mock tick 得 11 条时间线（④ 因 mock 不上报而缺席，合法），
+渲染探针给出「现在停在第 ⑥ 站」与 `station/stalledForMs` 返回值。详见 `README.md` §5.2.1、
+`user-guide.md` §5.2.1、`architecture.md` §11.3、`operation-flow.md` §1/§7。
 
 ---
 
 ## 2. 代码清单
 
-`src/` 共 **43 个 .js / 15 788 行**；`scripts/` 共 9 个 .mjs / **10 066 行**（`dev-run.mjs` **3 075 行**）；`lib/client.js` 2 795 行（浏览器端设置面板）。
+`src/` 共 **43 个 .js / 16 240 行**；`scripts/` 共 9 个 .mjs / **10 300 行**（`dev-run.mjs` **3 276 行**）；`lib/client.js` 2 794 行（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 203 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 4 388 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects`）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 7 499 | 见下表 |
-| `src/tools/` | 1 178 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 271 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 184 行） |
-| 根 | 1 249 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| `src/contracts/` | 1 279 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry`**）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 4 538 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`**）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 7 610 | 见下表 |
+| `src/tools/` | 1 296 | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（关键节点时间线渲染 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
+| `src/remote/` | 269 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 184 行） |
+| 根 | 1 248 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -488,7 +522,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 | `source-wps/` | 1 660 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet`；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
 | `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
 | `source-mock/` | 329 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
-| `executor-agent/` | 2 373 | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
+| `executor-agent/` | 2 496 | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 143 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
 | `gitlab-client/` | 495 | **真实可用** | Commits API + MR API；源分支已有开放 MR 时复用而不撞 409 |
 | `push-qqmail/` | 574 | **真实可用** | 零依赖手写 SMTP（`node:net` / `node:tls` / `node:crypto`），已实发成功 |
@@ -743,10 +777,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **363** | 通过 363，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → **363**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，最后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项，见 §1.14） |
+| `node scripts/dev-run.mjs` | **376** | 通过 376，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → **376**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），最后 13 条是「关键节点流程日志（时间线）」（见 §1.16）） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
-`dev-run.mjs` 分 25 个小节：
+`dev-run.mjs` 分 26 个小节：
 
 | # | 小节 | 覆盖 |
 | --- | --- | --- |
@@ -774,6 +808,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 15 | 改代码落点 | `inspectCheckout` 干净/脏/拿不到状态三种情况（`-z -uall` + 排除插件自有目录）；`describeDirtyCheckout` 脏工作区只提醒不拒跑、文案能照着理解；`isIsolatedWorktreePath` 只认 `.agents/worktrees/<name>`；真实 `apply()` 缺省不建隔离 worktree、票据落在工作区根上（`branch` = 检出当前分支、`baseCommit` = 检出 HEAD） |
 | 16 | 处理完回填工单表 + 保留工作区会话 | done → 三列都写；`writeBackStatus` 可配、空白回落「是」；`writeBack=false` 完全不写（退化成只读）；failed 不回填；回填失败只记票据、票态不回退、不影响通知；老适配器没有 `writeResult` 时静默跳过；执行器返回 `sessionId` 落到票据、状态里能看到去哪找会话；`pipeline_status` 成功/失败都能一眼看到；skipped 的回填首句要说「验证没跑通，需要人工确认」 |
 | 16b | 事后动作补偿（`pendingEffects`）与租约诚实化 | **14 项**：回填失败要在通知里说、回填成功时不写回填行、一场跑完 `pendingEffects` 必须清干净、`clearPendingEffect` 只清报上来的那一项（两项清完就把字段整个删掉）、启动补偿：残留终态票把回填和通知补做完并清标记、`enqueue` / `resetByHuman` / `revise` 都不继承上一轮 `pendingEffects`、租约：别的 owner 连试两次都拿不到且续租按 token 判定、就地重跑起点与票面记录不一致时日志要说明「被判没有改动是预期」、`failed` 也是终态（通知发完同样清 `pendingEffects`）、启动补偿只捞终态票、`pipeline_status` 待补动作要能看见 |
+| 16c | 关键节点流程日志（时间线） | **13 项**：主站顺序（①–⑨ + 补充站）、每条 `at` 是时间 / `ok` 是布尔 / `label` 非空、相邻 `at` 单调不减、执行器 `onFlow` 报的 ④ 会话进时间线、失败票 `failed` 站记 ✗、连续同节点同成败合并、90 条触发 80 条封顶、重新入队继承时间线、人工重置不清空只补「排队中」分隔、`pipeline_status` 渲染「现在停在第 ⑤ 站…已 1 分 35 秒没动」、终态写「已经收尾」/ needs-info 写「不是插件卡死」、返回体带 `timeline`/`station`/`stalledForMs`、老票无时间线不引入 `undefined` |
 | 17 | 选择分支 | `parseBranchRefs` 解析 `for-each-ref`（`refs/remotes/` 后只切第一个 `/`、丢掉 `origin/HEAD` 这类符号引用）；`mergeBranchChoices` 排序（当前分支 → 远端默认 → 本地 → 其余远端）；`listBranches` 真跑通；四种拿不到分支的情况（无 `repo.path` / 无 git 执行链路 / 不是 git 检出 / git 抛错）**只返回 `ok:false` + 原因、绝不抛**；游离 HEAD 不算分支名；宿主 remote 暴露 `branches()` 且某个项目配错不影响别的项目 |
 
 ### 8.2 真实链路验证记录
@@ -785,7 +820,8 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
 | 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **105** 条断言全过 |
-| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` **363/363**（第 16b 节 14 条）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
+| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
+| 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |
 | QQ 邮箱真实发信 | ✅ `accepted=true`，traceId `<mw319ltk.47861f8c479221d3@qq.com>` |
@@ -873,7 +909,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **363** 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **376** 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -899,9 +935,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「插件版本自检」（**已完成**，2026-11-06） | 宿主加载的是 profile 下的目录副本（跨盘 `file:` 落成复制），HMR `root: []` 不监听源码 ⇒ 改完不同步就静默跑旧代码；新增 `src/core/plugin-version.js`，`pipeline_doctor` 比对安装副本与源码的**文件内容**，落后时给出同步命令，只进「提醒」 | ✅ 自测 288 → 293（新增 5 组断言）；见 §1.6 与 `architecture.md` §12.11 |
 | 「`setPhase` 清不掉字段」缺陷修复（**已完成**，2026-11-06） | `setPhase` 把补丁里所有 `undefined` 一概过滤，于是调用方写的每一种「清掉」都静默失效：成功票上挂着上一轮 `lastError`（真实事故：`pms\|reczz28VWNWVbpgL` 跑成 done 却显示 `provider "workbuddy" has no configured model`），启动恢复以为清了死坐标其实没清。改为「键不存在 = 不动 / 键在值为 undefined = 删掉」 | ✅ 自测 293 → 294（新增 1 条走真实重试路径 —— 旧的那条是 `resetByHuman` 兜的假绿）；见 §1.7 |
 | 「回填 / 保留会话 / 基线 / 面板」四项改造（**已完成**，2026-11-06） | ①处理完回填工单表（`TicketSource.writeResult` 唯一写入口 + `writeBack`/`writeBackStatus`，见 §1.8）②处理完保留会话（`ExecResult.sessionId` + `keepSession`，见 §1.9）③脏工作区只提交 agent 改过的文件（`createBaseline` + `describeDirtyCheckout`，`assertCleanCheckout` 删除，见 §1.10）④设置面板补齐（`projects` 子树可编辑 + 第 3 个 Remote 方法，配置 33 键 / 7 组，见 §1.11） | ✅ 自测 319/319（新增 25 条，`dev-run.mjs` 第 16 节 + 第 15 节改写）；`feishu-checks` 52 → 58、`gitlab-checks` 68 → 78；`client-check` / `client-smoke` 全绿 |
-| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固后现为 363/363）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
-| **上线加固**（**已完成**，2026-11-06） | 5 条阻断项 + 4 条重要项：适配器名强校验（`workExecutor` / `pushAdapter` 的 `enum`，写错抛 `invalid-input` 不静默退 mock）、验证命令超时与取消（30 分钟缺省、退出码 124、取消真 kill）、敏感名单 9 → **8 大类 41 条正则**、`.git`/profile 篡改自检（28 + 10 + 4）、终态与事后动作同一次落库（`pendingEffects` + `replayPendingEffects`）、回填失败进通知、就地重跑起点、租约诚实化（best-effort，不是原子 CAS），见 §1.14 | ✅ 自测 325 → **363/363**（新增 38 条，`dev-run.mjs` 第 16b 节 14 条 + 各 checks）；`gitlab-checks` 78 → 86、`wps-checks` 25 → 34、`workspace-checks` 11 → 19 |
+| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固 + 时间线后现为 376/376）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
+| **上线加固**（**已完成**，2026-11-06） | 5 条阻断项 + 4 条重要项：适配器名强校验（`workExecutor` / `pushAdapter` 的 `enum`，写错抛 `invalid-input` 不静默退 mock）、验证命令超时与取消（30 分钟缺省、退出码 124、取消真 kill）、敏感名单 9 → **8 大类 41 条正则**、`.git`/profile 篡改自检（28 + 10 + 4）、终态与事后动作同一次落库（`pendingEffects` + `replayPendingEffects`）、回填失败进通知、就地重跑起点、租约诚实化（best-effort，不是原子 CAS），见 §1.14 | ✅ 自测 325 → **363/363**（当轮；新增 38 条，`dev-run.mjs` 第 16b 节 14 条 + 各 checks）；`gitlab-checks` 78 → 86、`wps-checks` 25 → 34、`workspace-checks` 11 → 19 |
+| **关键节点流程日志（时间线）**（**已完成**，2026-11-06） | 票据 `timeline` 17 节点表（9 主站 ①–⑨ + 8 补充站）、`markNode` / `markExtra` / `onFlow` 全链路打点、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、历史不清空 + 80 条封顶，见 §1.16 | ✅ 自测 363 → **376/376**（新增 13 条，`dev-run.mjs` 第 16c 节）；26 小节；真实链路探针 11 条时间线、渲染探针给出 `station`/`stalledForMs` |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 363 → 383；一张真表读出一张真票 |
+| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 376 → 396；一张真表读出一张真票 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

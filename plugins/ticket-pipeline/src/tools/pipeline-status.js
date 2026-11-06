@@ -12,9 +12,14 @@
  */
 
 import { defineTool, textBlocks } from './define.js'
-import { PHASE_LABEL, TERMINAL } from '../contracts/types.js'
+import { PHASE_LABEL, TERMINAL, TIMELINE_NODES } from '../contracts/types.js'
 import { describeConfig } from '../core/config.js'
 import { foundAtSortKey, summarize } from '../core/store.js'
+
+// 9 个主站的编号。补充站的 no 是 '·'，不参与「第 N 站」的说法。
+const MAIN_STATION_NO = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨']
+// Asia/Shanghai 固定 UTC+8，1991 年后不再有夏令时。
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000
 
 const PHASE_ADVICE = {
   pending: '排队中，下一轮会轮到它。',
@@ -30,13 +35,118 @@ const PHASE_ADVICE = {
   gone: '表格里这一行已经删掉了，静默退役。',
 }
 
+function pad2 (n) {
+  return String(n).padStart(2, '0')
+}
+
+/**
+ * epoch ms → Asia/Shanghai 的墙上时间。用固定 UTC+8 而不是 `toLocaleString`：
+ * 1991 年后这里不再有夏令时，纯算术就能得到确定结果，自测不用赌机器的时区设置。
+ * @param {number} at
+ * @returns {string} `MM-DD HH:MM:SS`
+ */
+function formatClock (at) {
+  if (typeof at !== 'number' || !Number.isFinite(at)) return '时间未知  '
+  const iso = new Date(at + SHANGHAI_OFFSET_MS).toISOString()
+  return `${iso.slice(5, 10)} ${iso.slice(11, 19)}`
+}
+
+/** @param {number} ms @returns {string} `X 秒` / `X 分 Y 秒` / `X 时 Y 分` */
+function formatDuration (ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '时间未知'
+  const total = Math.max(0, Math.floor(ms / 1000))
+  if (total < 60) return `${total} 秒`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  if (m < 60) return `${m} 分 ${s} 秒`
+  const h = Math.floor(m / 60)
+  return `${h} 时 ${pad2(m % 60)} 分`
+}
+
+/** @param {import('../core/store.js').TicketRecordRow} row */
+function timelineOf (row) {
+  return Array.isArray(row.timeline) ? row.timeline : []
+}
+
+/**
+ * 把一条票的流程日志压成「现在停在哪、停了多久」的机器可读结论。
+ * 文字渲染与返回体共用这一份，免得两处对「第几站」的理解分家。
+ * @param {import('../core/store.js').TicketRecordRow} row
+ * @param {number} now
+ */
+function describeFlow (row, now) {
+  const timeline = timelineOf(row)
+  if (timeline.length === 0) {
+    return { timeline: [], stalledForMs: undefined, station: undefined, lastNodeOk: undefined, terminal: TERMINAL.includes(row.phase) }
+  }
+  const last = timeline[timeline.length - 1]
+  // 「第 N 站」取最后到达过的主站（①–⑨），补充站的 no 是 '·' 不算站号。
+  let station
+  for (let i = timeline.length - 1; i >= 0; i -= 1) {
+    const meta = TIMELINE_NODES[timeline[i].node]
+    if (meta && MAIN_STATION_NO.includes(meta.no)) {
+      station = { no: meta.no, label: timeline[i].label ?? meta.label }
+      break
+    }
+  }
+  return {
+    timeline,
+    stalledForMs: Math.max(0, now - (typeof last.at === 'number' ? last.at : now)),
+    station,
+    lastNodeOk: last.ok !== false,
+    terminal: TERMINAL.includes(row.phase),
+  }
+}
+
+/**
+ * 渲染一张票的时间线。这一段是这次需求的核心：人扫一眼就知道「走到哪、
+ * 哪一站没做成、卡了多久」，不用去翻插件日志。
+ * @param {import('../core/store.js').TicketRecordRow} row
+ * @param {number} now
+ * @returns {string[]}
+ */
+function renderTimeline (row, now) {
+  const flow = describeFlow(row, now)
+  if (flow.timeline.length === 0) {
+    return ['  流程日志：还没有记录（这张票可能是老数据，或刚入队还没开始打点）']
+  }
+  const lines = []
+  lines.push('  流程日志（关键节点，✓ 做成 / ✗ 没做成；括号里是上一站耗时）：')
+  for (let i = 0; i < flow.timeline.length; i += 1) {
+    const e = flow.timeline[i]
+    const meta = TIMELINE_NODES[e.node]
+    const no = meta?.no ?? '·'
+    const label = e.label ?? meta?.label ?? e.node
+    const mark = e.ok === false ? '✗' : '✓'
+    const cost = i > 0 ? `（上一站 ${formatDuration(e.at - flow.timeline[i - 1].at)}）` : ''
+    const detail = e.detail ? ` —— ${e.detail}` : ''
+    lines.push(`    ${formatClock(e.at)}  ${no} ${mark} ${label}${detail}${cost}`)
+  }
+  const idle = formatDuration(flow.stalledForMs ?? 0)
+  if (flow.terminal) {
+    lines.push(`  ▶ 已经收尾（${PHASE_LABEL[row.phase] ?? row.phase}），最后一次动静在 ${idle} 前。`)
+  } else if (row.phase === 'needs-info') {
+    lines.push(`  ▶ 现在停在「等你补充信息」，已 ${idle}没动（这一站在等人，不是插件卡死）。`)
+  } else if (flow.station) {
+    const tail = flow.lastNodeOk
+      ? '时间一直不涨就是卡在这一站里（日志只在站点切换时打点）。'
+      : '最后这一站没做成，往上看 ✗ 那行的原因。'
+    lines.push(`  ▶ 现在停在第 ${flow.station.no} 站「${flow.station.label}」，已 ${idle}没动。${tail}`)
+  } else {
+    lines.push(`  ▶ 还没走到第一个主站，已 ${idle}没动。`)
+  }
+  return lines
+}
+
 /**
  * @param {Object} options
  * @param {import('../core/store.js').TicketStore} options.store
  * @param {() => Record<string, unknown>} options.getConfig 取当前生效的配置
+ * @param {() => number} [options.now] 当前时刻（epoch ms），可注入以便自测；缺省 Date.now
  * @returns {Record<string, unknown>}
  */
 export function createPipelineStatusTool (options) {
+  const nowFn = typeof options.now === 'function' ? options.now : () => Date.now()
   return defineTool({
     name: 'pipeline_status',
     description:
@@ -69,6 +179,9 @@ export function createPipelineStatusTool (options) {
       const config = options.getConfig()
       const limit = typeof args.limit === 'number' ? args.limit : 20
       const includeDone = args.includeDone === true
+      // 整次查询用同一个「现在」：否则逐票算时间线时，前一张票与后一张票的
+      // 「已多久没动」会差几毫秒，自测也没法写确定值。
+      const now = nowFn()
 
       let rows = options.store.listTickets()
 
@@ -181,6 +294,8 @@ export function createPipelineStatusTool (options) {
             }
           }
           if (row.revisionCount > 1) lines.push(`  这是第 ${row.revisionCount} 版（工单被改过 ${row.revisionCount - 1} 次）`)
+          // 时间线放在最后：前面的「最近错误 / 待补做」先给结论，这里给完整过程。
+          lines.push(...renderTimeline(row, now))
         }
 
         if (rows.length > shown.length) {
@@ -194,29 +309,38 @@ export function createPipelineStatusTool (options) {
         // counts = 全库口径（老字段名不变，避免调用方炸）；filteredCounts = 本次筛选口径。
         counts: total,
         filteredCounts: filtered,
-        tickets: shown.map((row) => ({
-          projectId: row.projectId,
-          recordId: row.recordId,
-          phase: row.phase,
-          problemSummary: row.problemSummary,
-          module: row.module,
-          priority: row.priority,
-          worktreePath: row.worktreePath,
-          branch: row.branch,
-          commitSha: row.commit?.sha,
-          mrUrl: row.mr?.url,
-          sessionId: row.sessionId,
-          writeBack: row.writeBack,
-          // 只暴露「还有没有待补做」，不把整份 writeBack 输入摊给调用方：
-          // 那是内部载荷，对调用方没有意义，还会把工具输出撑大。
-          pendingEffects: row.pendingEffects
-            ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
-            : undefined,
-          lastError: row.lastError,
-          testDetail: row.testDetail,
-          revisionCount: row.revisionCount,
-          attempt: row.attempt,
-        })),
+        tickets: shown.map((row) => {
+          // 机器可读的时间线在这里给全量（node/label/at/ok/detail 原样），
+          // 不截断成布尔：调用方拿它自己画图或做告警都要原始条目。
+          const flow = describeFlow(row, now)
+          return {
+            projectId: row.projectId,
+            recordId: row.recordId,
+            phase: row.phase,
+            problemSummary: row.problemSummary,
+            module: row.module,
+            priority: row.priority,
+            worktreePath: row.worktreePath,
+            branch: row.branch,
+            commitSha: row.commit?.sha,
+            mrUrl: row.mr?.url,
+            sessionId: row.sessionId,
+            writeBack: row.writeBack,
+            // 只暴露「还有没有待补做」，不把整份 writeBack 输入摊给调用方：
+            // 那是内部载荷，对调用方没有意义，还会把工具输出撑大。
+            pendingEffects: row.pendingEffects
+              ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
+              : undefined,
+            lastError: row.lastError,
+            testDetail: row.testDetail,
+            revisionCount: row.revisionCount,
+            attempt: row.attempt,
+            timeline: flow.timeline,
+            stalledForMs: flow.stalledForMs,
+            station: flow.station,
+            lastNodeOk: flow.lastNodeOk,
+          }
+        }),
         config: describeConfig(config),
         text: lines.join('\n'),
       }

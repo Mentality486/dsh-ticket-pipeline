@@ -11,9 +11,18 @@
  * `recordId` 字段保留平台原值、`projectId` 单独存，二者同时进 row。
  */
 
-import { canTransition, priorityWeight, TERMINAL } from '../contracts/types.js'
+import { canTransition, priorityWeight, TERMINAL, TIMELINE_NODES } from '../contracts/types.js'
 import { PipelineError } from '../contracts/errors.js'
 import { isIsolatedWorktreePath } from './worktree-path.js'
+
+/**
+ * 一张票的时间线最多留多少条记录。
+ *
+ * 跑完一张票约产生 10–15 条，人工重置 30 次就 400 条。无限长的时间线
+ * 既撑大存储，又让人在 `pipeline_status` 里翻不到当前这一轮的重点 ——
+ * 所以只留最近 80 条，最旧的丢掉。丢了什么不重要：卡在哪儿只看最后几条。
+ */
+const TIMELINE_LIMIT = 80
 
 /** 表名：票据 / 水位 / 租约。 */
 export const TABLES = Object.freeze({
@@ -55,6 +64,7 @@ export const TABLES = Object.freeze({
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
  * @property {string} [sessionId] 这次执行用的会话 id（会话默认保留在项目工作区名下，可在 GUI 里点回去继续问）
  * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果
+ * @property {import('../contracts/types.js').TimelineEntry[]} [timeline] 关键节点流程日志：每个节点一条，带完成时刻与成败。**不是**工单原文里那个「流程」列（那是 `flow`，字符串），别搞混。由 `appendTimeline` 追加，只有人工重置才会清空。
  * @property {{ writeBack?: { phase: string, plan?: unknown, commit?: { sha: string, branch: string, files: string[] }, mr?: { iid: number, url: string, draft: boolean }, changedFiles?: string[], worktreePath?: string, sessionId?: string, verification?: { outcome?: string, detail?: string } }, notify?: boolean }} [pendingEffects]
  *   终态票还没做完的「事后动作」。done/skipped 落库时先记上，回填/通知各自成功后再把子项清掉；
  *   进程在两者之间崩掉时，下次启动由 `replayPendingEffects()` 补做（回填幂等，通知会补发）。
@@ -189,6 +199,12 @@ export class TicketStore {
       row.testDetail = existing.testDetail
       row.mr = existing.mr
       row.startedAt = existing.startedAt
+      // 关键节点流程日志是**历史**，不是「这一轮的结果」：重新入队（修订后重跑、
+      // 终态票复活）不能把上一轮走到哪儿抹掉 —— 人要靠它对照「这次和上次是不是
+      // 卡在同一个地方」。和 lastError / pendingEffects 不同：那两个是「这一轮」的
+      // 状态，带过来只会骗人（一次偶发失败会永远挂在票上、启动补偿会在新 pending 票
+      // 上做上一轮的终态动作）。
+      if (existing.timeline) row.timeline = existing.timeline
     }
     // 不继承 lastError：重新入队就是「从头再来一遍」，上一轮为什么没跑成
     // 与这一轮无关。留着它，一次偶发失败会永远挂在票上 —— 人看队列时
@@ -342,6 +358,55 @@ export class TicketStore {
   }
 
   /**
+   * 往票据的**关键节点流程日志**（时间线）上追加一条记录。
+   *
+   * 为什么单独开一个方法而不走 `setPhase`：`setPhase` 每次都把 `finishedAt` 重写成
+   * 「现在」，而时间线是跑的过程中打的点，拿它当完成时刻会让「这票跑了多久」失真；
+   * 而且 `setPhase` 会校验阶段转移，「记一笔日志」不该被阶段机拦住
+   *（记日志时可能正处于任何阶段，包括终态）。
+   *
+   * 连续同节点同结果的两条**合并成一条**（保留最新的 `at` 与 `detail`）：
+   * `worktree-ready` 在调度器里会被连续触发两次（新建工作区之后 + 兜底补一次），
+   * 各记一条会让时间线里出现两个一模一样的站，看不出到底走到哪儿了。
+   * 合并保留最新 `at` 是有意的：`pipeline_status` 用「现在 − 最后一条的 at」回答
+   * 「卡了多久没动」，旧的 `at` 会把这个数说大。
+   *
+   * 封顶 `TIMELINE_LIMIT` 条，超出丢最旧的。`ok` 缺省 true。
+   *
+   * @param {string} key 票据复合主键
+   * @param {string} node 节点 id（见 TIMELINE_NODES）
+   * @param {string} detail 一句给人看的中文补充
+   * @param {boolean} [ok] 这一站做成了没有，缺省 true
+   * @param {string} [label] 节点中文名；省略时按 node 查表
+   * @returns {Promise<TicketRecordRow | undefined>} 更新后的行；票不存在时 undefined
+   */
+  async appendTimeline (key, node, detail, ok = true, label) {
+    const row = this.getTicket(key)
+    if (!row) return undefined
+    const meta = TIMELINE_NODES[node]
+    /** @type {import('../contracts/types.js').TimelineEntry} */
+    const entry = {
+      node,
+      label: label ?? meta?.label ?? node,
+      at: this.now(),
+      ok: ok !== false,
+      ...(detail ? { detail: String(detail) } : {}),
+    }
+    const list = Array.isArray(row.timeline) ? [...row.timeline] : []
+    const last = list[list.length - 1]
+    if (last && last.node === entry.node && last.ok === entry.ok) {
+      list[list.length - 1] = entry
+    } else {
+      list.push(entry)
+    }
+    const trimmed = list.length > TIMELINE_LIMIT ? list.slice(list.length - TIMELINE_LIMIT) : list
+    /** @type {TicketRecordRow} */
+    const next = { ...row, timeline: trimmed }
+    await this.repo.put(TABLES.tickets, key, next)
+    return next
+  }
+
+  /**
    * 人工重置：表格里「是否处理」从别的值拨回 `处理中`。
    *
    * 这是 `failed` 票**唯一**的重开路径（用户拍板：超时不自动重试）。
@@ -368,6 +433,18 @@ export class TicketStore {
     }
     // undefined 会被 repo 原样写进去，这里显式删字段（和 setPhase 的 undefined=删 语义一致）。
     delete next.pendingEffects
+    // 时间线**不清空**：上一轮走到哪儿、卡在哪儿，正是重开之后最想对照着看的东西。
+    // 只在末尾补一条「人工重置」，把上一轮的故事和这一轮分开 —— 否则两轮的节点
+    // 挤在一起，看起来像是同一轮里又跑了一次「获取工单」。
+    const timeline = Array.isArray(row.timeline) ? [...row.timeline] : []
+    timeline.push({
+      node: 'pending',
+      label: '排队中',
+      at: next.enqueuedAt,
+      ok: true,
+      detail: `人工重置，重新入队（第 ${(row.attempt ?? 0) + 1} 次尝试作废，从头再跑一遍）`,
+    })
+    next.timeline = timeline.length > TIMELINE_LIMIT ? timeline.slice(timeline.length - TIMELINE_LIMIT) : timeline
     await this.repo.put(TABLES.tickets, key, next)
     this.log('人工重置成功，重新入队', { key, projectId: row.projectId, recordId: row.recordId })
     return true

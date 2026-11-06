@@ -42,6 +42,66 @@ export const PHASE_LABEL = Object.freeze({
 })
 
 /**
+ * 关键节点流程日志（时间线）的节点表。
+ *
+ * 用户原话（2026-11-06）：「从获取到工单-查找对应工单的项目-检查是否存在工作区-创建会话
+ * 选择分支和模型-处理工单问题-处理完成后提交PR-并发送消息给我。完整的关键节点的流程日志
+ * 不然我不知道哪里有问题了或者卡在哪里了」。
+ *
+ * 所以每张票的票据行上挂一条 `timeline` 数组：**每个节点一条记录，带写下时刻 + 成败 +
+ * 一句中文补充**。`pipeline_status` 把它排成时间线，末尾直接写「现在停在第 N 站，
+ * 已 X 分 Y 秒没动」—— 这就是「卡在哪里」的答案，不用再去翻宿主日志。
+ *
+ * 节点 id 的约定：**凡是 phase 名，节点 id 就等于 phase 名**（`editing`/`testing`/
+ * `mr-opening` 以及所有终态）。`onPhase` 拿到 phase 直接查 `TIMELINE_NODES[phase]`
+ * 就能打点，不用再维护一张反查表。其余节点（发现/定位/工作区/会话/回填/通知）不是
+ * phase，由调度器与执行器在各自那一刻显式记。
+ *
+ * `no` 只用于展示（①…⑨ 是主链路，`·` 是补充站点），不参与任何判定；
+ * `label` 写进记录里是**自包含**的 —— 渲染时不查这张表也看得懂。
+ */
+export const TIMELINE_NODES = Object.freeze({
+  'discover': { no: '①', label: '获取工单' },
+  'locate': { no: '②', label: '查找对应工单的项目' },
+  'workspace': { no: '③', label: '检查工作区' },
+  'session': { no: '④', label: '创建会话（分支+模型）' },
+  'editing': { no: '⑤', label: '处理工单问题' },
+  'testing': { no: '⑥', label: '跑验证' },
+  'mr-opening': { no: '⑦', label: '提交（本地提交 / PR）' },
+  'writeback': { no: '⑧', label: '回填工单表' },
+  'notify': { no: '⑨', label: '发送消息' },
+  // 补充站点：不是用户点名的主链路，但卡在这些地方同样要看得见
+  'worktree-ready': { no: '·', label: '工作区就绪' },
+  'planning': { no: '·', label: '规划改动' },
+  'pending': { no: '·', label: '排队中' },
+  'needs-info': { no: '·', label: '等你补充信息' },
+  'done': { no: '·', label: '已完成' },
+  'skipped': { no: '·', label: '已提交但没跑通验证' },
+  'failed': { no: '·', label: '失败' },
+  'gone': { no: '·', label: '表格里已删除' },
+})
+
+/**
+ * 时间线里一条记录的形状。
+ *
+ * `at` 是**这条记录写下的时刻**（epoch 毫秒）。这么定是为了让 `pipeline_status`
+ * 只靠一条公式就能回答「卡在哪里」：`现在 − 最后一条的 at` = 「距最后一次动静
+ * 过了多久」；相邻两条 `at` 之差 = 「上一站花了多久」。两个数都要，取写下时刻
+ * 最省事，也不用在每个节点上分别记开始/结束两次。
+ *
+ * `ok` 只表示这一站**做成了没有**：`true`=做成了，`false`=没做成（detail 里写原因）。
+ * 没有「进行中」这个状态 —— 一条票最后一条记录落在哪个节点，人就停在哪个节点：
+ * 票还没到终态却很久没有新记录，就说明卡在那儿了，这正是要暴露的东西。
+ *
+ * @typedef {Object} TimelineEntry
+ * @property {string} node 节点 id（见 TIMELINE_NODES）
+ * @property {string} label 节点中文名（自包含，渲染时不查表也看得懂）
+ * @property {number} at 这条记录写下的时刻，epoch 毫秒
+ * @property {boolean} ok true=做成了 / false=没做成
+ * @property {string} [detail] 一句给人看的补充
+ */
+
+/**
  * 合法的 phase 转移。所有写入方（`TicketStore.setPhase`）都要过这张表。
  * 表外的转移一律拒绝并记日志 —— 这是「终态不可退回」的执行点。
  */

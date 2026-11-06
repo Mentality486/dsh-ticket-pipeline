@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `678475f`）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-06；本轮「关键节点流程日志（时间线）」的代码与本文同一次提交，上一轮已提交代码为 `8d93478`，`b5940ce` 仅改文档；见 §11.3）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -1347,6 +1347,55 @@ await store.setPhase(key, finalPhase, {
 
 这不是「保证不会双跑」，而是「正常路径下单飞 + 抢到了能发现」。多进程同表跑同一票仍有极小的双跑窗口
 （例如两边同时在 read 与 put 之间），代价是同一票可能被改两遍；`leaseTtlMinutes` 只影响「多久算过期」。
+
+### 11.3 关键节点流程日志（时间线）
+
+以前想知道「票卡在哪了」只能靠翻插件日志：日志是按时间散落的、没有结构，看到「阶段 → testing」之后
+迟迟没有下一条，也说不清是卡在跑验证里还是已经死了。现在票据行上挂一个 `timeline` 数组，把
+「获取工单 → 找到项目 → 检查工作区 → 建会话 → 改代码 → 跑验证 → 提交 → 回填 → 发消息」这条主链的
+每个关键节点都写成一条带时刻、带成败的记录，`pipeline_status` 直接排成时间线并给出「现在停在第 N 站，
+已 X 分 Y 秒没动」。
+
+- **节点表**：`src/contracts/types.js` 的 `TIMELINE_NODES`（17 项）。9 个主站带序号
+  ① `discover` 获取工单 / ② `locate` 查找对应工单的项目 / ③ `workspace` 检查工作区 /
+  ④ `session` 创建会话（分支+模型） / ⑤ `editing` 处理工单问题 / ⑥ `testing` 跑验证 /
+  ⑦ `mr-opening` 提交（本地提交 / PR） / ⑧ `writeback` 回填工单表 / ⑨ `notify` 发送消息；
+  另 8 个补充站用 `no: '·'`（`worktree-ready` / `planning` / `pending` / `needs-info` / `done` /
+  `skipped` / `failed` / `gone`）。**节点 id 就等于 phase 名** —— ⑤⑥⑦ 及终态由 `onPhase` 直接查表打点，
+  不用维护一张「phase → 节点」的反查表（少一层状态机、少一处漏更新的地方）。
+
+- **记录结构** `TimelineEntry`：`{ node, label, at, ok, detail? }`。`at` 是**写下这一刻**的 epoch ms
+  （不是阶段开始时间），所以「相邻两条 `at` 之差」正好是上一站耗时、「现在 − 最后一条 `at`」正好是
+  「距最后一次动静多久」。`ok` 只有布尔 `true`/`false`（没有「进行中」）：`✓` 做成、`✗` 没做成。
+  `label` 自包含中文站名，渲染不必再查表。
+
+- **谁打点**：`core/scheduler.js` 的 `markNode(key, node, detail, ok, label)` 是唯一写入口，
+  内部 `store.appendTimeline(...)` 并包一层 `try/catch`（**记日志绝不能把票带崩**）；
+  `markExtra(...)` 给补充站补上查表得到的 `label`。调度器在扫描入队后记 ①、定位仓库后记 ②、
+  准备/复用工作区后记 ③、`executor.run` 的 ctx 加 `onFlow` 让真 agent 执行器通过 `reportFlow`
+  上报 ④（会话 id / provider+model / 分支 / 工作目录），成功收尾记 ⑧⑨，各失败分支（超时 / 取消 /
+  退避重试 / 不可重试 / needs-info / 租约丢失）记 ✗，启动补偿 `replayPendingEffects` 补做时标「补做」。
+  ⑤⑥⑦ 与终态由 `onPhase` 自动记。
+
+- **历史不清空**：`timeline` 是历史，不是这一轮的状态。`store.enqueue` 的 `if (existing)` 段显式
+  `row.timeline = existing.timeline` 继承旧记录（与 `lastError`/`pendingEffects` 相反，那两个是本轮状态），
+  `revise` 用 `{...existing}` 自然保留，`resetByHuman` 也不清空、只在末尾补一条 `pending` 分隔记录
+  「人工重置，重新入队」，方便重开后对照上一轮走到哪。数组上限 80 条（跑完约 10–15 条），超了丢最旧；
+  连续两条同 node 同 ok 会合并成一条（保留最新 `at`/`detail`），因为 `worktree-ready` 会被连触发两次。
+
+- **`appendTimeline` 刻意不走 `setPhase`**：`setPhase` 每次重写 `finishedAt`（会让「跑了多久」失真）
+  而且要过阶段转移校验 —— 而记日志可能发生在任何阶段（含终态），不该被阶段机拦住。
+
+- **渲染**：`src/tools/pipeline-status.js` 的 `describeFlow(row, now)` 倒序找出最后到达的主站，
+  算出 `stalledForMs`、`station`、`lastNodeOk`，`renderTimeline(row, now)` 排成
+  `11-06 20:14:58  ⑥ ✓ 跑验证 —— 开始跑验证命令（上一站 5 秒）` 这样的行，末尾一句
+  `▶ 现在停在第 ⑥ 站「跑验证」，已 3 分 25 秒没动。`；`needs-info` 特别写「这一站在等人，不是插件卡死」，
+  终态写「已经收尾」。时间一律按固定 UTC+8 纯算术换算（Asia/Shanghai 1991 年后无夏令时），不赌机器时区。
+  返回体 `tickets[]` 带 `timeline` / `stalledForMs` / `station` / `lastNodeOk`，便于机器读；
+  `now` 可注入（缺省 `() => Date.now()`），整次查询用同一个「现在」，自测能写确定值。
+
+- **④ 只有真 agent 执行器会记**：`executor-mock` 不调 `onFlow`（合法，老调用方不传等于不记时间线）；
+  真 agent 的 `reportFlow` 也包了 `try/catch`，`onFlow` 抛错只记日志、不影响跑票。
 
 ---
 

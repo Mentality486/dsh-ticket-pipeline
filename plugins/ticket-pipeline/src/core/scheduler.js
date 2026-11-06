@@ -10,7 +10,7 @@
  */
 
 import { PipelineError, isAbortError, linkSignal, toPipelineError } from '../contracts/errors.js'
-import { TERMINAL, canTransition } from '../contracts/types.js'
+import { TERMINAL, canTransition, TIMELINE_NODES } from '../contracts/types.js'
 import { fingerprintChanged, summarize, ticketKey } from './store.js'
 import { renderTicketContent, renderTicketPrompt } from './prompt.js'
 
@@ -171,7 +171,44 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     sourceByProject.set(source.projectId, source)
   }
 
+  /**
+   * 往一张票的「关键节点流程日志」（时间线）上记一笔。
+   *
+   * 记日志绝不能反过来把票带崩：写失败只留一条插件日志，跑票照旧。
+   * `node` 是稳定 id（见 contracts/types.js 的 TIMELINE_NODES），`label` 可选，
+   * 省略时 `store.appendTimeline` 会自己查表；`ok` 缺省 true（这一站做成了）。
+   *
+   * @param {string} key 票据复合主键
+   * @param {string} node 节点 id
+   * @param {string} detail 一句给人看的中文补充
+   * @param {boolean} [ok] 这一站做成了没有
+   * @param {string} [label] 节点中文名（onFlow 会带过来）
+   */
+  async function markNode (key, node, detail, ok = true, label) {
+    try {
+      await store.appendTimeline(key, node, detail, ok, label)
+    } catch (error) {
+      logInfo('流程日志写入失败（不影响跑票）', {
+        node,
+        reason: String(error?.message ?? error),
+      })
+    }
+  }
+
   // ── 扫描与入队 ──────────────────────────────────────────
+
+  /**
+   * 记一个「补充站点」：不是用户点名的 ①–⑨，但卡在这些地方同样要看得见。
+   * 标签一律从 `TIMELINE_NODES` 查表（存进记录里是自包含的），调用方只给一句 detail。
+   * @param {string} key
+   * @param {string} node
+   * @param {string} detail
+   * @param {boolean} [ok]
+   */
+  async function markExtra (key, node, detail, ok = true) {
+    const meta = TIMELINE_NODES[node]
+    await markNode(key, node, detail, ok, meta?.label ?? node)
+  }
 
   /**
    * 扫一轮，把变化落进存储。
@@ -199,6 +236,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         await store.enqueue(ticket, { phase: 'pending', attempt: 0, enqueuedAt: nowFn() })
         counters.created += 1
         logInfo('新票入队', { projectId: ticket.projectId ?? projectId, recordId: ticket.recordId, priority: ticket.priority, summary: summarize(ticket.description) })
+        // ① 获取工单：这一刻就是「从表格里拿到这张票」的时刻。
+        await markNode(key, 'discover',
+          `扫到「处理中」一行，入队（项目 ${ticket.projectId ?? projectId}、优先级 ${ticket.priority ?? '未标'}、${summarize(ticket.description)}）`)
       }
 
       for (const ticket of result.updated ?? []) {
@@ -207,6 +247,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         if (!existing) {
           await store.enqueue(ticket, { phase: 'pending', attempt: 0, enqueuedAt: nowFn() })
           counters.created += 1
+          await markNode(key, 'discover', '这一轮扫描里第一次见到这张票，入队')
           continue
         }
         if (!fingerprintChanged(existing, ticket.fingerprint)) continue
@@ -215,11 +256,14 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           await store.enqueue(ticket, { phase: 'pending', attempt: 0, enqueuedAt: nowFn() })
           counters.revivals += 1
           logInfo('终态票收到修订，重新入队', { projectId: ticket.projectId ?? projectId, recordId: ticket.recordId, was: existing.phase })
+          await markNode(key, 'discover', `表格里这行从 ${existing.phase} 又被改成「处理中」，重新入队（上一轮的流程日志保留在下面，方便对照）`)
           continue
         }
         const { row, restarted } = await store.revise(ticket)
         counters.updated += 1
         logInfo('票有修订，排到队尾', { projectId: ticket.projectId ?? projectId, recordId: ticket.recordId, revisionCount: row.revisionCount, restarted })
+        // 修订不打断当前运行、也不是一次新的「获取工单」，不另记 ① —— 下一轮
+        // runOne 会重新记 ②③④…，时间线上自然能看出「这票又跑了一遍」。
       }
 
       for (const recordId of result.disappeared ?? []) {
@@ -230,6 +274,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         await store.setPhase(key, 'gone', { lastError: undefined })
         counters.disappeared += 1
         logInfo('表格里这行消失了，退役', { projectId, recordId })
+        await markNode(key, 'gone', '表格里这一行被删掉了，静默退役')
       }
     }
 
@@ -343,18 +388,28 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       logInfo(`阶段 → ${phase}`, isDetail
         ? { projectId, recordId, detail: detailOrPatch }
         : { projectId, recordId })
+      // 关键节点流程日志：节点 id 就等于 phase 名。执行器进到 editing/testing/
+      // mr-opening 时调的就是这里，正好把「走到这一站」记进时间线 —— 这条就是
+      // 回答「现在停在哪」的依据。只记 ①–⑨ 主站（no !== '·'）：worktree-ready、
+      // planning、终态这些补充站由调度器自己在落库处显式记，顺序才不会乱。
+      const meta = TIMELINE_NODES[phase]
+      if (meta && meta.no !== '·') {
+        await markNode(key, phase, isDetail ? String(detailOrPatch) : '', true, meta.label)
+      }
     }
 
     try {
       // 传 signal：定位器可能碰磁盘（isGitRepo 校验）或网络，这票被取消/超时之后
       // 还接着查下去毫无意义；不传的话它只是白干，而我们多等一份没有意义的耗时。
       const located = await locator.locate(ticket, handle.signal)
+      await markNode(key, 'locate', `定位到项目 ${projectId}：仓库 ${located.repoPath ?? '（未给出）'}${located.baseBranch ? `，基准分支 ${located.baseBranch}` : ''}${located.module ? `，模块 ${located.module}` : ''}${located.remote ? `，remote ${located.remote}` : ''}`)
 
       // 截图是**输入**，不是阶段。必须在任何「开工」阶段之前处理掉：
       // 取不到就直接 needs-info，此时票还停在 pending，转移合法，
       // 也不会白建一个工作区。
       const shots = await showScreenshots(source, ticket, handle.signal)
       if (shots === false) {
+        await markExtra(key, 'needs-info', '截图取不到，等你补图（票停在 needs-info，不会往下跑）', false)
         await store.releaseLease(key)
         return true
       }
@@ -396,6 +451,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         })
       }
 
+      const workspaceAction = staleCoords
+        ? '票据上的工作区坐标已失效，重新准备'
+        : (!row.worktreePath || !ws.workspacePath)
+          ? '票据上还没有工作区，新建/登记一个'
+          : '票据上的工作区坐标仍然有效，直接复用'
       if ((!row.worktreePath || !ws.workspacePath || staleCoords) && typeof prepareWorkspace === 'function') {
         const prepared = await prepareWorkspace({
           ticket,
@@ -435,11 +495,14 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       if (store.getTicket(key)?.phase === 'pending') {
         await onPhase('worktree-ready', {})
       }
+      await markExtra(key, 'worktree-ready', `${workspaceAction}；工作目录 ${ws.worktreePath || '（未建，离线跑）'}${ws.branch ? `，分支 ${ws.branch}` : ''}${ws.workspacePath ? `，项目工作区 ${ws.workspacePath}` : ''}`)
+      await markNode(key, 'workspace', `${workspaceAction}；工作目录 ${ws.worktreePath || '（未建，离线跑）'}${ws.branch ? `，分支 ${ws.branch}` : ''}${ws.workspacePath ? `，项目工作区 ${ws.workspacePath}` : ''}`)
 
       await onPhase('planning', {
         module: located.module ?? row.module,
         startedAt: row.startedAt ?? nowFn(),
       })
+      await markExtra(key, 'planning', `模块 ${located.module ?? row.module ?? '未标'}，改代码前先整理任务书与基线`)
 
       const result = await executor.run(ticket, located, {
         signal: handle.signal,
@@ -458,6 +521,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         config,
         log: (msg, detail) => logInfo(msg, detail),
         onPhase,
+        // 执行器内部才知道的那几站（主要是 ④ 创建会话：分支 + 模型）由它自己
+        // 调 onFlow 报上来；这里只负责把它落到票据的时间线上，不让日志写失败炸整票。
+        onFlow: (node, label, detail, ok) => markNode(key, node, detail, ok, label),
       })
 
       // `WorkExecutor` 已经把 phase 走到 done/skipped/failed 之一，这里只落结果并通知。
@@ -502,6 +568,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         lastError: finalLastError,
         pendingEffects: Object.keys(pendingEffects).length > 0 ? pendingEffects : undefined,
       })
+      await markExtra(key, finalPhase, finalLastError ? `执行器收尾：${finalLastError}` : (result.commit?.sha ? `本地提交 ${String(result.commit.sha).slice(0, 12)}` : '执行器收尾，无本地提交'), finalPhase !== 'failed')
 
       // 回填工单表：只在「真的改完了」的时候写。failed 不写 —— 表里那一行还是
       // 「处理中」，人一眼就能看出这票没成，等着重新拨进队列。
@@ -522,6 +589,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         await store.setPhase(key, finalPhase, { writeBack: writeBackReceipt })
       }
       if (writeBackPlanned) await clearPendingEffect(key, 'writeBack')
+      if (writeBackReceipt === undefined) {
+        await markNode(key, 'writeback', '按配置跳过（writeBack=false、源没有 writeResult，或这一站不是 done/skipped）')
+      } else if (writeBackReceipt.written) {
+        await markNode(key, 'writeback', `已写回工单表（${(writeBackReceipt.fields ?? []).join('、') || '状态/结果/处理时间'}）`)
+      } else {
+        await markNode(key, 'writeback', `回填没写成：${writeBackReceipt.note ?? '原因未记录'}`, false)
+      }
 
       // 不铺 ...result：ExecResult 里的 error 是对象，铺进来会污染整个通知载荷。
       // 逐字段显式搬运，通知里读到的就是这次执行的结果而不是运行前的快照。
@@ -545,6 +619,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         writeBack: writeBackReceipt,
       }, handle.signal)
       if (pendingEffects.notify) await clearPendingEffect(key, 'notify')
+      await markNode(key, 'notify', willNotify(finalPhase)
+        ? `已按配置给 ${(config.notifyOn ?? ['done', 'skipped', 'failed', 'needs-info']).join('、')} 发消息`
+        : `按配置不发（notifyOn 不含 ${finalPhase}）`)
       await store.releaseLease(key)
       return true
     } catch (error) {
@@ -557,6 +634,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: '租约丢失（被其他进程抢走），已让出这张票',
           enqueuedAt: nowFn(),
         })
+        await markExtra(key, 'failed', '租约被别的进程抢走，本轮让出、重新排队（不是这一轮跑挂了）', false)
         logInfo('已让出这张票', { projectId, recordId })
         await store.releaseLease(key)
         return true
@@ -573,6 +651,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: timedOut ? `超时 ${timeoutMinutes} 分钟` : 'cancelled by user',
           pendingEffects: timedOut && willNotify('failed') ? { notify: true } : undefined,
         })
+        await markExtra(key, 'failed', timedOut ? `整票超时 ${timeoutMinutes} 分钟，已标 failed` : '被人工取消，已标 failed', false)
         if (timedOut) {
           // 这里**故意不传 handle.signal**：走到这一行时它必然已经 aborted，
           // 而推送适配器（push-mock 第一行就是这么写的）见 aborted 会把消息原样推回 ——
@@ -588,6 +667,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             lastError: `超时 ${timeoutMinutes} 分钟`,
           })
           if (willNotify('failed')) await clearPendingEffect(key, 'notify')
+          await markNode(key, 'notify', '超时通知已发出（不传已 aborted 的 signal，免得被推送适配器吞掉）')
         }
         logInfo(timedOut ? '超时，已标 failed' : '被取消，已标 failed', { projectId, recordId, worktreePath: row.worktreePath })
         await store.releaseLease(key)
@@ -610,6 +690,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: `${normalized.kind}: ${normalized.message}`,
           enqueuedAt: dueAt,
         })
+        await markExtra(key, 'failed', `第 ${attempt} 次没跑成（${normalized.kind}: ${normalized.message}），可重试，${Math.round(waitMs / 1000)} 秒后再来`, false)
         logInfo('可重试错误，退避后再来', { projectId, recordId, attempt, kind: normalized.kind, retryInMs: waitMs })
       } else {
         // 失败也是终态，同样有「落库了但通知没发」的窗口：DSH 重启一次，
@@ -620,6 +701,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: `${normalized.kind}: ${normalized.message}`,
           pendingEffects: willNotify('failed') ? { notify: true } : undefined,
         })
+        await markExtra(key, 'failed', `第 ${attempt} 次没跑成，已用尽重试：${normalized.kind}: ${normalized.message}`, false)
         // 工作区坐标要带 ws 的值，不能用 ...row：row 是进 runOne 时的快照，
         // 首次运行时里面根本没有 worktreePath，失败的票明明留着工作区，
         // 通知正文却会缺掉「工作区保留在」那一行 —— 人照着去修时找不到目录。
@@ -632,6 +714,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: `${normalized.kind}: ${normalized.message}`,
         }, handle.signal)
         if (willNotify('failed')) await clearPendingEffect(key, 'notify')
+        await markNode(key, 'notify', '失败通知已发出')
         logInfo('失败，已通知', { projectId, recordId, kind: normalized.kind, worktreePath: ws.worktreePath })
       }
       await store.releaseLease(key)
@@ -792,6 +875,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           await store.setPhase(row.key, row.phase, { writeBack: receipt })
         }
         await clearPendingEffect(row.key, 'writeBack')
+        await markNode(row.key, 'writeback', '启动补偿：上次进程在回填前退出了，这一站是补做', receipt?.written !== false)
         replayed += 1
       }
 
@@ -804,6 +888,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         })
         await notifyFor(ticket, { ...current, phase: current.phase }, signal)
         await clearPendingEffect(row.key, 'notify')
+        await markNode(row.key, 'notify', '启动补偿：上次进程在通知前退出了，这条是补发不是新一轮')
         replayed += 1
       }
     }

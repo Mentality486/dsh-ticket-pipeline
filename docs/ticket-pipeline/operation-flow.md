@@ -43,6 +43,8 @@ flowchart TD
 
 > 回填（`writeBackFor()`）三条硬约束：①**只写 `done` / `skipped`** —— `failed` 的票留在表里「处理中」是刻意留的信号；②**回填失败只记日志**，票态不回退、通知照发，人能从 `pipeline_status` 的「回填表格：没写成 —— …」看到原因；③**被取消就不写**。开关是 `writeBack`（缺省 `true`）与 `writeBackStatus`（缺省 `是`）。
 
+> **关键节点流程日志（时间线）**：上面这整条链路的 9 个主站会被逐条记进票据的 `timeline` 字段，用 `pipeline_status` 排成时间线给人看。①获取工单（`scanAndEnqueue` 入队时）→ ②查找对应工单的项目（`locator.locate` 后）→ ③检查工作区（新建/复用/陈旧重建三种，`prepareWorkspace` 之后）→ ④创建会话（分支+模型，由执行器通过 `ctx.onFlow` 上报，只有真 agent 会记）→ ⑤处理工单问题 / ⑥跑验证 / ⑦提交（`onPhase` 自动按 `TIMELINE_NODES` 打点）→ ⑧回填工单表（`writeBackFor` 之后）→ ⑨发送消息（`notifyFor` 之后）。补充站（工作区就绪 / 规划改动 / 排队中 / 等你补充信息 / 已完成 / 已提交但验证没跑通 / 失败 / 表格里已删除）以 `·` 记、不占站号。每条带写下时刻（`at`）、`✓/✗` 成败、一句中文补充；`pipeline_status` 末行直接写「现在停在第 N 站，已 X 分 Y 秒没动」，用来判断卡住。超时、取消、退避、失败、needs-info、租约丢失都记 ✗；启动补做的 ⑧⑨ 标注「补做 / 补发不是新一轮」。时间线是历史，修订/重新入队/人工重置不清空、只在末尾补一条「排队中」分隔、上限 80 条；写失败只记插件日志不影响跑票。
+
 ---
 
 ## 2. 工单扫描与入队（来源适配层）
@@ -194,7 +196,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     T1[pipeline_scan<br/>立刻扫一轮] --> Q([队列])
-    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成<br/>+ 待补:回填表格 / 通知（pendingEffects 没做完时）] --> Q
+    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成<br/>+ 待补:回填表格 / 通知（pendingEffects 没做完时）<br/>+ 关键节点流程日志:现在停在第 N 站,已多久没动] --> Q
     T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警<br/>检出脏只提醒（照跑,会拍基线）] --> Q
     T4[pipeline_reset<br/>failed/needs-info/gone 放回重跑] --> Q
     T5[pipeline_cancel<br/>取消正在跑的那张票] --> Q
@@ -204,7 +206,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线：HEAD `678475f`（2026-11-06），含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码）、「回填工单表 / 保留会话 / 只提交 agent 改过的文件 / 设置面板补齐」四项改造、选择分支，以及 5 条上线阻断项 + 4 条重要项的加固（适配器名强校验、验证超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 补偿、租约诚实化），自测 363/363 + 链路冒烟 11/11。
+状态基线（2026-11-06）：含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码）、「回填工单表 / 保留会话 / 只提交 agent 改过的文件 / 设置面板补齐」四项改造、选择分支、配置页 UI/UX 大改造，以及 5 条上线阻断项 + 4 条重要项的加固（适配器名强校验、验证超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 补偿、租约诚实化），再加上**关键节点流程日志（时间线）**——票据 `timeline` 逐站打点、`pipeline_status` 直接写「现在停在第 N 站，已 X 分 Y 秒没动」，自测 376/376 + 链路冒烟 11/11。
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |

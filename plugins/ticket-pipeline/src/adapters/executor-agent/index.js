@@ -434,6 +434,91 @@ export function filterSensitiveFiles (files) {
 }
 
 /**
+ * 关键节点流程日志的 node → label 对照表。
+ *
+ * 与 `src/contracts/work-executor.js` 里 `onFlow` 的注释保持同一份口径：
+ * node 是稳定 id（落库/筛选用它），label 是给人看的中文名。执行器只记自己
+ * 内部才知道的那几站，其余由调度器在调用前后记。
+ *
+ * @type {Readonly<Record<string, string>>}
+ */
+const FLOW_LABEL = Object.freeze({
+  session: '创建会话（分支+模型）',
+})
+
+/**
+ * 写一条流程日志到票据时间线。
+ *
+ * 三件必须做的事，少一件就会把「记日志」变成「搞坏跑票」：
+ * 1. `Promise.resolve(...)` —— 回调可能是同步也可能是 async，裸 `await` 一个
+ *    `undefined` 看着没事，但调用方以后改成同步实现时行为和现在不一致；
+ * 2. 没有 `onFlow` 直接返回 —— 老调用方（自测、mock 执行器、别的组合根）
+ *    不传就等于不记时间线，不能因此炸；
+ * 3. 回调抛错只记一条 log 然后继续 —— 时间线写失败不该让一张已经改完代码的
+ *    票判失败，那是本末倒置。
+ *
+ * @param {any} ctx 执行上下文（`onFlow` 在它上面，可能没有）
+ * @param {(msg: string, detail?: unknown) => void} log 插件日志
+ * @param {string} node 稳定 id
+ * @param {string} label 中文名
+ * @param {string} detail 一句中文补充
+ * @param {boolean} [ok] 这一站做成了没有（缺省 true；false = 没做成，时间线上要标 ✗）
+ */
+async function reportFlow (ctx, log, node, label, detail, ok = true) {
+  const onFlow = ctx?.onFlow
+  if (typeof onFlow !== 'function') return
+  try {
+    await Promise.resolve(onFlow(node, label, detail, ok))
+  } catch (error) {
+    log('executor-agent：流程日志写入失败（不影响跑票）', { node, reason: String(error?.message ?? error) })
+  }
+}
+
+/**
+ * 时间线上写「模型 provider/model」的那一段。
+ *
+ * 不写成 `${agentOptions.provider}/${agentOptions.model}`：`resolveAgentOptions`
+ * 在缺服务、缺默认值的裁剪 profile 下会保持配置原样返回（可能两项都空），
+ * 直接拼会得到 `模型 undefined/undefined` —— 人看到会以为是自己配错了。
+ *
+ * @param {{ provider?: string, model?: string }} agentOptions
+ * @returns {string}
+ */
+function describeModel (agentOptions) {
+  const provider = typeof agentOptions?.provider === 'string' ? agentOptions.provider.trim() : ''
+  const model = typeof agentOptions?.model === 'string' ? agentOptions.model.trim() : ''
+  if (provider.length > 0 && model.length > 0) return `${provider}/${model}`
+  if (model.length > 0) return model
+  if (provider.length > 0) return `${provider}/（模型未定）`
+  return '（未定，跟随宿主默认）'
+}
+
+/**
+ * 时间线上写「分支」的那一段。
+ *
+ * `ctx.branch` 在就地改代码模式下可能为空（没有新建分支），这时线程上必须写
+ * 「未定」而不是留空 —— 空白会让「分支叫什么」这个问题看不出是没分支还是没读到。
+ *
+ * @param {any} ctx
+ * @returns {string}
+ */
+function flowBranch (ctx) {
+  const branch = typeof ctx?.branch === 'string' ? ctx.branch.trim() : ''
+  return branch.length > 0 ? branch : '（未定）'
+}
+
+/**
+ * 时间线上写「会话归属」的那一段：有工作区坐标才说得出归属，否则必须显式说不归属。
+ *
+ * @param {any} ctx
+ * @returns {string}
+ */
+function flowWorkspaceLabel (ctx) {
+  const workspacePath = typeof ctx?.workspacePath === 'string' ? ctx.workspacePath.trim() : ''
+  return workspacePath.length > 0 ? `项目工作区 ${workspacePath}` : '未归属到项目工作区'
+}
+
+/**
  * 造一个真执行器。
  *
  * @param {Object} [options]
@@ -498,46 +583,84 @@ export function createAgentExecutor (options = {}) {
 
       ctx.log?.(`executor-agent：起 agent（sessionId=${sessionId}，cwd=${sessionCwd}，改动目录=${worktreePath}）`)
 
+      // 模型参数：配置优先，缺的用宿主当前默认补齐。缺了 model 宿主会在
+      // {{model}} 模板上崩，票全变成「没有产生任何文件改动」。
+      //
+      // 提到 `agents.create` 之前算，是为了「创建会话」这一站的流程日志能写出
+      // **真正下发**的 provider/model：配一次真正下发一次，时间线上必须一致。
+      const agentOptions = resolveAgentOptions(config, { agentDefaultModel: options.agentDefaultModel, log })
+
       /** setup 回调里拿到的 agentCtx（收会话要用它的 `sessions` 服务）。 */
       let runtimeAgentCtx
 
       // ── 1. 起 agent ─────────────────────────────────────
-      const created = await agents.create({
-        sessionId,
-        // cwd = 项目工作区根：会话要能挂到工作区名下（见上面 sessionCwd 的说明）。
-        // 真正的改代码目录由 setup 里的 workingDirectory.set 钉到 worktree ——
-        // agent 的读写工具按那个目录解析相对路径，指错了就会在人的主检出里改代码。
-        meta: { cwd: sessionCwd },
-        // 模型参数：配置优先，缺的用宿主当前默认补齐。缺了 model 宿主会在
-        // {{model}} 模板上崩，票全变成「没有产生任何文件改动」。
-        agentOptions: resolveAgentOptions(config, { agentDefaultModel: options.agentDefaultModel, log }),
-        // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
-        // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
-        // 起来是个没有任何工具的壳，改不出任何文件。
-        //
-        // 顺手把 agentCtx 存下来：收尾时要靠它弱取 `sessions` 服务
-        // （`keepSession=false` 才用得上；默认保留，见 finally 里的说明）。
-        setup: (agentCtx, agent) => {
-          runtimeAgentCtx = agentCtx
-          return setupAgent(options, {
-            agentCtx,
-            agent,
-            worktreePath,
-            workspacePath,
-            workspaceId: ctx?.workspaceId,
-            // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
-            workspaceRegistry: options.workspaceRegistry,
-            presetId: config.agentPreset,
-            signal,
-            sessionId,
-            log,
-          })
-        },
-      })
+      let created
+      try {
+        created = await agents.create({
+          sessionId,
+          // cwd = 项目工作区根：会话要能挂到工作区名下（见上面 sessionCwd 的说明）。
+          // 真正的改代码目录由 setup 里的 workingDirectory.set 钉到 worktree ——
+          // agent 的读写工具按那个目录解析相对路径，指错了就会在人的主检出里改代码。
+          meta: { cwd: sessionCwd },
+          agentOptions,
+          // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
+          // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
+          // 起来是个没有任何工具的壳，改不出任何文件。
+          //
+          // 顺手把 agentCtx 存下来：收尾时要靠它弱取 `sessions` 服务
+          // （`keepSession=false` 才用得上；默认保留，见 finally 里的说明）。
+          setup: (agentCtx, agent) => {
+            runtimeAgentCtx = agentCtx
+            return setupAgent(options, {
+              agentCtx,
+              agent,
+              worktreePath,
+              workspacePath,
+              workspaceId: ctx?.workspaceId,
+              // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
+              workspaceRegistry: options.workspaceRegistry,
+              presetId: config.agentPreset,
+              signal,
+              sessionId,
+              log,
+            })
+          },
+        })
+      } catch (error) {
+        // 会话根本没建起来也要在时间线上留一条：否则人只看到「卡住」，不知道
+        // 卡在「创建会话」这一站，还是卡在后面处理工单。错误照原样抛出，行为不变。
+        await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+          `会话没起来：${error?.message ?? String(error)}`,
+          `模型 ${describeModel(agentOptions)}`,
+          `分支 ${flowBranch(ctx)}`,
+          `工作目录 ${sessionCwd}`,
+          flowWorkspaceLabel(ctx),
+        ].filter(Boolean).join('，'), false)
+        throw error
+      }
       const agent = created?.agent
       if (!agent || typeof agent.followup !== 'function') {
+        await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+          '会话没起来：agents.create 没有返回可用的 agent（缺 followup）',
+          `会话 ${sessionId}`,
+          `模型 ${describeModel(agentOptions)}`,
+          `分支 ${flowBranch(ctx)}`,
+          `工作目录 ${sessionCwd}`,
+          flowWorkspaceLabel(ctx),
+        ].filter(Boolean).join('，'), false)
         throw new PipelineError('internal', 'agents.create 没有返回可用的 agent（缺 followup）')
       }
+
+      // 会话真的建起来了：这一刻 sessionId、provider/model、cwd 都已经定下来，
+      // 外面（调度器）看不见这些，只有这里知道 —— 所以「创建会话（分支+模型）」
+      // 这一站由执行器自己记。
+      await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+        `会话 ${sessionId}`,
+        `模型 ${describeModel(agentOptions)}`,
+        `分支 ${flowBranch(ctx)}`,
+        `工作目录 ${sessionCwd}`,
+        flowWorkspaceLabel(ctx),
+      ].filter(Boolean).join('，'))
 
       /** 取消时 agent 上的工作量很大，中途要把它停下来，不能留着空转烧 token。 */
       const cancelAgent = () => {
