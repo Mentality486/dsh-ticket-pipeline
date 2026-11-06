@@ -185,9 +185,10 @@ for (const project of projects) {
   }
   lines.push(`${mark} 项目 ${name}（${platform}）：仓库 ${path}${branchNote}${exists ? '' : ' ⚠️ 不可用'}${remoteNote}`)
 
-  // 缺省模式下 agent 直接在这个检出里改代码、就地提交，所以「检出现在干净吗」
-  // 是能不能开工的前提：不干净的话每张票都会以 invalid-input 失败。
-  // 体检时就把这件事说出来，别等人跑票才看到。
+  // 缺省模式下 agent 直接在这个检出里改代码、就地提交。检出脏不再挡跑票
+  // （跑票前会先拍一份只读基线，结束后只提交 agent 真正改过的文件），
+  // 但体检时还是要说清楚有几处未提交改动会让基线变大 —— 人有时候以为自己
+  // 只改了一处，其实还留着三天前的半成品。
   //
   // 参数与 `inspectCheckout`（src/index.js）必须一致：-z 免掉引号转义、-uall 展开
   // 未跟踪目录（否则人放进新目录的 .env 看不见）、排除插件自己的 .agents/worktrees
@@ -207,12 +208,14 @@ for (const project of projects) {
         } else {
           const shown = dirty.slice(0, 5).join('、')
           const more = dirty.length > 5 ? `等 ${dirty.length} 个` : ''
+          // 归到 warnings 而不是 problems：脏检出已经不再挡跑票了
+          // （跑票前会拍只读基线，结束后只提交 agent 改过的文件）。
           warnings.push(
             `项目 ${name}：检出里有 ${dirty.length} 个未提交改动（${shown}${more}）——`
-            + '缺省模式下每张票都会因为「工作区不干净」被拒。提交或 stash 之后再跑，'
-            + '或者把配置项 isolateWorktree 打开让每票用独立隔离目录。',
+            + '不影响跑票：插件会先拍一份只读基线，结束后只提交 agent 真正改过的文件，'
+            + '你自己这些改动会原样留在工作区。',
           )
-          lines.push(`　⚠️ 检出有 ${dirty.length} 个未提交改动（跑票会被拒）`)
+          lines.push(`　检出不干净：${dirty.length} 个未提交改动（照跑，只提交 agent 改过的）`)
         }
       }
     } catch (error) {
@@ -259,7 +262,7 @@ lines.push(`ℹ️ 执行器：${executor}｜通知：${push}`)
 // 这跟「每票一个隔离 worktree」是完全不同的风险面，人不该靠猜。
 lines.push(config.isolateWorktree === true
   ? 'ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）'
-  : 'ℹ️ 改代码落点：项目工作区检出里（要求检出干净）')
+  : 'ℹ️ 改代码落点：项目工作区检出里（脏也能跑，只提交 agent 改过的文件）')
 
 // ── 5. 插件版本 ──────────────────────────────────
 // 「跑的是旧代码」不会报错，只表现为旧行为，所以必须主动比一次。
