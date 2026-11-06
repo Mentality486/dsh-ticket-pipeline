@@ -72,6 +72,11 @@ lib/
   `wps` 时出现。项目卡片整体可收起，卡内 5 个分区也能各自收起（两套折叠类名分开，折叠状态存两个
   localStorage 键）。**改过或有错的字段无论收起与否都会露出来** —— 折叠不能成为遮蔽错误的工具。
   隐藏 ≠ 删字段：`PROJECT_SECTIONS` 里 21 个 path 一个没少。
+- **面板长得什么样**：浅灰底 + 纯白圆角卡片，字段是「加粗字段名 / 输入框 / 浅灰说明」的上下三行
+  （不是左边一长串文字 + 右边输入框）；布尔项是 `role="switch"` 开关；全页只一颗主按钮（顶部「保存」），
+  凭据值攒着随它一起提交，行内只剩「清除」（要二次确认）。项目清单右上角「+ 添加项目」、卡片头「删除」
+  都走 `settings.mutate` 的数组语义（追加 / `splice`），不新增 Remote 方法。
+  控件是自写的 —— 宿主 `practices.md` 禁止把 `dsh-client-ui-primitives` 之类客户端包当模块加载。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
 （每个节点带 `toJSON`、叶子带 `meta.volatile`），宿主 `dsh-settings` 用它投影出可写字段。
@@ -280,7 +285,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 （platform 写错宿主会静默跳过整个 bundle），以及 **`projects` 子树的 `meta.volatile`**：
 descriptor 叶子 **33 个 / 7 组**、schema 信封 **71 节点 / 33 叶子**、Remote **4 个方法**
 （`doctor` / `config` / `projects` / `branches`）、`projects` 可写 **25 字段**、面板项目字段 **21 项**与宿主对得上。
-（`client-smoke` 真跑一遍 bundle，实跑 **94 条**断言。）
+（`client-smoke` 真跑一遍 bundle，实跑 **105 条**断言。）
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

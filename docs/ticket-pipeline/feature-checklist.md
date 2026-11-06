@@ -2,7 +2,9 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 71 次提交，代码基线 HEAD `678475f`；其后 `20e0369` 只改各文档的基线行，未动代码），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-06，新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），自测 **363/363** 全绿；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
+> 最近一次更新：2026-11-06，新增**配置页 UI/UX 大改造**（Label 置顶、高级参数折叠、凭据统一走顶部保存、
+> 项目清单可增删、卡片化 + Switch 开关，顺手修掉 `[object Object]` 渲染 bug，见 §1.15），
+> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），自测 **363/363** 全绿；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -443,18 +445,42 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 ---
 
+### 1.15 配置页 UI/UX 大改造（2026-11-06）
+
+**要解决什么**：面板功能全了，但一屏全是「左边一长串说明文字 + 右边输入框」，33 个配置项加 21 个项目字段不分主次；
+更糟的是 `projects` 被当成普通字段渲染，`draftValueOf` 把对象数组 `join` 成 `[object Object], [object Object]` 摆在页面上。
+
+**做法**：
+
+| 环 | 落点 |
+| --- | --- |
+| 修 `[object Object]` | `lib/client.js` 的 `collectLeaves` 剔除 `projects`（`path.length===1 && path[0]==='projects'`）：它是结构化数组，由 `ProjectListCard` 画成卡片，当普通叶子会被 `draftValueOf` 拼成 `[object Object], [object Object]` |
+| Label 置顶 | `.tp-field` 从 `grid-template-columns:minmax(140px,220px) 1fr`（左右两栏）改成上下三行：加粗字段名 / 输入框 / 浅灰说明（`1-60，缺省 3` 这种）；字段走 `repeat(auto-fill,minmax(260px,1fr))` 网格 |
+| 高级参数折叠 | 新增 `ADVANCED_CONFIG_KEYS`（`safePageRun` / `goneAfterScans` / `concurrency` / `leaseHeartbeatSeconds` / `maxAttempts` / `fetchBeforeCreate` / `branchPrefix` / `worktreeRetentionHours` / `writeBackStatus` / `qqmail.port` / `qqmail.secure` / `pushplus.channel` / `pushplus.template` / `pushplus.callbackUrl`）收进组内「高级设置」折叠；**改过的和有错的字段永不藏**；刻意不收 `enabled` / `logLevel` / `qqmail.host`（自测断言它们必须可见） |
+| 凭据统一操作 | `CredentialRow` 删掉每行小「保存」，改由顶部主「保存」一次提交（`onSave` 里先发 `credNs.set`、**不 await**，再同步 `ns.mutate`）；「已配置」用绿色 Tag（`✓ 已配置`），输入框 placeholder「已配置，留空即不修改」；「清除」保留但加 `window.confirm` 二次确认；`state` 字段名与宿主 `remote.credentials.describe()` 对齐（`configured` / `writable`） |
+| 项目可增删 | 「+ 添加项目」走 `['projects', '<len>']` + `set` 追加；卡片头「删除」走 `['projects', '<i>']` + `unset`（宿主 `applyPathOp` 对数组是 `splice(i,1)`）。两者都复用现有 `settings.mutate` 通道，**不新增 Remote 方法**；有未保存字段改动时禁用，避免下标错位 |
+| 卡片化 | 面板浅灰底（`--dsw-alias-bg-layer-1`）、卡片纯白 + 圆角 + `box-shadow:0 2px 8px rgba(0,0,0,.05)` + 24px 内边距；输入框 36px 高、限宽 |
+| Switch 开关 | 布尔项换成 `role="switch"` + `aria-checked` 的开关（宿主 `practices.md` **禁止** `require('@deepseek-ai/dsh-client-ui-primitives')` 之类加载客户端包，只能自写控件、抄宿主 markup/CSS/行为） |
+| 顶部操作条 | 顺序照草图：放弃改动 / 重新载入 / 体检 … 保存（主按钮最右，全页只此一颗 `tp-primary`） |
+
+**自测**：`client-smoke` 94 → **105 条**（新增：凭据每行不再有「保存」按钮、清单无 `[object Object]`、
+「+ 添加项目」/「删除」按钮、`role="switch"` 语义、布尔不落回原生 checkbox、全页只一颗主按钮）；
+`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**、`chain-smoke` **11** 全绿。
+
+---
+
 ## 2. 代码清单
 
-`src/` 共 **43 个 .js / 15 747 行**；`scripts/` 共 9 个 .mjs / **10 066 行**（`dev-run.mjs` **3 075 行**）；`lib/client.js` 2 401 行（浏览器端设置面板）。
+`src/` 共 **43 个 .js / 15 788 行**；`scripts/` 共 9 个 .mjs / **10 066 行**（`dev-run.mjs` **3 075 行**）；`lib/client.js` 2 795 行（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 195 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 4 376 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects`）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 7 487 | 见下表 |
-| `src/tools/` | 1 172 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 269 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 182 行） |
-| 根 | 1 248 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| `src/contracts/` | 1 203 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 4 388 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects`）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 7 499 | 见下表 |
+| `src/tools/` | 1 178 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
+| `src/remote/` | 271 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 184 行） |
+| 根 | 1 249 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -758,7 +784,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
-| 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **94** 条断言全过 |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **105** 条断言全过 |
 | 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` **363/363**（第 16b 节 14 条）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |

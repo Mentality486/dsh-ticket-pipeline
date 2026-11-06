@@ -1142,6 +1142,22 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 - 隐藏 ≠ 删字段：`PROJECT_SECTIONS` 里 21 个 path 一个没少，`client-check.mjs` 的
   「面板 21 项与宿主 descriptor 对得上」照旧成立。
 
+**视觉与操作的统一**（2026-11-06 UI/UX 改造，见 feature-checklist §1.15）：
+面板浅灰底、卡片纯白圆角带极轻阴影，字段是「加粗字段名 / 输入框 / 浅灰说明」的上下三行
+（不是左边一长串文字 + 右边输入框），颜色一律走 `--dsw-alias-*` token 不写死。三条操作纪律：
+
+- **全页只一颗主按钮**（顶部「保存」）—— 凭据行原先各带一个小「保存」，页面上同时出现五六个
+  「保存」谁也说不清点哪个会把什么写下去；现在凭据值攒着随顶部保存一起提交，行内只剩「清除」
+  （破坏性，要二次确认）。
+- **布尔项一律 `role="switch"` 开关**，不落回原生 checkbox；宿主 `practices.md` **禁止**加载
+  `dsh-client-ui-primitives` 之类客户端包当模块，所以控件是自写的、抄宿主 markup/CSS/行为。
+- **项目清单可增删**：「+ 添加项目」→ `['projects','<len>']` + `set` 追加；卡片头「删除」→
+  `['projects','<i>']` + `unset`（宿主 `applyPathOp` 对数组是 `splice(i,1)`）。复用现有
+  `settings.mutate` 通道，**不新增 Remote 方法**；有未保存字段改动时禁用，避免删完下标错位。
+
+`projects` 子树不再进普通字段渲染：`collectLeaves` 直接跳过它（`path[0] === 'projects'`），
+否则它是 `type:'array'` 的结构化数组，会被 `draftValueOf` 拼成 `[object Object], [object Object]`。
+
 ### 判定标准（改完自己验一遍）
 
 > 删掉 `src/adapters/source-feishu/` 整个目录 + `src/index.js` 里那个 import 和表里那一行，
@@ -1423,7 +1439,7 @@ fatal: unable to fork
 
 | 项 | 影响 | 何时定 |
 |---|---|---|
-| Web UI 面板 | 设置页已落地（33 个字段 / 7 组 + 项目清单可编辑 + 分支下拉 + 两层折叠与「显示全部字段」开关、4 个 Remote 方法）；队列看板仍未做（`lib/client.js` 已有挂载点） | 有人真的想看队列时 |
+| Web UI 面板 | 设置页已落地（33 个字段 / 7 组 + 项目清单可增删可编辑 + 分支下拉 + 两层折叠、「显示全部字段」开关与组内「高级设置」、Label 置顶 + Switch + 卡片化、4 个 Remote 方法）；队列看板仍未做（`lib/client.js` 已有挂载点） | 有人真的想看队列时 |
 | 多张工单指向同一模块的冲突 | 当前靠串行天然规避，但是「时间换安全」 | 出现真冲突时 |
 | 处理人绑定规则 | 当前不绑（只看 `statusValues`） | 有人抱怨「谁都能被派活」时 |
 | 金山文档的开放平台取数通道 | 现在只能靠 `match.sheetUrl` + 全局 fetch（大概率要登录态），或宿主注入 `fetchSheet` | 要真跑多张金山表时 |

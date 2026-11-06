@@ -126,7 +126,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
 | 配置 | **33 个字段 / 7 个分组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项），改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`keepSession`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `writeBack`、`writeBackStatus` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
-| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（名称 / 匹配 / 仓库 / 远程 GitLab / 验证命令），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的预览，明文不会下发到浏览器；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。手改配置文件仍然有效。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是 `wps` 时出现。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来 |
+| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（名称 / 匹配 / 仓库 / 远程 GitLab / 验证命令），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的预览，明文不会下发到浏览器；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。手改配置文件仍然有效。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是 `wps` 时出现。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
 > 确认插件活着，再看 §6 的排查。
@@ -359,7 +359,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
 | 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
-| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置（**33 个字段，7 个分组**）/ 项目清单（可编辑，21 个字段） |
+| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据（填好点顶部「保存」一起提交）/ 配置（**33 个字段，7 个分组**，不常动的收在组内「高级设置」里）/ 项目清单（可增删、可编辑，21 个字段） |
 | 设置页体检 | 该页点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
 | 设置页保存 | 改任一字段 → 保存 | 提示「已保存」；重启后值还在 |
 | 浏览器端一致性 | `node scripts/client-check.mjs`（开发目录） | `✅ client-check 通过` |
