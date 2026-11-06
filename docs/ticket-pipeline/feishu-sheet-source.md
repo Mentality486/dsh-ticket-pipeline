@@ -6,7 +6,7 @@
 > - **身份策略 = B（行号 / 序号）** —— 电子表格没有 `record_id`，只能自造行身份。
 > - **本轮范围 = 先出设计 + 排期**，不写实现代码。
 > 配套文档：`docs/ticket-pipeline/architecture.md`（四层契约）、`docs/ticket-pipeline/feature-checklist.md`（完成度与缺陷）、`docs/adr/0005-飞书电子表格源按表型分派.md`（决策）、`docs/ticket-pipeline/operation-flow.md`（操作流程图）。
-> 文中所有行号取自 2026-11-06 工作区源码（HEAD `dbfa21f`）。
+> 文中所有行号取自 2026-11-06 工作区源码（HEAD `678475f`）。
 
 ---
 
@@ -427,7 +427,7 @@ flowchart TD
 
 ### 7.3 预期计数
 
-现基线：`node scripts/dev-run.mjs` 实跑 **363 项全过**（2026-11-06，HEAD `dbfa21f` + 未提交的上线加固），`node scripts/chain-smoke.mjs` **11/11**。本设计落地后目标：**363 + 20 = 383 项**，`chain-smoke` 不变（不碰内核）。
+现基线：`node scripts/dev-run.mjs` 实跑 **363 项全过**（2026-11-06，HEAD `678475f`），`node scripts/chain-smoke.mjs` **11/11**。本设计落地后目标：**363 + 20 = 383 项**，`chain-smoke` 不变（不碰内核）。
 
 ---
 
