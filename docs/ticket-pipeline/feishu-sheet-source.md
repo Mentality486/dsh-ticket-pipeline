@@ -427,7 +427,7 @@ flowchart TD
 
 ### 7.3 预期计数
 
-现基线：`node scripts/dev-run.mjs` 实跑 **294 项全过**（2026-11-06，HEAD `2158e41` + 插件版本自检改动），`node scripts/chain-smoke.mjs` **11/11**。本设计落地后目标：**294 + 20 = 314 项**，`chain-smoke` 不变（不碰内核）。
+现基线：`node scripts/dev-run.mjs` 实跑 **294 项全过**（2026-11-06，HEAD `deec1a5`，干净检出），`node scripts/chain-smoke.mjs` **11/11**。本设计落地后目标：**294 + 20 = 314 项**，`chain-smoke` 不变（不碰内核）。
 
 ---
 

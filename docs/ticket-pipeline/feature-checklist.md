@@ -180,7 +180,7 @@ if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'fun
 所以改完源码不手工同步，宿主**一声不响地继续跑旧代码**。此前的表现是「明明改了却没生效」，
 只能靠人肉 `robocopy` + 重启，出错时完全看不出来。
 
-**做法**：新增 `src/core/plugin-version.js`（425 行），在 `pipeline_doctor` 里作第 5 节汇报。
+**做法**：新增 `src/core/plugin-version.js`（480 行），在 `pipeline_doctor` 里作第 5 节汇报。
 
 - **不比版本号**：两侧 `package.json` 的 `version` 都是 `0.1.0-test.1`，比了也没用。
 - **不跟 origin 比**：本阶段的交付形态是「工作区里的本地提交」，origin 长期落后本地，方向正好反了。
