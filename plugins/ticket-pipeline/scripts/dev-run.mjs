@@ -41,7 +41,8 @@ import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
-import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy } from '../src/index.js'
+import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, assertCleanCheckout } from '../src/index.js'
+import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
 
 // ── 小工具 ────────────────────────────────────────────────
 
@@ -218,10 +219,12 @@ async function main () {
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'done')
     assert.equal(row.testOutcome, 'passed')
-    assert.ok(row.mr, '必须存下 mr')
-    assert.equal(row.mr.draft, true)
+    assert.ok(row.commit, '必须存下本地提交')
+    assert.ok(String(row.commit.sha).length > 0, 'commit 要带 sha')
+    assert.deepEqual(row.commit.files, row.changedFiles, '提交的文件要与改动文件对得上')
     assert.equal(push.messages.length, 1, 'done 只发一条通知')
     assert.match(push.messages[0].title, /已完成/)
+    assert.match(push.messages[0].body, /本地提交：/, '通知书里要能直接看到提交在哪')
   })
 
   await check('并发恒为 1：一轮最多跑一票', async () => {
@@ -495,31 +498,33 @@ async function main () {
   })
 
   section('8. 工作区清理')
-  await check('done 且超保留期才清；failed 永不自动清', async () => {
+  await check('done 且超保留期才清；failed 永不自动清；主检出永不进清理候选', async () => {
     const { repo, store } = harness()
     const source = createMockSource()
     const scan = await source.scan(new AbortController().signal)
     const old = Date.now() - 10 * 24 * 3600 * 1000
+    // 只有插件自己开的隔离 worktree 才会被清（`<repo>/.agents/worktrees/<name>`）。
+    const isolated = (name) => `D:/repo/.agents/worktrees/${name}`
 
     // 终态票直接以终态入队（`pending → done` 不是合法转移，走 setPhase 会被拒），
     // 再用 repo.put 硬写 finishedAt —— setPhase 落终态时会把 finishedAt 盖成「现在」。
     await store.enqueue(scan.created[0], { phase: 'done' })
     await repo.put('tickets', k('rec-mock-001'), {
       ...store.getTicket(k('rec-mock-001')),
-      worktreePath: 'D:/wt/a',
+      worktreePath: isolated('ticket-demo-rec-mock-001-r1'),
       finishedAt: old,
     })
     // 刚完成的 done：还在保留期内，不该被清
     await store.enqueue(scan.created[2], { phase: 'done' })
     await repo.put('tickets', k('rec-mock-003'), {
       ...store.getTicket(k('rec-mock-003')),
-      worktreePath: 'D:/wt/c',
+      worktreePath: isolated('ticket-demo-rec-mock-003-r1'),
       finishedAt: Date.now(),
     })
     await store.enqueue(scan.created[1], { phase: 'failed' })
     await repo.put('tickets', k('rec-mock-002'), {
       ...store.getTicket(k('rec-mock-002')),
-      worktreePath: 'D:/wt/b',
+      worktreePath: isolated('ticket-demo-rec-mock-002-r1'),
       finishedAt: old,
     })
 
@@ -528,6 +533,18 @@ async function main () {
     assert.ok(ids.includes('rec-mock-001'), 'done 超期要清')
     assert.equal(ids.includes('rec-mock-003'), false, '还在保留期内不该清')
     assert.equal(ids.includes('rec-mock-002'), false, 'failed 的永不自动清')
+
+    // 缺省模式（不开 isolateWorktree）票据的 worktreePath 就是人的主检出。
+    // 它再老也不能进清理候选：`git worktree remove --force` 对主检出等于删掉整个工作目录。
+    await store.enqueue({ ...scan.created[0], recordId: 'rec-mock-main-checkout' }, { phase: 'done' })
+    await repo.put('tickets', k('rec-mock-main-checkout'), {
+      ...store.getTicket(k('rec-mock-main-checkout')),
+      worktreePath: 'D:/WorkSpace/mgiot-pms',
+      finishedAt: old,
+    })
+    const afterMainCheckout = store.listExpiredWorktrees(3600 * 1000).map((r) => r.recordId)
+    assert.equal(afterMainCheckout.includes('rec-mock-main-checkout'), false, '主检出永不被自动清理')
+    assert.ok(afterMainCheckout.includes('rec-mock-001'), '真实隔离目录照旧要清')
   })
 
   section('9. 飞书适配器（离线打桩，不联网）')
@@ -1081,20 +1098,30 @@ async function main () {
 
   await check('pipeline_doctor 全绿：git 可用 + 仓库正常 + 凭据齐', async () => {
     const tool = createPipelineDoctorTool({
-      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      // status --porcelain 必须回空串：缺省模式下「检出干净」是能跑票的前提，
+      // 回 'true' 会被当成一堆未提交改动（这条断言就是被它绊过）。
+      gitRunner: async (argv) => ({
+        code: 0,
+        stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'),
+        stderr: '',
+      }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
       credentials: { describe: async (ref) => ({ configured: true }) },
     })
     const out = await tool.execute({}, {})
     assert.equal(out.ok, true, `应该全绿：${out.text}`)
     assert.equal(out.problems.length, 0)
     assert.equal(out.warnings.length, 0)
+    assert.ok(out.text.includes('检出干净'), '缺省模式下要报告检出是否干净')
+    assert.ok(out.text.includes('改代码落点'), '要把改代码落在哪里说出来')
+    assert.ok(out.text.includes('项目工作区检出里'), '缺省是就地改，不是隔离 worktree')
   })
 
   await check('pipeline_doctor 报 git 不可用 + remote 连不上 + mock 提醒', async () => {
     const tool = createPipelineDoctorTool({
       gitRunner: async () => ({ code: 1, stdout: '', stderr: 'fatal: not a git repository' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/nope', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'mock', pushAdapter: 'mock' }),
+      // 只有显式打开远程出口（repo.gitlab.enabled）才会去握手探测 remote。
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/nope', remote: 'http://gitlab.example.com/mk/pms.git', gitlab: { enabled: true } } }], workExecutor: 'mock', pushAdapter: 'mock' }),
       credentials: null,
       probeRemote: async () => ({ ok: false, reason: "fatal: could not read Username for 'http://gitlab.example.com'" }),
     })
@@ -1112,8 +1139,8 @@ async function main () {
     const make = (probeRemote) => createPipelineDoctorTool({
       gitRunner: async (argv) => (argv[0] === 'ls-remote'
         ? { code: 0, stdout: '', stderr: '' }
-        : { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+        : { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git', gitlab: { enabled: true } } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
       credentials: { describe: async () => ({ configured: true }) },
       detectBaseBranch: async () => 'v2.x',
       probeRemote,
@@ -1126,6 +1153,40 @@ async function main () {
 
     const unreachable = await make(async () => ({ ok: false, reason: 'timeout' })).execute({}, {})
     assert.ok(unreachable.warnings.some((w) => w.includes('连不上')), '连不上要提醒')
+
+    // 没打开远程出口 -> 一次握手都不该发，且要说明「只做本地提交」。
+    let probed = 0
+    const noRemote = createPipelineDoctorTool({
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      credentials: { describe: async () => ({ configured: true }) },
+      probeRemote: async () => { probed += 1; return { ok: true } },
+    })
+    const out2 = await noRemote.execute({}, {})
+    assert.equal(probed, 0, '没开远程出口就不该去连 GitLab')
+    assert.ok(out2.text.includes('只做本地提交'), `要说明只做本地提交：${out2.text}`)
+  })
+
+  await check('pipeline_doctor 检出脏时要提醒（缺省模式每票都会被拒）', async () => {
+    const tool = createPipelineDoctorTool({
+      gitRunner: async (argv) => {
+        if (argv[0] === 'status') return { code: 0, stdout: ' M a.ts\0?? b.ts\0', stderr: '' }
+        return { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }
+      },
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.ok(out.warnings.some((w) => w.includes('未提交改动')), `脏检出要提醒：${JSON.stringify(out.warnings)}`)
+    // 打开隔离开关后就不该再拿「检出脏」说事：那时每票有自己的目录。
+    const isolated = createPipelineDoctorTool({
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: true }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out3 = await isolated.execute({}, {})
+    assert.ok(!out3.warnings.some((w) => w.includes('未提交改动')), '开了隔离就不该再要检出干净')
+    assert.ok(out3.text.includes('隔离 worktree'), '要说明改代码落在隔离目录')
   })
 
   await check('pipeline_doctor 会显示自动识别出的基准分支，并在回退 main 时提醒', async () => {
@@ -1781,6 +1842,150 @@ function makeFakeCtx ({ domain, registered }) {
 
   section('14. 项目工作区：有则复用、无则登记、服务缺失降级')
   await runWorkspaceChecks(check)
+
+  section('15. 改代码落点：缺省在工作区检出里改（要求干净）')
+  await check('inspectCheckout：干净 / 脏 / 拿不到状态三种情况都说清', async () => {
+    const clean = async (argv) => {
+      if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
+      if (argv[0] === 'rev-parse' && argv[1] === '--abbrev-ref') return { code: 0, stdout: 'v2.x\n', stderr: '' }
+      return { code: 0, stdout: 'abc123\n', stderr: '' }
+    }
+    const ok = await inspectCheckout(clean, 'D:/repo')
+    assert.equal(ok.clean, true, '没有输出就是干净')
+    assert.equal(ok.branch, 'v2.x')
+    assert.equal(ok.head, 'abc123')
+
+    const dirty = async (argv) => {
+      // -z 格式：记录之间是 NUL、路径不带引号。生产代码只认这一种（见
+      // contracts/git-status.js：未跟踪目录折叠 / 中文名八进制转义 / 含空格加引号）。
+      if (argv[0] === 'status') return { code: 0, stdout: ' M a.ts\0?? b.ts\0', stderr: '' }
+      if (argv[0] === 'rev-parse' && argv[1] === '--abbrev-ref') return { code: 0, stdout: 'HEAD\n', stderr: '' }
+      return { code: 0, stdout: 'abc123\n', stderr: '' }
+    }
+    const d = await inspectCheckout(dirty, 'D:/repo')
+    assert.equal(d.clean, false)
+    assert.deepEqual(d.dirty, ['M a.ts', '?? b.ts'])
+    assert.equal(d.branch, undefined, 'detached HEAD 不该当成分支名')
+
+    // 拿不到状态必须抛：不知道检出现在什么样的时候，绝不能往里提交。
+    const broken = async () => ({ code: 128, stdout: '', stderr: 'not a git repo' })
+    await assert.rejects(() => inspectCheckout(broken, 'D:/repo'), /看不了项目检出的状态/)
+  })
+
+  await check('inspectCheckout：读状态用 -z -uall 并排除插件自己的 .agents/worktrees', async () => {
+    // 三个真实坑，缺一个都会出错：
+    // 1. 不加 -uall → 未跟踪目录被折叠成 `?? .agents/`，插件自己开的隔离 worktree
+    //    会把主的检出判成「脏」，每张票都被拒跑；
+    // 2. 不加 -z → 中文名变八进制转义、含空格的名字被引号包住，报错里人看不懂；
+    // 3. 不排除 .agents/worktrees → 同上第 1 条。
+    const calls = []
+    const fake = async (argv) => {
+      calls.push(argv)
+      if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
+      if (argv[0] === 'rev-parse' && argv[1] === '--abbrev-ref') return { code: 0, stdout: 'v2.x\n', stderr: '' }
+      return { code: 0, stdout: 'abc123\n', stderr: '' }
+    }
+    await inspectCheckout(fake, 'D:/repo')
+    const statusCall = calls.find((argv) => argv[0] === 'status')
+    assert.ok(statusCall.includes('--porcelain'), '还是 porcelain 格式，人读得懂')
+    assert.ok(statusCall.includes('-z'), '必须 -z，否则中文名被转义')
+    assert.ok(statusCall.includes('-uall'), '必须 -uall，否则未跟踪目录折叠')
+    assert.ok(statusCall.includes(':(exclude).agents/worktrees'), '插件自己的隔离目录不能算脏')
+    assert.ok(statusCall.includes(':(exclude).agents/worktrees/**'))
+
+    // 中文名与空格名要能原样认出来（-z 下 git 不给引号也不转义）。
+    const weird = async (argv) => {
+      if (argv[0] === 'status') return { code: 0, stdout: '?? 新建文件.txt\0?? space name.txt\0', stderr: '' }
+      if (argv[0] === 'rev-parse' && argv[1] === '--abbrev-ref') return { code: 0, stdout: 'main\n', stderr: '' }
+      return { code: 0, stdout: 'abc123\n', stderr: '' }
+    }
+    const w = await inspectCheckout(weird, 'D:/repo')
+    assert.deepEqual(w.dirty, ['?? 新建文件.txt', '?? space name.txt'], '中文名与空格名都不能被转义')
+  })
+
+  await check('assertCleanCheckout：脏工作区拒跑，报错要能照着做', async () => {
+    assertCleanCheckout({ dirty: [] }, 'D:/repo') // 干净时什么都不做
+    let error = null
+    try {
+      assertCleanCheckout({ dirty: ['M a.ts', '?? b.ts'] }, 'D:/repo')
+    } catch (err) {
+      error = err
+    }
+    assert.ok(error, '不干净必须抛')
+    assert.equal(error.kind, 'invalid-input')
+    assert.ok(error.message.includes('M a.ts'), `要点名具体文件：${error.message}`)
+    assert.ok(error.message.includes('stash'), '要告诉人怎么办')
+    assert.ok(error.message.includes('isolateWorktree'), '要给出旁路配置项')
+  })
+
+  await check('isIsolatedWorktreePath：只认插件自己开的 .agents/worktrees/<name>', async () => {
+    assert.equal(isIsolatedWorktreePath('D:/repo/.agents/worktrees/ticket-demo-r1'), true)
+    assert.equal(isIsolatedWorktreePath('D:\\repo\\.agents\\worktrees\\ticket-demo-r1'), true, 'Windows 反斜杠也要认')
+    // 以下都不是「某一票的隔离目录」，绝不能交给 git worktree remove --force。
+    assert.equal(isIsolatedWorktreePath('D:/WorkSpace/mgiot-pms'), false, '人的主检出')
+    assert.equal(isIsolatedWorktreePath('D:/repo/.agents'), false)
+    assert.equal(isIsolatedWorktreePath('D:/repo/.agents/worktrees'), false, '目录本身不算')
+    assert.equal(isIsolatedWorktreePath('D:/repo/.agents/worktrees/'), false)
+    assert.equal(isIsolatedWorktreePath(''), false)
+    assert.equal(isIsolatedWorktreePath(undefined), false)
+    assert.equal(isIsolatedWorktreePath('D:/repo/.agents/worktrees/../..'), false, '路径穿越要拒')
+  })
+
+  await check('真实 apply()：缺省模式不建隔离 worktree，票据落在工作区根上', async () => {
+    // 这一段走的是 index.js 里真实接线的 prepareWorkspace —— 只有 apply() 能测到它。
+    const { domain } = makeFakeDomain()
+    const registered = []
+    const shell = {
+      resolve: (request) => ({ ...request }),
+      execute: async (spec) => {
+        const command = String(spec?.command ?? '')
+        let stdout = ''
+        if (command.includes('rev-parse --abbrev-ref HEAD')) stdout = 'v2.x'
+        else if (command.includes('rev-parse HEAD')) stdout = 'base0001'
+        else if (command.includes('--is-inside-work-tree')) stdout = 'true'
+        else if (command.includes('--version')) stdout = 'git version 2.45.1'
+        // status --porcelain 故意留空：干净仓库。
+        return { result: async () => ({ exitCode: 0, stdout: { text: stdout }, stderr: { text: '' } }) }
+      },
+    }
+    const ctx = {
+      ...makeFakeCtx({ domain, registered }),
+      get: (name) => (name === 'shell' ? shell : undefined),
+    }
+    const { value: config } = validateConfig({
+      projects: [{ name: 'demo', match: { platform: 'mock' }, repo: { path: 'D:/repo' } }],
+      workExecutor: 'mock',
+      pushAdapter: 'mock',
+      isolateWorktree: false,
+      // 总开关缺省是 false（配置项默认关），不开这一轮 tick 直接返回 disabled、什么都不跑。
+      enabled: true,
+    })
+    await apply(ctx, config)
+
+    const byName = new Map(registered.map((tool) => [tool.name, tool]))
+    assert.ok(byName.has('pipeline_scan'), 'scan 工具必须注册')
+    const store = new TicketStore({ repo: makeDomainRepo(domain), log: silent })
+    const scan = await createMockSource().scan(new AbortController().signal)
+    await store.enqueue(scan.created[0])
+    // pipeline_scan 是 fire-and-forget（同步等会撑爆工具通道），所以这里自己等它跑完。
+    await byName.get('pipeline_scan').execute({ skipScan: true }, {})
+    const deadline = Date.now() + 5000
+    let row = store.getTicket(k('rec-mock-001'))
+    while (Date.now() < deadline && (!row || row.phase === 'pending')) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      row = store.getTicket(k('rec-mock-001'))
+    }
+
+    assert.ok(row, '这张票应该已经被跑过')
+    assert.equal(
+      String(row.worktreePath ?? '').includes('.agents/worktrees/'),
+      false,
+      `缺省模式不该建隔离 worktree，实际 ${row.worktreePath}`,
+    )
+    assert.ok(String(row.worktreePath ?? '').length > 0, '缺省模式仍要给出改代码的目录（工作区根）')
+    assert.equal(row.branch, 'v2.x', '就地改代码时分支就是检出当前分支，不该另开票分支')
+    assert.equal(row.baseCommit, 'base0001', '基线提交要记下来，改动靠它算 diff')
+  })
 
   // ── 收尾 ────────────────────────────────────────────────
   console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

@@ -194,13 +194,14 @@ async function main () {
       for (const block of images) assert.ok(block.image, '图片块不能是空的')
     })
 
-    await check('通知里有 draft MR 链接，标题是「已完成」', async () => {
+    await check('通知里有本地提交 sha，标题是「已完成」', async () => {
       assert.equal(push.messages.length, 1)
       const msg = push.messages[0]
       assert.match(msg.title, /已完成/)
-      assert.match(msg.body, /draft MR：/)
-      // 有链接才谈得上「点进去看 PR 详情」。
-      assert.match(String(msg.link ?? ''), /^mock:\/\/draft-mr\//)
+      // 本阶段的交付形态是工作区检出里的本地提交：通知里给的是 sha 而不是远端 MR 链接。
+      assert.match(msg.body, /本地提交：/)
+      assert.match(msg.body, /mock[0-9a-zA-Z]{8}/)
+      assert.equal(msg.link, undefined, '没开远程 MR 时不该有链接')
     })
 
     await check('通知正文里没有 [object Object] 和 undefined', async () => {

@@ -23,17 +23,19 @@ import {
   buildMessages,
   buildMrDescription,
   buildMrTitle,
+  buildLocalCommitMessage,
   buildSessionId,
+  commitLocally,
+  collectChanges,
   createAgentExecutor,
   filterSensitiveFiles,
   isAllowedGitCommand,
   isSensitivePath,
   normalizeActions,
   parseGitRemote,
-  parseNameStatus,
-  parsePorcelainChanges,
   resolveGitlab,
   splitCommand,
+  unstageSensitiveFiles,
 } from '../src/adapters/executor-agent/index.js'
 import {
   agentFailureToPipelineError,
@@ -41,6 +43,11 @@ import {
   parseRetryAfterMs,
   readTurnEndFailure,
 } from '../src/adapters/executor-agent/agent-failure.js'
+import {
+  parseNameStatusZ,
+  parseStatusZ,
+  statusCodeToAction,
+} from '../src/contracts/git-status.js'
 
 const NOTICE = '注意：下面的工单内容来自共享表格。'
 
@@ -289,7 +296,11 @@ const TICKET = Object.freeze({
  * @returns {any}
  */
 /**
- * 把 {path, status, from} 渲染成 `git diff --name-status` 的输出。
+ * 把 {path, status, from} 渲染成 `git diff --name-status -z` 的输出。
+ *
+ * `-z` 格式：状态与路径之间是 NUL；重命名是「状态 / 旧路径 / 新路径」。
+ * 这里必须按 `-z` 渲染 —— 生产代码只用 `-z` 解析（理由见 `contracts/git-status.js`），
+ * 假 git 若还回 tab 分隔的旧格式，测出来的东西和真实 git 不是一回事。
  *
  * @param {Array<{ path: string, status: string, from?: string }>} changes
  * @returns {string}
@@ -298,13 +309,16 @@ function renderNameStatus (changes) {
   const letters = { create: 'A', update: 'M', delete: 'D', move: 'R100' }
   return changes.map((change) => {
     const letter = letters[change.status] ?? 'M'
-    if (letter === 'R100') return `R100\t${change.from ?? change.path}\t${change.path}`
-    return `${letter}\t${change.path}`
-  }).join('\n')
+    if (letter === 'R100') return `${letter}\0${change.from ?? change.path}\0${change.path}`
+    return `${letter}\0${change.path}`
+  }).join('\0') + '\0'
 }
 
 /**
- * 把 {path, status, from} 渲染成 `git status --porcelain` 的输出。
+ * 把 {path, status, from} 渲染成 `git status --porcelain -z` 的输出。
+ *
+ * `-z` 格式：每条记录是「两字符状态码 + 空格 + 路径」，记录之间 NUL 分隔；
+ * 重命名/复制**新路径在前**、紧跟一条只含旧路径的记录（与 `--name-status -z` 相反）。
  *
  * @param {Array<{ path: string, status: string, from?: string }>} changes
  * @returns {string}
@@ -313,9 +327,9 @@ function renderPorcelain (changes) {
   const codes = { create: '??', update: ' M', delete: ' D', move: 'R ' }
   return changes.map((change) => {
     const code = codes[change.status] ?? ' M'
-    if (code === 'R ') return `R  ${change.from ?? change.path} -> ${change.path}`
+    if (code === 'R ') return `R  ${change.path}\0${change.from ?? change.path}`
     return `${code} ${change.path}`
-  }).join('\n')
+  }).join('\0') + '\0'
 }
 
 function makeRunEnv (options = {}) {
@@ -327,6 +341,8 @@ function makeRunEnv (options = {}) {
   const created = []
   /** @type {string[]} */
   const phases = []
+  /** @type {Array<{ message: string, paths: string[] }>} */
+  const commits = []
   const files = options.files ?? ['src/login.js', 'src/helper.js']
   const contents = options.contents ?? {}
   // git 视角的改动清单：默认全是「改现有文件」（M），要测新增/删除/重命名就传 changes。
@@ -358,6 +374,15 @@ function makeRunEnv (options = {}) {
     if (argv[0] === 'diff' && argv[1] === '--name-only') return { code: 0, stdout: files.join('\n'), stderr: '' }
     if (argv[0] === 'status') return { code: 0, stdout: options.gitStatusOutput ?? renderPorcelain(changes), stderr: '' }
     if (argv[0] === 'add') return { code: 0, stdout: '', stderr: '' }
+    // 本地提交：记下 commit 的 argv（paths 在 `--` 之后），供断言核对「只提交非敏感文件」。
+    if (argv[0] === 'commit') {
+      const sep = argv.indexOf('--')
+      commits.push({ message: argv[argv.indexOf('-m') + 1], paths: sep >= 0 ? argv.slice(sep + 1) : [] })
+      return { code: options.commitFails ? 1 : 0, stdout: '', stderr: options.commitFails ? 'nothing to commit' : '' }
+    }
+    if (argv[0] === 'rev-parse' && argv[1] === 'HEAD') {
+      return { code: 0, stdout: options.headSha ?? 'deadbeefcafe1234567890abcdef1234567890ab', stderr: '' }
+    }
     if (argv[0] === 'show') {
       const path = String(argv[1]).replace(/^:0:/, '')
       return { code: 0, stdout: contents[path] ?? `content of ${path}`, stderr: '' }
@@ -384,7 +409,16 @@ function makeRunEnv (options = {}) {
     projects: [{
       name: 'demo',
       match: { platform: 'mock' },
-      repo: { path: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main', targetBranch: 'main' },
+      // 远程 MR 出口默认**关着**（本阶段只要本地提交）；这一节里大部分用例验的是
+      // 远程物化路径，所以显式打开 repo.gitlab.enabled 才走 MR；传 gitlabEnabled:false
+      // 就是「本阶段默认形态」：只做本地提交、不要 GITLAB_TOKEN。
+      repo: {
+        path: '/repo',
+        remote: 'git@gitlab.example.com:group/sub/repo.git',
+        baseBranch: 'main',
+        targetBranch: 'main',
+        ...(options.gitlabEnabled === false ? {} : { gitlab: { enabled: true } }),
+      },
       verify: options.verify,
     }],
   }
@@ -412,7 +446,7 @@ function makeRunEnv (options = {}) {
     onPhase: async (phase) => { phases.push(phase) },
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, gitCalls, gitServer, setupState, changes, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -830,6 +864,282 @@ export async function runGitlabChecks (check) {
     assert.deepEqual(env.phases, ['editing', 'testing', 'mr-opening'])
   })
 
+  await check('执行器：在工作区检出里做本地提交，返回 sha 与分支', async () => {
+    const env = makeRunEnv({ headSha: 'abc1234def5678' })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.equal(result.commit.sha, 'abc1234def5678', 'commit 必须带回 git 给的真实 sha')
+    assert.equal(result.commit.branch, env.ctx.branch, 'commit 要带分支名，通知书里才有上下文')
+    assert.deepEqual(result.commit.files, ['src/login.js', 'src/helper.js'])
+    // git 调用顺序：add -- <文件…> → commit（带 pathspec）→ rev-parse HEAD
+    const verbs = env.gitCalls.map((argv) => argv[0])
+    assert.ok(verbs.includes('add'), '必须先 git add')
+    assert.ok(verbs.includes('commit'), '必须真有 git commit')
+    assert.ok(verbs.includes('rev-parse'), '提交后要取 sha')
+    const addCall = env.gitCalls.find((argv) => argv[0] === 'add')
+    assert.deepEqual(addCall, ['add', '--', 'src/login.js', 'src/helper.js'], '暂存也要点名，不许全量暂存')
+    assert.equal(env.commits.length, 1, '一次执行只做一次本地提交')
+    assert.deepEqual(env.commits[0].paths, ['src/login.js', 'src/helper.js'], '提交只点名非敏感文件')
+  })
+
+  await check('执行器：本地提交不带敏感文件，敏感文件留在工作区', async () => {
+    // 敏感文件连索引都不能进：`git add -A` 全量暂存之后，人回来看到
+    // `A  application.yml` 顺手 `git commit` 就把它带走了。所以这一步也点名暂存。
+    const env = makeRunEnv({ files: ['src/login.js', 'application.yml', '.env.local'] })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.deepEqual(env.commits[0].paths, ['src/login.js'], '敏感文件绝不能进这次提交')
+    const addCall = env.gitCalls.find((argv) => argv[0] === 'add')
+    assert.deepEqual(addCall, ['add', '--', 'src/login.js'], '暂存也不能碰到敏感文件')
+    assert.ok(/application\.yml/.test(env.commits[0].message), '提交说明要写清哪些文件被刻意留下')
+    assert.ok(/未提交/.test(env.commits[0].message))
+  })
+
+  await check('执行器：没打开 repo.gitlab.enabled 时只做本地提交，不碰 GITLAB_TOKEN', async () => {
+    // 这是本阶段的默认形态：只做本地提交、不连远程。
+    // 关键点是「配了 repo.remote 也不代表要开 MR」——否则会去要 token、去连 GitLab。
+    const env = makeRunEnv({ gitlabEnabled: false })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.ok(result.commit, '本地提交必须有')
+    assert.equal(result.mr, undefined, '远程出口没打开就不该开 MR')
+    assert.equal(
+      env.gitServer.requests.filter((r) => r.url.endsWith('/merge_requests')).length,
+      0,
+      '一次 MR 请求都不该发出去',
+    )
+    assert.equal(
+      env.gitServer.requests.filter((r) => r.url.endsWith('/repository/commits')).length,
+      0,
+      '也不该走 Commits API（那是远程物化路径）',
+    )
+  })
+
+  await check('执行器：本地提交失败要让票失败，不能报 done', async () => {
+    // 没有提交就等于什么都没交付；报 done 会让人以为工作区里已经有成果了。
+    const env = makeRunEnv({ commitFails: true })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'failed')
+    assert.equal(result.commit, undefined)
+  })
+
+  await check('执行器：本地提交说明带工单溯源、验证结论与未提交文件', async () => {
+    const message = buildLocalCommitMessage(TICKET, {
+      blocked: ['application.yml'],
+      verification: { outcome: 'skipped', detail: '没配命令' },
+    })
+    assert.ok(message.includes('rec-9'), `提交说明要带 recordId：${message}`)
+    assert.ok(message.includes('验证：skipped（没配命令）'), `要写清验证结论：${message}`)
+    assert.ok(message.includes('未提交'), '要写清哪些文件被刻意留下')
+    assert.ok(message.includes('application.yml'))
+    // 验证通过时文案不同：不能把 passed 也写成「skipped」。
+    const passed = buildLocalCommitMessage(TICKET, { verification: { outcome: 'passed', detail: '全部 0' } })
+    assert.ok(passed.includes('验证：通过（全部 0）'), passed)
+    assert.ok(!passed.includes('未提交'), '没有 blocked 时不该出现「未提交」一节')
+  })
+
+  await check('执行器：commitLocally 拒绝空提交与缺 git 运行器', async () => {
+    await assert.rejects(
+      () => commitLocally({}, { ticket: TICKET, worktreePath: '/w', branch: 'b', files: [], blocked: [], verification: { outcome: 'passed', detail: '' } }),
+      (error) => {
+        assert.equal(error.kind, 'invalid-input')
+        assert.match(error.message, /缺少注入的 git 运行器/)
+        return true
+      },
+    )
+    await assert.rejects(
+      () => commitLocally({ git: async () => ({ code: 0, stdout: '', stderr: '' }) }, { ticket: TICKET, worktreePath: '/w', branch: 'b', files: [], blocked: [], verification: { outcome: 'passed', detail: '' } }),
+      (error) => {
+        assert.equal(error.kind, 'internal')
+        assert.match(error.message, /空提交/)
+        return true
+      },
+    )
+  })
+
+  await check('执行器：agent 自己暂存过的敏感文件要被退回未跟踪（否则人顺手 commit 就带走了）', async () => {
+    // 真实场景：agent 干活时跑过 `git add -A`，application.yml 就停在索引里
+    // （`A  application.yml`）。我们的提交是点名暂存的，它进不了这次提交 ——
+    // 但它还躺在索引里，人回来 `git commit` 一下就把真实凭据提交上去了。
+    const calls = []
+    const restored = await unstageSensitiveFiles({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'status') return { code: 0, stdout: 'A  application.yml\0 M src/login.js\0?? .env.local\0', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, '/w', ['application.yml', 'src/login.js', '.env.local'], {})
+    // 只有 application.yml 真的在索引里；src/login.js 只是工作区改动（次列 M），
+    // .env.local 是未跟踪（`??`）—— 对这两个跑 restore --staged 会 fatal。
+    assert.deepEqual(restored, ['application.yml'])
+    const restoreCall = calls.find((argv) => argv[0] === 'restore')
+    assert.deepEqual(restoreCall, ['restore', '--staged', '--', 'application.yml'])
+  })
+
+  await check('执行器：没有敏感文件在索引里时不发 restore（该命令对未暂存文件会 fatal）', async () => {
+    const calls = []
+    const restored = await unstageSensitiveFiles({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'status') return { code: 0, stdout: '?? .env.local\0 M application.yml\0', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, '/w', ['.env.local', 'application.yml'], {})
+    assert.deepEqual(restored, [])
+    assert.equal(calls.filter((argv) => argv[0] === 'restore').length, 0)
+  })
+
+  await check('执行器：读不到检出状态也不影响提交（只记一条日志）', async () => {
+    const logs = []
+    const restored = await unstageSensitiveFiles({
+      git: async (argv) => ({ code: 128, stdout: '', stderr: 'not a git repo' }),
+    }, '/w', ['application.yml'], { log: (message) => logs.push(message) })
+    assert.deepEqual(restored, [])
+    assert.equal(logs.length, 1, '要留下一条能查的日志')
+  })
+
+  await check('执行器：git 白名单放行 commit / rev-parse HEAD，仍挡 push', async () => {
+    assert.equal(isAllowedGitCommand(['commit', '-m', 'x', '--', 'a.js']), true)
+    assert.equal(isAllowedGitCommand(['rev-parse', 'HEAD']), true)
+    // 只放行 `rev-parse HEAD`：别的 rev-parse 子形态没有用处，放进来只是扩大攻击面。
+    assert.equal(isAllowedGitCommand(['rev-parse', '--all']), false)
+    assert.equal(isAllowedGitCommand(['push']), false)
+  })
+
+  await check('执行器：git 白名单只放行「带 -z -uall 与排除规则」的 status', async () => {
+    // status 的放行面必须收窄到生产代码真正用的那一组参数：
+    // 放宽成「argv[0] === 'status' 就 true」等于给了一个能读整个仓库的入口。
+    assert.equal(isAllowedGitCommand(['status', '--porcelain', '-z', '-uall']), true)
+    assert.equal(
+      isAllowedGitCommand(['status', '--porcelain', '-z', '-uall', '--', '.', ':(exclude).agents/worktrees', ':(exclude).agents/worktrees/**']),
+      true,
+      '排除插件自有目录的那一组必须放行，否则 collectChanges 会被自己的闸门挡住',
+    )
+    assert.equal(isAllowedGitCommand(['status', '--porcelain']), true, '老形态仍要放行')
+    assert.equal(isAllowedGitCommand(['status']), false)
+    assert.equal(isAllowedGitCommand(['status', '--porcelain', '--short']), false, '未知 flag 一律拒')
+    assert.equal(isAllowedGitCommand(['status', '--porcelain', '--', '/etc']), false, 'pathspec 只能以 . 开头')
+    assert.equal(isAllowedGitCommand(['status', '--porcelain', '--', '.', 'src']), false, '只允许排除规则，不允许额外包含')
+  })
+
+  await check('执行器：git 白名单放行 restore --staged，但挡住不带 --staged 的 restore', async () => {
+    // 敏感文件被 agent 自己 add 进去之后，必须先退回未跟踪，否则它会留在索引里
+    // 等人下一次 git commit 顺手带走。
+    assert.equal(isAllowedGitCommand(['restore', '--staged', '--', 'application.yml']), true)
+    // 不带 --staged 的 restore 会把工作区的改动一起扔掉 —— 那是「删人代码」，绝不能放行。
+    assert.equal(isAllowedGitCommand(['restore', '--', 'a.js']), false)
+    assert.equal(isAllowedGitCommand(['restore', '--staged', 'a.js']), false, '必须用 -- 隔开')
+    assert.equal(isAllowedGitCommand(['restore', '--staged', '--']), false, '空列表没意义')
+  })
+
+  await check('执行器：collectChanges 把未跟踪的新文件也算进改动（git diff 看不见它们）', async () => {
+    // 这是本改造最致命的一条：缺省模式下 baseCommit 必然有值，
+    // 只跑 `git diff <baseCommit>` 就会漏掉 agent 新建的所有文件 ——
+    // 而「新建一个页面/组件」恰恰是工单里最常见的产物。
+    const calls = []
+    const cwd = '/repo'
+    const result = await collectChanges({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'diff') return { code: 0, stdout: 'M\0src/old.js\0', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: ' M src/old.js\0?? src/new.js\0?? 中文名.js\0', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, { cwd, baseCommit: 'base123', signal: new AbortController().signal })
+    assert.deepEqual(result.changes, [
+      { path: 'src/old.js', status: 'update' },
+      { path: 'src/new.js', status: 'create' },
+      { path: '中文名.js', status: 'create' },
+    ])
+    assert.deepEqual(result.files, ['src/old.js', 'src/new.js', '中文名.js'])
+    // 两条 git 调用都必须带排除插件自有目录的 pathspec，否则 .agents/worktrees 会被收进来。
+    for (const argv of calls) {
+      assert.ok(argv.includes(':(exclude).agents/worktrees'), `每条都要排除插件目录：${argv.join(' ')}`)
+      assert.ok(argv.includes('-z'), `必须用 -z 读，否则中文名/空格名会被转义：${argv.join(' ')}`)
+    }
+    assert.ok(calls.some((argv) => argv[0] === 'status' && argv.includes('-uall')), '未跟踪目录必须 -uall 展开到文件级')
+  })
+
+  await check('执行器：同一路径 diff 与 status 都报时不重复计数', async () => {
+    const result = await collectChanges({
+      git: async (argv) => {
+        if (argv[0] === 'diff') return { code: 0, stdout: 'A\0src/both.js\0', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: '?? src/both.js\0', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, { cwd: '/repo', baseCommit: 'base123', signal: new AbortController().signal })
+    assert.deepEqual(result.changes, [{ path: 'src/both.js', status: 'create' }], '以 diff 的结论为准，不重复')
+  })
+
+  await check('执行器：没有 baseCommit 时也靠 status 拿到改动（首提交前的仓库）', async () => {
+    // 无 HEAD 的仓库里 `git diff HEAD` 直接 fatal，只有 status 这条路能走通。
+    const result = await collectChanges({
+      git: async (argv) => {
+        if (argv[0] === 'status') return { code: 0, stdout: '?? a.js\0', stderr: '' }
+        throw new Error(`不该走 diff：${argv.join(' ')}`)
+      },
+    }, { cwd: '/repo', baseCommit: '', signal: new AbortController().signal })
+    assert.deepEqual(result.changes, [{ path: 'a.js', status: 'create' }])
+  })
+
+  await check('执行器：本地提交对删除与重命名分别给对 pathspec', async () => {
+    // 三个坑（都真跑过 git 2.45.1）：
+    // 1. `git add -- <已删除路径>` → fatal: pathspec did not match any files
+    // 2. 未跟踪文件不先 add → commit 报 pathspec not known to git
+    // 3. 重命名只给新路径 → 历史里变成「复制 + 留下旧路径的删除」
+    const calls = []
+    const commit = await commitLocally({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'sha-after\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      ticket: TICKET,
+      worktreePath: '/w',
+      branch: 'b',
+      files: ['src/added.js', 'src/gone.js', 'src/new-name.js'],
+      changes: [
+        { path: 'src/added.js', status: 'create' },
+        { path: 'src/gone.js', status: 'delete' },
+        { path: 'src/new-name.js', status: 'move', from: 'src/old-name.js' },
+      ],
+      blocked: [],
+      verification: { outcome: 'passed', detail: 'ok' },
+    })
+    assert.equal(commit.sha, 'sha-after')
+    const addCall = calls.find((argv) => argv[0] === 'add')
+    assert.deepEqual(addCall, ['add', '--', 'src/added.js', 'src/new-name.js'], '删除的文件绝不能进 add（会 fatal）')
+    const commitCall = calls.find((argv) => argv[0] === 'commit')
+    const sep = commitCall.indexOf('--')
+    assert.deepEqual(
+      commitCall.slice(sep + 1),
+      ['src/added.js', 'src/gone.js', 'src/new-name.js', 'src/old-name.js'],
+      '删除路径与重命名的旧路径都必须进 commit 的 pathspec',
+    )
+  })
+
+  await check('执行器：本地提交全是删除时不发 add（否则 git 直接 fatal）', async () => {
+    const calls = []
+    await commitLocally({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'sha\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      ticket: TICKET,
+      worktreePath: '/w',
+      branch: 'b',
+      files: ['src/gone.js'],
+      changes: [{ path: 'src/gone.js', status: 'delete' }],
+      blocked: [],
+      verification: { outcome: 'passed', detail: 'ok' },
+    })
+    assert.equal(calls.filter((argv) => argv[0] === 'add').length, 0, '没有要暂存的路径时不该发 add')
+    assert.equal(calls.filter((argv) => argv[0] === 'commit').length, 1)
+  })
+
   await check('执行器：改动经 GitLab Commits API 物化，开的是 draft MR', async () => {
     const env = makeRunEnv()
     const result = await env.executor.run(env.ticket, env.target, env.ctx)
@@ -887,19 +1197,28 @@ export async function runGitlabChecks (check) {
     assert.equal(commit.body.actions[0].previous_path, 'src/before.js', '缺 previous_path 会变成「新建一个 + 留一个孤儿」')
   })
 
-  await check('执行器：git 状态解析 —— name-status 与 porcelain 都给出 create/update/delete/move', async () => {
-    assert.deepEqual(parseNameStatus('A\tsrc/a.js\nM\tsrc/b.js\nD\tsrc/c.js\nR100\tsrc/d.js\tsrc/e.js'), [
+  await check('执行器：git 状态解析 —— -z 格式的 name-status 与 porcelain 都给出 create/update/delete/move', async () => {
+    // 生产代码只认 -z（未跟踪目录折叠、路径引号转义、两种格式 rename 字段顺序相反
+    // 这三个坑见 contracts/git-status.js）。这里直接喂 -z 原始字节。
+    assert.deepEqual(parseNameStatusZ('A\0src/a.js\0M\0src/b.js\0D\0src/c.js\0R100\0src/d.js\0src/e.js\0'), [
       { path: 'src/a.js', status: 'create' },
       { path: 'src/b.js', status: 'update' },
       { path: 'src/c.js', status: 'delete' },
       { path: 'src/e.js', status: 'move', from: 'src/d.js' },
     ])
-    assert.deepEqual(parsePorcelainChanges('?? src/a.js\n M src/b.js\n D src/c.js\nR  src/d.js -> src/e.js'), [
-      { path: 'src/a.js', status: 'create' },
-      { path: 'src/b.js', status: 'update' },
-      { path: 'src/c.js', status: 'delete' },
-      { path: 'src/e.js', status: 'move', from: 'src/d.js' },
+    // porcelain 的 rename 字段顺序与 name-status 相反：新路径在前，旧的单独一段。
+    assert.deepEqual(parseStatusZ('?? src/a.js\0 M src/b.js\0 D src/c.js\0R  src/e.js\0src/d.js\0'), [
+      { code: '??', path: 'src/a.js' },
+      { code: ' M', path: 'src/b.js' },
+      { code: ' D', path: 'src/c.js' },
+      { code: 'R ', path: 'src/e.js', from: 'src/d.js' },
     ])
+    assert.equal(statusCodeToAction('??'), 'create')
+    assert.equal(statusCodeToAction('!!'), 'ignored')
+    assert.equal(statusCodeToAction('R '), 'move')
+    assert.equal(statusCodeToAction(' D'), 'delete')
+    assert.equal(statusCodeToAction('A '), 'create')
+    assert.equal(statusCodeToAction(' M'), 'update')
     // 没有状态（老调用方只传 files）就退回 update：这是唯一安全假设。
     assert.deepEqual(normalizeActions(['src/x.js'], undefined), [{ path: 'src/x.js', status: 'update' }])
     assert.deepEqual(normalizeActions(['src/x.js'], [{ path: 'src/x.js', status: 'weird' }]), [{ path: 'src/x.js', status: 'update' }])
@@ -918,14 +1237,20 @@ export async function runGitlabChecks (check) {
     const { workspacePath: _wp, workspaceId: _wid, ...ctxWithoutWorkspace } = env.ctx
     const executor = createAgentExecutor({
       agents: { create: async (input) => { await input.setup?.({ get: () => undefined }, env.agent); return { agent: env.agent } } },
-      git: async (argv) => { if (argv[0] === 'diff') return { code: 0, stdout: 'M\tsrc/login.js', stderr: '' }; return { code: 0, stdout: '', stderr: '' } },
+      git: async (argv) => {
+        if (argv[0] === 'diff') return { code: 0, stdout: 'M\0src/login.js\0', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
+        if (argv[0] === 'rev-parse' && argv[1] === 'HEAD') return { code: 0, stdout: 'abc123def456', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
       readFile: async (path) => { read.push(path); return 'x' },
       runCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
       getSecret: async () => 'glpat-test',
       createGitlabClient: async (cfg) => createGitlabClient({ ...cfg, fetch: env.gitServer.fetchImpl }),
       prompts: { untrustedNotice: NOTICE },
     })
-    await executor.run(env.ticket, env.target, ctxWithoutWorkspace)
+    const result = await executor.run(env.ticket, env.target, ctxWithoutWorkspace)
+    assert.equal(result.phase, 'done')
     assert.equal(read.length, 1)
     // Windows 上 path.join 会输出反斜杠，统一成正斜杠再断言。
     const normalized = read[0].replace(/\\/g, '/')
@@ -1112,9 +1437,16 @@ export async function runGitlabChecks (check) {
   await check('执行器：git 命令白名单挡住 push / fetch 这类会改变远端的命令', async () => {
     assert.equal(isAllowedGitCommand(['status', '--porcelain']), true)
     assert.equal(isAllowedGitCommand(['diff', '--name-only', 'abc']), true)
-    assert.equal(isAllowedGitCommand(['add', '-A']), true)
+    assert.equal(isAllowedGitCommand(['add', '--', 'src/a.js']), true)
     assert.equal(isAllowedGitCommand(['commit', '-m', 'x']), true)
-    for (const argv of [['push'], ['push', 'origin', 'main'], ['fetch', 'origin'], ['reset', '--hard'], ['clean', '-fd']]) {
+    // 全量暂存被禁：`add -A` 会把敏感文件也塞进索引，人一回来 `git commit` 就带走了。
+    // 只认点名暂存（`add -- <文件…>`）。
+    for (const argv of [
+      ['add', '-A'],
+      ['add', '.'],
+      ['add', '--'],
+      ['push'], ['push', 'origin', 'main'], ['fetch', 'origin'], ['reset', '--hard'], ['clean', '-fd'],
+    ]) {
       assert.equal(isAllowedGitCommand(argv), false, `git ${argv.join(' ')} 必须被白名单挡住`)
     }
   })

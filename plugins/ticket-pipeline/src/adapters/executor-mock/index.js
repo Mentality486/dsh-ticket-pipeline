@@ -5,8 +5,8 @@
  * **执行**这一端也不碰。两者一组合，整条内核链路（扫描 → 入队 → 租约 → 阶段 →
  * 结果 → 通知 → 清理）都能离线跑通。
  *
- * 它**不建 worktree、不改代码、不开 MR**（返回的 mr 是假的，`iid` 为 0、url 指向
- * `mock://`）—— 所以不要把它当成「流水线验证过了」的证据。真执行器见
+ * 它**不建 worktree、不改代码、不真提交**（返回的 commit 是假的，sha 以 `mock` 开头）
+ * —— 所以不要把它当成「流水线验证过了」的证据。真执行器见
  * `executor-agent/`。
  */
 
@@ -95,20 +95,22 @@ export function createMockExecutor (options = {}) {
       await ctx.onPhase('mr-opening')
       await sleep(ctx.signal)
 
-      const mr = {
-        iid: 0,
-        url: `mock://draft-mr/${encodeURIComponent(ticket.recordId)}`,
-        draft: true,
+      // 本阶段的交付形态是「工作区检出里的本地提交」，mock 也照这个形状返回：
+      // sha 是假的，但字段形状与真执行器一致，内核与通知模板才能一起被验到。
+      const commit = {
+        sha: `mock${String(ticket.recordId ?? '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 8).padEnd(8, '0')}`,
+        branch: ctx.branch ?? '',
+        files: mockChanged,
       }
 
       if (outcome === 'skipped') {
-        // 合法的成功路径：MR 开了，但验证没跑成 —— 但必须写清楚为什么。
+        // 合法的成功路径：提交做了，但验证没跑成 —— 但必须写清楚为什么。
         return makeExecResult({
           phase: 'skipped',
           changedFiles: mockChanged,
           testOutcome: 'skipped',
           testDetail: 'mock 执行器不跑真实构建与测试',
-          mr,
+          commit,
           plan: {
             summary: 'mock 计划',
             targetPaths: target.candidatePaths.slice(0, 2),
@@ -121,7 +123,7 @@ export function createMockExecutor (options = {}) {
         phase: 'done',
         changedFiles: mockChanged,
         testOutcome: 'passed',
-        mr,
+        commit,
         plan: {
           summary: 'mock 计划',
           targetPaths: target.candidatePaths.slice(0, 2),

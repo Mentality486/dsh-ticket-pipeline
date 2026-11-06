@@ -34,6 +34,7 @@
  */
 
 import { defineTool, textBlocks } from './define.js'
+import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ } from '../contracts/git-status.js'
 
 /**
  * @typedef {Object} DoctorOptions
@@ -124,8 +125,13 @@ for (const project of projects) {
   }
   const mark = exists ? '✅' : '❌'
   let remoteNote = ''
-  if (remote.length === 0) {
-    warnings.push(`项目 ${name}：repo.remote 没配 —— fetch/PR 将无法进行。`)
+  const wantRemote = repo?.gitlab?.enabled === true
+  if (remote.length === 0 && wantRemote) {
+    warnings.push(`项目 ${name}：repo.gitlab.enabled 是 true 但 repo.remote 没配 —— 远程 MR 开不出来。`)
+  } else if (remote.length === 0) {
+    // 本阶段交付形态是「工作区检出里的本地提交」，没有 remote 完全正常，不打扰人。
+  } else if (!wantRemote) {
+    remoteNote = '，只做本地提交（remote 未启用）'
   } else if (typeof options.probeRemote === 'function') {
     // 只按域名猜「是不是占位符」是不可靠的：`gitlab.example.com` 在某些内网部署里
     // 就是真服务器（猜错 = 把健康配置报成故障），而真正连不上的地址反而不一定长得像占位符。
@@ -165,6 +171,41 @@ for (const project of projects) {
     }
   }
   lines.push(`${mark} 项目 ${name}（${platform}）：仓库 ${path}${branchNote}${exists ? '' : ' ⚠️ 不可用'}${remoteNote}`)
+
+  // 缺省模式下 agent 直接在这个检出里改代码、就地提交，所以「检出现在干净吗」
+  // 是能不能开工的前提：不干净的话每张票都会以 invalid-input 失败。
+  // 体检时就把这件事说出来，别等人跑票才看到。
+  //
+  // 参数与 `inspectCheckout`（src/index.js）必须一致：-z 免掉引号转义、-uall 展开
+  // 未跟踪目录（否则人放进新目录的 .env 看不见）、排除插件自己的 .agents/worktrees
+  // （否则每个开过隔离 worktree 的项目都会被报成脏）。三处口径不一致最难查。
+  if (exists && config.isolateWorktree !== true && typeof options.gitRunner === 'function') {
+    try {
+      const status = await options.gitRunner(
+        ['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES],
+        { cwd: path },
+      )
+      if (status.code !== 0) {
+        problems.push(`项目 ${name}：看不了检出状态（git status 退出码 ${status.code}）：${String(status.stderr ?? '').split('\n')[0]?.slice(0, 160) || '没有输出'}。`)
+      } else {
+        const dirty = parseStatusZ(status.stdout).map((record) => `${record.code.trim()} ${record.path}`)
+        if (dirty.length === 0) {
+          lines.push(`　检出干净，可以直接跑票`)
+        } else {
+          const shown = dirty.slice(0, 5).join('、')
+          const more = dirty.length > 5 ? `等 ${dirty.length} 个` : ''
+          warnings.push(
+            `项目 ${name}：检出里有 ${dirty.length} 个未提交改动（${shown}${more}）——`
+            + '缺省模式下每张票都会因为「工作区不干净」被拒。提交或 stash 之后再跑，'
+            + '或者把配置项 isolateWorktree 打开让每票用独立隔离目录。',
+          )
+          lines.push(`　⚠️ 检出有 ${dirty.length} 个未提交改动（跑票会被拒）`)
+        }
+      }
+    } catch (error) {
+      warnings.push(`项目 ${name}：检查检出是否干净失败（${error?.message ?? String(error)}）。`)
+    }
+  }
 }
 
 // ── 3. 凭据 ──────────────────────────────────────
@@ -178,7 +219,9 @@ if (creds && typeof creds.describe === 'function') {
         warnings.push(`凭据 ${ref} 未配置 —— 飞书扫描将无法工作。`)
       }
       if (!ok && ref === 'GITLAB_TOKEN') {
-        warnings.push('凭据 GITLAB_TOKEN 未配置 —— 真 executor 开 MR 时才需要，mock 模式不影响。')
+        // 本阶段不需要：交付形态是工作区里的本地提交，不连远程、不开 MR。
+        lines.push('ℹ️ 凭据 GITLAB_TOKEN：未配置（本阶段不需要）')
+        continue
       }
       lines.push(`${ok ? '✅' : '⚠️'} 凭据 ${ref}：${ok ? '已配置' : '未配置'}`)
     } catch {
@@ -199,6 +242,11 @@ if (push === 'mock') {
   warnings.push('pushAdapter=mock：通知走假推送（不会真的发邮件/微信）。')
 }
 lines.push(`ℹ️ 执行器：${executor}｜通知：${push}`)
+// 改代码的落点必须显式说出来：缺省是「直接在项目工作区里改」，
+// 这跟「每票一个隔离 worktree」是完全不同的风险面，人不该靠猜。
+lines.push(config.isolateWorktree === true
+  ? 'ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）'
+  : 'ℹ️ 改代码落点：项目工作区检出里（要求检出干净）')
 
 // ── 汇总 ─────────────────────────────────────────
 const ok = problems.length === 0

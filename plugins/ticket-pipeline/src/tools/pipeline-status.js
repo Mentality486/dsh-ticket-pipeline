@@ -18,14 +18,14 @@ import { foundAtSortKey, summarize } from '../core/store.js'
 
 const PHASE_ADVICE = {
   pending: '排队中，下一轮会轮到它。',
-  'worktree-ready': '已经从基准分支切出工作区，下一步开始规划改动。',
+  'worktree-ready': '已经确定改代码落在哪个目录上，下一步开始规划改动。',
   planning: '正在确认要改哪些文件。卡在这里超过一票超时时间就会被判超时。',
   editing: '正在改代码。',
   testing: '正在跑构建与测试。',
-  'mr-opening': '改动已经完成，正在开 draft MR。',
+  'mr-opening': '改动已经完成，正在工作区检出里做本地提交。',
   'needs-info': '在等人：通常是截图取不到。补一张图或改「截图」列，再让它重来。',
-  done: '已完成，draft MR 已开。等人去看、本地验证后自己提交。',
-  skipped: '代码改完、MR 也开了，但构建/测试没跑成（原因见下）。这是合法的成功路径，仍需人工验证。',
+  done: '已完成，改动已提交到项目工作区的检出里（本地提交，不是远端 MR）。去检出里 git show 就能 review。',
+  skipped: '代码改完、也提交了，但构建/测试没跑成（原因见下）。这是合法的成功路径，仍需人工验证。',
   failed: '失败了。要重跑就用 pipeline_reset（传它的 recordId）；失败不会自动重试，超时也一样。',
   gone: '表格里这一行已经删掉了，静默退役。',
 }
@@ -156,7 +156,10 @@ export function createPipelineStatusTool (options) {
           const advice = PHASE_ADVICE[row.phase]
           if (advice) lines.push(`  ${advice}`)
           if (row.module) lines.push(`  模块：${row.module}${row.priority ? `｜优先级：${row.priority}` : ''}`)
-          if (row.worktreePath) lines.push(`  工作区：${row.worktreePath}`)
+          if (row.worktreePath) lines.push(`  改代码目录：${row.worktreePath}`)
+          if (row.commit?.sha) {
+            lines.push(`  本地提交：${String(row.commit.sha).slice(0, 12)}${row.commit.branch ? ` @ ${row.commit.branch}` : ''}`)
+          }
           if (row.mr?.url) lines.push(`  MR：${row.mr.url}${row.mr.draft ? '（draft）' : ''}`)
           if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
           if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
@@ -183,6 +186,7 @@ export function createPipelineStatusTool (options) {
           priority: row.priority,
           worktreePath: row.worktreePath,
           branch: row.branch,
+          commitSha: row.commit?.sha,
           mrUrl: row.mr?.url,
           lastError: row.lastError,
           testDetail: row.testDetail,

@@ -396,6 +396,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         changedFiles: result.changedFiles ?? row.changedFiles,
         testOutcome: result.testOutcome,
         testDetail: result.testDetail,
+        commit: result.commit,
         mr: result.mr,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
@@ -414,6 +415,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         changedFiles: result.changedFiles ?? row.changedFiles,
         testOutcome: result.testOutcome,
         testDetail: result.testDetail,
+        commit: result.commit,
         mr: result.mr,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
@@ -794,7 +796,7 @@ function rowToTicket (row) {
 function phaseLabelOf (phase) {
   switch (phase) {
     case 'done': return '已完成'
-    case 'skipped': return '已开 MR 但未验证'
+    case 'skipped': return '已提交但未验证'
     case 'failed': return '失败'
     case 'needs-info': return '等你补信息'
     case 'gone': return '已删除'
@@ -822,6 +824,12 @@ function renderNotifyBody (ticket, row, phase) {
   lines.push('')
 
   if (phase === 'done' || phase === 'skipped') {
+    // 交付形态是「工作区检出里的本地提交」：给出 sha 与分支，人就能在检出里
+    // `git show <sha>` 直接 review，跟看一个 PR 一样。配了远程出口的部署才多一行 MR。
+    if (row.commit?.sha) {
+      const where = row.worktreePath ? `（${row.worktreePath}）` : ''
+      lines.push(`本地提交：${String(row.commit.sha).slice(0, 12)}${row.commit.branch ? ` @ ${row.commit.branch}` : ''}${where}`)
+    }
     if (row.mr) lines.push(`draft MR：${row.mr.url}`)
     if (Array.isArray(row.changedFiles) && row.changedFiles.length > 0) {
       lines.push(`改动文件：${row.changedFiles.length} 个`)
@@ -831,7 +839,7 @@ function renderNotifyBody (ticket, row, phase) {
     if (row.testOutcome === 'passed') lines.push('验证：通过')
     else if (row.testOutcome === 'skipped') lines.push(`验证：未跑成 —— ${row.testDetail ?? '原因未记录'}`)
     else if (row.testOutcome === 'failed') lines.push('验证：未通过')
-    if (phase === 'skipped') lines.push('', '（MR 已开成 draft，但验证没跑通，请人工确认）')
+    if (phase === 'skipped') lines.push('', '（改动已提交到工作区，但验证没跑通，请人工确认）')
   } else if (phase === 'failed') {
     lines.push(`失败原因：${row.lastError ?? '未记录'}`)
     if (row.worktreePath) lines.push(`工作区保留在：${row.worktreePath}`)

@@ -90,7 +90,9 @@ export async function recoverPending ({ store, worktreeExists, log, now }) {
             // 要退回 mr-opening 之前，就跑不回那条 MR 上了：工作区一重建就是新分支
             // （分支名带 revisionCount），旧 MR 指向的是被删掉的分支。不清掉的话，
             // 通知里会挂着一条已经作废的链接，人点进去以为活还在。
+            // commit 同理：新工作区是新检出，旧 sha 在新历史里根本不存在。
             mr: undefined,
+            commit: undefined,
             lastError: '工作区丢失，启动恢复时重建',
           })
           reset += 1
@@ -106,6 +108,7 @@ export async function recoverPending ({ store, worktreeExists, log, now }) {
             // 这里原本还指望执行器「自己去查重」，但那要求执行器知道旧 MR 的存在；
             // 存储里留一条作废记录，最可能的结局是下轮通知把人引到一条死链上。
             mr: undefined,
+            commit: undefined,
             lastError: '工作区丢失，启动恢复时重新排队',
           })
           reset += 1

@@ -39,7 +39,8 @@
  * @property {string[]} changedFiles
  * @property {'passed'|'failed'|'skipped'} testOutcome
  * @property {string} [testDetail] skipped 时必须写原因
- * @property {{ iid: number, url: string, draft: boolean }} [mr]
+ * @property {{ iid: number, url: string, draft: boolean }} [mr] 走远程 GitLab 开出来的 MR
+ * @property {{ sha: string, branch: string, files: string[] }} [commit] 在工作区检出里做出来的本地提交
  * @property {{ kind: ErrorKind, message: string, retryable: boolean }} [error]
  */
 
@@ -50,9 +51,11 @@
  * - 必须尊重 `signal`：aborted 时停手、保留 worktree、抛 `PipelineError('aborted')`。
  * - 每进入新阶段必须 `await onPhase(...)`，不能只在自己的内存里更新。
  * - 不改 worktree 之外的文件；不 push（沙箱封死，见架构文档 §12.2）。
- * - 返回前必须已经开完 MR（或在 `error` 里说明为什么没开）。
- * - `testOutcome: 'skipped'` 是**合法成功路径**：环境起不来就记 skipped 仍然开 draft MR，
- *   但必须把原因写进 `testDetail`（进而进 MR 描述），不能默默略过。
+ * - 返回前必须已经把改动落成**可交付的东西**：默认是在工作区检出里做一次本地提交
+ *   （`commit`，写清工单溯源）；配了 GitLab 的部署还会同时开 draft MR（`mr`）。
+ *   两样都没有时必须在 `error` 里说明为什么没有。
+ * - `testOutcome: 'skipped'` 是**合法成功路径**：环境起不来就记 skipped，
+ *   但必须把原因写进 `testDetail`（进而进提交说明/通知），不能默默略过。
  *
  * @typedef {Object} WorkExecutor
  * @property {string} id
@@ -82,8 +85,8 @@ export function assertWorkExecutor (candidate, label = 'WorkExecutor') {
  * 结果归一 + 一致性校验。
  *
  * 这里拦住两类最常见的执行器 bug：
- * 1. 返回 `skipped` 却没写 `testDetail` —— 人看到 draft MR 不知道没被真跑过。
- * 2. 返回 `done`/`skipped` 却没给 `mr` —— 流程承诺「返回前必须已开完 MR」。
+ * 1. 返回 `skipped` 却没写 `testDetail` —— 人看到结果不知道没被真跑过。
+ * 2. 返回 `done`/`skipped` 却既没 `commit` 也没 `mr` —— 流程承诺「返回前必须已把改动落成可交付的东西」。
  *
  * @param {Partial<ExecResult>} input
  * @returns {ExecResult}
@@ -100,8 +103,8 @@ export function makeExecResult (input) {
 
   const changedFiles = Array.isArray(input.changedFiles) ? input.changedFiles.filter((f) => typeof f === 'string') : []
 
-  if ((phase === 'done' || phase === 'skipped') && !input.mr) {
-    throw new Error(`makeExecResult: phase=${phase} 时必须给出 mr（流程承诺返回前已开完 MR）`)
+  if ((phase === 'done' || phase === 'skipped') && !input.mr && !input.commit) {
+    throw new Error(`makeExecResult: phase=${phase} 时必须给出 commit 或 mr（流程承诺返回前已把改动落成可交付的东西）`)
   }
   if (testOutcome === 'skipped' && (phase === 'done' || phase === 'skipped')) {
     const detail = typeof input.testDetail === 'string' ? input.testDetail.trim() : ''
@@ -122,6 +125,16 @@ export function makeExecResult (input) {
       throw new Error('makeExecResult: mr 必须包含 iid(number) 与 url(string)')
     }
     result.mr = { iid: input.mr.iid, url: input.mr.url, draft: input.mr.draft === true }
+  }
+  if (input.commit) {
+    if (typeof input.commit.sha !== 'string' || input.commit.sha.length === 0) {
+      throw new Error('makeExecResult: commit 必须包含 sha(string)')
+    }
+    result.commit = {
+      sha: input.commit.sha,
+      branch: typeof input.commit.branch === 'string' ? input.commit.branch : '',
+      files: Array.isArray(input.commit.files) ? input.commit.files.filter((f) => typeof f === 'string') : [],
+    }
   }
   if (input.error) {
     result.error = {

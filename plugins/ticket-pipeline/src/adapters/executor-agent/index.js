@@ -1,6 +1,6 @@
 /**
  * `executor-agent` —— 真正干活的那个执行器：起一个 agent、在 worktree 里改代码、
- * 跑构建与测试、最后开 draft MR。
+ * 跑构建与测试、最后在工作区检出里做一次本地提交。
  *
  * 它串起来的东西比别的适配器都多，每一段都对应一条实测结论：
  *
@@ -11,10 +11,12 @@
  *    inject=next-step 不唤醒）。用 inject 会得到一个永远不动的 agent。
  * 3. **等结束**：`whenIdle()` 之后再比一次 `session.seq`，不轮询 `agent/status`。
  * 4. **验证**：命令从项目配置 `verify` 注入，执行器里**不硬编码任何命令**。
- *    环境起不来就记 `testOutcome:'skipped'` 并写清原因、照样开 draft MR ——
+ *    环境起不来就记 `testOutcome:'skipped'` 并写清原因、照样交付 ——
  *    这是契约里明确的合法成功路径，不是失败。
- * 5. **开 MR**：`git push` 在本机物理上不可能（沙箱不给 `git-receive-pack` 建
- *    stdin 管道），所以改动要走 GitLab Commits API 物化，见 `gitlab-client/`。
+ * 5. **交付**：在工作区检出里 `git add -- <改动文件>` + `git commit -- <改动文件 ∪ 旧路径>`
+ *    形成本地提交（`commitLocally`）。**不需要远程、不需要 GITLAB_TOKEN**。
+ *    只有项目显式打开 `repo.gitlab.enabled: true` 时才额外走 GitLab Commits API
+ *    开一个 draft MR（`openDraftMr` 的 optional 出口）—— 本阶段用不到。
  *
  * 关于依赖注入：本文件**不 import 任何 `@deepseek-ai/*`**（插件目录里解析不到，
  * 离线自测会 ERR_MODULE_NOT_FOUND）。agent 服务、`createUserMessage`、`git`、
@@ -27,6 +29,13 @@ import { isAbsolute, join } from 'node:path'
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
 import { assertWorkExecutor, makeExecResult } from '../../contracts/work-executor.js'
+import {
+  PLUGIN_WORKTREE_PATHSPEC_EXCLUDES,
+  PORCELAIN_STATUS_ARGS,
+  parseNameStatusZ,
+  parseStatusZ,
+  statusCodeToAction,
+} from '../../contracts/git-status.js'
 import { agentFailureToPipelineError, watchAgentFailures } from './agent-failure.js'
 
 /** 给 `agents.create` 的 sessionId 前缀。sessionId 里不能出现 `/`，所以下面全部替换掉。 */
@@ -74,7 +83,7 @@ export function isSensitivePath (filePath) {
  * `git` 命令白名单。执行器只读工作区 + 本地提交，**不 push、不 fetch、不改历史**。
  *
  * 为什么要白名单而不是「反正只有我们自己调用」：agent 可能会往任务里塞命令，
- * 而执行器下游还接了 GitLab（有 token）。白名单是这一层唯一能挡住
+ * 而执行器下游可能还接了 GitLab（有 token）。白名单是这一层唯一能挡住
  * 「读 diff」悄悄变成「推代码」的地方。
  *
  * @param {string[]} argv
@@ -83,11 +92,60 @@ export function isSensitivePath (filePath) {
 export function isAllowedGitCommand (argv) {
   if (!Array.isArray(argv) || argv.length === 0) return false
   const [command, ...rest] = argv
-  if (command === 'status') return rest.length === 1 && rest[0] === '--porcelain'
-  if (command === 'add') return rest.length === 1 && rest[0] === '-A'
+  // 只允许「读状态」这一种形态：`status --porcelain [-z] [-uall] [-- . <exclude…>]`。
+  // 参数必须严格是下面这些已知片段 —— 放行任意 flags 等于给了一个能改索引的入口
+  // （`status --<未知flag>` 现在还只是读，但未来 git 加什么没人保证）。
+  if (command === 'status') return isAllowedStatusArgs(rest)
+  // 只允许「点名暂存」：`git add -- <文件…>`。
+  //
+  // 以前这里是 `add -A`（全量暂存），然后靠 `commit -- <非敏感文件>` 把它们挑出来。
+  // 那样虽然提交里没有敏感文件，但**索引里被暂存了** —— 人一回来 `git status`
+  // 看到一堆 `A  application.yml`，紧接着 `git commit` 就把它带走了。
+  // 改成点名暂存后，敏感文件连索引都不进，`git status` 里还是原样的未跟踪状态。
+  if (command === 'add') {
+    if (rest[0] !== '--') return false
+    return rest.length >= 2 && rest.slice(1).every((item) => typeof item === 'string' && item.length > 0)
+  }
   if (command === 'commit') return true // 只允许本地提交，push 不在白名单里
   if (command === 'diff') return true
+  // 提交要拿 sha：只放行 rev-parse HEAD 这一种读法。
+  if (command === 'rev-parse') return rest.length === 1 && rest[0] === 'HEAD'
+  // 把 agent 自己暂存进去的敏感文件退回未跟踪状态。
+  // 只允许 `--staged`：那条会把工作区的改动一起丢掉，绝不能放行。
+  if (command === 'restore') {
+    return rest.length >= 3 && rest[0] === '--staged' && rest[1] === '--'
+      && rest.slice(2).every((item) => typeof item === 'string' && item.length > 0)
+  }
   return false
+}
+
+/**
+ * `git status` 的参数是否在允许范围内。
+ *
+ * 允许的组合就是 `--porcelain` + 可选 `-z` + 可选 `-uall` + 可选
+ * `-- . <exclude pathspec…>`（最后那段只在要排除 `.agents/worktrees/` 时出现）。
+ *
+ * @param {string[]} rest
+ * @returns {boolean}
+ */
+function isAllowedStatusArgs (rest) {
+  if (!Array.isArray(rest) || rest.length === 0) return false
+  const known = new Set(['--porcelain', '-z', '-uall'])
+  let index = 0
+  let porcelain = false
+  for (; index < rest.length; index += 1) {
+    const item = rest[index]
+    if (item === '--') break
+    if (typeof item !== 'string' || !known.has(item)) return false
+    if (item === '--porcelain') porcelain = true
+  }
+  if (!porcelain) return false
+  if (index >= rest.length) return true // 没有 pathspec 段
+  const specs = rest.slice(index + 1)
+  if (specs.length === 0) return false
+  // pathspec 段：先是 `.`，后面可以全是排除规则。
+  if (specs[0] !== '.') return false
+  return specs.slice(1).every((item) => typeof item === 'string' && item.startsWith(':(exclude)'))
 }
 
 /**
@@ -234,6 +292,10 @@ export function createAgentExecutor (options = {}) {
           // 不抛错：业务代码可能已经改对了，抛了人只看到「失败」，看不到「哪几个文件被拦」。
           // 但不能只写日志 —— 插件日志人平时不看，最后只会在 MR 里发现「少改了一个文件」。
           ctx.log?.(`executor-agent：${blocked.length} 个敏感文件不会提交`, { files: blocked })
+          // 更阴的一种情况：agent 自己 `git add` 过这些敏感文件。那样它们虽然不在
+          // 我们的提交里，却**停在索引里**（`A  application.yml`），人回来顺手一个
+          // `git commit` 就带走了。现在把它们退回未跟踪状态。
+          await unstageSensitiveFiles(options, worktreePath, blocked, ctx)
         }
 
         if (committable.length === 0) {
@@ -249,9 +311,9 @@ export function createAgentExecutor (options = {}) {
             ctx.log?.(`executor-agent：agent 这一轮失败了（${failure.code}）：${failure.message}`)
             throw failureError
           }
-          // 没改动就不该开 MR：一个只有标题的空 MR 只会让人白点一次。
+          // 没改动就不该交付：一次空的本地提交只会留下一行没有内容的 git 历史。
           const reason = collected.files.length > 0
-            ? `agent 只动了敏感文件（${collected.files.join('、')}），按约定不提交，因此没有可开 MR 的改动`
+            ? `agent 只动了敏感文件（${collected.files.join('、')}），按约定不提交，因此没有可交付的改动`
             : 'agent 没有产生任何文件改动'
           await ctx.onPhase('failed')
           return makeExecResult({
@@ -267,18 +329,35 @@ export function createAgentExecutor (options = {}) {
         await ctx.onPhase('testing', '跑项目配置里的验证命令')
         const verification = await runVerification(options, verify, worktreePath, signal)
 
-        // ── 6. 提交 + 开 draft MR ─────────────────────────
-        await ctx.onPhase('mr-opening', '经 GitLab Commits API 物化改动')
+        // ── 6. 本地提交（+ 可选开 draft MR）───────────────
+        // 需求：处理完「向本地仓库（非远程）提交 PR」。本机 git push 物理上不可能
+        // （沙箱不给 git-receive-pack 建 stdin 管道），所以改动的交付形态是
+        // **工作区检出里的一次真实本地提交** —— 人在检出里 `git show` / `git log`
+        // 就能 review，跟看 PR 一样；不需要 GITLAB_TOKEN。
+        // 部署里另配了 GitLab 坐标时，再顺手开一个 draft MR（保留远程出口，不强制）。
+        await ctx.onPhase('mr-opening', '在工作区检出里做本地提交')
+        const commit = await commitLocally(options, {
+          ticket, worktreePath,
+          branch: String(ctx.branch ?? ''),
+          files: committable,
+          // 必须把「每个文件是怎么变的」一起交下去：删除的路径不能进 `git add`
+          // （会 fatal），重命名的旧路径必须进 `git commit` 的 pathspec
+          // （否则 git 记成新增+删除，历史里看不到重命名）。
+          changes: committableChanges,
+          blocked,
+          verification,
+        })
         const mr = await openDraftMr(options, {
           ticket, target, ctx, project,
           files: committable,
           changes: committableChanges,
           blocked,
           verification,
+          optional: true,
         })
 
         // 验证失败（命令跑了、退出码非零）才是 skipped —— 代码有问题，不能算「完成」。
-        // 没配验证 / 起不来仍算 done：契约里 skipped 是合法成功路径（改动已开 MR 待人审），
+        // 没配验证 / 起不来仍算 done：契约里 skipped 是合法成功路径（改动已提交待人审），
         // 但 plan.summary 必须把「未跑过测试」写在最前面，不能让「完成」这个字眼
         // 替人默认测试过了 —— 工单需求里「完成后对问题功能进行测试」是硬要求。
         const phase = verification.outcome === 'failed' ? 'skipped' : 'done'
@@ -293,6 +372,7 @@ export function createAgentExecutor (options = {}) {
           changedFiles: committable,
           testOutcome: verification.outcome,
           testDetail: verification.detail,
+          commit,
           mr,
           plan: {
             summary: `按工单改动了 ${committable.length} 个文件；${verifyNote}${blockedNote}`,
@@ -755,15 +835,22 @@ function resolveCreateUserMessage (injected) {
 /**
  * 收集 agent 改了什么。
  *
- * 两条路：
- * 1. 有 `baseCommit` 就 `git diff --name-only <baseCommit>` —— 这是**权威**答案，
- *    它能看见新增、删除、重命名，也不受 agent 中途 `git add` 的影响。
- * 2. 没有 `baseCommit`（手动跑、或建 worktree 没记基线）就退到
- *    `git status --porcelain`，从状态码里抠路径。
+ * 两条路**并且不是二选一**：
+ * 1. 有 `baseCommit` 就 `git diff --name-status -z <baseCommit>` —— 已跟踪文件的
+ *    权威答案（新增、删除、重命名都对，也不受 agent 中途 `git add` 影响）。
+ * 2. **无论有没有 baseCommit 都要再跑一次 `git status --porcelain -z -uall`** ——
+ *    因为 `git diff <commit>` **看不见未跟踪文件**。而「新建一个文件」恰好是工单里
+ *    最常见的产物（加页面、加组件），漏了它就等于这张票白跑：改动没进提交，
+ *    而且 `committable.length === 0` 还会把它判成「agent 没有产生任何文件改动」。
+ *
+ * 从 status 里只补 diff 看不见的那些（未跟踪 = `??`），其余交给 diff —— diff 带
+ * rename 的旧路径信息，status 的 `R` 只有在已暂存时才出现，两者互补但 diff 更全。
+ *
+ * `-z` / `-uall` / 排除 `.agents/worktrees/` 的理由见 `contracts/git-status.js`。
  *
  * @param {any} options
  * @param {{ cwd: string, baseCommit?: string, signal: AbortSignal }} input
- * @returns {Promise<{ files: string[] }>}
+ * @returns {Promise<{ files: string[], changes: Array<{ status: string, path: string, from?: string }> }>}
  */
 export async function collectChanges (options, input) {
   const git = options.git
@@ -773,104 +860,87 @@ export async function collectChanges (options, input) {
   }
 
   const baseCommit = typeof input.baseCommit === 'string' ? input.baseCommit.trim() : ''
-  /** @type {{ code: number, stdout: string, stderr: string }} */
-  let result
-  let changes
+  /** @type {Array<{ status: string, path: string, from?: string }>} */
+  let changes = []
   if (baseCommit.length > 0) {
     // `--name-status` 而不是 `--name-only`：前者带 A/M/D/R 状态，后者只给路径。
-    // 状态决定 Commits API 的 action，缺了就只能一律按 update 提交，新增文件会 400。
-    result = await runGit(['diff', '--name-status', baseCommit])
+    // 状态决定提交里是新增还是修改，缺了就只能一律按 update 处理。
+    const result = await runGit(['diff', '--name-status', '-z', baseCommit, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
     if (result.code !== 0) {
       throw new PipelineError('internal', `收集改动失败：git diff --name-status ${baseCommit} 返回 ${result.code}：${tail(result.stderr)}`)
     }
-    changes = parseNameStatus(result.stdout)
-  } else {
-    result = await runGit(['status', '--porcelain'])
-    if (result.code !== 0) {
-      throw new PipelineError('internal', `收集改动失败：git status 返回 ${result.code}：${tail(result.stderr)}`)
-    }
-    changes = parsePorcelainChanges(result.stdout)
+    changes = parseNameStatusZ(result.stdout)
   }
+
+  const status = await runGit(['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
+  if (status.code !== 0) {
+    throw new PipelineError('internal', `收集改动失败：git status 返回 ${status.code}：${tail(status.stderr)}`)
+  }
+  const known = new Set(changes.map((change) => change.path))
+  for (const record of parseStatusZ(status.stdout)) {
+    if (known.has(record.path)) continue
+    const action = statusCodeToAction(record.code)
+    // 只要 diff 看不见的那部分（未跟踪）；已跟踪文件的结论以 diff 为准。
+    if (action !== 'create') continue
+    if (record.code !== '??') continue
+    changes.push({ status: 'create', path: record.path })
+    known.add(record.path)
+  }
+
   return { files: changes.map((change) => change.path), changes }
 }
 
 /**
- * 解析 `git diff --name-status`。
+ * 把 agent 自己暂存进去的敏感文件退回未跟踪状态。
  *
- * 一行一条：`<状态>\t<路径>`；重命名/复制是 `R100\t旧路径\t新路径`。
- * 状态字母只取首字母：GitLab 的 action 只认 create / update / delete / move。
+ * 为什么需要这一步：我们的提交是点名暂存的，敏感文件自然不会进提交。但 agent
+ * 有可能自己 `git add -A` 过 —— 那些文件就**停在索引里**（`A  application.yml`），
+ * 人回来 `git status` 看到一片 `A`，随手 `git commit` 就把真实凭据带走了。
+ * 所以提交前把它们 `restore --staged` 回未跟踪。
  *
- * @param {string} stdout
- * @returns {Array<{ path: string, status: 'create'|'update'|'delete'|'move', from?: string }>}
+ * 只对**确实在索引里**的文件动手：`git restore --staged -- <从未暂存的文件>`
+ * 会 `fatal: pathspec ... did not match any file(s) known to git`。
+ * 所以先读一次 status，看首列是不是非空非 `?`（`??` 是未跟踪，本来就不在索引里）。
+ *
+ * @param {any} options
+ * @param {string} worktreePath
+ * @param {string[]} files
+ * @param {{ log?: Function }} ctx
+ * @returns {Promise<string[]>} 真的被退回未跟踪的那些文件
  */
-export function parseNameStatus (stdout) {
-  /** @type {Array<{ path: string, status: string, from?: string }>} */
-  const changes = []
-  for (const line of String(stdout ?? '').split(/\r?\n/)) {
-    if (line.trim().length === 0) continue
-    const parts = line.split('\t').map((part) => part.trim()).filter((part) => part.length > 0)
-    if (parts.length < 2) continue
-    const letter = String(parts[0]).charAt(0).toUpperCase()
-    if ((letter === 'R' || letter === 'C') && parts.length >= 3) {
-      const status = letter === 'R' ? 'move' : 'create'
-      const change = { path: parts[2], status }
-      if (letter === 'R') change.from = parts[1]
-      changes.push(change)
-      continue
-    }
-    const status = letter === 'A' ? 'create' : letter === 'D' ? 'delete' : 'update'
-    changes.push({ path: parts[1], status })
+export async function unstageSensitiveFiles (options, worktreePath, files, ctx = {}) {
+  const list = Array.isArray(files) ? files.filter((file) => typeof file === 'string' && file.length > 0) : []
+  if (list.length === 0) return []
+  if (typeof options.git !== 'function') return []
+  const runGit = async (argv) => {
+    assertAllowedGit(argv)
+    return options.git(argv, { cwd: worktreePath })
   }
-  return changes
-}
-
-/**
- * 解析 `git status --porcelain`。
- *
- * 格式是固定的两列状态 + 一个空格 + 路径。重命名/复制那一行的路径写成
- * `旧路径 -> 新路径`，**只取新路径**：GitLab 的 action 需要的是改动落点。
- *
- * @param {string} stdout
- * @returns {string[]}
- */
-export function parsePorcelain (stdout) {
-  return parsePorcelainChanges(stdout).map((change) => change.path)
-}
-
-/**
- * 解析 `git status --porcelain` 并带上状态。
- *
- * 格式是固定的两列状态 + 一个空格 + 路径：
- * - `??` = 未跟踪 → create
- * - 首列或次列出现 `D` → delete（首列是暂存区、次列是工作区，任一为删除都算删）
- * - 首列为 `R` → move，路径写成 `旧路径 -> 新路径`，只取新路径（Commits API 需要落点）
- * - 其余 → update
- *
- * @param {string} stdout
- * @returns {Array<{ path: string, status: 'create'|'update'|'delete'|'move', from?: string }>}
- */
-export function parsePorcelainChanges (stdout) {
-  /** @type {Array<{ path: string, status: string, from?: string }>} */
-  const changes = []
-  for (const line of String(stdout ?? '').split(/\r?\n/)) {
-    if (line.length < 4) continue
-    const code = line.slice(0, 2)
-    const raw = line.slice(3).trim()
-    if (raw.length === 0) continue
-    const arrow = raw.lastIndexOf(' -> ')
-    const path = arrow >= 0 ? raw.slice(arrow + 4).trim() : raw
-    if (path.length === 0) continue
-    /** @type {'create'|'update'|'delete'|'move'} */
-    let status = 'update'
-    if (code === '??' || code === '!!') status = 'create'
-    else if (arrow >= 0 || code.charAt(0) === 'R') status = 'move'
-    else if (code.charAt(0) === 'D' || code.charAt(1) === 'D') status = 'delete'
-    else if (code.charAt(0) === 'A') status = 'create'
-    const change = { path, status }
-    if (status === 'move' && arrow >= 0) change.from = raw.slice(0, arrow).trim()
-    changes.push(change)
+  const status = await runGit(['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
+  if (Number(status?.code ?? 1) !== 0) {
+    // 读不到状态不是致命错：提交本身仍然只点名非敏感文件，敏感文件进不去。
+    ctx.log?.('executor-agent：读不到检出状态，无法确认敏感文件是否被 agent 暂存', { reason: tail(status?.stderr) })
+    return []
   }
-  return changes
+  const staged = new Map()
+  for (const record of parseStatusZ(status.stdout)) {
+    const index = record.code.charAt(0)
+    // 首列是空格 = 索引干净；`?` = 未跟踪（本来就不在索引里）。
+    if (index === ' ' || index === '?') continue
+    staged.set(record.path, record.code)
+  }
+  const targets = list.filter((file) => staged.has(String(file).replace(/\\/g, '/')))
+  if (targets.length === 0) return []
+  const restored = await runGit(['restore', '--staged', '--', ...targets.map((file) => String(file).replace(/\\/g, '/'))])
+  if (Number(restored?.code ?? 1) !== 0) {
+    ctx.log?.('executor-agent：把敏感文件退回未跟踪失败（它们仍停在索引里，提交时要留意）', {
+      files: targets,
+      reason: tail(restored?.stderr),
+    })
+    return []
+  }
+  ctx.log?.('executor-agent：已把 agent 暂存进去的敏感文件退回未跟踪', { files: targets })
+  return targets
 }
 
 /**
@@ -892,7 +962,7 @@ function assertAllowedGit (argv) {
  * - `passed`：build 与 test 都过；
  * - `failed`：命令跑了但退出码非零 —— 这是**真的失败**，人要看；
  * - `skipped`：没配命令，或者命令根本起不来（`spawn` 抛 ENOENT）。
- *   按契约这是合法成功路径：照样开 draft MR，但原因必须写清楚。
+ *   按契约这是合法成功路径：照样交付，但原因必须写清楚。
  *
  * @param {any} options
  * @param {{ build?: string, test?: string }} verify
@@ -946,7 +1016,7 @@ export async function runVerification (options, verify, cwd, signal) {
       const message = error instanceof Error ? error.message : String(error)
       return {
         outcome: 'skipped',
-        detail: `验证命令起不来（${item.label}: ${item.command}）：${message}。改动未经验证，仍按约定开 draft MR。`,
+        detail: `验证命令起不来（${item.label}: ${item.command}）：${message}。改动未经验证，仍按约定交付（本地提交）。`,
       }
     }
     const code = Number(result?.code ?? 0)
@@ -1019,22 +1089,141 @@ export function splitCommand (command) {
 }
 
 /**
- * 物化改动 + 开 draft MR。
+ * 在工作区检出里做一次**本地提交**。
  *
- * 顺序很关键：先确保分支在（分支不存在时 GitLab 的 POST 也可能 201，所以客户端要先 GET），
- * 再一次性把文件提交上去，最后开 MR。任何一步失败都往上抛，由 run 的 catch 归成 failed。
+ * 这是本需求的核心出口：处理完一个工单，把改动落成工作区里一条真实的 git 提交。
+ * 人在检出里 `git log` / `git show <sha>` 就能 review，等价于看一个 PR，
+ * 而且**不需要任何远程凭据**（GITLAB_TOKEN 在本阶段完全用不上）。
+ *
+ * ## 为什么不是「先 `add -A` 再 `commit -- <文件>」那条更短的路
+ *
+ * 以前是 `add -A`（全量暂存）+ `commit -- <非敏感文件>`：提交里确实没有敏感文件，
+ * 但**索引里被暂存了** —— 人一回来 `git status` 看到一堆 `A  application.yml`，
+ * 手一抖 `git commit` 就把它带走了。改成点名暂存后敏感文件连索引都不进。
+ *
+ * ## 三步为什么必须这么排（七个场景逐个真跑过）
+ *
+ * 1. **暂存只点名「非删除」的落点**：`git add -- <已删除的路径>` 会
+ *    `fatal: pathspec ... did not match any files` —— 文件已经不在工作区了，
+ *    git 拒绝接受这个 pathspec。删除只能靠 commit 的 pathspec 带上。
+ * 2. **commit 的 pathspec 必须同时含「新路径」和「旧路径」**：删除靠它、
+ *    重命名更靠它 —— 已暂存的重命名如果只给新路径，git 会把它记成
+ *    「新增一个文件」而旧路径的删除留在索引里，历史里就成了复制而不是重命名。
+ * 3. **未跟踪文件必须先 add**：`git commit -- <未跟踪文件>` 会
+ *    `error: pathspec ... did not match any file(s) known to git`。
+ *
+ * 为什么 commit 失败要往上抛而不是记 done：没有提交就等于「什么都没交付」，
+ * 报 done 会让人以为工作区里已经有成果了。
  *
  * @param {any} options
- * @param {{ ticket: any, target: any, ctx: any, project: any, files: string[], changes?: Array<{ path: string, status: string, from?: string }>, blocked: string[], verification: { outcome: string, detail: string } }} input
- * @returns {Promise<{ iid: number, url: string, draft: true }>}
+ * @param {{ ticket: any, worktreePath: string, branch: string, files: string[], changes?: Array<{ status: string, path: string, from?: string }>, blocked: string[], verification: { outcome: string, detail: string } }} input
+ * @returns {Promise<{ sha: string, branch: string, files: string[] }>}
+ */
+export async function commitLocally (options, input) {
+  const { ticket, worktreePath, files, blocked, verification } = input
+  if (typeof options.git !== 'function') {
+    throw new PipelineError('invalid-input', 'executor-agent 缺少注入的 git 运行器（options.git），无法做本地提交')
+  }
+  const fileList = Array.isArray(files) ? files.filter((f) => typeof f === 'string' && f.length > 0) : []
+  if (fileList.length === 0) {
+    throw new PipelineError('internal', '没有可提交的文件，拒绝做空提交')
+  }
+
+  const runGit = async (argv) => {
+    assertAllowedGit(argv)
+    const result = await options.git(argv, { cwd: worktreePath })
+    if (Number(result?.code ?? 1) !== 0) {
+      throw new PipelineError('internal', `本地提交失败（git ${argv.join(' ')}）：${String(result?.stderr ?? '').trim() || '没有输出'}`)
+    }
+    return result
+  }
+
+  // 路径统一转成仓库相对的 POSIX 形式：`git status`/`git diff` 给的是正斜杠，
+  // 而 Windows 上如果谁传了反斜杠，git 会把 pathspec 当成通配符匹配不上。
+  const normalize = (file) => String(file).replace(/\\/g, '/')
+  const changes = (Array.isArray(input.changes) ? input.changes : [])
+    .filter((change) => change && typeof change.path === 'string' && change.path.length > 0)
+  // 没有 changes（老调用点只传 files）时按「全是修改」处理：既不暂存删除，
+  // 也没有旧路径要带上，正好是最保守的做法。
+  const statusOf = (file) => changes.find((change) => normalize(change.path) === normalize(file))?.status ?? 'update'
+
+  const addTargets = fileList.filter((file) => statusOf(file) !== 'delete').map(normalize)
+  const commitSpecs = [...new Set(fileList.flatMap((file) => {
+    const change = changes.find((item) => normalize(item.path) === normalize(file))
+    const from = change?.from ? [normalize(change.from)] : []
+    return [normalize(file), ...from]
+  }))]
+
+  if (addTargets.length > 0) await runGit(['add', '--', ...addTargets])
+  await runGit(['commit', '-m', buildLocalCommitMessage(ticket, { blocked, verification }), '--', ...commitSpecs])
+  const head = await runGit(['rev-parse', 'HEAD'])
+  const sha = String(head?.stdout ?? '').trim()
+  if (sha.length === 0) {
+    throw new PipelineError('internal', '本地提交后拿不到 HEAD 的 sha，无法确认提交是否成功')
+  }
+  return {
+    sha,
+    branch: String(input.branch ?? ''),
+    files: fileList,
+  }
+}
+
+/**
+ * 本地提交的提交说明。
+ *
+ * 比 `buildCommitMessage` 多带验证结论与未提交文件：提交说明是人在 `git log`
+ * 里唯一能看到的上下文，把「测试跑没跑通」「哪些文件被刻意漏掉」写进去，
+ * 才能不看插件也能判断这次提交能不能用。
+ *
+ * @param {any} ticket
+ * @param {{ blocked?: string[], verification?: { outcome: string, detail: string } }} [extra]
+ * @returns {string}
+ */
+export function buildLocalCommitMessage (ticket, extra = {}) {
+  const lines = [buildCommitMessage(ticket)]
+  const verification = extra.verification
+  if (verification) {
+    lines.push('', verification.outcome === 'passed'
+      ? `验证：通过（${verification.detail}）`
+      : `验证：${verification.outcome}（${verification.detail}）`)
+  }
+  const blocked = Array.isArray(extra.blocked) ? extra.blocked : []
+  if (blocked.length > 0) {
+    lines.push(`未提交（疑似含真实凭据，按约定留在工作区）：${blocked.join('、')}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 物化改动 + 开 draft MR（**可选出口**）。
+ *
+ * 顺序很关键：先确保分支在（分支不存在时 GitLab 的 POST 也可能 201，所以客户端要先 GET），
+ * 再一次性把文件提交上去，最后开 MR。
+ *
+ * `optional: true` 时：项目没配 GitLab 坐标或没注入客户端工厂，就**跳过**返回 undefined，
+ * 而不是抛错 —— 本阶段的交付形态是「本地提交」，远程 MR 只是额外出口。
+ * 其余错误（网络、鉴权、409）照样往上抛，由 run 的 catch 归成 failed。
+ *
+ * @param {any} options
+ * @param {{ ticket: any, target: any, ctx: any, project: any, files: string[], changes?: Array<{ path: string, status: string, from?: string }>, blocked: string[], verification: { outcome: string, detail: string }, optional?: boolean }} input
+ * @returns {Promise<{ iid: number, url: string, draft: true } | undefined>}
  */
 async function openDraftMr (options, input) {
-  const { ticket, target, ctx, project, files, blocked, verification } = input
+  const { ticket, target, ctx, project, files, blocked, verification, optional } = input
   const gitlabInfo = resolveGitlab(project, target)
   if (!gitlabInfo) {
+    if (optional) return undefined
     throw new PipelineError('invalid-input', '项目没有配置 GitLab（repo.gitlab.projectId / repo.remote），改动没法物化成 MR')
   }
+  // 默认**不开远程 MR**：本阶段的交付形态是工作区里的本地提交（见 commitLocally）。
+  // 远程出口要显式打开 `repo.gitlab.enabled: true`，否则配了 remote 就会去要 token、
+  // 去连 GitLab —— 而需求明确说这一阶段用不上 GITLAB_TOKEN。
+  if (project?.repo?.gitlab?.enabled !== true) {
+    if (optional) return undefined
+    throw new PipelineError('invalid-input', '项目没有打开远程 MR 出口（repo.gitlab.enabled 不是 true），改动只做本地提交')
+  }
   if (typeof options.createGitlabClient !== 'function') {
+    if (optional) return undefined
     throw new PipelineError('invalid-input', 'executor-agent 没有注入 GitLab 客户端工厂（options.createGitlabClient）')
   }
 
@@ -1149,8 +1338,8 @@ export function joinWorktreePath (worktreePath, file) {
  * 两种读法，按可靠性排：
  * 1. `options.readFile(path)`（组合根注入，直接读磁盘）—— 最准；
  * 2. `git show :0:<path>` 读**暂存区**里的那份。为什么是暂存区而不是工作区：
- *    工作区里可能有 agent 没写完的中间状态，暂存区是它 `git add -A` 之后的完整快照。
- *    这也解释了为什么收集完改动要先 `git add -A`。
+ *    工作区里可能有 agent 没写完的中间状态，而暂存区是刚刚点名 `git add -- <文件>`
+ *    之后的快照，与「要提交的那一版」最接近。所以这里会先点名暂存一次。
  *
  * 读不到就抛错而不是提交空内容 —— 空内容会把远端那份文件清空，比失败糟得多。
  *
@@ -1174,9 +1363,11 @@ async function fillContents (options, ctx, files) {
   }
 
   const git = options.git
-  const added = await git(['add', '-A'], { cwd })
+  // 只暂存要提交的文件（与 commitLocally 同一口径）：`add -A` 会把敏感文件也塞进索引。
+  const pathSpecs = files.map((file) => String(file).replace(/\\/g, '/'))
+  const added = await git(['add', '--', ...pathSpecs], { cwd })
   if (added.code !== 0) {
-    throw new PipelineError('internal', `提交前 git add -A 失败：${tail(added.stderr)}`)
+    throw new PipelineError('internal', `提交前 git add 失败：${tail(added.stderr)}`)
   }
   for (const file of files) {
     assertAllowedGit(['diff', '--name-only', 'x'])

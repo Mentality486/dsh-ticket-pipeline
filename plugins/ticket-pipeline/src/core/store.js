@@ -13,6 +13,7 @@
 
 import { canTransition, priorityWeight, TERMINAL } from '../contracts/types.js'
 import { PipelineError } from '../contracts/errors.js'
+import { isIsolatedWorktreePath } from './worktree-path.js'
 
 /** 表名：票据 / 水位 / 租约。 */
 export const TABLES = Object.freeze({
@@ -50,7 +51,8 @@ export const TABLES = Object.freeze({
  * @property {string[]} [changedFiles]
  * @property {'passed'|'failed'|'skipped'} [testOutcome]
  * @property {string} [testDetail]
- * @property {{ iid: number, url: string, draft: boolean }} [mr]
+ * @property {{ sha: string, branch: string, files: string[] }} [commit] 工作区检出里的本地提交（本阶段的交付形态）
+ * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
  * @property {number} attempt
  * @property {number} [startedAt]
  * @property {number} [finishedAt]
@@ -459,6 +461,11 @@ export class TicketStore {
 
   /**
    * 需要清理 worktree 的行：终态、非 failed、超保留期。
+   *
+   * **只认真隔离 worktree**（`<repo>/.agents/worktrees/<name>`）。缺省模式下
+   * 票据的 `worktreePath` 就是项目工作区本身，那是人的主检出 —— 把它交给
+   * `git worktree remove --force` 等于删掉人的整个工作目录。
+   *
    * @param {number} retentionMs
    * @returns {TicketRecordRow[]}
    */
@@ -467,6 +474,8 @@ export class TicketStore {
     const now = this.now()
     return this.listTickets().filter((row) => {
       if (!row.worktreePath) return false
+      // 主检出永远不进清理候选：不管它多老。
+      if (!isIsolatedWorktreePath(row.worktreePath)) return false
       // failed 的 worktree 永不自动删 —— 那是排查线索。
       if (row.phase === 'failed') return false
       if (!TERMINAL.includes(row.phase)) return false

@@ -173,19 +173,24 @@ export const CONFIG_FIELDS = Object.freeze({
   fetchBeforeCreate: {
     type: 'boolean',
     default: true,
-    description: '切 worktree 前先 git fetch 一次基准分支',
+    description: '建隔离 worktree 前先 git fetch 一次基准分支（只在 isolateWorktree 打开时用得上；缺省就地改代码时不连远端）',
   },
   branchPrefix: {
     type: 'string',
     default: 'ticket-',
-    description: '票分支名前缀；后接 <projectId>-<recordId>-r<修订号>',
+    description: '隔离 worktree 的票分支名前缀；后接 <projectId>-<recordId>-r<修订号>（只在 isolateWorktree 打开时用得上）',
   },
   worktreeRetentionHours: {
     type: 'number',
     default: 24,
     min: 0,
     max: 720,
-    description: '终态票的 worktree 保留小时数；0 = 不自动清理',
+    description: '终态票的 worktree 保留小时数；0 = 不自动清理（只有开了 isolateWorktree 才有 worktree 可清）',
+  },
+  isolateWorktree: {
+    type: 'boolean',
+    default: false,
+    description: '每票再开一个隔离 worktree（缺省关：直接在项目工作区的检出里改代码，与「在工作区新增会话」一致）。打开前想清楚：工作区必须干净，改动会落在隔离分支上',
   },
 
   // ── agent 与模型 ────────────────────────────────────
@@ -327,6 +332,7 @@ export const CONFIG_GROUPS = Object.freeze([
     fields: Object.freeze([
       Object.freeze(['workExecutor', '执行器']),
       Object.freeze(['ticketTimeoutMinutes', '单票超时（分钟）']),
+      Object.freeze(['isolateWorktree', '每票开隔离 worktree']),
       Object.freeze(['fetchBeforeCreate', '切 worktree 前先 fetch']),
       Object.freeze(['branchPrefix', '分支名前缀']),
       Object.freeze(['worktreeRetentionHours', 'worktree 保留（小时）']),
@@ -566,6 +572,9 @@ function validateProject (raw, index) {
   // repo.gitlab 是自建站点 / 子组路径的唯一表达方式（执行器 resolveGitlab 会以它为准）。
   // 不在这里透传就等于把人的配置吞掉：URL 解析不出来时只会得到一句
   // 「项目没有配置 GitLab」，而配置里明明写着。
+  //
+  // enabled 是**远程 MR 出口的总开关**，缺省 false：本阶段处理完工单只做
+  // 「工作区检出里的本地提交」，不连远程、不要 GITLAB_TOKEN。要开 draft MR 才显式写 true。
   if (repo.gitlab && typeof repo.gitlab === 'object' && !Array.isArray(repo.gitlab)) {
     /** @type {any} */
     const gitlab = {}
@@ -574,6 +583,7 @@ function validateProject (raw, index) {
     const gid = repo.gitlab.projectId
     if (typeof gid === 'number' && Number.isFinite(gid)) gitlab.projectId = gid
     else if (typeof gid === 'string' && gid.trim().length > 0) gitlab.projectId = gid.trim()
+    if (repo.gitlab.enabled === true) gitlab.enabled = true
     if (Object.keys(gitlab).length > 0) value.repo.gitlab = gitlab
   }
 

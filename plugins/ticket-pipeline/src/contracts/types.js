@@ -33,10 +33,10 @@ export const PHASE_LABEL = Object.freeze({
   'planning': '分析中',
   'editing': '修改中',
   'testing': '验证中',
-  'mr-opening': '正在开 MR',
+  'mr-opening': '正在本地提交',
   'needs-info': '等你补充信息',
   'done': '已完成',
-  'skipped': '已开 MR，但未跑通验证',
+  'skipped': '已本地提交，但未跑通验证',
   'failed': '失败',
   'gone': '表格里已删除',
 })

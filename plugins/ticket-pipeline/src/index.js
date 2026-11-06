@@ -29,10 +29,12 @@ import { makeDomainSpec } from './core/domain.js'
 import { TicketStore, makeDomainRepo } from './core/store.js'
 import { createScheduler } from './core/scheduler.js'
 import { createProjectWorkspaceManager } from './core/workspace.js'
+import { isIsolatedWorktreePath } from './core/worktree-path.js'
 import { recoverPending, checkWorktreeByGit } from './core/recover.js'
 import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
 import { sanitizeBranchName } from './core/branch-name.js'
 import { PipelineError } from './contracts/errors.js'
+import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ } from './contracts/git-status.js'
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
@@ -295,6 +297,84 @@ export async function detectBaseBranch (gitRunner, repoPath, log) {
   }
   log?.('无法自动判断基准分支，退回 main；建议在项目配置里显式写 repo.baseBranch', { repoPath })
   return 'main'
+}
+
+/**
+ * 看一眼某个检出当前的状态：干净吗？在哪个分支？HEAD 是哪一次提交？
+ *
+ * 「干净」的判定用 `git status --porcelain -z -uall`，并排除插件自己的
+ * `.agents/worktrees/`：
+ *
+ * - `-uall` 是必需的。不加时 `git status` 会把一个全是新文件的目录折叠成
+ *   `?? newdir/`，里面有什么看不见 —— 人放进去了一个 `.env` 也发现不了。
+ * - `-z` 是必需的。不加时中文路径被转义成 `\346\226\260...`、含空格的路径被加引号，
+ *   拿去当 pathspec 会找不到文件（细节见 `contracts/git-status.js`）。
+ * - 排除 `.agents/worktrees/` 也是必需的。它是插件自己开的隔离目录，留在检出里会让
+ *   每个项目看起来都不干净；只排这个子目录、不排整个 `.agents`，因为人自己的
+ *   `.agents/xxx` 仍要算数。
+ *
+ * `-uno` 不能加：忽略文件之外的未跟踪文件同样是「人的东西」，混进工单提交里是事故。
+ *
+ * 拿不到 status 时（git 报错）**当成不干净**并抛出去 —— 宁可这张票不跑，
+ * 也不能在「不知道检出现在什么样」的情况下往里面提交。
+ *
+ * @param {(argv: string[], opts?: { cwd?: string }) => Promise<{ code: number, stdout: string, stderr: string }>} gitRunner
+ * @param {string} repoPath
+ * @returns {Promise<{ clean: boolean, dirty: string[], branch?: string, head?: string }>}
+ */
+export async function inspectCheckout (gitRunner, repoPath) {
+  const status = await gitRunner(
+    ['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES],
+    { cwd: repoPath },
+  )
+  if (status.code !== 0) {
+    throw new PipelineError(
+      'invalid-input',
+      `看不了项目检出的状态（git status 退出码 ${status.code}）：${String(status.stderr ?? '').trim() || '没有输出'}。`
+      + `确认 ${repoPath} 是一个可用的 git 检出。`,
+    )
+  }
+  // 给人看的形式：「M a.ts」「?? b.ts」「R new.ts」—— 状态码左对齐再跟路径。
+  const dirty = parseStatusZ(status.stdout).map((record) => `${record.code.trim()} ${record.path}`)
+
+  const branchResult = await gitRunner(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath })
+  const headResult = await gitRunner(['rev-parse', 'HEAD'], { cwd: repoPath })
+  const branch = branchResult.code === 0 ? String(branchResult.stdout ?? '').trim() : ''
+  const head = headResult.code === 0 ? String(headResult.stdout ?? '').trim() : ''
+
+  return {
+    clean: dirty.length === 0,
+    dirty,
+    branch: branch.length > 0 && branch !== 'HEAD' ? branch : undefined,
+    head: head.length > 0 ? head : undefined,
+  }
+}
+
+/**
+ * 检出不干净就拒绝这张票。
+ *
+ * 为什么必须硬拒而不是只警告：缺省模式（不开 `isolateWorktree`）下 agent 直接在
+ * 项目工作区里改代码，最后 `git add -- <改动文件>` + `commit -- <改动文件 ∪ 旧路径>`
+ * 会把**收集到的那些改动**一起提交。收集口径是「相对 baseCommit 的 diff ∪ status」，
+ * 一旦人和 agent 改了同一个文件，人的半成品就会被并进工单提交 —— 提交已经成型，
+ * 再想把它从工单改动里择出来基本不可能。
+ *
+ * 所以这里只做一件事：把「为什么不干净、怎么办」说清楚，让人能一步解决。
+ *
+ * @param {{ dirty: string[] }} snapshot `inspectCheckout` 的结果
+ * @param {string} repoPath
+ */
+export function assertCleanCheckout (snapshot, repoPath) {
+  const dirty = Array.isArray(snapshot?.dirty) ? snapshot.dirty : []
+  if (dirty.length === 0) return
+  const shown = dirty.slice(0, 10).join('、')
+  const more = dirty.length > 10 ? `等 ${dirty.length} 个` : ''
+  throw new PipelineError(
+    'invalid-input',
+    `项目工作区不干净，拒绝在这张票里改代码：${repoPath} 有未提交改动（${shown}${more}）。`
+    + '插件会把改动直接提交在这个检出里，混着走会把你的半成品一起提交掉。'
+    + '请先把这些改动提交或 stash，或者打开配置项 isolateWorktree 让每张票用独立的隔离 worktree。',
+  )
 }
 
 /**
@@ -679,9 +759,9 @@ export async function apply (ctx, config) {
   })
 
   /**
-   * 准备本项目的工作区 + 本票的隔离 worktree。
+   * 准备本票的落点：项目工作区（= 项目在本机的那个检出），需要隔离时才额外开 worktree。
    *
-   * 两件事，顺序不能反：
+   * 顺序不能反：
    *
    * 1. **项目工作区**（`repoPath` 所在的目录）：先在宿主里登记成 Workspace，
    *    已登记就直接复用。这是「这张工单属于哪个项目」在宿主侧的落点，
@@ -689,10 +769,15 @@ export async function apply (ctx, config) {
    *    飞书表里没有「待修改项目」列，归属本来就只能由 `projects[].match`
    *    （表 = 项目）决定 —— 所以这里用项目的 `repo.path`，不依赖工单正文。
    *
-   * 2. **隔离 worktree**（`.agents/worktrees/<branch>`）：每票一个分支一份检出，
-   *    互不踩踏。它**不是**工作区 —— 宿主 `attachSession` 要求会话 cwd 等于
-   *    工作区路径，worktree 子目录不满足，所以会话 cwd 必须是工作区根
-   *    （见 executor-agent 的 setup）。
+   * 2. **改代码的目录**。缺省就是工作区根 —— 需求要的是「在该工作区新增会话
+   *    处理工单」，会话 cwd 就是它，agent 直接在这个检出里改、就地提交。
+   *    但这样会动到人自己的检出，所以进门先要求**工作区干净**（有未提交改动
+   *    就拒跑并说明），否则人的半成品会被混进工单提交里。
+   *
+   *    打开 `isolateWorktree` 时退回旧行为：每票一个
+   *    `.agents/worktrees/<branch>` 隔离检出。它**不是**工作区 —— 宿主
+   *    `attachSession` 要求会话 cwd 等于工作区路径，worktree 子目录不满足，
+   *    所以会话 cwd 仍是工作区根，只是 workingDirectory 会被钉到隔离目录。
    *
    * 通用化后，仓库路径与基准分支都来自 `located`（按 projectId 查 `projects[]`），
    * 不再读全局 `config.repoPath` / `config.baseRef`。
@@ -703,10 +788,10 @@ export async function apply (ctx, config) {
     const { located, projectId, recordId, revisionCount, fetch, signal, title } = opts
     const repoPath = located?.repoPath
     if (!repoPath) {
-      throw new Error('定位结果缺少 repoPath，无法建 worktree')
+      throw new Error('定位结果缺少 repoPath，无法确定改哪个检出')
     }
 
-    // 先确保工作区，再谈 worktree：没有工作区，后面 agent 起的会话就没有归属，
+    // 先确保工作区，再谈检出：没有工作区，后面 agent 起的会话就没有归属，
     // 人也不知道这张票在动哪个项目。这一步与 git 无关，所以放在 gitRunner 判空之前。
     const workspace = await projectWorkspaces.ensureProjectWorkspace({
       path: repoPath,
@@ -720,8 +805,27 @@ export async function apply (ctx, config) {
     }
 
     if (!gitRunner) {
-      log('没有 subprocess，无法建 worktree，本轮只推进阶段不落盘工作区')
-      return workspaceCoords
+      log('没有 subprocess，无法探查检出状态，本轮只推进阶段不落盘工作区')
+      return { path: repoPath, repoPath, ...workspaceCoords }
+    }
+
+    if (config.isolateWorktree !== true) {
+      // 缺省路径：就在项目工作区里改。除非工作区干净，否则一步都不走。
+      const snapshot = await inspectCheckout(gitRunner, repoPath)
+      assertCleanCheckout(snapshot, repoPath)
+      log('在项目工作区里改代码（未开隔离 worktree）', {
+        projectId,
+        recordId,
+        workspacePath: workspace.workspacePath,
+        branch: snapshot.branch,
+      })
+      return {
+        path: workspace.workspacePath ?? repoPath,
+        branch: snapshot.branch,
+        baseCommit: snapshot.head,
+        repoPath,
+        ...workspaceCoords,
+      }
     }
 
     const existingWorktree = typeof opts.worktreePath === 'string' && opts.worktreePath.length > 0
@@ -731,7 +835,7 @@ export async function apply (ctx, config) {
       // 已有 worktree：这次只补工作区登记，绝不动分支与检出。
       // 重建会撞上「分支已存在」（`git worktree add -b` 直接失败），
       // 而且那张票可能已经有未提交的改动躺在里面 —— 抹掉等于毁掉半成品。
-      log('已有工作区，本次只补登记（不重建 worktree）', {
+      log('已有隔离工作区，本次只补登记（不重建 worktree）', {
         projectId,
         recordId,
         worktreePath: existingWorktree,
@@ -794,14 +898,25 @@ export async function apply (ctx, config) {
 
   /**
    * 清理过期 worktree：`git worktree remove` + `git worktree prune`。
+   *
+   * **只清插件自己开的隔离 worktree**（路径必须在 `<repoPath>/.agents/worktrees/` 下）。
+   * 缺省模式下票据的 `worktreePath` 就是项目工作区本身 —— 那是人的主检出，
+   * 拿 `worktree remove --force` 去删它等于直接删掉人的整个工作目录。
+   * 所以这里先做前缀校验，不在白名单里的一律跳过（只记日志，不报错）。
+   *
    * @type {(opts: { path: string, branch: string, repoPath?: string }) => Promise<void>}
    */
   async function removeWorktree (opts) {
     if (!gitRunner) return
+    const target = String(opts.path ?? '')
+    if (!isIsolatedWorktreePath(target)) {
+      log('跳过清理：这个路径不是插件开的隔离 worktree', { path: target })
+      return
+    }
     const repoPath = opts.repoPath ?? opts.path
-    const removed = await gitRunner(['worktree', 'remove', '--force', opts.path], { cwd: repoPath })
+    const removed = await gitRunner(['worktree', 'remove', '--force', target], { cwd: repoPath })
     if (removed.code !== 0) {
-      log('清理 worktree 失败（下一轮会再试）', { path: opts.path, stderr: removed.stderr })
+      log('清理 worktree 失败（下一轮会再试）', { path: target, stderr: removed.stderr })
       return
     }
     await gitRunner(['worktree', 'prune'], { cwd: repoPath })
@@ -821,7 +936,7 @@ export async function apply (ctx, config) {
   })
 
   // ── 4. 工具 ───────────────────────────────────────────
-  ctx.tools.register(createPipelineScanTool({ tick: (opts) => scheduler.tick(opts) }))
+  ctx.tools.register(createPipelineScanTool({ tick: (opts) => scheduler.tick(opts), log }))
   ctx.tools.register(createPipelineStatusTool({
     store,
     getConfig: () => config,

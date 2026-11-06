@@ -41,7 +41,11 @@ export function createPipelineScanTool (options) {
       // fire-and-forget：tick 里「跑一张票」可能要几十秒到 40 分钟（超时上限），
       // 同步等它会让宿主工具通道超时、报 not lossless JSON（生产实锤过）。
       // 所以这里只触发一轮、立刻返回；跑完的结果用 pipeline_status 查。
-      void options.tick({ skipScan: args.skipScan === true, signal: exec?.signal }).catch(() => {})
+      void options.tick({ skipScan: args.skipScan === true, signal: exec?.signal }).catch((error) => {
+        // 后台失败没人接：只静默吞掉等于「点了没反应」，人永远查不出为什么。
+        // 工具通道已经返回了，所以这里只能靠日志留痕（不打断调用方）。
+        options.log?.('后台一轮流水线失败', { reason: error instanceof Error ? error.message : String(error) })
+      })
 
       return {
         status: 'triggered',
