@@ -110,6 +110,18 @@ export function isAllowedGitCommand (argv) {
   if (command === 'diff') return true
   // 提交要拿 sha：只放行 rev-parse HEAD 这一种读法。
   if (command === 'rev-parse') return rest.length === 1 && rest[0] === 'HEAD'
+  // 拍基线：`git stash create` 只**造**一个 stash commit 对象并回它的 sha，
+  // 不写 ref、不动工作区、不动索引（实测 `git stash create` 之后 `git stash list`
+  // 仍是空的）。`stash` 的其它子命令都会改工作区 —— 尤其 `pop`/`apply` 会把
+  // 用户没收起来的改动重新糊回去，`drop` 会删掉人唯一的一份备份。绝不能放行。
+  if (command === 'stash') return rest.length === 1 && rest[0] === 'create'
+  // 读未跟踪文件的内容哈希（用来判断「这个文件是人本来就有的、还是 agent 新建/改过的」）。
+  // 只允许 `hash-object -- <路径…>`：缺 `--` 时文件名叫 `-w` 之类就会被 git 当成 flag，
+  // 而 `-w` 会把内容**写进对象库**，那就不是只读了。
+  if (command === 'hash-object') {
+    if (rest[0] !== '--') return false
+    return rest.length >= 2 && rest.slice(1).every((item) => typeof item === 'string' && item.length > 0)
+  }
   // 把 agent 自己暂存进去的敏感文件退回未跟踪状态。
   // 只允许 `--staged`：那条会把工作区的改动一起丢掉，绝不能放行。
   if (command === 'restore') {
@@ -226,6 +238,9 @@ export function createAgentExecutor (options = {}) {
 
       ctx.log?.(`executor-agent：起 agent（sessionId=${sessionId}，cwd=${sessionCwd}，改动目录=${worktreePath}）`)
 
+      /** setup 回调里拿到的 agentCtx（收会话要用它的 `sessions` 服务）。 */
+      let runtimeAgentCtx
+
       // ── 1. 起 agent ─────────────────────────────────────
       const created = await agents.create({
         sessionId,
@@ -239,19 +254,25 @@ export function createAgentExecutor (options = {}) {
         // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
         // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
         // 起来是个没有任何工具的壳，改不出任何文件。
-        setup: (agentCtx, agent) => setupAgent(options, {
-          agentCtx,
-          agent,
-          worktreePath,
-          workspacePath,
-          workspaceId: ctx?.workspaceId,
-          // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
-          workspaceRegistry: options.workspaceRegistry,
-          presetId: config.agentPreset,
-          signal,
-          sessionId,
-          log,
-        }),
+        //
+        // 顺手把 agentCtx 存下来：收尾时要靠它弱取 `sessions` 服务
+        // （`keepSession=false` 才用得上；默认保留，见 finally 里的说明）。
+        setup: (agentCtx, agent) => {
+          runtimeAgentCtx = agentCtx
+          return setupAgent(options, {
+            agentCtx,
+            agent,
+            worktreePath,
+            workspacePath,
+            workspaceId: ctx?.workspaceId,
+            // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
+            workspaceRegistry: options.workspaceRegistry,
+            presetId: config.agentPreset,
+            signal,
+            sessionId,
+            log,
+          })
+        },
       })
       const agent = created?.agent
       if (!agent || typeof agent.followup !== 'function') {
@@ -273,21 +294,43 @@ export function createAgentExecutor (options = {}) {
       const failureWatcher = watchAgentFailures(agent)
 
       try {
-        // ── 2. 推任务：必须 followup（inject 不唤醒 agent）──
+        // ── 2. 拍基线：只提交 agent 改过的，不动人自己没收起来的改动 ──
+        //
+        // 为什么必须在 followup 之前：agent 一开始干活，工作区就被污染了，
+        // 再也分不出「哪些改动是人早就有的」。`git stash create` 恰好是唯一
+        // 一个**只读**的取基线方式：它把当前工作区+索引打成一个 stash commit
+        // 对象并回 sha（不写 ref、不动工作区、`git stash list` 仍是空的）。
+        //
+        // 基线拍不到不影响跑票 —— 退化成老行为（按 baseCommit 收集全部改动），
+        // 最多是把人原有的改动一起提交，那也比整票失败强。
+        const baseline = await createBaseline(options, worktreePath, signal).catch((error) => {
+          ctx.log?.(`executor-agent：拍基线失败，退化为按检出点收集改动（人原本未提交的改动可能被一起提交）：${error?.message ?? String(error)}`)
+          return undefined
+        })
+
+        // ── 3. 推任务：必须 followup（inject 不唤醒 agent）──
         agent.followup(createUserMessage({ content: messages, source: { kind: 'user' } }))
         await ctx.onPhase('editing', 'agent 已接到任务书，开始改代码')
 
-        // ── 3. 等 agent 干完 ───────────────────────────────
+        // ── 4. 等 agent 干完 ───────────────────────────────
         await waitForAgentIdle(agent, signal, cancelAgent)
 
-        // ── 4. 收集改动 ────────────────────────────────────
+        // ── 5. 收集改动 ────────────────────────────────────
         // 不只是「改了哪些文件」，还要知道每个文件是新增 / 修改 / 删除：
         // GitLab Commits API 的 action 必须对得上，否则新文件报「已存在」、
         // 被删的文件还会被当成 update 提交空内容（等于把远端文件清空）。
-        const collected = await collectChanges(options, { cwd: worktreePath, baseCommit: ctx.baseCommit, signal })
+        const collected = await collectChanges(options, { cwd: worktreePath, baseCommit: ctx.baseCommit, baseline, signal })
         const committableChanges = collected.changes.filter((change) => !isSensitivePath(change.path) && !isSensitivePath(change.from ?? ''))
         const committable = committableChanges.map((change) => change.path)
         const blocked = collected.files.filter((file) => !committable.includes(file))
+        // 一句话交代「谁的改动进了提交」—— 这是这张票最容易引起误会的地方，
+        // 不写清楚，人只看到提交里少了几个自己改的文件，会以为执行器丢了东西。
+        if (baseline) {
+          const held = Number(baseline.dirtyCount ?? 0)
+          ctx.log?.(`executor-agent：基线：用户已有 ${held} 个未提交改动，本次只提交 agent 改过的 ${committable.length} 个`)
+        } else {
+          ctx.log?.(`executor-agent：没有基线（工作区干净或拍基线失败），本次提交 ${committable.length} 个改动文件`)
+        }
         if (blocked.length > 0) {
           // 不抛错：业务代码可能已经改对了，抛了人只看到「失败」，看不到「哪几个文件被拦」。
           // 但不能只写日志 —— 插件日志人平时不看，最后只会在 MR 里发现「少改了一个文件」。
@@ -318,6 +361,9 @@ export function createAgentExecutor (options = {}) {
           await ctx.onPhase('failed')
           return makeExecResult({
             phase: 'failed',
+            // 失败也把 sessionId 带回去：人/调度器要知道是哪次会话没干成活，
+            // 才能在工作区里点进去看那一轮到底聊了什么。
+            sessionId,
             changedFiles: [],
             testOutcome: 'skipped',
             testDetail: reason,
@@ -325,11 +371,11 @@ export function createAgentExecutor (options = {}) {
           })
         }
 
-        // ── 5. 验证 ────────────────────────────────────────
+        // ── 6. 验证 ────────────────────────────────────────
         await ctx.onPhase('testing', '跑项目配置里的验证命令')
         const verification = await runVerification(options, verify, worktreePath, signal)
 
-        // ── 6. 本地提交（+ 可选开 draft MR）───────────────
+        // ── 7. 本地提交（+ 可选开 draft MR）───────────────
         // 需求：处理完「向本地仓库（非远程）提交 PR」。本机 git push 物理上不可能
         // （沙箱不给 git-receive-pack 建 stdin 管道），所以改动的交付形态是
         // **工作区检出里的一次真实本地提交** —— 人在检出里 `git show` / `git log`
@@ -369,6 +415,9 @@ export function createAgentExecutor (options = {}) {
           : `⚠ 未通过验证（${verification.outcome}）：${verification.detail}`
         return makeExecResult({
           phase,
+          // 会话默认保留在工作区名下（配置项 keepSession），人按这个 id 就能找回
+          // 这张票的会话、接着追问。所以结果里必须带出去，否则谁也定位不到它。
+          sessionId,
           changedFiles: committable,
           testOutcome: verification.outcome,
           testDetail: verification.detail,
@@ -398,6 +447,7 @@ export function createAgentExecutor (options = {}) {
         await ctx.onPhase('failed').catch(() => {})
         return makeExecResult({
           phase: 'failed',
+          sessionId,
           changedFiles: [],
           testOutcome: 'skipped',
           testDetail: normalized.message,
@@ -421,10 +471,57 @@ export function createAgentExecutor (options = {}) {
         } catch (error) {
           log('executor-agent：释放 agent 时出错', { reason: String(error) })
         }
+        // agent 释放 = 这一轮跑完了、不再占模型配额；**会话**是另一回事。
+        //
+        // 缺省 `keepSession: true`：会话留在项目工作区名下 —— 人在 GUI 里按
+        // `result.sessionId` 能找到这张票的那一轮，接着追问「为什么这么改」。
+        // 这时候绝不能顺手把会话也关掉，否则人点进去就是一条空会话。
+        if (config.keepSession !== false) {
+          log(`executor-agent：agent 已释放，会话保留（sessionId=${sessionId}，keepSession=true）`, {
+            sessionId,
+            workspaceId: ctx?.workspaceId,
+          })
+        } else {
+          await closeSession(options, runtimeAgentCtx, sessionId, log)
+        }
       }
     },
   })
 }
+/**
+ * `keepSession=false` 时，把这次执行用的会话也收掉。
+ *
+ * 为什么是「尽量做」：`sessions` 服务不是每个 profile 都有，方法名在不同宿主版本里
+ * 也不一样（`close` / `dispose` / `closeSession`）。收不掉会话只是留下一条孤儿会话，
+ * 不该让一张已经跑完的票变成失败 —— 所以这里永远不抛，只记日志。
+ *
+ * agent 的释放**不在这里**：那是无论如何都要做的事，在 `run` 的 finally 里无条件执行。
+ *
+ * @param {any} options createAgentExecutor 的 options
+ * @param {any} agentCtx setup 回调拿到的上下文（可能没拿到：agents.create 抛了）
+ * @param {string} sessionId
+ * @param {(msg: string, detail?: unknown) => void} log
+ * @returns {Promise<void>}
+ */
+async function closeSession (options, agentCtx, sessionId, log) {
+  // 弱取：宿主只在某些 profile 挂 `sessions`，组合根也可能直接注入到 options 里。
+  const sessions = agentCtx?.get?.('sessions') ?? options.sessions
+  const close = sessions?.close ?? sessions?.dispose ?? sessions?.closeSession
+  if (typeof close !== 'function') {
+    log('executor-agent：本机没有能关会话的服务，keepSession=false 只能释放 agent', { sessionId })
+    return
+  }
+  try {
+    await close.call(sessions, sessionId)
+    log('executor-agent：agent 与会话都已释放（keepSession=false）', { sessionId })
+  } catch (error) {
+    log('executor-agent：agent 已释放，但关会话失败（会话留在工作区名下，不影响本票结论）', {
+      sessionId,
+      reason: String(error),
+    })
+  }
+}
+
 /**
  * sessionId：`ticket-<projectId>-<recordId>-<时间戳>`。
  *
@@ -846,10 +943,25 @@ function resolveCreateUserMessage (injected) {
  * 从 status 里只补 diff 看不见的那些（未跟踪 = `??`），其余交给 diff —— diff 带
  * rename 的旧路径信息，status 的 `R` 只有在已暂存时才出现，两者互补但 diff 更全。
  *
+ * **`baseline`（`createBaseline` 的产物）改变的是「跟谁比」**：
+ * - 没有 baseline：`git diff <baseCommit>`，即「跟检出点比」。工作区是脏的时候，
+ *   人自己早先的未提交改动也会出现在这份 diff 里，然后被当成 agent 的产物提交掉
+ *   —— 这正是「不提交不是你修改的文件」要防的事。
+ * - 有 baseline（`baseline.sha`）：`git diff <baseline.sha>`，即「跟 agent 动手前比」。
+ *   人已有的未提交改动在基线快照里已经有了，diff 出来就是空的，自然不会进提交。
+ * - 未跟踪文件两边都看不见（`git diff <commit>` 不列未跟踪），只能靠 status 补。
+ *   有基线时按内容哈希判断：基线上有同名同哈希的文件 = 人本来就放在那儿的，跳过；
+ *   哈希变了（人改过一半 agent 接着改）或者压根不在基线上 = 本次的产物，收下。
+ *
  * `-z` / `-uall` / 排除 `.agents/worktrees/` 的理由见 `contracts/git-status.js`。
  *
  * @param {any} options
- * @param {{ cwd: string, baseCommit?: string, signal: AbortSignal }} input
+ * @param {{
+ *   cwd: string,
+ *   baseCommit?: string,
+ *   signal: AbortSignal,
+ *   baseline?: { sha?: string, head?: string, untracked?: Map<string, string> },
+ * }} input
  * @returns {Promise<{ files: string[], changes: Array<{ status: string, path: string, from?: string }> }>}
  */
 export async function collectChanges (options, input) {
@@ -860,14 +972,19 @@ export async function collectChanges (options, input) {
   }
 
   const baseCommit = typeof input.baseCommit === 'string' ? input.baseCommit.trim() : ''
+  const baselineSha = typeof input.baseline?.sha === 'string' ? input.baseline.sha.trim() : ''
+  const untrackedBaseline = input.baseline?.untracked instanceof Map ? input.baseline.untracked : new Map()
+  // 有基线就用基线，否则退回检出点。两者都是「一个能 `git diff` 的 commit-ish」。
+  const against = baselineSha.length > 0 ? baselineSha : baseCommit
   /** @type {Array<{ status: string, path: string, from?: string }>} */
   let changes = []
-  if (baseCommit.length > 0) {
+  if (against.length > 0) {
     // `--name-status` 而不是 `--name-only`：前者带 A/M/D/R 状态，后者只给路径。
     // 状态决定提交里是新增还是修改，缺了就只能一律按 update 处理。
-    const result = await runGit(['diff', '--name-status', '-z', baseCommit, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
+    // 末尾的 `--` 也把 `against` 钉成 revision：即使它长得像路径也不会被当成 pathspec。
+    const result = await runGit(['diff', '--name-status', '-z', against, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
     if (result.code !== 0) {
-      throw new PipelineError('internal', `收集改动失败：git diff --name-status ${baseCommit} 返回 ${result.code}：${tail(result.stderr)}`)
+      throw new PipelineError('internal', `收集改动失败：git diff --name-status ${against} 返回 ${result.code}：${tail(result.stderr)}`)
     }
     changes = parseNameStatusZ(result.stdout)
   }
@@ -883,11 +1000,137 @@ export async function collectChanges (options, input) {
     // 只要 diff 看不见的那部分（未跟踪）；已跟踪文件的结论以 diff 为准。
     if (action !== 'create') continue
     if (record.code !== '??') continue
+    // 未跟踪文件没法靠 diff 分辨「谁写的」，只能比内容哈希。
+    if (untrackedBaseline.has(record.path)) {
+      const before = untrackedBaseline.get(record.path)
+      const now = await hashPath(runGit, record.path)
+      // 哈希一致 = 一个字都没动过，是人的东西；读不出哈希（文件在建基线后被删了等）
+      // 就当作没变，宁可不提交也不要替人做主。
+      if (now === undefined || now === before) continue
+    }
     changes.push({ status: 'create', path: record.path })
     known.add(record.path)
   }
 
+  // 重命名的旧路径同样要过一遍基线过滤：`R` 的记录里 `from` 是「被改名的那个文件」。
+  // 它如果本来就是人的未跟踪文件、现在内容还一个字没变，那这条 rename 是 diff 的
+  // 错位匹配，不是 agent 干的活 —— 整条丢掉。（真被改名/删掉的话哈希取不到，
+  // 下面 `now === undefined` 会让它保留，不会误伤 agent 的改名。）
+  if (untrackedBaseline.size > 0) {
+    const filtered = []
+    for (const change of changes) {
+      const from = typeof change.from === 'string' ? change.from : ''
+      if (from.length === 0 || !untrackedBaseline.has(from)) {
+        filtered.push(change)
+        continue
+      }
+      const now = await hashPath(runGit, from)
+      if (now !== undefined && now === untrackedBaseline.get(from)) continue
+      filtered.push(change)
+    }
+    changes = filtered
+  }
+
   return { files: changes.map((change) => change.path), changes }
+}
+
+/**
+ * 「这个文件当时的内容哈希读不出来」的哨兵值。
+ *
+ * 用不可能出现的字符串而不是 `undefined`：`collectChanges` 拿它跟后来算出的哈希比，
+ * 必然不相等，于是这个 `??` 文件仍会被当成本次产物提交 —— 读不出哈希就漏掉
+ * agent 新建的文件，会让整票白跑，那是更坏的错。
+ */
+const UNKNOWN_HASH = '<unknown>'
+
+/**
+ * 取单个文件的内容哈希（`git hash-object -- <path>`，不写对象库）。
+ *
+ * 读不出来就返回 `undefined` —— 调用方把 `undefined` 当作「判断不了」，
+ * 一律偏向「这不是 agent 改的」，宁可不提交也不替人做主。
+ *
+ * @param {(argv: string[]) => Promise<{ code: number, stdout: string, stderr: string }>} runGit
+ * @param {string} filePath
+ * @returns {Promise<string | undefined>}
+ */
+async function hashPath (runGit, filePath) {
+  try {
+    const result = await runGit(['hash-object', '--', filePath])
+    if (Number(result?.code ?? 1) !== 0) return undefined
+    const hash = String(result?.stdout ?? '').trim()
+    return hash.length > 0 ? hash : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 拍一张「agent 动手之前」的基线。
+ *
+ * 为什么要 `git stash create` 而不是记 `HEAD`：工作区可能本来就是脏的 ——
+ * 人自己留着一堆没提交的改动在跑票。记 `HEAD` 的话 `git diff HEAD` 会把那些
+ * 人的改动一并算成 agent 的产物，「不提交不是你修改的文件」就成了空话。
+ * `git stash create` 恰好是「把当前工作区+索引拍成一个 commit 对象并返回它的 sha，
+ * 但**不写任何 ref、不动工作区**」—— 拿它当 diff 的右端点，比的就是「agent 动手前」。
+ *
+ * 它有两个非常规返回值，都必须处理：
+ * - **空字符串**：工作区完全干净（没有暂存、没有未提交改动）→ 没有基线 commit 可拍，
+ *   `sha` 记 `undefined`，`collectChanges` 退回按 `baseCommit` 比（此时两者等价）。
+ * - 命令失败（老 git、仓库损坏）：调用方会 catch 后当没基线处理，不该让整票失败。
+ *
+ * 未跟踪文件是另一套：`git stash create` 缺省不包含未跟踪文件，`git diff <sha>`
+ * 也看不见它们。所以额外拍一份 `路径 → 内容哈希` 的快照，让 `collectChanges` 用
+ * 「内容有没有变」判断一个 `??` 文件是新出现的还是人早就放在那儿的。
+ *
+ * @param {any} options
+ * @param {string} cwd 检出（worktree）路径
+ * @param {AbortSignal} [signal] 暂时只作签名占位：拍基线是三个只读 git 命令，很快，
+ *   不值得在中间插取消点；`run()` 的 `.catch` 也会把取消吞成「没基线」。
+ * @returns {Promise<{ sha?: string, head?: string, dirtyCount: number, untracked: Map<string, string> } | undefined>}
+ */
+export async function createBaseline (options, cwd, signal) {
+  // 没有 git 适配器 = 测试或只读档位，没有可拍的基线，也没有东西会被提交。
+  if (typeof options.git !== 'function') return undefined
+  const runGit = async (argv) => {
+    assertAllowedGit(argv)
+    return options.git(argv, { cwd })
+  }
+
+  const stashed = await runGit(['stash', 'create'])
+  if (Number(stashed?.code ?? 1) !== 0) {
+    throw new PipelineError('internal', `拍基线失败：git stash create 返回 ${stashed?.code}：${tail(stashed?.stderr)}`)
+  }
+  const rawSha = String(stashed?.stdout ?? '').trim()
+
+  const headResult = await runGit(['rev-parse', 'HEAD'])
+  const head = Number(headResult?.code ?? 1) === 0 ? String(headResult?.stdout ?? '').trim() : ''
+
+  /** @type {Map<string, string>} */
+  const untracked = new Map()
+  // 顺带数一下「agent 动手前人自己有多少个未提交改动」—— 只为了写一句让人看得懂的
+  // 日志（「基线：用户已有 N 个未提交改动，本次只提交 agent 改过的 M 个」）。
+  // 数错不影响判断：真正的「提交哪些」只看 diff 与哈希，不看这个数。
+  let dirtyCount = 0
+  const status = await runGit(['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
+  if (Number(status?.code ?? 1) === 0) {
+    for (const record of parseStatusZ(String(status?.stdout ?? ''))) {
+      // `!!` 是 .gitignore 忽略的，既不是人的改动也不会被提交，不计数。
+      if (record.code === '!!') continue
+      dirtyCount += 1
+      if (record.code !== '??') continue
+      const hash = await hashPath(runGit, record.path)
+      // 读不出哈希（文件恰好在建基线时被删、权限问题）就记哨兵值：后续比对必然不等，
+      // 这个文件仍会被当成本次产物提交 —— 漏掉 agent 新建的文件会让整票白跑。
+      untracked.set(record.path, hash ?? UNKNOWN_HASH)
+    }
+  }
+
+  return {
+    sha: rawSha.length > 0 ? rawSha : undefined,
+    head: head.length > 0 ? head : undefined,
+    dirtyCount,
+    untracked,
+  }
 }
 
 /**

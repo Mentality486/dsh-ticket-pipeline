@@ -53,6 +53,8 @@ export const TABLES = Object.freeze({
  * @property {string} [testDetail]
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 工作区检出里的本地提交（本阶段的交付形态）
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
+ * @property {string} [sessionId] 这次执行用的会话 id（会话默认保留在项目工作区名下，可在 GUI 里点回去继续问）
+ * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果
  * @property {number} attempt
  * @property {number} [startedAt]
  * @property {number} [finishedAt]

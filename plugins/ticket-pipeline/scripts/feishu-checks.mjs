@@ -13,7 +13,7 @@
  * - docNamePattern 命中 0 张或 >1 张 = 配置错误
  * - sort 被服务端拒时兜底重试
  * - 错误码分类
- * - **绝不写回表格**
+ * - **扫描绝不写回表格；回填只能走 writeResult，且只碰那三列**
  */
 
 import assert from 'node:assert/strict'
@@ -26,6 +26,8 @@ import {
 // 分支名清洗是纯函数，顺带在这里一起测：它虽然住在 core/，但唯一的调用方是拼分支名的上层，
 // 而 recordId 正是从飞书适配器里出来的 —— 放在这一节能顺手验证「飞书的脏 recordId 不会炸 git」。
 import { sanitizeBranchName } from '../src/core/branch-name.js'
+// mock 源放在这一节测：它要跟飞书适配器**同形状**，两个实现放一起对比才看得见偏差。
+import { createMockSource } from '../src/adapters/source-mock/index.js'
 
 const APP_TOKEN = 'app-token-1'
 const TABLE_ID = 'tbl-1'
@@ -1154,5 +1156,183 @@ export async function runFeishuChecks (check) {
     assert.ok(!/-$/.test(long), '截断后不能以 - 结尾')
     const dirty = sanitizeBranchName('rec 9 / 登录 * 故障')
     assert.ok(!/[^A-Za-z0-9._/-]/.test(dirty), `清洗后不能残留非法字符：${dirty}`)
+  })
+
+  // ——————————————————————————————————————————————————————————————
+  // 回填（writeResult）：本文件里**唯一**允许的写操作，所以断言要盯死三件事 ——
+  // 打的是哪条接口、写的是哪三列、失败时吐的是回执还是异常。
+  // 上面那条「绝不写回表格」的用例只覆盖 scan / loadScreenshot，
+  // 这里补的是另一个方向：scan 一步不动表，回填只动那三列。
+  // ——————————————————————————————————————————————————————————————
+
+  await check('回填：PUT 打 records/{recordId}，只写「是否处理 / 处理结果 / 处理日期」三列', async () => {
+    // 为什么盯 method 和 path：飞书回填记录的写法有好几种（batch_update、update、PUT records/{id}），
+    // 选错一个就会在真环境里写错行或写错表。契约只承诺「把结果落到这张票上」，
+    // 具体接口是适配器的实现细节 —— 而实现细节错了，在离线用例里就该先炸。
+    const server = createFakeServer({ rows: [makeRow('rec-1')] })
+    const { source } = makeSource(server)
+
+    assert.equal(typeof source.writeResult, 'function', 'writeResult 是契约里的可选能力，飞书源必须提供')
+
+    const receipt = await source.writeResult('rec-1', { result: '已修好，加了空值保护' })
+    assert.equal(receipt.written, true, '写成功要回 written:true')
+    assert.deepEqual(
+      [...receipt.fields].sort(),
+      [FEISHU_COLUMNS.status, FEISHU_COLUMNS.result, FEISHU_COLUMNS.handledAt].sort(),
+      '回执里的字段名必须是这三个中文列名（人对着表格能直接对上）',
+    )
+
+    const put = server.requests.find((request) => request.method === 'PUT')
+    assert.ok(put, `回填没发出 PUT 请求，实际请求：${server.requests.map((r) => `${r.method} ${r.url}`).join(', ')}`)
+    assert.ok(
+      put.url.endsWith(`/open-apis/bitable/v1/apps/${APP_TOKEN}/tables/${TABLE_ID}/records/rec-1`),
+      `回填要打到这张表的具体那一行，实际 ${put.url}`,
+    )
+
+    const fields = put.body?.fields
+    assert.ok(fields && typeof fields === 'object', `PUT 的 body 必须是 { fields }，实际 ${JSON.stringify(put.body)}`)
+    assert.equal(fields[FEISHU_COLUMNS.result], '已修好，加了空值保护', '「处理结果」要原样写进去')
+    assert.equal(fields[FEISHU_COLUMNS.status], '是', 'status 缺省就是「是」—— 票处理完了就是处理了')
+    assert.equal(typeof fields[FEISHU_COLUMNS.handledAt], 'number', '「处理日期」传毫秒时间戳数字，别传格式化字符串')
+    assert.ok(
+      Math.abs(Number(fields[FEISHU_COLUMNS.handledAt]) - Date.now()) < 60_000,
+      `handledAt 缺省应该是「现在」，实际 ${String(fields[FEISHU_COLUMNS.handledAt])}`,
+    )
+    // 只准碰这三列：顺手写了「处理人」「最后更新时间」之类，等于替人改了别的列。
+    assert.deepEqual(
+      Object.keys(fields).sort(),
+      [FEISHU_COLUMNS.status, FEISHU_COLUMNS.result, FEISHU_COLUMNS.handledAt].sort(),
+      `回填只能写这三个字段，实际写了：${Object.keys(fields).join('、')}`,
+    )
+  })
+
+  await check('回填：status / handledAt 可显式覆盖，空 status 回落到「是」', async () => {
+    // 为什么允许覆盖 status：不同团队的表用「已完成」「已处理」而不是「是」，
+    // 这是**表**的约定，适配器不该替人改词。
+    const server = createFakeServer({ rows: [] })
+    const { source } = makeSource(server)
+
+    await source.writeResult('rec-2', { status: '已完成', result: '已修复', handledAt: 1_700_000_123_456 })
+    const put = server.requests.find((request) => request.method === 'PUT')
+    assert.equal(put.body.fields[FEISHU_COLUMNS.status], '已完成', '调用方给了 status 就用它')
+    assert.equal(put.body.fields[FEISHU_COLUMNS.handledAt], 1_700_000_123_456, '调用方给了 handledAt 就用它，别改写')
+
+    await source.writeResult('rec-3', { status: '   ', result: '只有空格的状态值等于没给' })
+    const last = server.requests.filter((request) => request.method === 'PUT').at(-1)
+    assert.equal(last.body.fields[FEISHU_COLUMNS.status], '是', '空白 status 要回落成缺省值，不能往表里写一串空格')
+  })
+
+  await check('回填：表里没有那几列时退回只读回执，不把整票判失败', async () => {
+    // 为什么这条重要：回填是**附加动作**。人把插件接到一张没有「处理结果」列的表上时，
+    // 票其实已经处理完了 —— 因为「表少一列」把它判失败，是本末倒置。
+    // 正确做法是回 { written:false } 并在 note 里说清缺什么，让人去补表结构。
+    const server = createFakeServer({ rows: [] })
+
+    // 形态一：业务码（FieldNameNotFound 是飞书这一族的常见写法）。
+    const codeFetch = async (url, init = {}) => (
+      String(init.method ?? 'GET').toUpperCase() === 'PUT'
+        ? jsonResponse({ code: 1254045, msg: 'FieldNameNotFound' })
+        : server.fetchImpl(url, init)
+    )
+    const { source } = makeSource(server, { fetch: codeFetch })
+    const byCode = await source.writeResult('rec-1', { result: '已修复' })
+    assert.equal(byCode.written, false, '字段缺失不是故障，应该回 written:false 而不是抛')
+    assert.ok(/没有「/.test(byCode.note ?? '') || /列/.test(byCode.note ?? ''), `note 要说清缺的是列：${byCode.note}`)
+    assert.ok(/是否处理/.test(byCode.note ?? ''), `note 要点出具体列名，实际：${byCode.note}`)
+
+    // 形态二：码没对上、但 msg 里明说「字段不存在」—— 错误码表是飞书侧的闭源约定，
+    // 只认码迟早会漏，所以还要认关键词。
+    const msgFetch = async (url, init = {}) => (
+      String(init.method ?? 'GET').toUpperCase() === 'PUT'
+        ? jsonResponse({ code: 1254006, msg: '字段「处理结果」不存在' })
+        : server.fetchImpl(url, init)
+    )
+    const { source: byMsg } = makeSource(server, { fetch: msgFetch })
+    const byMessage = await byMsg.writeResult('rec-1', { result: '已修复' })
+    assert.equal(byMessage.written, false, 'msg 里明说字段不存在时也要退化成只读回执')
+  })
+
+  await check('回填：真故障（鉴权 / 网络）必须抛出来，不能吞掉假装写成功', async () => {
+    // 为什么不能一律吞：吞掉异常会让「表格压根没更新」这件事无声无息，
+    // 人对着没回填的表会以为插件没跑。上层会兜住并记日志，但适配器必须如实抛。
+    const server = createFakeServer({ rows: [] })
+    const forbiddenFetch = async (url, init = {}) => (
+      String(init.method ?? 'GET').toUpperCase() === 'PUT'
+        ? { ok: false, status: 403, headers: headerBag({}), json: async () => ({ code: 0 }), text: async () => 'forbidden' }
+        : server.fetchImpl(url, init)
+    )
+    const { source } = makeSource(server, { fetch: forbiddenFetch })
+    await assert.rejects(
+      () => source.writeResult('rec-1', { result: '已修复' }),
+      (error) => error.kind === 'auth',
+      '403 重试一次后仍然是 auth 错误，必须抛出去，而不是回 written:true',
+    )
+    const puts = server.requests.filter((request) => request.method === 'PUT')
+    assert.equal(puts.length, 0, '403 是被包装的 fetch 拦下的，不该落到真实桩上')
+  })
+
+  await check('回填：recordId / result / handledAt 不合法时当场报错，一个请求都不发', async () => {
+    // 为什么先校验再发请求：飞书的 PUT 一旦发出去就可能改错行，
+    // 参数层面的错必须在校验阶段就拦住（也省一次网络往返）。
+    const server = createFakeServer({ rows: [] })
+    const { source } = makeSource(server)
+    const before = server.requests.length
+
+    await assert.rejects(
+      () => source.writeResult('', { result: '已修复' }),
+      (error) => error.kind === 'invalid-input',
+      '空 recordId 定位不到行，必须报 invalid-input',
+    )
+    await assert.rejects(
+      () => source.writeResult('rec-1', null),
+      (error) => error.kind === 'invalid-input',
+      '回填内容不是对象时要报错，而不是写一堆 undefined 上去',
+    )
+    await assert.rejects(
+      () => source.writeResult('rec-1', { status: '是' }),
+      (error) => error.kind === 'invalid-input',
+      '缺 result（「处理结果」写什么）必须报错 —— 空着回填等于没回填',
+    )
+    await assert.rejects(
+      () => source.writeResult('rec-1', { result: '已修复', handledAt: -1 }),
+      (error) => error.kind === 'invalid-input',
+      '负数时间戳写进日期字段会让飞书报错，提前拦住',
+    )
+    assert.equal(server.requests.length, before, `校验失败不该发出任何请求，实际发了 ${server.requests.length - before} 个`)
+
+    // 取消信号同样要在发请求之前生效。
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(
+      () => source.writeResult('rec-1', { result: '已修复' }, controller.signal),
+      (error) => error.kind === 'aborted',
+      '已经取消的调用不该再发请求',
+    )
+  })
+
+  await check('mock 源也有同形状的 writeResult：记在内存里，failWrite 时抛错', async () => {
+    // 为什么 mock 也要测：自测/离线试跑全走 mock，这条链路（唯一会写远端的动作）
+    // 在 mock 上不成立的话，dev-run 里所有「跑完一张票」的用例都验证不到回填。
+    // 两条适配器必须同形状 —— 上层调度器不该为「是真表还是假表」分叉。
+    const source = createMockSource({ seeds: [{ recordId: 'rec-m1', status: '处理中', description: '登录页报 500' }] })
+    assert.equal(typeof source.writeResult, 'function', 'mock 源同样要实现契约里的 writeResult')
+
+    const receipt = await source.writeResult('rec-m1', { result: '已修好' })
+    assert.equal(receipt.written, true)
+    assert.equal(source.writes.length, 1, '回填要能在内存里被数出来，否则用例断言不到')
+    assert.deepEqual(
+      { recordId: source.writes[0].recordId, status: source.writes[0].status, result: source.writes[0].result },
+      { recordId: 'rec-m1', status: '是', result: '已修好' },
+      `mock 记下来的内容要和真适配器写出去的一致，实际 ${JSON.stringify(source.writes[0])}`,
+    )
+    assert.equal(typeof source.writes[0].handledAt, 'number', 'handledAt 缺省也必须是毫秒时间戳')
+
+    source.setFailWrite(true)
+    await assert.rejects(
+      () => source.writeResult('rec-m1', { result: '再修一次' }),
+      (error) => error.kind === 'network',
+      'setFailWrite 打开的开关必须真的让回填失败（用来验证「回填失败不回退票态」）',
+    )
+    assert.equal(source.writes.length, 1, '失败的这次不该记进 writes')
   })
 }

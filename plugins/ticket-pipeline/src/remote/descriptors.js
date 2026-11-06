@@ -11,8 +11,11 @@
  * - 每个 codec 必须 `mode: 'strict'` 且带 `typeSymbol` + `create()`
  * - 只有 `{ kind: 'direct' }` 这一种 invocation（另一种是 stream）
  *
- * 为什么这些方法没有参数：体检与读配置都是「点一下就出结果」，不需要入参；
- * 少一个参数就少一条 `assertExactArguments` 能炸的路。
+ * 为什么这些方法没有参数：体检、读配置、读项目清单、读分支清单都是「点一下就出结果」，
+ * 不需要入参；少一个参数就少一条 `assertExactArguments` 能炸的路。
+ *
+ * `branches()` 也刻意不带 `repoPath` 入参：面板按下拉框时手上正好有一整份项目清单，
+ * 一次取回全部项目的分支比「每个项目各发一次」少一整类竞态（面板重绘时会重复发）。
  */
 
 /** 远程命名空间名 = `ctx.provide()` 的键 = descriptor 里的 namespace。 */
@@ -39,18 +42,29 @@ const doctorReport = codec('DoctorReport', (value) => value)
 /** 配置快照：原样透传（`describeConfig()` 已经打过码）。 */
 const configSnapshot = codec('ConfigSnapshot', (value) => value)
 
+/** 项目清单：原样透传（`describeProject()` 已经把 appToken 收成摘要）。 */
+const projectList = codec('ProjectList', (value) => value)
+
+/** 分支清单：原样透传（`listBranches()` 已经把 git 输出解析成纯字符串数组）。 */
+const branchList = codec('BranchList', (value) => value)
+
 /**
  * 一个无参 direct 方法。
  * @param {string} method
  */
 function method (method) {
+  /** @type {any} */
+  let result = configSnapshot
+  if (method === 'doctor') result = doctorReport
+  if (method === 'projects') result = projectList
+  if (method === 'branches') result = branchList
   return {
     id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/${method}`,
     service: TICKET_PIPELINE_NAMESPACE,
     namespace: TICKET_PIPELINE_NAMESPACE,
     method,
     invocation: { kind: 'direct' },
-    result: method === 'doctor' ? doctorReport : configSnapshot,
+    result,
     parameters: [],
   }
 }
@@ -59,6 +73,8 @@ function method (method) {
 export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('doctor'),
   method('config'),
+  method('projects'),
+  method('branches'),
 ])
 
 /**

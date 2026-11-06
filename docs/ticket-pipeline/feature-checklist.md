@@ -1,8 +1,8 @@
 # 工单流水线插件 · 功能清单与完成度
 
 > 生成日期：2026-11-05
-> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 53 次提交，HEAD `2488036`），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-06，新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 **294/294** 全绿；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，开跑前要求检出干净；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
+> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 64 次提交，HEAD `59c8708` + 工作树未提交的四项改造与选择分支），插件目录 `plugins/ticket-pipeline`
+> 最近一次更新：2026-11-06，新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12），自测 **325/325** 全绿；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -31,7 +31,7 @@
 
 | # | 需求（原始表述） | 状态 | 真实依据 | 差在哪 |
 | --- | --- | --- | --- | --- |
-| ① | AI 同时监控多个平台（金山共享 Excel、飞书）上的工单表，检测内容变化 | **✅ 可用** | 飞书源 1264 行，已接真实表（appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条记录实测）；金山源 1340 行（xlsx/zip 自解 OOXML）；webform/mock 演示源 | 金山缺开放平台取数通道，只能用注入的 `fetchSheet`；飞书「收票状态值」与真实表语义不一致，已做成可配（`statusValues`） |
+| ① | AI 同时监控多个平台（金山共享 Excel、飞书）上的工单表，检测内容变化 | **✅ 可用** | 飞书源 1384 行，已接真实表（appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条记录实测）；金山源 1360 行（xlsx/zip 自解 OOXML）；webform/mock 演示源 | 金山缺开放平台取数通道，只能用注入的 `fetchSheet`；飞书「收票状态值」与真实表语义不一致，已做成可配（`statusValues`） |
 | ② | 可以在插件中配置对应工单的项目本地仓库地址 | **✅ 可用** | `projects[].repo.path` / `remote` / `baseBranch` / `targetBranch` / `gitlab`（enabled / baseUrl / projectId / remote），由 `locator-table`（187 行）把工单 projectId 映射到仓库；`repo.gitlab` 已能在配置校验层存活（`5b94a17`），`gitlab.enabled` 是远程 MR 出口总开关、缺省 `false` | 无（这项已补齐） |
 | ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `FEISHU_COLUMNS`（描述/操作流程/截图/模块/优先级/发现日期等）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② ~~金山表该列的值被丢弃~~ → **已修（`26f0391`）**：金山表该列的值现在进 `ticket.targetProject` 并写进任务书（不顶 `projectId` —— 那是存储主键的一半，而这一列是人手填的自由文本）；③ ~~URL 形态截图默认全拒、无配置键~~ → **已修（`26f0391`）**：新增 `match.allowedImageHosts` 白名单配置键（缺省仍为空 = 一律拒绝，安全闸门只有人能打开） |
 | ④ | 自主规划并执行修复 | **⚠️ 部分** | `executor-agent` 真实现：先确保**项目工作区**（`repo.path` 目录在宿主 `workspaceRegistry` 里登记，一个项目一条，多票共用）→ `agents.create({meta:{cwd: workspacePath}})` + 挂 preset + （仅 `isolateWorktree: true` 时）`workingDirectory.set(worktreePath)` + `attachSession` 归属工作区 + followup + `git diff --name-status` 收集改动 + 敏感文件过滤；沙盒票 `sandbox\|rec-mock-001` 已由 agent 真改出 `src/pagination.js`，当轮开成 MR !1（**本轮改成在工作区检出里做本地提交**，见 §1.2） | 真实业务票（pms）只在配额上卡过一次；两处宿主侧雷已修（`5b94a17`：`{{model}}` 补齐、preset 缺服务硬失败），但**尚未在真实 pms 票上完整跑绿一次**（上游 workbuddy 429 配额限制，非插件缺陷） |
@@ -110,14 +110,14 @@ fix(pms): [pms] ##1 rec-probe-1
 | --- | --- | --- |
 | 改代码落点 | 每票 `git worktree add -b <branch> .agents/worktrees/<branch>` | **缺省就在项目工作区的检出里改**（分支 = 检出当前分支，不另开票分支，`baseCommit` = 检出当前 HEAD） |
 | 新增配置键 | — | `isolateWorktree: boolean`，**默认 `false`**。`true` 才退回上面的隔离 worktree 行为 |
-| 开跑前置条件 | 无（新 worktree 天然是干净的新检出） | 缺省模式**必须检出干净**：`inspectCheckout()` 读 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>` + `rev-parse --abbrev-ref HEAD`（`-z` / `-uall` / 排除规则三者的必要性见 §1.4），`assertCleanCheckout()` 脏就抛 `invalid-input`，报错**点名具体文件**并提示「提交或 stash 之后再跑，或者打开 `isolateWorktree` 让每票用独立隔离目录」 |
+| 开跑前置条件 | 无（新 worktree 天然是干净的新检出） | 缺省模式**脏也能跑**：`inspectCheckout()` 读 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>` + `rev-parse --abbrev-ref HEAD`（`-z` / `-uall` / 排除规则三者的必要性见 §1.4），`describeDirtyCheckout()` 只提醒不拒跑（详见 §1.10） |
 | `workingDirectory.set` | 只要有工作区坐标就钉到 worktree | 判据改成 `worktreePath !== workspacePath`：缺省模式两者相等 → 不需要钉、也不要求宿主有 `workingDirectory` 服务；只有 `isolateWorktree: true` 且缺服务才抛 `invalid-input` |
 | 清理安全 | `git worktree remove --force` 直接执行 | 加 `isIsolatedWorktreePath()` 前缀校验（只认 `<repo>/.agents/worktrees/<name>`）。缺省模式下没有隔离 worktree，若不校验，`remove --force` 会对着人的主检出执行 —— 这是必须堵的口子 |
 | 配置项关联 | `fetchBeforeCreate` / `branchPrefix` / `worktreeRetentionHours` 恒生效 | 三者现在**只在 `isolateWorktree: true` 时用得上**（不建 worktree 就没有可清、可拉、可命名的票分支） |
 | `pipeline_doctor` | 只报凭据与 remote | 缺省模式额外检查检出干净度：干净显示「检出干净，可以直接跑票」，脏显示「⚠️ 检出有 N 个未提交改动（跑票会被拒）」；并打一行「ℹ️ 改代码落点：项目工作区检出里（要求检出干净）」/「ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）」 |
 
 自测 269 → **274**（`dev-run.mjs` 新增第 15 节「改代码落点」）：`inspectCheckout` 干净/脏/拿不到状态三种情况都说清、
-`assertCleanCheckout` 脏工作区拒跑且报错点名文件 + 提 `stash` + 给出 `isolateWorktree` 旁路、
+`describeDirtyCheckout` 脏工作区只提醒不拒跑且文案能照着理解（当时是 `assertCleanCheckout` 拒跑，见 §1.10 的后续改造）、
 `isIsolatedWorktreePath` 只认插件自己开的 `.agents/worktrees/<name>`（人的主检出、`.agents` 本身、路径穿越一律 false）、
 真实 `apply()` 缺省模式不建隔离 worktree 且票据落在工作区根上（`branch` = 检出当前分支，`baseCommit` = 检出 HEAD）。
 
@@ -261,26 +261,149 @@ next.phase = to
 
 ---
 
+### 1.8 处理完回填工单表（2026-11-06，工作树未提交）
+
+**要解决什么**：票跑完了，人还得自己去表格里把「是否处理」改成「是」、把改了哪些文件抄进「处理结果」。
+插件明明什么都知道，却让这一步纯手工 —— 忘一次，表里就是一张永远「处理中」的假在办票。
+
+**做法**：`TicketSource` 加一个**可选**方法 `writeResult(recordId, { status?, result, handledAt? }, signal)`，
+`scan` 仍然只读，**这是唯一的写入口**，只在票跑成 `done` / `skipped` 之后被调用一次。
+
+| 环节 | 落点 |
+| --- | --- |
+| 契约 | `src/contracts/ticket-source.js`：`writeResult?` + `WriteBackReceipt = { written, fields?, note? }` |
+| 调用 | `src/core/scheduler.js` `writeBackFor()` —— 三条硬约束：只写 done/skipped（failed 留在「处理中」是刻意留的信号）、回填失败只记日志**绝不影响票态**、被取消就不写 |
+| 正文 | `renderWriteBackResult()`：首句（skipped 是「已按工单改完并提交，但验证没跑通，需要人工确认。」）+ 改动文件（最多 8 个）+ 验证结论 + 本地提交 sha/分支/路径 + draft MR（若开）+ 处理会话 id + 末段「要进一步修改，把这个单元格清空、把「是否处理」拨回「处理中」即可重跑。」 |
+| 飞书实现 | `PUT /open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}`，body `{ fields: { 是否处理, 处理结果, 处理日期 } }`；字段缺失（业务码 1254040 / 1254045）返 `{ written:false, note }` **不抛**，其余异常照抛 |
+| 开关 | `writeBack`（bool，缺省 **true**）、`writeBackStatus`（str，缺省 `'是'`） |
+| 可观测 | `pipeline_status` 每票多一行 `回填表格：成功（是否处理、处理结果、处理日期）` 或 `回填表格：没写成 —— <原因>`；返回体多 `writeBack` |
+| 决策 | 新增 [ADR-0006](../adr/0006-处理完回填工单表.md) |
+
+**为什么写在 `writeResult` 而不是塞进 `scan`**：`scan` 是高频、可重试、随时可能被取消的只读动作；
+写必须低频（一票一次）、只在真出结果之后。混在一起的后果是「扫一半就把表写了」和「重试一轮写一次」。
+
+**新增断言**（`dev-run.mjs` 第 16 节 + `feishu-checks.mjs`）：三列都写、`writeBackStatus` 可配且空白回落、
+`writeBack=false` 一个请求都不发、failed 不回填、回填失败票态不回退、老适配器没实现时静默跳过、
+skipped 的首句要说「验证没跑通」。`feishu-checks.mjs` 52 → **58**。
+
+### 1.9 处理完保留会话（2026-11-06，工作树未提交）
+
+**要解决什么**：票跑完 agent 就没了，人收到「改完了，`git show` 看吧」，想追问一句「为什么这么改、
+这里能不能换个写法」—— 没有地方问，只能自己读代码。
+
+**做法**：`ExecResult` 新增可选 `sessionId`，`run()` 的三个出口（done / skipped / failed）都带它，
+`executor-agent` 用 `buildSessionId(ticket, ctx)` 生成；票据上落 `sessionId`。
+
+- **agent 实例永远释放**：`finally` 里无条件 `dispose()` —— 保留会话不等于占着模型配额。
+- `keepSession !== false`（缺省）时只记一句日志「agent 已释放，会话保留」，与会话留在项目工作区名下，
+  宿主 GUI 的会话列表里能看到并点进去继续问。
+- `keepSession === false` 才调宿主的 `sessions` 服务收掉（`close` / `dispose` / `closeSession` **三选一，取到哪个用哪个，永不抛**）。
+- `pipeline_status` 多一行 `处理会话：<sessionId>（保留在工作区名下，可在会话列表里点进去继续问）`。
+
+**为什么默认保留**：会话归属的是项目工作区（一个项目一条），留着成本只是几条记录，而「能追问」是这件事
+最有价值的部分。真嫌多余的人把 `keepSession` 关掉即可。
+
+**新增断言**（`gitlab-checks.mjs`）：执行器返回 `sessionId` → 落到票据上、状态里能看到去哪找会话；
+两个出口都带；`keepSession=false` 时会调回收且不抛。
+
+### 1.10 只提交 agent 真正改过的文件（2026-11-06，工作树未提交）
+
+**要解决什么**：缺省模式在人的日常检出里改代码，而人的检出**通常是脏的**（一堆没提交的调试改动）。
+原先的 `assertCleanCheckout` 一律拒跑，等于「想跑票先把你手上的活收干净」；放宽成「脏也照跑」之后，
+又必须保证**人的改动一个都不能被一起提交**。
+
+**做法**：删掉 `assertCleanCheckout`，换成 `describeDirtyCheckout()`（脏只提醒不拒跑）+ 基线快照。
+
+- `createBaseline()`（`executor-agent/index.js`，`agent.followup` **之前**拍）：`git stash create`
+  只造一个 stash commit 对象并回它的 sha —— **不写 ref、不动工作区、不动索引**，`git stash list` 仍是空的；
+  干净时返回空串 → 视为无基线；再 `git rev-parse HEAD`、`git status --porcelain -z -uall` 数人自己的未提交改动数、
+  对每个 `??` 跑 `git hash-object -- <path>` 存内容哈希。
+- `collectChanges()` 的 diff 端点换成基线 sha：比的是「agent 动手前」，人自己的改动天然不在里面；
+  未跟踪文件哈希与基线相同 → 人早就放在那儿，跳过。人是 `git add` 进索引的改动同样被排除。
+- **基线拍不下来就降级**：日志里说明「人原本未提交的改动可能被一起提交」，票不失败。
+- 提示文案（`describeDirtyCheckout`）：项目工作区有 N 个未提交改动，本次照跑；会先拍基线，
+  结束后只提交 agent 真正改过的文件，你自己的改动原样留在工作区。
+- git 白名单新增两项：`stash create`（只这一个，`pop` / `apply` / `drop` 全拒）、`hash-object -- <path>`（强制 `--`）。
+
+**为什么用 `git stash create` 而不是记 `HEAD`**：记 `HEAD` 的话 `git diff HEAD` 会把人的未提交改动
+一并算成 agent 的产物，「不提交不是你修改的文件」就成了空话。
+
+**验收**：真 git 端到端跑过（`dev-run.mjs` 第 15 节）——人的改动一个不出现；`.agents/worktrees/` 不污染判定；
+`isIsolatedWorktreePath` 只认插件自己开的目录，防 `git worktree remove --force` 误删人的主检出。
+
+### 1.11 设置面板补齐：项目清单可编辑（2026-11-06，工作树未提交）
+
+**要解决什么**：设置页之前只能改标量配置，`projects[]` 那 25 个字段（仓库路径、工单表绑定、验证命令…）
+还得手改 `cordis.patch.yml`；写错不报错、改了不生效都要重启才发现。
+
+**做法**：
+
+| 环 | 落点 |
+| --- | --- |
+| Config 树 | `src/core/config.js` `buildProjectsDescriptor()` 新增 `projects` 节点：`type:'array'`、**节点自身 `meta.volatile = true`**、`inner` 是 object（子节点也标 volatile）,`inner.dict` 覆盖 **25 个字段** |
+| 为什么必须自标 volatile | 宿主 `isVolatilePath()` 只沿 `schema.dict` 下钻、**不认 `inner`**，而 `projects` 是数组 —— 深层路径 `['projects','0','repo','path']` 只能靠根节点自己 volatile 短路放行 |
+| 写入 | 只发**深层路径**（`{op:'set', path:['projects','0','repo','path'], value}`），**绝不整数组替换**（会抹掉别的项目和手写 `appToken`），`lib/client.js` 的 `collectOps()` 守着 |
+| 新 Remote 方法 | `ticketPipeline.projects()`（第 3 个）与 `ticketPipeline.branches()`（第 4 个，另两个是 `doctor` / `config`）。`projects()` 返回项目的扁平视图；`appToken` 只给 `hasAppToken` + `appTokenPreview`（前 4…后 4），**明文绝不下发**。`branches()` 对每个项目的检出跑 `git for-each-ref`，把本地 + 远端分支剥成纯分支名，给 `repo.baseBranch` / `repo.targetBranch` 当候选（`src/core/branches.js`） |
+| 面板 | 项目清单可编辑（5 分区 21 字段）、字段约束即时校验（必填 / 数字 min-max / enum / 列表逗号切分）、**基准/目标分支带候选下拉**（输入框 + `<datalist>`，见 §1.12）、分组可折叠（`localStorage`）、sticky 操作条、脏字段「已改」徽标 + 单字段撤销、加载态「正在等待宿主就绪…」 |
+
+全局配置随之变成 **33 个键 / 7 个分组**（新增 `writeBack`、`writeBackStatus` 进新组「回填工单表」，
+`keepSession` 进「执行」组）；`projects` 子树另有 25 个字段，不在这 33 个里。
+
+**验收**：`client-check.mjs` 全绿 —— descriptor 叶子 33 个 / 7 组，schema 信封 71 节点 33 叶子三方一致，
+面板 21 项与宿主 `projects` descriptor 对得上，Remote 4 个方法一致，`projects` 可写 25 字段（深层路径 mutate）；
+`client-smoke.mjs` 85 条断言全过。
+
+### 1.12 选择分支：`repo.baseBranch` / `repo.targetBranch` 带候选（2026-11-06）
+
+**要解决什么**：这两个键以前只能在面板上手打。打错的自查成本极高 —— 本机 pms 仓库主干叫 `v2.x`，
+人凭印象写成 `main`，跑到 `git fetch origin main` 才炸 `fatal: couldn't find remote ref main`，
+票全挂在第一步，错误文案里看不出是「分支名写错了」，人会去查权限、查网络。让面板把检出里真实存在的
+分支列出来，这类错就从「运行时炸」变成「选项里根本没有」。
+
+**做法**：
+
+| 环 | 落点 |
+| --- | --- |
+| 解析 | `src/core/branches.js` 的 `parseBranchRefs()`：`git for-each-ref --format=%(refname) refs/heads refs/remotes` 一条一行；`refs/remotes/` 后**只切第一个 `/`**（`feature/x` 这种分支名要保留）；`origin/HEAD` 是符号引用，丢掉 |
+| 合并 | `mergeBranchChoices()` 去重后按「当前分支 → 远端默认分支 → 本地分支 → 其余远端分支」排序 —— 下拉框第一项就是最可能对的那个 |
+| 列 | `listBranches(gitRunner, repoPath, {detectDefaultBranch})`：**绝不抛**，拿不到就 `ok:false` + 一句人话原因（`repo.path` 没配 / 宿主没给 git 执行链路 / 不是 git 检出 / git 抛错）；主干分支复用体检那边的 `detectBaseBranch`，避免两处对「主干叫什么」的判断漂移 |
+| Remote | `ticketPipeline.branches()`（第 4 个方法）**不带参数**：一次返回全部项目的分支。做成 `branches(repoPath)` 的话，面板每次重绘都会对每个项目各发一次请求，卡片一多就是几十个并发 git 进程 |
+| 面板 | `PROJECT_SECTIONS` 里两个分支字段的 `kind` 从 `text` 改成 `branch`：渲染成 `<input list=...>` + `<datalist>`。**不做成纯 `<select>`** —— 列不出分支时（新克隆、`repo.path` 还没填）下拉是空的，人就彻底填不了了；输入框 + 候选让「列不出来」退化成「手打」而不是「填不了」 |
+| 失败隔离 | 某个项目的 `repo.path` 配错只让它自己的下拉空着并附一句原因，不连累其他项目；分支取不到**从不设错误**，不影响项目清单那一路 |
+
+**为什么按 index 对齐而不是按 repoPath**：两个项目可能指向同一个检出，按路径查表会串味；
+`branches()` 与 `projects()` 用的是同一次 `config.projects` 遍历，index 一定对得上。
+
+**验收**：`dev-run` 新增 6 条断言（解析 / 排序去重 / 真跑通 / 四种失败不抛 / 游离 HEAD / 宿主 remote 按项目隔离），
+自测 **325/325** 全绿；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
+真机验证 `listBranches` 在 `D:/WorkSpace/mgiot-pms`（当前 `v2.x`，候选 `v2.x`/`master`/`workbuddy/v2-x-8ef29a33`/`main`）、
+本仓库（`v0.0.1`/`main`）、`.repos/tp-sandbox`（`main` + 3 个 worktree 分支）上都返回正确清单，
+不存在的路径返回 `fatal: cannot change to ...`。
+
+---
+
+---
+
 ## 2. 代码清单
 
-`src/` 共 **42 个 .js / 13 544 行**；`scripts/` 共 9 个 .mjs / 7 941 行（`dev-run.mjs` 2 508 行）；`lib/client.js` 1 083 行（浏览器端设置面板）。
+`src/` 共 **43 个 .js / 14 675 行**；`scripts/` 共 9 个 .mjs / 9 035 行（`dev-run.mjs` 2 774 行）；`lib/client.js` 2 151 行（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 151 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 3 606 | `scheduler.js`（调度核心）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 6 437 | 见下表 |
-| `src/tools/` | 1 145 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 151 | `descriptors.js`、`host.js`（宿主 Remote 通道） |
-| 根 | 1 054 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `assertCleanCheckout` 也在这里） |
+| `src/contracts/` | 1 185 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 4 156 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult`）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 6 852 | 见下表 |
+| `src/tools/` | 1 154 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
+| `src/remote/` | 269 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 182 行） |
+| 根 | 1 059 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `source-feishu/` | 1 274 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单 |
+| `source-feishu/` | 1 384 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单；**`writeResult` 回填三列**（`PUT /records/:record_id`，字段缺失返 `{written:false}` 不抛） |
 | `source-wps/` | 1 360 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet` |
 | `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
-| `source-mock/` | 267 | 测试 | 离线源；也接 recordIds |
-| `executor-agent/` | 1 795 | **真实实现** | 真 agent 改码、`-z` 口径收集改动（未跟踪新文件也算进来）、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`、删除路径不进 add、重命名旧路径进 commit pathspec）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件 `restore --staged` 退回未跟踪；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
+| `source-mock/` | 329 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
+| `executor-agent/` | 1 786 | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 143 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
 | `gitlab-client/` | 495 | **真实可用** | Commits API + MR API；源分支已有开放 MR 时复用而不撞 409 |
 | `push-qqmail/` | 574 | **真实可用** | 零依赖手写 SMTP（`node:net` / `node:tls` / `node:crypto`），已实发成功 |
@@ -331,23 +454,24 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 平台枚举：`src/core/config.js:447` `PLATFORMS = ['feishu', 'wps', 'mock', 'webform']`（表驱动，新增平台只加这一处）。
 
-### 3.4 契约层（8 个文件 / 1 151 行）
+### 3.4 契约层（8 个文件 / 1 185 行）
 
 | 契约 | 内容 |
 | --- | --- |
 | `errors.js` | `ERROR_KINDS` 7 类（auth / network / rate-limit / not-found / invalid-input / aborted / internal）；`RETRYABLE_KINDS = {network, rate-limit, internal}`；`FATAL_KINDS = {auth, not-found, invalid-input}`；`PipelineError` 带 `retryAfterMs` |
 | `types.js` | 11 个 phase 与 `PHASE_TRANSITIONS` 转移表；`TERMINAL = [done, skipped, failed, gone]`；指纹字段序 |
-| `ticket-source.js` | `TicketSource` 接口：`scan()` 产出 created / updated / disappeared |
-| `work-executor.js` | `WorkExecutor` 接口：`run(ticket, target, ctx)` 产出 `ExecResult` |
+| `ticket-source.js` | `TicketSource` 接口：`scan()` 产出 created / updated / disappeared；**可选 `writeResult(recordId, {status, result, handledAt}, signal)` 是唯一写入口**，只在 done/skipped 后调一次 |
+| `work-executor.js` | `WorkExecutor` 接口：`run(ticket, target, ctx)` 产出 `ExecResult`（含可选 `commit` / `mr` / `sessionId`） |
 | `push-adapter.js` | `PushAdapter` 接口：`send(input, signal)` 产出 `PushReceipt` |
 | `repo-locator.js` | `locate(projectId)` → 仓库 / 分支 / remote |
 | `record-filter.js` | 工单收窄开关（recordIds） |
+| `git-status.js` | `parseStatusZ` / `parseNameStatusZ` / `statusCodeToAction`：`-z` 状态与改名解析、插件自有目录排除规则 |
 
 ---
 
 ## 4. 配置项全表
 
-全局配置 **30 个键**（`src/core/config.js` `CONFIG_FIELDS`，含 `pushplus.*` / `qqmail.*` 这类点号子键），另有项目级配置。
+全局配置 **33 个键 / 7 个分组**（`src/core/config.js` `CONFIG_FIELDS` + `CONFIG_GROUPS`，含 `pushplus.*` / `qqmail.*` 这类点号子键），另有项目级配置（`projects` 子树 25 个字段，不在这 33 个里）。
 
 | 键 | 类型 | 默认 | 范围 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -360,10 +484,13 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | `maxAttempts` | int | 2 | 1–5 | 超过即进死信 |
 | `workExecutor` | str | `mock` | — | `mock` / `agent` |
 | `ticketTimeoutMinutes` | number | 40 | 5–180 | 单票执行超时 |
-| `isolateWorktree` | bool | **false** | — | **改代码落点**：`false`（缺省）直接在项目工作区的检出里改、就地提交，**要求检出干净**（脏就拒跑并点名文件）；`true` 才每票 `git fetch` + `git worktree add -b <branch> .agents/worktrees/<branch>` |
+| `isolateWorktree` | bool | **false** | — | **改代码落点**：`false`（缺省）直接在项目工作区的检出里改、就地提交，**检出脏也能跑**（先拍基线、只提交 agent 改过的）；`true` 才每票 `git fetch` + `git worktree add -b <branch> .agents/worktrees/<branch>` |
 | `fetchBeforeCreate` | bool | true | — | 建工作区前先 `git fetch`（只有 `isolateWorktree: true` 时用得上） |
 | `branchPrefix` | str | `ticket-` | — | 分支名前缀（只有 `isolateWorktree: true` 时用于票分支） |
 | `worktreeRetentionHours` | number | 24 | 0–720 | 隔离 worktree 保留时长（只有 `isolateWorktree: true` 才有 worktree 可清） |
+| `keepSession` | bool | **true** | — | **处理完保留会话**：agent 实例一定释放，会话留在项目工作区名下（GUI 里能点进去继续追问）；设 `false` 才连会话一起收掉 |
+| `writeBack` | bool | **true** | — | **处理后回填工单表**：「是否处理 / 处理结果 / 处理日期」三列；关掉退回纯只读，一个写请求都不发 |
+| `writeBackStatus` | str | `是` | — | 回填写进「是否处理」的值（空串回落 `是`；有的表用「已完成」） |
 | `provider` | str | `workbuddy` | — | 模型 provider |
 | `model` | str | `''`（空=跟随会话默认） | — | 留空才跟随会话默认；钉死会在它被限流时全灭 |
 | `maxTokens` | int | 32000 | 1024–200000 | |
@@ -430,13 +557,17 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
                       │                      ├─ acquireLease（租约 + 心跳续期）
                       │                      ├─ locator.locate(projectId) → 仓库/分支
                       │                      ├─ prepareWorkspace（确保项目工作区）
-                      │                      │     ├─ 缺省：inspectCheckout + assertCleanCheckout（脏则拒跑）
+                      │                      │     ├─ 缺省：inspectCheckout + describeDirtyCheckout（脏只提醒、照跑）
                       │                      │     └─ isolateWorktree: true：git fetch + worktree add
                       │                      ├─ 取截图字节 → saveImage → ImageBlock
                       │                      ├─ executor.run(ticket, target, ctx)
-                      │                      │     ├─ agent：改码 → collectChanges → verify → commitLocally（本地提交）
+                      │                      │     ├─ agent：拍基线(createBaseline) → 改码 → collectChanges(对基线) → verify
+                      │                      │     │        → commitLocally（本地提交）→ 返回 commit + sessionId
+                      │                      │     │        → keepSession 决定要不要回收会话
                       │                      │     └─ mock：只演（返回假 commit）
                       │                      ├─ setPhase(done/skipped/failed/gone)
+                      │                      ├─ writeBackFor（仅 done/skipped 且 writeBack 没关）
+                      │                      │     └─ source.writeResult → 回执落到票据 writeBack
                       │                      ├─ releaseLease
                       │                      └─ push.send（按 notifyOn 过滤）
                       │
@@ -519,10 +650,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **294** | 通过 294，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288 → 293 → 294，倒数第 2 批 5 条是「插件版本自检」，最后 1 条是 setPhase 清 lastError） |
+| `node scripts/dev-run.mjs` | **325** | 通过 325，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → **325**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
-`dev-run.mjs` 分 22 个小节：
+`dev-run.mjs` 分 24 个小节：
 
 | # | 小节 | 覆盖 |
 | --- | --- | --- |
@@ -535,7 +666,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 6 | 启动恢复 | `recoverPending` 断点续跑 |
 | 7 | 通用仓库定位器 | `projects[]` 查表、坏条目隔离 |
 | 8 | 工作区清理 | 过期 worktree 回收（只有开了 `isolateWorktree` 才有 worktree 可清）、`isIsolatedWorktreePath` 前缀校验 |
-| 9 | 飞书适配器（离线打桩） | 52 项：状态值、recordIds、指纹、早停退役 |
+| 9 | 飞书适配器（离线打桩） | **58 项**：状态值、recordIds、指纹、早停退役、**`writeResult` 回填三列**（+6 条） |
 | 10 | P0 修复 | 租约心跳、注入时钟、送达回执配置、人工取消 |
 | 11 | §5.1 A 组链路断点 | 截图进 prompt、真实工作区、失败原因、人工重开；**陈旧工作区坐标不复用**（目录已删要重建且不把死坐标传下去 / 换了仓库要重建 / 探测抛错时不重建） |
 | 11.6 | `onPhase` 的第二参 | 字符串是「说明」，不能被当字段补丁写进票据 |
@@ -545,15 +676,21 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 12c | 走宿主 shell 必须显式带 sandboxPolicy | 写授权 |
 | 12d | 工具输出必须是 lossless JSON | `undefined` 会让宿主判整次调用失败 |
 | 12e | 平台可插拔 | 状态值可配 + 金山文档接进组合根 |
-| 13 | 新适配器 | gitlab 客户端 68 项（新增 7 条本地提交断言 + 10 条 `-z` 收集/暂存断言，原 51）/ qqmail 推送 18 项 / wps 工单源 25 项 |
+| 13 | 新适配器 | gitlab 客户端 **78 项**（新增 7 条本地提交断言 + 10 条 `-z` 收集/暂存断言 + **10 条基线/keepSession 断言**，原 51）/ qqmail 推送 18 项 / wps 工单源 25 项 |
 | 14 | 项目工作区 | 11 项：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用、attachSession 归属 |
-| 15 | 改代码落点 | `inspectCheckout` 干净/脏/拿不到状态三种情况；`assertCleanCheckout` 脏则拒跑并点名文件 + 给 `stash` 与 `isolateWorktree` 两条出路；`isIsolatedWorktreePath` 只认 `.agents/worktrees/<name>`；真实 `apply()` 缺省不建隔离 worktree、票据落在工作区根上（`branch` = 检出当前分支、`baseCommit` = 检出 HEAD） |
+| 15 | 改代码落点 | `inspectCheckout` 干净/脏/拿不到状态三种情况（`-z -uall` + 排除插件自有目录）；`describeDirtyCheckout` 脏工作区只提醒不拒跑、文案能照着理解；`isIsolatedWorktreePath` 只认 `.agents/worktrees/<name>`；真实 `apply()` 缺省不建隔离 worktree、票据落在工作区根上（`branch` = 检出当前分支、`baseCommit` = 检出 HEAD） |
+| 16 | 处理完回填工单表 + 保留工作区会话 | done → 三列都写；`writeBackStatus` 可配、空白回落「是」；`writeBack=false` 完全不写（退化成只读）；failed 不回填；回填失败只记票据、票态不回退、不影响通知；老适配器没有 `writeResult` 时静默跳过；执行器返回 `sessionId` 落到票据、状态里能看到去哪找会话；`pipeline_status` 成功/失败都能一眼看到；skipped 的回填首句要说「验证没跑通，需要人工确认」 |
+| 17 | 选择分支 | `parseBranchRefs` 解析 `for-each-ref`（`refs/remotes/` 后只切第一个 `/`、丢掉 `origin/HEAD` 这类符号引用）；`mergeBranchChoices` 排序（当前分支 → 远端默认 → 本地 → 其余远端）；`listBranches` 真跑通；四种拿不到分支的情况（无 `repo.path` / 无 git 执行链路 / 不是 git 检出 / git 抛错）**只返回 `ok:false` + 原因、绝不抛**；游离 HEAD 不算分支名；宿主 remote 暴露 `branches()` 且某个项目配错不影响别的项目 |
 
 ### 8.2 真实链路验证记录
 
 | 验证项 | 结果 |
 | --- | --- |
 | 本地提交（本阶段交付形态） | ✅ `git add -- <非敏感文件>`（点名暂存）→ `git commit -m <说明> -- <非敏感文件>` → `rev-parse HEAD` 全链路实跑，提交说明含工单溯源、验证结论与「未提交」文件清单 |
+| 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
+| 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
+| 保留会话（新） | ✅ 本地提交那轮的通知与 `pipeline_status` 都能看到 `处理会话：<sessionId>`；agent 实例在 `finally` 里无条件释放 |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` 85 条断言全过 |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |
 | QQ 邮箱真实发信 | ✅ `accepted=true`，traceId `<mw319ltk.47861f8c479221d3@qq.com>` |
@@ -561,7 +698,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 真实飞书表读取 | ✅ appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条 |
 | 真实飞书工单入队 | ✅ `pms\|reczz28VWNWVefNA`（当时用 `statusValues` + `recordIds` 精确收窄，只收进这一张；宿主 profile 现已去掉 `recordIds` 试点限制，改按状态值整表收） |
 | 真实飞书工单改码 | ⚠️ 入队与四要素解析全对；agent 一轮被上游 429 配额挡死（非插件缺陷），宿主侧「`{{model}}` 崩」与「preset 缺服务」两个雷已在 `5b94a17` 排掉，尚未在配额恢复后复跑 |
-| 飞书写回状态列 | ❌ app 对该表只有读权限，写回报 `code 91403 Forbidden` |
+| 飞书写回状态列 | ⚠️ app 对该表之前只有读权限，写回返 `code 91403 Forbidden`；现在「回填」已是主路径（`writeResult`），需要把应用加成**可编辑**协作者后再验一次；没权限时票仍是 `done`，只在 `pipeline_status` 显示「回填表格：没写成 —— …」 |
 | 金山文档真实取数 | ❌ 无开放平台对接（见 9.1 第 3 条） |
 
 ### 8.3 环境事实（影响可复现性）
@@ -637,7 +774,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | 294 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **325** 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -646,7 +783,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 建议 | 理由 | 代价 |
 | --- | --- | --- |
 | 把 `scheduler` 里「执行器返回结果」与「执行器抛异常」两条失败通路合并成一条 | 现在可重试性判断被分裂在两处，行为不一致（9.2 第 7 条） | 中，要动调度器核心 + 补测试 |
-| 把 `src/index.js`（1 039 行）按「装配 / 工具注册 / 轮询」拆三块 | 文件偏大，但拆了也不改变行为 | 低，收益也一般，**不建议本轮做** |
+| 把 `src/index.js`（1 059 行）按「装配 / 工具注册 / 轮询」拆三块 | 文件偏大，但拆了也不改变行为 | 低，收益也一般，**不建议本轮做** |
 
 ### 10.3 建议的推进顺序
 
@@ -662,7 +799,9 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「陈旧工作区坐标不得复用」缺陷修复（**已完成**，2026-11-06） | 守卫只看字段有没有值 → 目录已删/换了仓库仍复用死路径，`workingDirectory.set` 对着空气报错；`resetByHuman` 不清坐标、`recoverPending` 不管 failed，两处放大器让票重置后必然复现 | ✅ 自测 288/288（新增 3 条）；见 §1.5 |
 | 「插件版本自检」（**已完成**，2026-11-06） | 宿主加载的是 profile 下的目录副本（跨盘 `file:` 落成复制），HMR `root: []` 不监听源码 ⇒ 改完不同步就静默跑旧代码；新增 `src/core/plugin-version.js`，`pipeline_doctor` 比对安装副本与源码的**文件内容**，落后时给出同步命令，只进「提醒」 | ✅ 自测 288 → 293（新增 5 组断言）；见 §1.6 与 `architecture.md` §12.11 |
 | 「`setPhase` 清不掉字段」缺陷修复（**已完成**，2026-11-06） | `setPhase` 把补丁里所有 `undefined` 一概过滤，于是调用方写的每一种「清掉」都静默失效：成功票上挂着上一轮 `lastError`（真实事故：`pms\|reczz28VWNWVbpgL` 跑成 done 却显示 `provider "workbuddy" has no configured model`），启动恢复以为清了死坐标其实没清。改为「键不存在 = 不动 / 键在值为 undefined = 删掉」 | ✅ 自测 293 → 294（新增 1 条走真实重试路径 —— 旧的那条是 `resetByHuman` 兜的假绿）；见 §1.7 |
+| 「回填 / 保留会话 / 基线 / 面板」四项改造（**已完成**，2026-11-06） | ①处理完回填工单表（`TicketSource.writeResult` 唯一写入口 + `writeBack`/`writeBackStatus`，见 §1.8）②处理完保留会话（`ExecResult.sessionId` + `keepSession`，见 §1.9）③脏工作区只提交 agent 改过的文件（`createBaseline` + `describeDirtyCheckout`，`assertCleanCheckout` 删除，见 §1.10）④设置面板补齐（`projects` 子树可编辑 + 第 3 个 Remote 方法，配置 33 键 / 7 组，见 §1.11） | ✅ 自测 319/319（新增 25 条，`dev-run.mjs` 第 16 节 + 第 15 节改写）；`feishu-checks` 52 → 58、`gitlab-checks` 68 → 78；`client-check` / `client-smoke` 全绿 |
+| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 294 → 314；一张真表读出一张真票 |
+| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 325 → 345；一张真表读出一张真票 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

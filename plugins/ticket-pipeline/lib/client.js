@@ -87,6 +87,24 @@ window.__ModuleLoader__.load({
           result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ConfigSnapshot', create: function () { return { parse: function (value) { return value } } } },
           parameters: [],
         },
+        {
+          id: 'ticket-pipeline#ticketPipeline/projects',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'projects',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ProjectList', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
+        {
+          id: 'ticket-pipeline#ticketPipeline/branches',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'branches',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#BranchList', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
       ],
     }
 
@@ -248,6 +266,434 @@ window.__ModuleLoader__.load({
       return undefined
     }
 
+    function hasKey (source, key) {
+      return source !== null && source !== undefined && Object.prototype.hasOwnProperty.call(source, key)
+    }
+
+    // ── 字段约束 ────────────────────────────────────────────────
+    // 约束文案完全由 descriptor 的 meta 推导（min/max/enum/default），不写死任何字段名：
+    // 宿主加字段、改范围时面板自动跟上。
+
+    /** 一句话约束提示，例如「1–60」「可选：feishu / wps / mock / webform」「缺省 30」。 */
+    function constraintOf (leaf) {
+      var meta = leaf.node.meta || {}
+      var parts = []
+      if (Array.isArray(meta.enum) && meta.enum.length > 0) {
+        parts.push('可选：' + meta.enum.join(' / '))
+      } else if (leaf.node.type === 'number') {
+        var min = meta.min
+        var max = meta.max
+        if (min !== undefined && max !== undefined) parts.push(min + '–' + max)
+        else if (min !== undefined) parts.push('不小于 ' + min)
+        else if (max !== undefined) parts.push('不大于 ' + max)
+      }
+      if (!isBoolean(leaf) && meta.default !== undefined && meta.default !== null) {
+        var text = isArrayField(leaf) && Array.isArray(meta.default) ? meta.default.join(', ') : String(meta.default)
+        if (text.length > 0) parts.push('缺省 ' + text)
+      }
+      return parts.join(' · ')
+    }
+
+    /**
+     * 单个字段的即时校验。
+     *
+     * 返回 `{ level, text }`：`level === 'error'` 会拦保存，`'soft'` 只是提醒。
+     * 这里只做**能在浏览器侧确定**的检查（类型、范围、枚举）；跨字段/跨数组的规则
+     * 由 `projectIssues` 与服务端 `~standard.validate` 兜。
+     */
+    function validateLeaf (leaf, draftValue) {
+      var meta = leaf.node.meta || {}
+      if (isBoolean(leaf)) return null
+      if (isSecret(leaf)) return null
+
+      if (Array.isArray(meta.enum) && meta.enum.length > 0) {
+        var value = String(draftValue === undefined || draftValue === null ? '' : draftValue)
+        // 空 = 「没设过，走缺省」：保存时会发 unset，不算错。
+        if (value.length === 0) return null
+        for (var i = 0; i < meta.enum.length; i += 1) {
+          if (String(meta.enum[i]) === value) return null
+        }
+        return { level: 'error', text: '只能是 ' + meta.enum.join(' / ') }
+      }
+
+      if (leaf.node.type === 'number') {
+        var raw = String(draftValue === undefined || draftValue === null ? '' : draftValue).trim()
+        // 同上：空表示回落缺省，不是错误。
+        if (raw.length === 0) return null
+        var num = Number(raw)
+        if (!Number.isFinite(num)) return { level: 'error', text: '必须是数字' }
+        if (meta.min !== undefined && num < meta.min) return { level: 'error', text: '不能小于 ' + meta.min }
+        if (meta.max !== undefined && num > meta.max) return { level: 'error', text: '不能大于 ' + meta.max }
+        return null
+      }
+
+      return null
+    }
+
+    /** 全部配置叶子的校验结果，按草稿 key 索引。 */
+    function configIssues (leaves, draft) {
+      var byKey = {}
+      var errorCount = 0
+      for (var i = 0; i < leaves.length; i += 1) {
+        var key = keyOf(leaves[i])
+        var issue = validateLeaf(leaves[i], draft[key])
+        if (issue === null) continue
+        byKey[key] = issue
+        if (issue.level === 'error') errorCount += 1
+      }
+      return { byKey: byKey, errorCount: errorCount }
+    }
+
+    /**
+     * 把服务端 `invalid config:\n  - <message> (at <path>)` 拆成可挂到字段上的清单。
+     *
+     * 服务端返回的路径形如 `projects[0].repo.path` 或 `pollIntervalMinutes`；
+     * 解析不出来就整段显示在顶部（宁可多显示，也不吞错误）。
+     */
+    function parseIssues (message) {
+      var out = []
+      if (typeof message !== 'string' || message.length === 0) return out
+      var lines = message.split('\n')
+      for (var i = 0; i < lines.length; i += 1) {
+        var line = lines[i].replace(/^\s*-\s*/, '').trim()
+        if (line.length === 0) continue
+        var match = /^(.*?)\s*\(at ([^)]+)\)$/.exec(line)
+        if (match === null) {
+          out.push({ path: '', text: line })
+          continue
+        }
+        out.push({ path: match[2].trim(), text: match[1].trim() })
+      }
+      return out
+    }
+
+    // ── 项目清单 ────────────────────────────────────────────────
+    // 项目的 schema 是 `unknown`（宿主不往 schema 里放 projects 子树），所以字段表
+    // 只能在这里手写一份。它对应 `src/core/config.js` 的 `validateProject`：
+    // 改那边记得回来对一下。`from` 是 host `describeProject()` 的扁平字段名。
+
+    var PLATFORMS = ['feishu', 'wps', 'mock', 'webform']
+
+    var PROJECT_SECTIONS = [
+      {
+        key: 'basic',
+        label: '基本',
+        fields: [
+          { path: ['name'], from: 'name', label: '项目名', kind: 'text', required: true, hint: 'projectId，必须唯一；工单里的项目要靠它对上仓库。' },
+          { path: ['description'], from: 'description', label: '说明', kind: 'text' },
+          { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true, hint: '决定用哪个 ticket-source 适配器收票。' },
+        ],
+      },
+      {
+        key: 'match',
+        label: '工单表',
+        fields: [
+          { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '飞书多维表格的 table id；与 appToken 一起构成显式绑定。' },
+          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text' },
+          { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 tableId 时按文件名模糊匹配（例：PMS项目管理系统工单）。' },
+          { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
+          { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', hint: '逗号分隔的 record id；留空表示整张表。' },
+          { path: ['match', 'allowedImageHosts'], from: 'allowedImageHosts', label: '允许的截图主机', kind: 'list', hint: '逗号分隔的主机名白名单；截图链接来自外部输入，不放行的一律拒绝。' },
+        ],
+      },
+      {
+        key: 'wps',
+        label: '金山文档（wps 专用）',
+        fields: [
+          { path: ['match', 'sheetUrl'], from: 'sheetUrl', label: '表格链接', kind: 'text' },
+          { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text' },
+          { path: ['match', 'statusColumn'], from: 'statusColumn', label: '状态列名', kind: 'text' },
+          { path: ['match', 'statusValue'], from: 'statusValue', label: '在处理中的取值', kind: 'text' },
+          { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text' },
+        ],
+      },
+      {
+        key: 'repo',
+        label: '仓库',
+        fields: [
+          { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。' },
+          { path: ['repo', 'remote'], from: 'repoRemote', label: '远端名', kind: 'text', hint: '缺省 origin。' },
+          { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
+          { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
+          { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', hint: '关掉只做本地提交，不需要 GITLAB_TOKEN。' },
+        ],
+      },
+      {
+        key: 'verify',
+        label: '验证',
+        fields: [
+          { path: ['verify', 'build'], from: 'verifyBuild', label: '构建命令', kind: 'text', hint: '留空跳过构建。' },
+          { path: ['verify', 'test'], from: 'verifyTest', label: '验证命令', kind: 'text', hint: '留空跳过验证，直接开 draft MR。' },
+        ],
+      },
+    ]
+
+    function projectKey (index, path) {
+      return 'p' + index + '.' + path.join('.')
+    }
+
+    /** 扁平 describeProject 记录 → 某个字段的草稿值。 */
+    function projectDraftValue (record, field) {
+      var raw = record === null || record === undefined ? undefined : record[field.from]
+      if (field.kind === 'bool') return Boolean(raw)
+      if (field.kind === 'list') {
+        if (Array.isArray(raw)) return raw.join(', ')
+        return raw === undefined || raw === null ? '' : String(raw)
+      }
+      return raw === undefined || raw === null ? '' : String(raw)
+    }
+
+    /** 草稿值 → 真正要写进去的值（列表拆逗号、布尔转 bool）。 */
+    function projectRawValue (field, draftValue) {
+      if (field.kind === 'bool') return Boolean(draftValue)
+      if (field.kind === 'list') {
+        var parts = String(draftValue === undefined || draftValue === null ? '' : draftValue).split(',')
+        var out = []
+        for (var i = 0; i < parts.length; i += 1) {
+          var item = parts[i].trim()
+          if (item.length > 0 && out.indexOf(item) < 0) out.push(item)
+        }
+        return out
+      }
+      return String(draftValue === undefined || draftValue === null ? '' : draftValue)
+    }
+
+    /** 一个项目的全部草稿值（key 形如 `p0.repo.path`）。 */
+    function projectDrafts (record, index) {
+      var out = {}
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var fields = PROJECT_SECTIONS[s].fields
+        for (var f = 0; f < fields.length; f += 1) {
+          out[projectKey(index, fields[f].path)] = projectDraftValue(record, fields[f])
+        }
+      }
+      return out
+    }
+
+    /** 看起来像不像一个路径/命令（只用来给软提示，不拦保存）。 */
+    function looksLikePath (text) {
+      return /[\\/]/.test(text) || /^[A-Za-z]:/.test(text) || text === '.' || text === '~'
+    }
+
+    /** 把「来自 profile 的当前值」渲染成人能读的一行（空值要说清是空的）。 */
+    function describeBase (value) {
+      if (Array.isArray(value)) return value.length === 0 ? '（空）' : value.join(', ')
+      if (typeof value === 'boolean') return value ? '是' : '否'
+      if (value === undefined || value === null || String(value).length === 0) return '（空）'
+      return String(value)
+    }
+
+    // ── 折叠状态 ────────────────────────────────────────────────
+    // 33 个配置项一屏放不下，全展开时保存按钮要滚很久。折叠状态记在 localStorage，
+    // key 带插件前缀避免和别的插件撞；存不下就退化成「每次都按默认展开」，不影响功能。
+
+    var OPEN_KEY = 'ticket-pipeline:open-groups'
+    var DEFAULT_OPEN_GROUP = '扫描与队列'
+
+    function readOpenMap () {
+      try {
+        if (typeof localStorage === 'undefined') return {}
+        var raw = localStorage.getItem(OPEN_KEY)
+        if (typeof raw !== 'string' || raw.length === 0) return {}
+        var parsed = JSON.parse(raw)
+        return parsed !== null && typeof parsed === 'object' ? parsed : {}
+      } catch (error) {
+        return {}
+      }
+    }
+
+    function writeOpenMap (map) {
+      try {
+        if (typeof localStorage === 'undefined') return
+        localStorage.setItem(OPEN_KEY, JSON.stringify(map))
+      } catch (error) {
+        // 存不下就算了，折叠状态丢了不影响功能。
+      }
+    }
+
+    /** 分组默认：只有「扫描与队列」展开，其余收起；用户点过就以记住的为准。 */
+    function isGroupOpen (map, label) {
+      if (hasKey(map, label)) return map[label] !== false
+      return label === DEFAULT_OPEN_GROUP
+    }
+
+    /**
+     * 把服务端的 `invalid config:` 报文挂到具体字段上。
+     *
+     * 服务端路径有两种形态：配置项是点号路径（`pollIntervalMinutes`），项目是
+     * `projects[0].repo.path`（也见过 `projects.0.repo.path` 形态）。认不出来的
+     * 一律留到顶部整段显示 —— 宁可多显示一行，也不把错误吞掉。
+     */
+    function mapServerIssues (message, configKeys) {
+      var entries = parseIssues(message)
+      var byKey = {}
+      var top = []
+      for (var i = 0; i < entries.length; i += 1) {
+        var entry = entries[i]
+        var path = String(entry.path === undefined || entry.path === null ? '' : entry.path)
+        var text = String(entry.text === undefined || entry.text === null ? '' : entry.text)
+        var indexed = /^projects(?:\[(\d+)\]|\.(\d+))\.?(.*)$/.exec(path)
+        if (indexed !== null) {
+          var index = Number(indexed[1] !== undefined ? indexed[1] : indexed[2])
+          var rest = indexed[3] === undefined ? '' : indexed[3]
+          // 文案本身也带着 `projects[0].repo.path ` 前缀，剥掉，字段下面只留原因。
+          var cleaned = text.replace(/^projects\[\d+\]\.[^\s]+\s+/, '')
+          if (rest.length === 0) {
+            // 整条项目级别的错误（例如「项目名重复」）挂不到具体字段，放顶部。
+            top.push('项目 #' + (index + 1) + '：' + cleaned)
+            continue
+          }
+          byKey[projectKey(index, rest.split('.'))] = { level: 'error', text: cleaned }
+          continue
+        }
+        if (path.length > 0 && configKeys.indexOf(path) >= 0) {
+          byKey[path] = { level: 'error', text: text }
+          continue
+        }
+        if (text.length > 0) top.push(text)
+      }
+      return { byKey: byKey, top: top.join('\n') }
+    }
+
+    /** 两份问题表合并：本地即时校验优先，服务端拒绝覆盖同 key 的文案。 */
+    function mergeIssues (local, remote) {
+      var byKey = {}
+      var errorCount = 0
+      var key
+      for (key in local) {
+        if (!hasKey(local, key)) continue
+        byKey[key] = local[key]
+        if (local[key].level === 'error') errorCount += 1
+      }
+      for (key in remote) {
+        if (!hasKey(remote, key)) continue
+        if (byKey[key] !== undefined && byKey[key].level === 'error') errorCount -= 1
+        byKey[key] = remote[key]
+        if (remote[key].level === 'error') errorCount += 1
+      }
+      return { byKey: byKey, errorCount: errorCount }
+    }
+
+
+    /**
+     * 单个项目的即时校验，返回按草稿 key 索引的问题表。
+     *
+     * 规则照 `src/core/config.js:validateProject` 抄，文案保持一致：
+     * 人和 agent 在面板上看到的，应该和启动时校验报出来的是同一句话。
+     */
+    function projectIssues (record, index, draft, names) {
+      var out = {}
+      function add (path, level, text) {
+        out[projectKey(index, path)] = { level: level, text: text }
+      }
+      function read (path) {
+        var key = projectKey(index, path)
+        return hasKey(draft, key) ? String(draft[key] === undefined || draft[key] === null ? '' : draft[key]) : ''
+      }
+
+      var name = read(['name']).trim()
+      if (name.length === 0) {
+        add(['name'], 'error', '必须是非空字符串')
+      } else {
+        var seen = 0
+        for (var i = 0; i < names.length; i += 1) {
+          if (names[i] === name) seen += 1
+        }
+        if (seen > 1) add(['name'], 'error', '项目名 "' + name + '" 重复，projectId 必须唯一')
+      }
+
+      var platform = read(['match', 'platform']).trim()
+      if (platform.length === 0) {
+        add(['match', 'platform'], 'error', '只能是 feishu / wps / mock / webform')
+      } else if (PLATFORMS.indexOf(platform) < 0) {
+        add(['match', 'platform'], 'error', '只能是 feishu / wps / mock / webform')
+      }
+
+      var repoPath = read(['repo', 'path']).trim()
+      if (repoPath.length === 0) {
+        add(['repo', 'path'], 'error', '必须是非空字符串（本地 git 检出根目录）')
+      } else if (!looksLikePath(repoPath)) {
+        add(['repo', 'path'], 'soft', '看起来不像路径（没有目录分隔符）。确认是相对 DSH 工作目录的路径？')
+      }
+
+      if (platform === 'feishu') {
+        var pattern = read(['match', 'docNamePattern']).trim()
+        var hasToken = Boolean(record && record.hasAppToken)
+        if (!hasToken && pattern.length === 0) {
+          add(['match', 'docNamePattern'], 'soft',
+            'feishu 项目需要 appToken+tableId（显式绑定）或表名匹配（docNamePattern）二选一；appToken 只能在配置文件里写。')
+        }
+      }
+
+      var statusText = read(['match', 'statusValues']).trim()
+      var statusValues = projectRawValue({ kind: 'list' }, statusText)
+      if (statusText.length > 0 && statusValues.length === 0) {
+        add(['match', 'statusValues'], 'error', '必须是非空字符串或字符串数组（值是状态列里表示「在处理中」的取值）')
+      } else {
+        for (var s = 0; s < statusValues.length; s += 1) {
+          if (/\s/.test(statusValues[s])) {
+            add(['match', 'statusValues'], 'soft', '状态值里带空格：' + statusValues[s] + '。确认表里就是一字不差的这个值。')
+            break
+          }
+        }
+      }
+
+      var recordText = read(['match', 'recordIds']).trim()
+      if (recordText.length > 0 && projectRawValue({ kind: 'list' }, recordText).length === 0) {
+        add(['match', 'recordIds'], 'error', '必须是非空字符串或字符串数组（record id）')
+      }
+
+      var hostText = read(['match', 'allowedImageHosts']).trim()
+      if (hostText.length > 0 && projectRawValue({ kind: 'list' }, hostText).length === 0) {
+        add(['match', 'allowedImageHosts'], 'error', '必须是非空字符串或字符串数组（截图链接允许的主机名，例如 cdn.example.com）')
+      }
+
+      var gitlabEnabled = Boolean(draft[projectKey(index, ['repo', 'gitlab', 'enabled'])])
+      if (gitlabEnabled) {
+        add(['repo', 'gitlab', 'enabled'], 'soft', '开 MR 需要 GITLAB_TOKEN 凭据，并且仓库要有可访问的远端。')
+      }
+
+      // verify 那两条填的是「命令」，只做软提示：真起进程去跑才知道对不对，
+      // 但把路径填进命令位、或者命令里带占位符，几乎一定是填错了。
+      softCommandHint(add, 'verifyBuild', ['verify', 'build'], read(['verify', 'build']))
+      softCommandHint(add, 'verifyTest', ['verify', 'test'], read(['verify', 'test']))
+
+      return out
+    }
+
+    /** 命令位的软提示：像路径、带尖括号占位符、或只有空白，都提醒一句但不拦。 */
+    function softCommandHint (add, from, path, text) {
+      var value = text.trim()
+      if (value.length === 0) return
+      if (/^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value)) {
+        add(path, 'soft', '这里填的是命令（例如 pnpm ' + (from === 'verifyBuild' ? 'build' : 'test') + '），不是路径；路径请填在上面「仓库路径」。')
+        return
+      }
+      if (/[<>]/.test(value)) {
+        add(path, 'soft', '命令里带尖括号占位符，真跑起来 shell 会当成重定向。确认已经换成实际参数。')
+      }
+    }
+
+    /** 全部项目的校验结果汇总（含错误计数）。 */
+    function allProjectIssues (list, draft) {
+      var names = []
+      for (var i = 0; i < list.length; i += 1) {
+        var key = projectKey(i, ['name'])
+        names.push(hasKey(draft, key) ? String(draft[key] === undefined ? '' : draft[key]).trim() : '')
+      }
+      var byKey = {}
+      var errorCount = 0
+      for (var j = 0; j < list.length; j += 1) {
+        var one = projectIssues(list[j], j, draft, names)
+        for (var field in one) {
+          if (!hasKey(one, field)) continue
+          byKey[field] = one[field]
+          if (one[field].level === 'error') errorCount += 1
+        }
+      }
+      return { byKey: byKey, errorCount: errorCount }
+    }
+
     // ── 样式 ────────────────────────────────────────────────────
     // 只用带 fallback 的 DSH 设计 token：宿主换主题时自动跟着变，宿主没定义也有兜底。
 
@@ -286,6 +732,36 @@ window.__ModuleLoader__.load({
       '.tp-pre{margin:8px 0 0;padding:10px 12px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-word;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-interactive-bg-hover,#8881);max-height:320px;overflow:auto}',
       '.tp-err{margin:8px 0 0;font-size:12px;color:var(--dsw-alias-label-error,#d33)}',
       '.tp-ok{margin-left:auto;font-size:11px;color:var(--dsw-alias-label-secondary,inherit)}',
+
+      // 顶部操作条：页面很长（33 个配置项 + N 个项目卡片），保存按钮必须一直够得着。
+      '.tp-bar{position:sticky;top:0;z-index:3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;background:var(--dsw-alias-bg-base,Canvas)}',
+      '.tp-bar .tp-spacer{margin-left:auto}',
+      '.tp-bar .tp-count{font-size:11px;color:var(--dsw-alias-label-secondary,inherit)}',
+
+      // 可折叠分组：标题本身就是按钮，键盘也能操作。
+      '.tp-group>h4{margin:0}',
+      '.tp-toggle{font:inherit;display:flex;align-items:center;gap:6px;width:100%;padding:4px 0;cursor:pointer;background:transparent;border:0;color:var(--dsw-alias-label-secondary,inherit);text-align:left;font-size:12px;font-weight:600}',
+      '.tp-toggle:hover{color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-toggle .tp-caret{display:inline-block;width:10px;opacity:.7}',
+      '.tp-toggle .tp-badge{margin-left:auto;font-weight:400}',
+
+      // 字段级校验
+      '.tp-field.tp-invalid .tp-input,.tp-field.tp-invalid .tp-select{border-color:var(--dsw-alias-label-error,#d33)}',
+      '.tp-field .tp-field-err{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-error,#d33)}',
+      '.tp-field .tp-constraint{margin:2px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit);opacity:.7}',
+      '.tp-field .tp-soft{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit)}',
+
+      // 项目卡片
+      '.tp-proj{border:1px solid var(--dsw-alias-border-l3,#8883);border-radius:var(--dsw-radius-sm,8px);padding:10px 12px;margin:10px 0 0}',
+      '.tp-proj-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 4px}',
+      '.tp-proj-head strong{font-size:12px}',
+      '.tp-proj-head .tp-spacer{margin-left:auto}',
+      '.tp-proj .tp-field{padding:4px 0}',
+      // 分支字段：输入框占满一行，候选提示跟在下面一行。
+      '.tp-branch{display:flex;flex-direction:column;gap:2px}',
+      '.tp-branch .tp-help{padding-left:2px}',
+      '.tp-empty{margin:6px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit)}',
+
       '@media(max-width:520px){.tp-field{grid-template-columns:1fr}.tp-field label{padding-top:0}}',
     ].join('')
 
@@ -298,6 +774,10 @@ window.__ModuleLoader__.load({
       var label = typeof meta.label === 'string' && meta.label.length > 0 ? meta.label : keyOf(leaf)
       var help = typeof meta.description === 'string' ? meta.description : ''
       var disabled = props.disabled
+      var issue = props.issue
+      var invalid = issue !== undefined && issue !== null && issue.level === 'error'
+      var constraint = constraintOf(leaf)
+      var secret = isSecret(leaf)
 
       var control
       if (isBoolean(leaf)) {
@@ -320,7 +800,6 @@ window.__ModuleLoader__.load({
           onChange: function (event) { props.onChange(event.target.value) },
         }, options)
       } else {
-        var secret = isSecret(leaf)
         control = h('input', {
           className: 'tp-input',
           type: secret ? 'password' : (leaf.node.type === 'number' ? 'number' : 'text'),
@@ -334,11 +813,60 @@ window.__ModuleLoader__.load({
         })
       }
 
-      return h('div', { className: 'tp-field' },
+      // 字段右侧的「已改 / 撤销」：只标记真正改过的字段，撤销只回退这一个。
+      var changed = Boolean(props.changed)
+      var mark = changed
+        ? h('span', { style: { marginLeft: '8px', display: 'inline-flex', gap: '6px', alignItems: 'center' } },
+          h('span', { className: 'tp-badge tp-on' }, '已改'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            style: { minHeight: '24px', padding: '0 8px', fontSize: '11px' },
+            disabled: disabled,
+            onClick: props.onRevert,
+          }, '撤销'))
+        : null
+
+      var notes = []
+      if (constraint.length > 0) notes.push(h('p', { key: 'constraint', className: 'tp-constraint' }, constraint))
+      if (issue !== undefined && issue !== null) {
+        notes.push(h('p', {
+          key: 'issue',
+          className: issue.level === 'error' ? 'tp-field-err' : 'tp-soft',
+        }, issue.text))
+      }
+
+      return h('div', { className: 'tp-field' + (invalid ? ' tp-invalid' : '') },
         h('div', null,
-          h('label', null, label),
+          h('label', null, label, mark),
           help.length > 0 ? h('p', { className: 'tp-help' }, help) : null),
-        h('div', null, control))
+        h('div', null,
+          control,
+          notes.length > 0 ? notes : null))
+    }
+
+    /**
+     * 一个可折叠的配置分组。
+     *
+     * 33 个字段一屏放不下，全展开时保存按钮要滚很久才够得着 —— 折叠状态记在
+     * localStorage 里，下次打开还是上次的样子。key 带插件前缀，避免和别的插件撞。
+     */
+    function GroupSection (props) {
+      var group = props.group
+      var open = props.open
+      var changedCount = props.changedCount
+      return h('div', { className: 'tp-group' },
+        h('h4', null,
+          h('button', {
+            type: 'button',
+            className: 'tp-toggle',
+            'aria-expanded': open ? 'true' : 'false',
+            onClick: props.onToggle,
+          },
+          h('span', { className: 'tp-caret' }, open ? '▾' : '▸'),
+          group.label,
+          changedCount > 0 ? h('span', { className: 'tp-badge tp-on' }, '本组已改 ' + changedCount + ' 项') : null)),
+        open ? props.children : null)
     }
 
     function CredentialRow (props) {
@@ -424,20 +952,30 @@ window.__ModuleLoader__.load({
 
       var groups = groupLeaves(leaves)
       var sections = groups.map(function (group) {
+        var changedCount = 0
         var fields = group.leaves.map(function (leaf) {
           var key = keyOf(leaf)
+          var changed = !sameDraft(draft[key], props.initialDraft[key])
+          if (changed) changedCount += 1
           return h(Field, {
             key: key,
             leaf: leaf,
             value: draft[key],
             disabled: disabled,
             secretSet: Boolean(props.secrets && props.secrets[key]),
+            issue: props.issues ? props.issues[key] : undefined,
+            changed: changed,
+            onRevert: function () { props.onRevert(key) },
             onChange: function (next) { props.onEdit(key, next) },
           })
         })
-        return h('div', { key: group.label, className: 'tp-group' },
-          h('h4', null, group.label),
-          fields)
+        return h(GroupSection, {
+          key: group.label,
+          group: group,
+          open: props.isOpen(group.label),
+          changedCount: changedCount,
+          onToggle: function () { props.onToggle(group.label) },
+        }, fields)
       })
 
       return h('section', { className: 'tp-card' },
@@ -451,7 +989,7 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'tp-btn tp-primary',
-            disabled: disabled || !props.dirty || props.saving,
+            disabled: disabled || !props.dirty || props.saving || props.errorCount > 0,
             onClick: props.onSave,
           }, props.saving ? '保存中…' : '保存'),
           h('button', {
@@ -460,8 +998,237 @@ window.__ModuleLoader__.load({
             disabled: disabled || props.saving,
             onClick: props.onReset,
           }, '放弃改动'),
+          props.errorCount > 0
+            ? h('span', { className: 'tp-err', style: { margin: 0 } }, props.errorCount + ' 项待修')
+            : null,
           props.message.length > 0 ? h('span', { className: 'tp-ok' }, props.message) : null),
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
+    }
+
+    /**
+     * 单个项目卡片。
+     *
+     * 字段表是手写的（`PROJECT_SECTIONS`），对应 `src/core/config.js:validateProject`。
+     * 每张卡片只渲染存在差值的字段路径发 mutate —— 绝不整数组替换：`path:['projects']`
+     * 会被宿主以「not volatile」拒掉，而且整替换会覆盖掉别人在同一份配置里改的其它项目。
+     */
+    function ProjectCard (props) {
+      var index = props.index
+      var record = props.record
+      var draft = props.draft
+      var issues = props.issues
+      var disabled = props.disabled
+      var changedCount = countProjectChanges(props)
+
+      var title = record && record.name ? record.name : ('项目 #' + (index + 1))
+      var head = h('div', { className: 'tp-proj-head' },
+        h('strong', null, title),
+        h('span', { className: 'tp-badge' }, record && record.platform ? record.platform : '未配置平台'),
+        changedCount > 0 ? h('span', { className: 'tp-badge tp-on' }, '已改 ' + changedCount + ' 项') : null,
+        h('span', { className: 'tp-spacer' }),
+        record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null)
+
+      var sections = PROJECT_SECTIONS.map(function (section) {
+        var fields = section.fields.map(function (field) {
+          var key = projectKey(index, field.path)
+          var value = hasKey(draft, key) ? draft[key] : projectDraftValue(record, field)
+          var issue = issues ? issues[key] : undefined
+          var invalid = issue !== undefined && issue !== null && issue.level === 'error'
+          var base = projectDraftValue(record, field)
+          var changed = !sameDraft(value, base)
+
+          var control
+          if (field.kind === 'bool') {
+            control = h('label', { className: 'tp-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: Boolean(value),
+                disabled: disabled,
+                onChange: function (event) { props.onEdit(key, event.target.checked) },
+              }),
+              '启用')
+          } else if (field.kind === 'select') {
+            var options = field.options.map(function (option) {
+              return h('option', { key: option, value: option }, option)
+            })
+            control = h('select', {
+              className: 'tp-select',
+              value: String(value),
+              disabled: disabled,
+              onChange: function (event) { props.onEdit(key, event.target.value) },
+            }, options)
+          } else if (field.kind === 'branch') {
+            // 分支：输入框 + datalist。
+            //
+            // 为什么不是纯 <select>：仓库里列不出分支时（新克隆、repo.path 还没填、
+            // 宿主没给 git 执行链路）下拉会是空的，人就彻底没法填了。输入框 + 候选
+            // 让「列不出来」退化成「手打」而不是「填不了」；列得出来时又等于下拉。
+            var listId = 'tp-branches-' + index + '-' + field.path.join('-')
+            var choices = Array.isArray(props.branchChoices) ? props.branchChoices : []
+            var branchOptions = choices.map(function (name) {
+              return h('option', { key: name, value: name }, name)
+            })
+            control = h('div', { className: 'tp-branch' },
+              h('input', {
+                className: 'tp-input',
+                type: 'text',
+                list: listId,
+                value: String(value === undefined || value === null ? '' : value),
+                disabled: disabled,
+                placeholder: choices.length > 0 ? '从候选里选，或直接手打' : '仓库里没读到分支，直接手打',
+                autoComplete: 'off',
+                onChange: function (event) { props.onEdit(key, event.target.value) },
+              }),
+              h('datalist', { id: listId }, branchOptions),
+              choices.length > 0
+                ? h('span', { className: 'tp-help' }, '候选 ' + choices.length + ' 条（来自这个项目的检出）')
+                : h('span', { className: 'tp-help' }, props.branchNote || '没读到分支清单；不影响保存，手打即可。'))
+          } else {
+            control = h('input', {
+              className: 'tp-input',
+              type: 'text',
+              value: String(value === undefined || value === null ? '' : value),
+              disabled: disabled,
+              placeholder: field.kind === 'list' ? '逗号分隔' : undefined,
+              autoComplete: 'off',
+              onChange: function (event) { props.onEdit(key, event.target.value) },
+            })
+          }
+
+          // 「来自 profile 的当前值」：改过的字段直接把这个原值摊开写出来，
+          // 没改的挂在 title 上（21 个字段全摊开会把卡片撑爆）。
+          var profileHint = '来自 profile 的当前值：' + describeBase(base)
+
+          return h('div', {
+            key: key,
+            className: 'tp-field' + (invalid ? ' tp-invalid' : ''),
+            title: profileHint,
+          },
+            h('div', null,
+              h('label', null, field.label,
+                changed
+                  ? h('span', { style: { marginLeft: '8px', display: 'inline-flex', gap: '6px', alignItems: 'center' } },
+                    h('span', { className: 'tp-badge tp-on' }, '已改'),
+                    h('button', {
+                      type: 'button',
+                      className: 'tp-btn',
+                      style: { minHeight: '24px', padding: '0 8px', fontSize: '11px' },
+                      disabled: disabled,
+                      onClick: function () { props.onRevert(key, base) },
+                    }, '撤销'))
+                  : null),
+              changed
+                ? h('p', { className: 'tp-help' }, '来自 profile 的当前值：' + describeBase(base))
+                : null,
+              field.hint ? h('p', { className: 'tp-help' }, field.hint) : null),
+            h('div', null,
+              control,
+              issue !== undefined && issue !== null
+                ? h('p', { className: issue.level === 'error' ? 'tp-field-err' : 'tp-soft' }, issue.text)
+                : null))
+        })
+        return h('div', { key: section.key, className: 'tp-group' },
+          h('h4', null, section.label),
+          fields)
+      })
+
+      // appToken：宿主只下发 hasAppToken + 打码预览，明文永不出宿主。
+      // 这里绝不提供输入框 —— 填了也没地方存，还会让人以为存进了凭据库。
+      var tokenText = record && record.hasAppToken
+        ? '已配置' + (record.appTokenPreview ? '（' + record.appTokenPreview + '）' : '')
+        : '未配置'
+      var tokenRow = h('div', { className: 'tp-field' },
+        h('div', null,
+          h('label', null, '飞书 appToken'),
+          h('p', { className: 'tp-help' },
+            '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
+            h('code', null, 'cordis.patch.yml'),
+            '。')),
+        h('div', null,
+          h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-on' : '') }, tokenText)))
+
+      return h('div', { className: 'tp-proj' }, head, sections, tokenRow)
+    }
+
+    /** 这张卡片里有多少个字段改过（用于「已改 N 项」徽标）。 */
+    function countProjectChanges (props) {
+      var count = 0
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var fields = PROJECT_SECTIONS[s].fields
+        for (var f = 0; f < fields.length; f += 1) {
+          var key = projectKey(props.index, fields[f].path)
+          var value = hasKey(props.draft, key) ? props.draft[key] : projectDraftValue(props.record, fields[f])
+          if (!sameDraft(value, projectDraftValue(props.record, fields[f]))) count += 1
+        }
+      }
+      return count
+    }
+
+    /**
+     * 「项目清单」整块。
+     *
+     * 数据来源是宿主的 `ticketPipeline.projects()`（只读投影）；改动走
+     * `settings.mutate` 的深层路径。两者刻意分开：读用的是打了码的投影，
+     * 写用的是设置通道，谁也不会把 appToken 明文带到浏览器里。
+     */
+    function ProjectListCard (props) {
+      var list = props.list
+      var draft = props.draft
+
+      var body
+      if (props.busy) {
+        body = h('p', { className: 'tp-note' }, '正在读取项目清单…')
+      } else if (props.error.length > 0) {
+        body = h('p', { className: 'tp-err' }, props.error)
+      } else if (list.length === 0) {
+        body = h('div', { className: 'tp-empty' },
+          h('p', null, '还没有配置任何项目。'),
+          h('p', null,
+            '项目（工单表 → 仓库的绑定）是结构化数组。上面已经可以编辑了；',
+            '如果当前宿主还不支持通过设置通道写 ',
+            h('code', null, 'projects'),
+            '，保存时会把宿主原话显示出来 —— 那就改 profile 的 ',
+            h('code', null, 'cordis.patch.yml'),
+            ' 里本行的 ',
+            h('code', null, 'config.projects'),
+            '，改完重启 DSH 生效。'))
+      } else {
+        body = h('div', null, list.map(function (record, index) {
+          // 分支候选按 index 对（宿主的 `branches()` 与 `projects()` 用的是同一次
+          // `config.projects` 遍历，index 一定对得上；按 repoPath 对会在两个项目
+          // 指向同一个检出时串味）。
+          var entry = props.branchList && props.branchList[index] ? props.branchList[index] : null
+          return h(ProjectCard, {
+            key: 'p' + index,
+            index: index,
+            record: record,
+            draft: draft,
+            issues: props.issues,
+            disabled: props.disabled,
+            onEdit: props.onEdit,
+            onRevert: props.onRevert,
+            branchChoices: entry && Array.isArray(entry.branches) ? entry.branches : [],
+            branchNote: entry && entry.ok === false && entry.reason ? entry.reason : '',
+          })
+        }))
+      }
+
+      return h('section', { className: 'tp-card' },
+        h('h3', null, '项目清单',
+          h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } },
+            list.length > 0 ? h('span', { className: 'tp-ok' }, list.length + ' 个项目') : null,
+            h('button', {
+              type: 'button',
+              className: 'tp-btn',
+              disabled: props.disabled || props.busy,
+              onClick: props.onReload,
+            }, props.busy ? '读取中…' : '重新读取'))),
+        h('p', { className: 'tp-note' },
+          '每个项目 = 一张工单表 + 一个仓库的绑定。改哪项就只写哪项（深层路径），',
+          '不会整块覆盖；appToken 明文只存在配置文件里，这里只显示配没配。'),
+        body,
+        props.message.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, props.message) : null,
+        props.saveError ? h('p', { className: 'tp-err' }, props.saveError) : null)
     }
 
     /**
@@ -498,6 +1265,24 @@ window.__ModuleLoader__.load({
       var [doctorError, setDoctorError] = useState('')
       var [mounted, setMounted] = useState(false)
       var [secretMap, setSecretMap] = useState({})
+
+      // 项目清单：数据来自宿主 `ticketPipeline.projects()`（只读投影，appToken 已打码），
+      // 改动走 settings.mutate 的深层路径。两条通道刻意分开。
+      var [projList, setProjList] = useState([])
+      var [projBusy, setProjBusy] = useState(false)
+      var [projError, setProjError] = useState('')
+      var [projDraft, setProjDraft] = useState({})
+      var [projInitial, setProjInitial] = useState({})
+
+      // 分支候选：来自宿主 `ticketPipeline.branches()`（每个项目一份）。
+      // 刻意与项目清单分开存 —— 分支取不到是常态（repo.path 还没填、路径不是
+      // git 检出），不该让「项目清单」跟着报错。
+      var [branchList, setBranchList] = useState([])
+      var [branchBusy, setBranchBusy] = useState(false)
+
+      // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
+      var [openMap, setOpenMap] = useState(readOpenMap)
+      var [serverIssues, setServerIssues] = useState({})
 
       var isPage = props.view !== 'summary'
 
@@ -551,6 +1336,74 @@ window.__ModuleLoader__.load({
         }, function () {})
       }, [getNamespace])
 
+      // 分支候选走 `ticketPipeline.branches()`：宿主对每个项目的检出跑一次
+      // `git for-each-ref`。失败是常态（repo.path 空、路径不是 git 检出），
+      // 所以这里**从不设错误**：拿到什么算什么，拿不到就让下拉退化成手打。
+      var loadBranches = useCallback(function (ns) {
+        var target = ns || getNamespace('ticketPipeline')
+        if (!target || typeof target.branches !== 'function') {
+          setBranchList([])
+          return Promise.resolve()
+        }
+        setBranchBusy(true)
+        return target.branches().then(function (response) {
+          setBranchBusy(false)
+          if (!response || !response.ok) {
+            setBranchList([])
+            return
+          }
+          var value = response.value || {}
+          setBranchList(Array.isArray(value.branches) ? value.branches : [])
+        }, function () {
+          setBranchBusy(false)
+          setBranchList([])
+        })
+      }, [getNamespace])
+
+      // 项目清单走 `ticketPipeline.projects()`：宿主的只读投影（appToken 已打码）。
+      // 拿不到就当空数组 —— 界面照样做出来，只是提示「没有项目」，不挡配置编辑。
+      var loadProjects = useCallback(function (target) {
+        var ns = target !== undefined ? target : getNamespace('ticketPipeline')
+        setProjError('')
+        if (!ns || typeof ns.projects !== 'function') {
+          setProjList([])
+          setProjDraft({})
+          setProjInitial({})
+          setBranchList([])
+          setProjError('宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）。项目清单暂时显示为空；配置仍然可以编辑。')
+          return Promise.resolve()
+        }
+        setProjBusy(true)
+        return ns.projects().then(function (response) {
+          setProjBusy(false)
+          if (!response || !response.ok) {
+            setProjList([])
+            setBranchList([])
+            setProjError('读取项目清单失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          var value = response.value || {}
+          var list = Array.isArray(value.projects) ? value.projects : []
+          var nextDraft = {}
+          for (var i = 0; i < list.length; i += 1) {
+            var perProject = projectDrafts(list[i], i)
+            var keys = Object.keys(perProject)
+            for (var k = 0; k < keys.length; k += 1) nextDraft[keys[k]] = perProject[keys[k]]
+          }
+          setProjList(list)
+          setProjDraft(nextDraft)
+          setProjInitial(nextDraft)
+          // 项目清单到手后再补分支候选：分支要比项目清单慢（要真跑 git），
+          // 分开发不至于让项目卡片等 git；拿不到就退化成手打，不算错误。
+          loadBranches(ns)
+        }, function (error) {
+          setProjBusy(false)
+          setProjList([])
+          setBranchList([])
+          setProjError('读取项目清单失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }, [getNamespace])
+
       useEffect(function () {
         if (!isPage) return
         var cancelled = false
@@ -589,7 +1442,9 @@ window.__ModuleLoader__.load({
             setDoctorError('挂载体检通道失败：' + (error && error.message ? error.message : String(error)))
           })
           loadSettings().then(function () {
-            if (!cancelled) loadCredentials()
+            if (cancelled) return
+            loadCredentials()
+            loadProjects()
           })
           diag('panel-remote', attempts)
         }
@@ -607,26 +1462,137 @@ window.__ModuleLoader__.load({
 
       var dirty = !sameDraft(draft, initialDraft)
 
+      // 项目清单和配置是两条通道、两套 key，脏标记也必须分开算 —— 否则改了个项目
+      // 却让「配置」卡片显示未保存，人会以为改错了地方。
+      var projectDirty = !sameDraft(projDraft, projInitial)
+
+      var configKeys = useMemo(function () {
+        var out = []
+        for (var i = 0; i < leaves.length; i += 1) out.push(keyOf(leaves[i]))
+        return out
+      }, [leaves])
+
+      var localConfigIssues = useMemo(function () {
+        return configIssues(leaves, draft)
+      }, [leaves, draft])
+
+      var localProjectIssues = useMemo(function () {
+        return allProjectIssues(projList, projDraft)
+      }, [projList, projDraft])
+
+      // 本地即时校验 + 上次保存被服务端拒绝的字段，合成一张表；error 级别会拦保存。
+      var issues = useMemo(function () {
+        var merged = mergeIssues(localConfigIssues.byKey, serverIssues)
+        var byKey = merged.byKey
+        var errorCount = merged.errorCount
+        var projectKeys = Object.keys(localProjectIssues.byKey)
+        for (var i = 0; i < projectKeys.length; i += 1) {
+          var one = projectKeys[i]
+          if (byKey[one] !== undefined) continue
+          byKey[one] = localProjectIssues.byKey[one]
+          if (localProjectIssues.byKey[one].level === 'error') errorCount += 1
+        }
+        return { byKey: byKey, errorCount: errorCount }
+      }, [localConfigIssues, localProjectIssues, serverIssues])
+
+      var changedCount = useMemo(function () {
+        var count = 0
+        for (var i = 0; i < leaves.length; i += 1) {
+          var key = keyOf(leaves[i])
+          if (!sameDraft(draft[key], initialDraft[key])) count += 1
+        }
+        for (var p = 0; p < projList.length; p += 1) {
+          for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+            var fields = PROJECT_SECTIONS[s].fields
+            for (var f = 0; f < fields.length; f += 1) {
+              var pkey = projectKey(p, fields[f].path)
+              if (!sameDraft(projDraft[pkey], projInitial[pkey])) count += 1
+            }
+          }
+        }
+        return count
+      }, [leaves, draft, initialDraft, projList, projDraft, projInitial])
+
+      /**
+       * 清掉服务端挂在某个字段上的旧抱怨。
+       *
+       * 服务端拒绝过一次之后，那条 issue 会一直留在表里、把保存按钮锁死；
+       * 人把值改对了却还被告知「N 项待修」，只能整页放弃改动才能再存 —— 太蠢。
+       * 改这个字段本身就是「我重填了」，先撤掉旧抱怨，再让本地校验重新说话。
+       */
+      function clearServerIssue (key) {
+        setServerIssues(function (previous) {
+          if (!hasKey(previous, key)) return previous
+          var copy = Object.assign({}, previous)
+          delete copy[key]
+          return copy
+        })
+      }
+
       function onEdit (key, next) {
         setDraft(function (previous) {
           var copy = Object.assign({}, previous)
           copy[key] = next
           return copy
         })
+        clearServerIssue(key)
         setSaveMessage('')
         setSaveError('')
       }
 
       function onReset () {
         setDraft(Object.assign({}, initialDraft))
+        setProjDraft(Object.assign({}, projInitial))
+        setServerIssues({})
         setSaveMessage('')
         setSaveError('')
       }
 
-      function onSave () {
-        var view = findNamespace(snapshot)
-        var ns = getNamespace('settings')
-        if (!view || !ns) return
+      /** 单字段撤销：只回退这一个 key，别的改动留着。 */
+      function onRevert (key) {
+        setDraft(function (previous) {
+          var copy = Object.assign({}, previous)
+          copy[key] = initialDraft[key]
+          return copy
+        })
+        clearServerIssue(key)
+        setSaveMessage('')
+        setSaveError('')
+      }
+
+      function onProjectEdit (key, next) {
+        setProjDraft(function (previous) {
+          var copy = Object.assign({}, previous)
+          copy[key] = next
+          return copy
+        })
+        clearServerIssue(key)
+        setSaveMessage('')
+        setSaveError('')
+      }
+
+      function onProjectRevert (key, base) {
+        setProjDraft(function (previous) {
+          var copy = Object.assign({}, previous)
+          copy[key] = base
+          return copy
+        })
+        clearServerIssue(key)
+        setSaveMessage('')
+        setSaveError('')
+      }
+
+      function onToggleGroup (label) {
+        setOpenMap(function (previous) {
+          var copy = Object.assign({}, previous)
+          copy[label] = !isGroupOpen(previous, label)
+          writeOpenMap(copy)
+          return copy
+        })
+      }
+
+      /** 配置项 + 项目改动合成一笔 mutate：一次 revision 检查，失败不会只写一半（整笔拒）。 */
+      function collectOps () {
         var ops = []
         for (var i = 0; i < leaves.length; i += 1) {
           var leaf = leaves[i]
@@ -640,8 +1606,35 @@ window.__ModuleLoader__.load({
             ops.push({ op: 'set', path: leaf.path, value: raw })
           }
         }
+        // 项目只发**改过的字段**，路径是 ['projects', '<i>', ...field.path]：
+        // 绝不能发 ['projects'] —— 宿主会以「not volatile」整笔拒掉，而且整块替换
+        // 会把别的项目、以及配置文件里手写的字段一起抹掉。
+        for (var p = 0; p < projList.length; p += 1) {
+          for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+            var fields = PROJECT_SECTIONS[s].fields
+            for (var f = 0; f < fields.length; f += 1) {
+              var field = fields[f]
+              var pkey = projectKey(p, field.path)
+              if (sameDraft(projDraft[pkey], projInitial[pkey])) continue
+              ops.push({
+                op: 'set',
+                path: ['projects', String(p)].concat(field.path),
+                value: projectRawValue(field, projDraft[pkey]),
+              })
+            }
+          }
+        }
+        return ops
+      }
+
+      function onSave () {
+        var view = findNamespace(snapshot)
+        var ns = getNamespace('settings')
+        if (!view || !ns) return
+        var ops = collectOps()
         if (ops.length === 0) {
           setDraft(Object.assign({}, initialDraft))
+          setProjDraft(Object.assign({}, projInitial))
           setSaveMessage('没有需要保存的改动')
           return
         }
@@ -652,13 +1645,26 @@ window.__ModuleLoader__.load({
           setSaving(false)
           if (!response || !response.ok) {
             var detail = response && response.error ? response.error : {}
-            setSaveError(detail.code === 'SETTINGS_CONFLICT'
+            var message = detail.message || '未知错误'
+            var mapped = mapServerIssues(message, configKeys)
+            setServerIssues(mapped.byKey)
+            var head = detail.code === 'SETTINGS_CONFLICT'
               ? '配置在别处被改过，已重新载入，请重试。'
-              : '保存失败：' + (detail.message || '未知错误'))
+              : '保存失败：' + message
+            // 兜底：宿主如果把 projects 这段整体判成「不可写」，回来的就是
+            // `Config field "projects" is not declared` / `is not volatile` 这类
+            // 底层文案 —— 对用户没有意义，给一句能照着做的。
+            // 正常的深层路径写入（`projects[0].repo.path`）不会走到这里。
+            if (/projects["'\]\s]*(is not|is)/i.test(message) && /not (volatile|declared)/i.test(message)) {
+              head += '\n项目配置这段被宿主拒了。先把上面这段错误原文发给我，或者临时改 profile 的 cordis.patch.yml 里本行的 config.projects 顶上。'
+            }
+            if (mapped.top.length > 0) head += '\n' + mapped.top
+            setSaveError(head)
             return loadSettings()
           }
+          setServerIssues({})
           setSaveMessage('已保存')
-          return loadSettings()
+          return loadSettings().then(function () { return loadProjects() })
         }, function (error) {
           setSaving(false)
           setSaveError('保存失败：' + (error && error.message ? error.message : String(error)))
@@ -743,7 +1749,13 @@ window.__ModuleLoader__.load({
       }
 
       if (loading) {
-        return h('div', { className: 'tp-panel' }, h('p', { className: 'tp-note' }, '载入中…'))
+        return h('div', { className: 'tp-panel' },
+          h('header', { className: 'tp-head' },
+            h('h2', null, '工单流水线'),
+            h('p', null, '从工单表检测变化、定位代码、改动验证、开 draft MR 并推送通知。')),
+          h('p', { className: 'tp-note' }, '正在等待宿主就绪…'),
+          h('p', { className: 'tp-note', style: { marginTop: '6px' } },
+            '浏览器侧的 remote 通道要等 typert / connection 启动，通常一两秒。最多等 20 秒，超时会告诉你卡在哪一步。'))
       }
 
       var credRows = CREDENTIAL_REFS.map(function (item) {
@@ -763,6 +1775,49 @@ window.__ModuleLoader__.load({
         h('header', { className: 'tp-head' },
           h('h2', null, '工单流水线'),
           h('p', null, '从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。')),
+
+        // 顶部操作条：33 个配置项 + N 张项目卡片，页面很长，保存按钮得一直够得着。
+        h('div', { className: 'tp-bar' },
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-primary',
+            disabled: saving || issues.errorCount > 0 || changedCount === 0,
+            onClick: onSave,
+          }, saving ? '保存中…' : '保存'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            disabled: saving || changedCount === 0,
+            onClick: onReset,
+          }, '放弃改动'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            disabled: saving || projBusy,
+            onClick: function () {
+              loadSettings()
+              loadProjects()
+              loadCredentials()
+            },
+          }, '重新载入'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            disabled: doctorBusy || !mounted,
+            onClick: onDoctor,
+          }, doctorBusy ? '体检中…' : '体检'),
+          h('span', { className: 'tp-spacer' }),
+          issues.errorCount > 0
+            ? h('span', { className: 'tp-count' }, issues.errorCount + ' 项待修')
+            : null,
+          changedCount > 0
+            ? h('span', { className: 'tp-count' }, '未保存 ' + changedCount + ' 项')
+            : null),
+
+        // 保存失败（含服务端拒绝）贴着操作条显示：人点完保存眼睛还在这里。
+        saveError.length > 0 ? h('p', { className: 'tp-err', style: { marginTop: '0', whiteSpace: 'pre-wrap' } }, saveError) : null,
+        saveMessage.length > 0 ? h('p', { className: 'tp-note' }, saveMessage) : null,
+        loadError.length > 0 ? h('p', { className: 'tp-err', style: { marginTop: '0' } }, loadError) : null,
 
         h(DoctorCard, {
           report: doctorReport,
@@ -784,26 +1839,39 @@ window.__ModuleLoader__.load({
           view: findNamespace(snapshot),
           leaves: leaves,
           draft: draft,
+          initialDraft: initialDraft,
           secrets: secretMap,
           disabled: saving,
           dirty: dirty,
           saving: saving,
-          error: saveError + (loadError ? ' ' + loadError : ''),
-          message: saveMessage,
+          error: '',
+          message: '',
+          issues: issues.byKey,
+          errorCount: issues.errorCount,
+          isOpen: function (label) { return isGroupOpen(openMap, label) },
+          onToggle: onToggleGroup,
           onEdit: onEdit,
+          onRevert: onRevert,
           onSave: onSave,
           onReset: onReset,
         }),
 
-        h('section', { className: 'tp-card' },
-          h('h3', null, '项目清单'),
-          h('p', { className: 'tp-note' },
-            '项目（工单表 → 仓库的绑定）是结构化数组，形态复杂、校验严格，这里不放编辑框。',
-            '请直接改 profile 的 ',
-            h('code', null, 'cordis.patch.yml'),
-            ' 里本行的 ',
-            h('code', null, 'config.projects'),
-            '，或让 agent 帮你改。改完重启 DSH 生效。')))
+        h(ProjectListCard, {
+          list: projList,
+          draft: projDraft,
+          issues: issues.byKey,
+          busy: projBusy,
+          error: projError,
+          disabled: saving,
+          message: '',
+          saveError: '',
+          dirty: projectDirty,
+          onReload: loadProjects,
+          onEdit: onProjectEdit,
+          onRevert: onProjectRevert,
+          branchList: branchList,
+          branchBusy: branchBusy,
+        }))
     }
 
     // 硬依赖只有 slots —— 它由 dsh-client-ui-renderer 启动时就 provide，不存在「等不到」。

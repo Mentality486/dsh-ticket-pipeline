@@ -161,6 +161,13 @@ export function createPipelineStatusTool (options) {
             lines.push(`  本地提交：${String(row.commit.sha).slice(0, 12)}${row.commit.branch ? ` @ ${row.commit.branch}` : ''}`)
           }
           if (row.mr?.url) lines.push(`  MR：${row.mr.url}${row.mr.draft ? '（draft）' : ''}`)
+          if (row.sessionId) lines.push(`  处理会话：${row.sessionId}（保留在工作区名下，可在会话列表里点进去继续问）`)
+          // 回填只在 done/skipped 后发生，写没写成是「表格里那行现在长什么样」的唯一线索。
+          if (row.writeBack) {
+            lines.push(row.writeBack.written
+              ? `  回填表格：成功${Array.isArray(row.writeBack.fields) && row.writeBack.fields.length > 0 ? `（${row.writeBack.fields.join('、')}）` : ''}`
+              : `  回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}`)
+          }
           if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
           if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
           if (row.revisionCount > 1) lines.push(`  这是第 ${row.revisionCount} 版（工单被改过 ${row.revisionCount - 1} 次）`)
@@ -188,6 +195,8 @@ export function createPipelineStatusTool (options) {
           branch: row.branch,
           commitSha: row.commit?.sha,
           mrUrl: row.mr?.url,
+          sessionId: row.sessionId,
+          writeBack: row.writeBack,
           lastError: row.lastError,
           testDetail: row.testDetail,
           revisionCount: row.revisionCount,

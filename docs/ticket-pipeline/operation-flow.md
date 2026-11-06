@@ -21,23 +21,27 @@ flowchart TD
     H --> I[locator.locate projectId<br/>→ repoPath / baseBranch / targetBranch]
     I --> J[detectBaseBranch<br/>显式配置→origin/HEAD→HEAD→main]
     J --> K[fetchBeforeCreate 先 git fetch<br/>仅 isolateWorktree: true 时]
-    K --> L[prepareWorkspace<br/>确保项目工作区 workspaceRegistry<br/>缺省：inspectCheckout + assertCleanCheckout<br/>（脏则拒跑点名文件）就地改<br/>isolateWorktree: true 才 git worktree add 开隔离目录]
+    K --> L[prepareWorkspace<br/>确保项目工作区 workspaceRegistry<br/>缺省：inspectCheckout + describeDirtyCheckout<br/>（脏只提醒、照跑）就地改<br/>isolateWorktree: true 才 git worktree add 开隔离目录]
     L --> M[取截图字节 → saveImage → ImageBlock<br/>三形态 attachment/path/url]
     M --> N[渲染任务书<br/>renderTicketPrompt 文本 + renderTicketContent 图文]
-    N --> O[executor.run ticket,target,ctx<br/>agent 改码 / mock 只演]
+    N --> N2[createBaseline 拍基线<br/>git stash create 只读：不写 ref / 不动工作区<br/>人的未提交改动一个都不进本次提交]
+    N2 --> O[executor.run ticket,target,ctx<br/>agent 改码 / mock 只演]
     O --> P{执行结果}
-    P -->|改码+验证| Q[git diff --name-status 收集改动<br/>敏感文件过滤]
+    P -->|改码+验证| Q[对基线 git diff --name-status 收集改动<br/>人的改动 / 已 add 进索引的都不算，敏感文件过滤]
     Q --> R[verify.build / verify.test 注入执行]
-    R --> S[commitLocally: git add -- 非敏感文件（点名暂存）→ git commit -- 非敏感文件<br/>产出 ExecResult.commit = sha/branch/files]
-    S --> T[phase=done / skipped]
+    R --> S[commitLocally: git add -- 非敏感文件（点名暂存）→ git commit -- 非敏感文件<br/>产出 ExecResult.commit = sha/branch/files，并带回 sessionId]
+    S --> T[phase=done / skipped<br/>agent 实例释放，keepSession 缺省 true 只留会话不回收]
     P -->|取不到图| U[phase=needs-info 等人补图]
     P -->|失败| V[错误分类 + 退避重试 / failed]
-    T --> W[push.send 通知<br/>QQ 邮箱 / PushPlus / mock]
+    T --> T2[writeBackFor 回填工单表<br/>仅 done/skipped 且 writeBack 没关<br/>source.writeResult 写 是否处理 / 处理结果 / 处理日期]
+    T2 --> W[push.send 通知<br/>QQ 邮箱 / PushPlus / mock]
     W --> X[releaseLease + 清超时]
     X --> Y([下一轮或队列空仅清理])
     V --> W
     U --> Y
 ```
+
+> 回填（`writeBackFor()`）三条硬约束：①**只写 `done` / `skipped`** —— `failed` 的票留在表里「处理中」是刻意留的信号；②**回填失败只记日志**，票态不回退、通知照发，人能从 `pipeline_status` 的「回填表格：没写成 —— …」看到原因；③**被取消就不写**。开关是 `writeBack`（缺省 `true`）与 `writeBackStatus`（缺省 `是`）。
 
 ---
 
@@ -72,6 +76,8 @@ flowchart TD
     OUT --> EQ([入 store.enqueue])
 ```
 
+> **扫描只读**：`scan()` 全程不写任何远端状态（飞书侧只发 auth / `records/search` 这类 GET）。唯一的写入口是同一条契约上的 `writeResult(recordId, { status, result, handledAt })`，在票跑完 `done` / `skipped` 之后由调度器调用一次 —— 为什么不把写藏在 `scan` 里，见架构 §5.2 与 [ADR 0006](../adr/0006-处理完回填工单表.md)。
+
 > ⚠ 上面 `feishu` 那条支路**只画到多维表格**（`records/search`）。飞书**电子表格**目前进不来 —— 是代码路径问题不是权限问题（`source-feishu/index.js:763-766` 把 `obj_type:'bitable'` 硬写进 query，`:770-775` 把 `sheet` 判成「不是多维表格」；`config.js:494-501` 只认两种绑定形态）。该分支的**设计已定、尚未实施**，探测与扫描两张流程图见 `docs/ticket-pipeline/feishu-sheet-source.md` §3.5 / §5.7。
 
 ---
@@ -87,9 +93,10 @@ flowchart TD
     E3 --> E3b[2. appendDelegatedPolicyOverrides 写策略]
     E3 --> E3c[3. 钉目录: workingDirectory.set → worktreePath<br/>✅ 仅 worktreePath ≠ workspacePath（isolateWorktree 打开）时才需要<br/>缺省模式两者相等,不需要这个服务]
     E3 --> E3d[4. attachSession 归属项目工作区<br/>失败只记日志,不影响改码]
-    E3a --> E4[agent.followup 推任务书<br/>⚠ inject 不唤醒,必须 followup]
+    E3d --> E3e[createBaseline 拍基线<br/>git stash create 只造 commit 对象<br/>不写 ref / 不动工作区 / 不动索引<br/>拍不下来只记日志,降级按 baseCommit 收集]
+    E3e --> E4[agent.followup 推任务书<br/>⚠ inject 不唤醒,必须 followup]
     E4 --> E5[waitForAgentIdle<br/>seq 连续静 2 次才认结束]
-    E5 --> E6[collectChanges: git diff --name-status -z ∪ git status --porcelain -z -uall<br/>✅ 未跟踪新文件也算；排除 .agents/worktrees]
+    E5 --> E6[collectChanges：有基线就对基线 git diff --name-status -z<br/>∪ git status --porcelain -z -uall；未跟踪文件哈希与基线相同则跳过<br/>✅ 人的改动一个都不进来；排除 .agents/worktrees]
     E6 --> E7{SENSITIVE_FILE_PATTERNS 命中?}
     E7 -->|是| E7a[✅ 拦下且写进提交说明的「未提交」一行,人 git show 就能看到]
     E7 -->|否| E8
@@ -103,7 +110,7 @@ flowchart TD
     E12 --> E14[commitLocally<br/>git restore --staged 退回 agent 自己暂存的敏感文件<br/>git add -- 非删除的文件（点名暂存,不用 add -A）<br/>→ git commit -m 说明 -- 改动文件 ∪ 重命名旧路径]
     E13 --> E14
     E9a --> E14
-    E14 --> E14a[git rev-parse HEAD<br/>取回 sha,并带出 branch / files]
+    E14 --> E14a[git rev-parse HEAD<br/>取回 sha,并带出 branch / files / sessionId]
     E14a --> E15{repo.gitlab.enabled === true?}
     E15 -->|否（缺省）| E22[commit 就是交付物<br/>不发任何 GitLab 请求、不要 GITLAB_TOKEN]
     E15 -->|是（显式打开远程出口）| E16[openDraftMr → resolveGitlab project,target<br/>✅ repo.gitlab{baseUrl,remote,projectId,enabled} 已能透传]
@@ -117,6 +124,10 @@ flowchart TD
     E21a --> E22
     E22 --> E23[makeExecResult<br/>phase=done/skipped, testOutcome<br/>✅ 必须给 commit 或 mr 之一]
 ```
+
+> **基线（`createBaseline`）为什么在 `followup` 之前拍**：它拍的是「agent 动手前」的样子，之后 `collectChanges` 只比这一份，所以人在这个检出里攒着的未提交改动、甚至已经 `git add` 进索引的改动，都不会混进本次提交。`git stash create` 是唯一一个只读的取基线方式 —— 它只造一个 commit 对象，不写 ref、不动工作区、不动索引（拍完 `git stash list` 仍是空的）。拍不下来（比如仓库有锁）只记日志，降级成按 `baseCommit` 收集，票不会因为「拍不到基线」而失败。
+>
+> **`keepSession` 管的是会话、不是 agent 实例**：`finally` 里 agent 实例**永远** `dispose()`（否则宿主侧会一直挂着一个跑着的 agent）。`keepSession !== false`（缺省 `true`）时只记一行日志「agent 已释放，会话保留」，会话留在项目工作区名下，人能在会话列表里点进去继续追问；只有显式 `keepSession: false` 才去调宿主的 `sessions` 服务（`close` / `dispose` / `closeSession` 三选一，调用永不抛）。
 
 ---
 
@@ -154,11 +165,13 @@ flowchart TD
     N2 -->|mock| N5[内存记录]
     N3 --> N6[送达?]
     N4 --> N6
-    N6 -->|QQ SMTP accepted| N7([人收到邮件,含本地提交 sha 与分支])
+    N6 -->|QQ SMTP accepted| N7([人收到邮件,含本地提交 sha、分支与处理会话 id])
     N6 -->|PushPlus code 200| N8([仅受理,回执看 callbackUrl sendStatus])
     N7 --> H1([人在检出里 git show &lt;sha&gt; 验收])
     N8 --> H1
-    H1 --> H2[人自己决定怎么合到主干<br/>插件从不自动合并、也不 push]
+    H1 --> H1a[表格已经回填好了<br/>是否处理 / 处理结果 / 处理日期<br/>要再改就清空处理结果 + 把「是否处理」拨回「处理中」]
+    H1a --> H1b[想接着问？点进那个处理会话<br/>pipeline_status 里有 处理会话:sessionId]
+    H1b --> H2[人自己决定怎么合到主干<br/>插件从不自动合并、也不 push]
     H2 --> H3{验收结论?}
     H3 -->|需重跑| H4[pipeline_reset 放回队列]
     H3 -->|取消在跑的票| H5[pipeline_cancel 并发恒1]
@@ -171,8 +184,8 @@ flowchart TD
 ```mermaid
 flowchart LR
     T1[pipeline_scan<br/>立刻扫一轮] --> Q([队列])
-    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch] --> Q
-    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警] --> Q
+    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成] --> Q
+    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警<br/>检出脏只提醒（照跑,会拍基线）] --> Q
     T4[pipeline_reset<br/>failed/needs-info/gone 放回重跑] --> Q
     T5[pipeline_cancel<br/>取消正在跑的那张票] --> Q
 ```
@@ -181,7 +194,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线：HEAD `deec1a5`（2026-11-06），含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码），自测 294/294 + 链路冒烟 11/11。
+状态基线：HEAD `59c8708`（2026-11-06），含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码）与「回填工单表 / 保留会话 / 只提交 agent 改过的文件 / 设置面板补齐」四项改造，自测 325/325 + 链路冒烟 11/11。
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |
@@ -199,6 +212,11 @@ flowchart LR
 >
 > 本轮（工作树改造）已关闭：**P1-14** 远程 Commits API 是唯一出口 —— 改为工作区检出里的本地提交优先，远程 MR 变成 `repo.gitlab.enabled: true` 才走的可选出口。
 >
-> 本轮同时改掉「每票必开隔离 worktree」这个隐含前置：缺省直接在项目工作区的检出里改（要求检出干净，脏则拒跑并点名文件），`isolateWorktree: true` 才退回 `git worktree add`；清理侧加 `isIsolatedWorktreePath()` 前缀校验，防止 `git worktree remove --force` 误删人的主检出。
+| P1-17 | 回填工单表需要飞书应用有**编辑**权限 | 权限缺口 | **已实现、待真表验证**。只有读权限时写回返回 `code 91403 Forbidden`；这时票仍是 `done`，只是 `pipeline_status` 显示「回填表格：没写成 —— …」。把应用加成可编辑协作者再验一次即可（见 `feature-checklist.md` §8.2） |
+| P1-18 | `keepSession` 依赖宿主的 `sessions` 服务 | 依赖缺口 | **缺省不需要**：缺省 `keepSession: true`，只留会话不回收，完全不碰该服务；只有显式 `keepSession: false` 才调 `close` / `dispose` / `closeSession`（三选一，调不通也不影响票态） |
+
+> 本轮（四项改造）已关闭：**P1-15** 处理完还得人工改表 → 回填工单表（`TicketSource.writeResult` 是唯一写入口，只写 done/skipped 三列）；**P1-19** 处理完会话找不回来 → `ExecResult.sessionId` + `keepSession` 把会话留在项目工作区名下；**P1-20** 检出不干净就拒跑 → 改成 `createBaseline()` 拍只读基线、只提交 agent 真正改过的文件；**P1-21** 设置页只能改全局配置 → `projects` 子树可编辑（25 字段）+ 第三个 Remote 方法 `ticketPipeline.projects()`。
+>
+> 本轮同时改掉「每票必开隔离 worktree」这个隐含前置：缺省直接在项目工作区的检出里改（**脏也能跑**，只提醒不拒跑），`isolateWorktree: true` 才退回 `git worktree add`；清理侧加 `isIsolatedWorktreePath()` 前缀校验，防止 `git worktree remove --force` 误删人的主检出。
 >
 > 本轮（改动收集改 `git -z`）已关闭三个会静默丢改动的缺陷：①`git diff` 看不见未跟踪新文件（agent 新建的文件既不提交、还会被误判成「没有产生任何文件改动」）；②非 `-z` 输出下中文名是八进制转义、含空格名带引号、未跟踪目录被折叠成一个目录名（敏感文件因此绕过拦截）；③插件自己的 `.agents/worktrees` 让主检出恒脏（缺省模式直接拒跑）。详见 `feature-checklist.md` §1.4。

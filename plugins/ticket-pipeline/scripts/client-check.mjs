@@ -26,9 +26,14 @@ function fail (message) {
   problems.push(message)
 }
 
-/** 从 bundle 源码里抠出一个顶层 `var NAME = {...}` / `export const NAME = ...` 的 JSON。 */
-function sliceJsonObject (source, startIndex) {
-  const open = source.indexOf('{', startIndex)
+/**
+ * 从 `startIndex` 往后抠一个括号平衡的字面量（字符串与注释里的括号不算）。
+ *
+ * `lib/client.js` 里的 `TICKET_PIPELINE_REMOTE` / `PROJECT_SECTIONS` 都是手写字面量，
+ * 只能靠源码切片再求值来核对 —— 但它们里面既有中文又有注释，正则切不准。
+ */
+function sliceBalanced (source, startIndex, openChar, closeChar) {
+  const open = source.indexOf(openChar, startIndex)
   if (open < 0) return undefined
   let depth = 0
   let inString = false
@@ -48,13 +53,140 @@ function sliceJsonObject (source, startIndex) {
       if (next === '/') { while (i < source.length && source[i] !== '\n') i += 1; continue }
       if (next === '*') { i += 2; while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i += 1; i += 1; continue }
     }
-    if (ch === '{') depth += 1
-    else if (ch === '}') {
+    if (ch === openChar) depth += 1
+    else if (ch === closeChar) {
       depth -= 1
       if (depth === 0) return source.slice(open, i + 1)
     }
   }
   return undefined
+}
+
+/** 从 bundle 源码里抠出一个顶层 `var NAME = {...}` 的 JSON。 */
+function sliceJsonObject (source, startIndex) {
+  return sliceBalanced(source, startIndex, '{', '}')
+}
+
+/** 从 bundle 源码里抠出一个顶层 `var NAME = [...]` 的数组字面量。 */
+function sliceJsonArray (source, startIndex) {
+  return sliceBalanced(source, startIndex, '[', ']')
+}
+
+/**
+ * 摊平 descriptor / 信封树，可选跳过根上的 `projects` 子树。
+ *
+ * `projects` 是数组，不在 `CONFIG_FIELDS` 里（由 `validateProjects` 单独校验），
+ * 所以「常规叶子必须与 CONFIG_FIELDS 完全一致」那两条断言摊平时要把它排除，
+ * 否则一旦宿主给它补上 descriptor 节点，断言就会误报。
+ */
+function collectLeaves (node, path, out, skipProjects) {
+  if (node === null || typeof node !== 'object') return out
+  if (node.dict && typeof node.dict === 'object') {
+    for (const [key, child] of Object.entries(node.dict)) {
+      if (skipProjects && path.length === 0 && key === 'projects') continue
+      collectLeaves(child, path.concat([key]), out, skipProjects)
+    }
+    return out
+  }
+  out.push({ path, node })
+  return out
+}
+
+/**
+ * 专项体检 `projects` 子树（如果有）。
+ *
+ * 面板写的是**深层路径**（`['projects','0','repo','path']` 这种），不是整数组替换 ——
+ * 整替换会把别人写的项目和 `appToken` 一起冲掉。要让深层路径写得进去，宿主
+ * `applyPathOp` 必须一路都能 `dict[...]` / `inner` 下去，且沿途**每个**节点都得是
+ * volatile（`validatePaths` 只在最后那一段上查 volatile，但中间的节点不声明就直接
+ * 抛 `Config field "..." is not declared`）。所以这里按沿途逐节点查。
+ *
+ * @param {any} node descriptor 或重建后的信封根上的 `projects` 节点
+ * @param {string} label 报错时用的位置说明
+ * @returns {{ present: boolean, fields: string[] }} fields 是去掉 `projects` 前缀后的路径
+ */
+function auditProjectsNode (node, label) {
+  if (node === undefined) return { present: false, fields: [] }
+  if (node === null || typeof node !== 'object') {
+    fail(label + ' 的 projects 节点不是对象')
+    return { present: true, fields: [] }
+  }
+  if (node.type !== 'array') {
+    fail(label + ' 的 projects 节点 type 是 ' + JSON.stringify(node.type) + '，必须是 "array"')
+  }
+  if (!node.meta || node.meta.volatile !== true) {
+    fail(label + ' 的 projects 节点没有 meta.volatile —— 宿主会以 Config field "projects" is not volatile 拒掉整笔写入')
+  }
+  const inner = node.inner
+  if (inner === undefined || inner === null || typeof inner !== 'object') {
+    fail(label + ' 的 projects 是数组但 inner 为空 —— 浏览器重建后读 inner.meta 会抛 TypeError: Cannot read properties of undefined')
+    return { present: true, fields: [] }
+  }
+  if (inner.type !== 'object') {
+    fail(label + ' 的 projects.inner 是 ' + JSON.stringify(inner.type) + '，必须是 "object"（否则 projects[0].repo.path 这种深层路径走不下去）')
+  }
+  if (!inner.meta || inner.meta.volatile !== true) {
+    fail(label + ' 的 projects.inner 没有 meta.volatile —— 深层路径写到元素上时会被拒')
+  }
+
+  const leaves = []
+  collectLeaves(inner, [], leaves, false)
+  const fields = []
+  for (const leaf of leaves) {
+    const key = leaf.path.join('.')
+    fields.push(key)
+    const meta = leaf.node.meta ?? {}
+    if (meta.volatile !== true) {
+      fail(label + ' 的项目字段 projects[].' + key + ' 没有 meta.volatile —— 写到这一层的 mutate 会被拒（Config field "' + (leaf.path[0] ?? '') + '" is not volatile）')
+    }
+    if (typeof leaf.node.toJSON !== 'function') {
+      fail(label + ' 的项目字段 projects[].' + key + ' 的 descriptor 节点没有 toJSON()')
+    }
+  }
+  if (fields.length === 0) {
+    fail(label + ' 的 projects.inner 里一个字段都没有 —— 面板没法展示任何项目字段')
+  }
+  return { present: true, fields }
+}
+
+/**
+ * 抠出 `lib/client.js` 里手写的项目字段表 `PROJECT_SECTIONS` 并摊平。
+ *
+ * 面板的字段表是手抄的（浏览器 bundle 用不了宿主源码），抄漏一个字段的表现是
+ * 「这个字段在界面上根本不出现」，抄错路径的表现是保存时被宿主拒成
+ * `Config field "..." is not declared`。两边都必须能对上。
+ */
+async function readClientProjectFields () {
+  const source = await readFile(join(root, 'lib/client.js'), 'utf8')
+  const anchor = source.indexOf('var PROJECT_SECTIONS')
+  if (anchor < 0) {
+    fail('lib/client.js 里找不到 PROJECT_SECTIONS（项目清单的字段表）')
+    return undefined
+  }
+  const literal = sliceJsonArray(source, anchor)
+  if (literal === undefined) {
+    fail('lib/client.js 里的 PROJECT_SECTIONS 不是字面量数组（脚本抠不出来）')
+    return undefined
+  }
+  // 字段表里引用外层常量（`options: PLATFORMS`），求值时要把它一起带上。
+  const platformAnchor = source.indexOf('var PLATFORMS')
+  const platformLiteral = platformAnchor < 0 ? undefined : sliceJsonArray(source, platformAnchor)
+  if (platformLiteral === undefined) {
+    fail('lib/client.js 里找不到 PLATFORMS 常量（项目平台下拉框的选项表）')
+    return undefined
+  }
+  let sections
+  try {
+    sections = new Function('PLATFORMS', 'return (' + literal + ')')(new Function('return (' + platformLiteral + ')')())
+  } catch (error) {
+    fail('lib/client.js 里的 PROJECT_SECTIONS 解析失败：' + error.message)
+    return undefined
+  }
+  const fields = []
+  for (const section of sections) {
+    for (const field of section.fields ?? []) fields.push(field)
+  }
+  return fields
 }
 
 /**
@@ -157,23 +289,20 @@ async function checkDescriptorMeta () {
   }
 
   const groupLabels = new Set(CONFIG_GROUPS.map((group) => group.label))
+  const descriptor = getConfigDescriptor()
   const leaves = []
-  /** 摊平 schema 树：有 dict 就是分支，否则是叶子。点号键在树里已经是嵌套的。 */
-  function walk (node, path) {
-    if (node === null || typeof node !== 'object') return
-    if (node.dict && typeof node.dict === 'object') {
-      for (const [key, child] of Object.entries(node.dict)) walk(child, path.concat([key]))
-      return
-    }
-    leaves.push({ path, node })
-  }
-  walk(getConfigDescriptor(), [])
+  // 摊平 schema 树：有 dict 就是分支，否则是叶子。点号键在树里已经是嵌套的。
+  // `projects` 是数组（不在 CONFIG_FIELDS 里），下面单独体检，这里跳过。
+  collectLeaves(descriptor, [], leaves, true)
 
   const expectedKeys = Object.keys(CONFIG_FIELDS).sort()
   const actualKeys = leaves.map((leaf) => leaf.path.join('.')).sort()
   if (JSON.stringify(expectedKeys) !== JSON.stringify(actualKeys)) {
     fail('descriptor 叶子与 CONFIG_FIELDS 对不上：\n  声明：' + expectedKeys.join(', ') + '\n  实际：' + actualKeys.join(', '))
   }
+
+  const projects = auditProjectsNode(descriptor && descriptor.dict ? descriptor.dict.projects : undefined, 'getConfigDescriptor()')
+  if (projects.present) notes.push('descriptor 里 projects 可写：' + projects.fields.length + ' 个字段（深层路径 mutate）')
 
   for (const leaf of leaves) {
     const key = leaf.path.join('.')
@@ -327,29 +456,18 @@ async function checkSchemaEnvelope () {
   for (const message of found) fail('信封重建后 ' + message)
 
   // 4) 信封摊出来的叶子必须与源树、CONFIG_FIELDS 三方一致，面板才知道每个字段叫什么、在哪一组。
+  //    `projects` 是数组、不在 CONFIG_FIELDS 里，摊平时跳过它（单独体检）。
   const sourceLeaves = []
   const sourceMeta = new Map()
-  const collectSource = (node, path) => {
-    if (node === null || typeof node !== 'object') return
-    if (node.dict && typeof node.dict === 'object') {
-      for (const [key, child] of Object.entries(node.dict)) collectSource(child, path.concat([key]))
-      return
-    }
-    sourceLeaves.push(path.join('.'))
-    sourceMeta.set(path.join('.'), node.meta)
+  for (const leaf of collectLeaves(getConfigDescriptor(), [], [], true)) {
+    sourceLeaves.push(leaf.path.join('.'))
+    sourceMeta.set(leaf.path.join('.'), leaf.node.meta)
   }
-  collectSource(getConfigDescriptor(), [])
 
-  const envelopeLeaves = []
-  const collectEnvelope = (node, path) => {
-    if (!node || typeof node !== 'object') return
-    if (node.dict && typeof node.dict === 'object') {
-      for (const [key, child] of Object.entries(node.dict)) collectEnvelope(child, path.concat([key]))
-      return
-    }
-    envelopeLeaves.push({ key: path.join('.'), meta: node.meta ?? {} })
-  }
-  collectEnvelope(rootNode, [])
+  const envelopeLeaves = collectLeaves(rootNode, [], [], true).map((leaf) => ({
+    key: leaf.path.join('.'),
+    meta: leaf.node.meta ?? {},
+  }))
 
   const expected = Object.keys(CONFIG_FIELDS).sort()
   const fromSource = sourceLeaves.slice().sort()
@@ -389,6 +507,66 @@ async function checkSchemaEnvelope () {
   }
 
   notes.push('schema 信封 ' + Object.keys(envelope.refs).length + ' 个节点，' + envelopeLeaves.length + ' 个叶子，三方一致')
+}
+
+/**
+ * 面板的项目字段表 vs 宿主 `projects` descriptor：两边必须能对上。
+ *
+ * 两份表是**手抄的两份**（`lib/client.js` 的 `PROJECT_SECTIONS` 与
+ * `src/core/config.js` 的 `buildProjectsDescriptor`）。对不上的后果只有两种，
+ * 而且都发生在别人点保存之后：漏抄字段 = 那个字段在界面上根本改不了；
+ * 多抄/抄错路径 = 宿主回 `Config field "..." is not declared`，整笔写入被拒。
+ */
+async function checkProjectFields () {
+  const configModule = await import(pathToFileURL(join(root, 'src/core/config.js')).href)
+  const { getConfigDescriptor } = configModule
+  if (typeof getConfigDescriptor !== 'function') return
+  const descriptor = getConfigDescriptor()
+  const projectsNode = descriptor && descriptor.dict ? descriptor.dict.projects : undefined
+  const fields = await readClientProjectFields()
+  if (fields === undefined) return
+
+  const panelPaths = fields.map((field) => (Array.isArray(field.path) ? field.path.join('.') : String(field.path)))
+  const duplicate = panelPaths.filter((path, index) => panelPaths.indexOf(path) !== index)
+  if (duplicate.length > 0) {
+    fail('lib/client.js 的 PROJECT_SECTIONS 里有重复字段：' + Array.from(new Set(duplicate)).join(', '))
+  }
+  for (const field of fields) {
+    if (!Array.isArray(field.path) || field.path.length === 0) {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里有字段没写 path：' + JSON.stringify(field))
+      continue
+    }
+    if (typeof field.from !== 'string' || field.from.length === 0) {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 没有 from（宿主 describeProject 的扁平字段名）')
+    }
+    if (['text', 'list', 'select', 'bool', 'branch'].indexOf(field.kind) < 0) {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 的 kind 不认识：' + JSON.stringify(field.kind))
+    }
+    if (typeof field.label !== 'string' || field.label.length === 0) {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 没有 label —— 界面上会显示裸键名')
+    }
+  }
+
+  if (projectsNode === undefined) {
+    // 宿主还没把 projects 做成可写节点时，面板照样能画出来（只是保存会被拒，
+    // 界面上会原样显示宿主的 error.message）。这不算失败，但要提示。
+    notes.push('宿主 descriptor 里还没有可写的 projects 节点（面板字段表 ' + panelPaths.length + ' 项已就绪，保存会被宿主拒）')
+    return
+  }
+
+  const audit = auditProjectsNode(projectsNode, 'getConfigDescriptor()')
+  const declared = new Set(audit.fields)
+  for (const path of panelPaths) {
+    if (!declared.has(path)) {
+      fail('面板字段 ' + path + ' 在宿主 projects descriptor 里没有对应节点 —— 保存会被拒成 Config field "' + path.split('.')[0] + '" is not declared')
+    }
+  }
+  for (const path of audit.fields) {
+    if (panelPaths.indexOf(path) < 0) {
+      notes.push('宿主 projects descriptor 里有 ' + path + '，面板没画（这个字段只能改配置文件）')
+    }
+  }
+  notes.push('面板项目字段 ' + panelPaths.length + ' 项与宿主 projects descriptor 对得上')
 }
 
 async function checkPackageJson () {
@@ -493,6 +671,7 @@ async function main () {
   await checkSlotInjection()
   await checkDescriptorMeta()
   await checkSchemaEnvelope()
+  await checkProjectFields()
 
   const host = await readHostRemote()
   const client = await readClientRemote()

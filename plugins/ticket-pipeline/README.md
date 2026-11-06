@@ -32,13 +32,13 @@ src/
     source-webform/  演示平台（内存表单源，实证可插拔流程）
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
-    executor-agent/  真执行器：起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交（commitLocally）→ 可选：Commits API 开 draft MR
+    executor-agent/  真执行器：拍基线 → 起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交（commitLocally）→ 保留会话（keepSession）→ 可选：Commits API 开 draft MR
     gitlab-client/   GitLab REST 客户端（分支/提交/MR/错误分类）；只在 repo.gitlab.enabled=true 时被调用
     push-mock/       假通知（记内存）
     push-pushplus/   PushPlus 真实现
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
   tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_doctor 五个工具
-  remote/            浏览器端可调的自建 Remote（ticketPipeline/doctor、ticketPipeline/config）
+  remote/            浏览器端可调的自建 Remote（ticketPipeline/doctor、ticketPipeline/config、ticketPipeline/projects、ticketPipeline/branches）
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
 lib/
   client.js          浏览器端 bundle：插件设置页（填配置 + 凭据 + 立即体检）
@@ -57,13 +57,27 @@ lib/
 - **凭据**：飞书 App ID / App Secret、QQ 邮箱授权码、PushPlus token；GitLab Token 也在这里，
   但只有项目打开 `repo.gitlab.enabled: true` 才需要（本阶段用不到），
   只写不读回（写入走 `ctx.get('remote.credentials')`，界面只显示「已配置 / 未配置」）。
-- **配置**：按分组渲染 30 个字段，保存走 `ctx.get('remote.settings').mutate`（写 profile 的
-  `cordis.patch.yml`，重启后仍在）。`projects[]` 是结构化数组，不在这张表单里，仍需手改配置（见使用手册 §3）。
+- **配置**：按分组渲染 **33 个字段 / 7 个分组**，保存走 `ctx.get('remote.settings').mutate`（写 profile 的
+  `cordis.patch.yml`，重启后仍在）。
+- **项目清单**：`projects[]` 现在**也能在面板上改**（5 个分区 21 个字段：名称 / 匹配 / 仓库 / 远程 GitLab / 验证命令）。
+  字段约束即时校验（必填、数字 `min`–`max`、枚举、列表按逗号切分），分组可折叠，脏字段带「已改」徽标并能单字段撤销。
+  `match.appToken` **明文不下发**，只给「已配置」+「前 4…后 4」的预览；保存只发改动过的**深层路径**
+  （`['projects','0','repo','path']` 这种），绝不整数组替换 —— 否则会抹掉别的项目和手写进去的 `appToken`。
+  驱动它的是第三个 Remote 方法 `ticketPipeline.projects()`（返回项目扁平视图）。
+  `repo.baseBranch` / `repo.targetBranch` 两个分支字段还带候选下拉（输入框 + `<datalist>`），
+  候选来自第四个 Remote 方法 `ticketPipeline.branches()`（一次返回**全部**项目，不按项目各发一次 git；
+  `src/core/branches.js` 的 `listBranches()` 绝不抛，拿不到就 `ok:false` + 一句人话原因）。
+  手改配置文件仍然有效（见使用手册 §3）。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
 （每个节点带 `toJSON`、叶子带 `meta.volatile`），宿主 `dsh-settings` 用它投影出可写字段。
 **没挂 descriptor 时宿主会静默跳过整条设置项** —— 加字段后记得同步 `CONFIG_GROUPS`，
 `node scripts/client-check.mjs` 会检查这一点。
+
+`projects` 这棵子树有个特殊要求：**数组节点自己必须标 `meta.volatile = true`**（`inner` 里的子节点也要标）。
+原因是宿主的 `isVolatilePath(schema, path)` 只沿 `schema.dict` 往下走、**完全不认 `inner`**，而 `projects` 是数组 ——
+深层路径 `['projects','0','repo','path']` 只能靠根节点自己 volatile 短路放行，否则每次保存都被拒成
+`Config field "projects" is not volatile`。`client-check.mjs` 的 `auditProjectsNode()` 会逐层查这一点。
 
 descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`，
 `refs` 里 `dict`/`inner`/`list` 的值是 **uid 数字**（引用），不能是内联对象。
@@ -100,7 +114,10 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 
 ## 关键决策（都来自地图 Decisions，勿擅自改）
 
-- **工单表只读**：不回写处理结果/处理人/PR 链接。收票条件 = `是否处理 = 处理中`。
+- **扫描只读，回填是唯一写入口**：`scan()` 全程不写远端状态。票跑成 `done` / `skipped` 之后，
+  调度器调一次 `TicketSource.writeResult(recordId, { status, result, handledAt })`，只写「是否处理 / 处理结果 / 处理日期」三列。
+  `failed` 不回填（留在「处理中」是刻意留的信号）；回填失败只记在票据上、票态不回退、通知照发。开关 `writeBack`（缺省 `true`）与 `writeBackStatus`（缺省 `是`）。
+  为什么必须拆成两个方法见 [`docs/adr/0006-处理完回填工单表.md`](../../docs/adr/0006-处理完回填工单表.md)。
 - **`record_id` 是平台内唯一身份**，不用「序号」列（人手填、会重排）。**跨项目用复合主键** `ticketKey(projectId, recordId)`。
 - **项目清单在插件配置 `projects[]` 里维护**（工单→项目在表级绑定，一个项目一条配置：name + match + repo + verify）。
 - **变更检测靠轮询**：飞书没有可靠的单元格变更事件。间隔读 `Config.pollIntervalMinutes`（默认 3 分钟）。
@@ -112,9 +129,10 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 - **项目工作区复用，改代码落点可配**：`projects[].repo.path` 那个目录就是一个项目的**工作区** ——
   插件会确保它在宿主 `workspaceRegistry` 里有一份登记（一个项目一条，多张票共用同一个；
   已登记则复用，没登记则补一条）。目录必须真实存在，插件不会替你克隆。
-  **缺省（`isolateWorktree: false`）就直接在这个检出里改代码**，分支 = 检出当前分支、不另开票分支，
-  但**开跑前硬性要求检出干净**：`git status --porcelain` 一有输出就抛 `invalid-input` 拒跑，点名是哪些文件，
-  并告诉你「提交或 `git stash` 之后再跑，或者打开 `isolateWorktree`」。
+  **缺省（`isolateWorktree: false`）就直接在这个检出里改代码**，分支 = 检出当前分支、不另开票分支。
+  **检出脏也能跑**：agent 动手前用 `git stash create` 拍一份只读基线（不写 ref、不动工作区、不动索引），
+  结束后只提交 agent 真正改过的文件 —— 你自己攒着的未提交改动、甚至已经 `git add` 进索引的改动都原样留在工作区。
+  `pipeline_doctor` 看到脏只提醒一句，不再拒跑。
   打开 `isolateWorktree: true` 才退回旧行为：每票 `git fetch` 该项目配置的 baseBranch，
   再 `git worktree add -b <branchPrefix><projectId>-<recordId>-r<修订号>` 开隔离 worktree
   （`fetchBeforeCreate` / `branchPrefix` / `worktreeRetentionHours` 也只有这时才用得上）。
@@ -126,6 +144,13 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
   （只认 `<repo>/.agents/worktrees/<name>`）。缺省模式没有隔离 worktree，若不校验，
   `git worktree remove --force` 会对着人的主检出执行 —— 这个口子必须堵。
 - **超时只报给人，不自动重试**；唯一重开路径 = 人把「是否处理」拨走再拨回「处理中」。
+- **处理完保留会话**：`ExecResult.sessionId` 落票据；agent 实例在 `finally` 里**永远** `dispose()`，
+  但 `keepSession !== false`（缺省 `true`）时不做任何会话回收 —— 会话留在项目工作区名下，人能在会话列表里点进去继续追问。
+  只有显式 `keepSession: false` 才调宿主 `sessions` 服务（`close` / `dispose` / `closeSession` 三选一，调用永不抛）。
+- **设置面板补齐**：`projects` 子树可编辑（5 分区 21 字段 / 25 个可写字段），`match.appToken` 只下发
+  `hasAppToken` + `appTokenPreview`（前 4…后 4）。第 3 个 Remote 方法 `ticketPipeline.projects()` 提供扁平视图，
+  第 4 个 `ticketPipeline.branches()` 给两个分支字段当候选；
+  写入只发深层路径，绝不整数组替换。全局配置现在 **33 个键 / 7 个分组**（`projects` 子树另算）。
 
 ## 安装
 
@@ -181,15 +206,15 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**294 项断言，全绿 exit 0**，共 22 个小节（编号到 15，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节）。
+**325 项断言，全绿 exit 0**，共 24 个小节（编号到 17，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节；第 16 节专测回填工单表与保留会话，第 17 节专测分支候选）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，但宿主服务全部打桩），
 其余测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 
 | 段 | 覆盖 |
 |---|---|
 | 内核与契约 | 调度、租约心跳、退避重试、状态机、store 持久化、pipeline_* 四工具、组合根接线 |
-| `feishu-checks`（52 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、全程无写操作 |
-| `gitlab-checks`（68 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器在工作区检出里做本地提交（`commitLocally`：sha/分支/文件、敏感文件不进提交、`repo.gitlab.enabled` 未开时零 GitLab 请求、提交失败让票失败、空提交与缺 git 运行器被拒、git 白名单只放行 `add -- <文件>` / `commit` / `rev-parse HEAD` / `restore --staged -- <文件>`）；`-z` 解析（`parseStatusZ` / `parseNameStatusZ`）：未跟踪新文件要算进改动、重命名的旧路径要进 commit pathspec、删除的路径不能进 `add`、中文名与空格名不被转义；会话 cwd = 项目工作区根、`workingDirectory` 仅在隔离 worktree 打开时钉到隔离子目录、`attachSession` 归属工作区 |
+| `feishu-checks`（58 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、扫描全程无写操作；**回填**：`writeResult` 走 `PUT …/records/:id` 只写三列、字段缺失（1254040 / 1254045）返 `{written:false,note}` 不抛、写失败时按 91403 分类 |
+| `gitlab-checks`（78 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器在工作区检出里做本地提交（`commitLocally`：sha/分支/文件、敏感文件不进提交、`repo.gitlab.enabled` 未开时零 GitLab 请求、提交失败让票失败、空提交与缺 git 运行器被拒、git 白名单只放行 `add -- <文件>` / `commit` / `rev-parse HEAD` / `restore --staged -- <文件>` / `stash create` / `hash-object --`）；**基线**：`createBaseline` 拍的基线只读、人的未提交改动与已 `git add` 的改动都进不了本次提交、拍不下来降级不失败；**保留会话**：`sessionId` 三个出口都带回、agent 实例必释放、`keepSession: false` 才回收；`-z` 解析（`parseStatusZ` / `parseNameStatusZ`）：未跟踪新文件要算进改动、重命名的旧路径要进 commit pathspec、删除的路径不能进 `add`、中文名与空格名不被转义；会话 cwd = 项目工作区根、`workingDirectory` 仅在隔离 worktree 打开时钉到隔离子目录、`attachSession` 归属工作区 |
 | `push-qqmail`（18 项） | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
 | `wps-checks`（25 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底 |
 | `workspace-checks`（11 项） | 项目工作区：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用同一工作区、attachSession 归属 |
@@ -213,8 +238,11 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 `client-check` 守的是「bundle 不能 import 宿主源码、只能手抄一份」这条约束 ——
 改了 `src/remote/descriptors.js` 忘了改 `lib/client.js` 会**静默无响应**（点了体检没反应、
 宿主也不报错），所以这个检查必须跑。它还校验 `require()` 的白名单（只允许
-`react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）与 `dsh.client.platform === 'web'`
-（platform 写错宿主会静默跳过整个 bundle）。
+`react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、`dsh.client.platform === 'web'`
+（platform 写错宿主会静默跳过整个 bundle），以及 **`projects` 子树的 `meta.volatile`**：
+descriptor 叶子 **33 个 / 7 组**、schema 信封 **71 节点 / 33 叶子**、Remote **4 个方法**
+（`doctor` / `config` / `projects` / `branches`）、`projects` 可写 **25 字段**、面板项目字段 **21 项**与宿主对得上。
+（`client-smoke` 真跑一遍 bundle，实跑 **85 条**断言。）
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

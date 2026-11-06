@@ -192,6 +192,21 @@ export const CONFIG_FIELDS = Object.freeze({
     default: false,
     description: '每票再开一个隔离 worktree（缺省关：直接在项目工作区的检出里改代码，与「在工作区新增会话」一致）。打开前想清楚：工作区必须干净，改动会落在隔离分支上',
   },
+  writeBack: {
+    type: 'boolean',
+    default: true,
+    description: '跑完后回填工单表：「是否处理」改成 writeBackStatus 的值，「处理结果」写怎么处理的，「处理日期」写今天。关掉就完全不写表格（退化成只读）',
+  },
+  writeBackStatus: {
+    type: 'string',
+    default: '是',
+    description: '回填时「是否处理」列要写的值（有的表用「是」，有的用「已完成」「已处理」）',
+  },
+  keepSession: {
+    type: 'boolean',
+    default: true,
+    description: '处理完保留项目工作区里的那次会话（agent 释放，会话留在工作区名下，可以在 GUI 里点进去继续追问）。关掉就处理完把会话一起收掉',
+  },
 
   // ── agent 与模型 ────────────────────────────────────
   provider: {
@@ -336,6 +351,15 @@ export const CONFIG_GROUPS = Object.freeze([
       Object.freeze(['fetchBeforeCreate', '切 worktree 前先 fetch']),
       Object.freeze(['branchPrefix', '分支名前缀']),
       Object.freeze(['worktreeRetentionHours', 'worktree 保留（小时）']),
+      Object.freeze(['keepSession', '保留处理完的会话']),
+    ]),
+  }),
+  Object.freeze({
+    id: 'writeback',
+    label: '回填工单表',
+    fields: Object.freeze([
+      Object.freeze(['writeBack', '处理完回填表格']),
+      Object.freeze(['writeBackStatus', '回填的「是否处理」值']),
     ]),
   }),
   Object.freeze({
@@ -718,8 +742,9 @@ export function validateConfig (raw) {
 // 2. `toJSON()` 必须返回**纯 JSON**（不能带函数），因为结果会被再序列化一次。
 // 3. 叶子要标 `meta.volatile = true`，否则 `volatileForm()` 会把整条设置项吞掉
 //    （静默消失、不报错，最难查）。
-// 4. 只标叶子、不标中间对象：中间对象保持 `meta: {}`，`volatileForm()` 会逐键筛，
-//    这样 `projects` 这类**不该在面板里编辑**的键自然被排除。
+// 4. 普通标量字段**只标叶子、不标中间对象**：中间对象保持 `meta: {}`，
+//    `volatileForm()` 会逐键筛。唯一的例外是 `projects`（见 `buildProjectsDescriptor`）：
+//    它是一个整体可写的结构，所以那一个节点自己标 volatile。
 // 5. 面板需要的元信息全放 `meta` 里（`label` / `description` / `default` /
 //    `min` / `max` / `enum`）——实测这些自定义键能原样穿过 schemastery 重建。
 // 6. `toJSON()` 返回的必须是 **schemastery 信封** `{ uid, refs }`：`refs` 里
@@ -827,10 +852,154 @@ function descriptorLeaf (field, label, group) {
 }
 
 /**
+ * `projects[]` 的字段在面板上归到这一组。
+ *
+ * 它不在 `CONFIG_GROUPS` 里 —— 那张表只描述 `CONFIG_FIELDS` 的 33 个标量键，
+ * 硬塞进去会让 `assertGroupCoverage()` 与「三方向一致」的断言都失准。面板
+ * 自己按 `PROJECT_SECTIONS` 分区渲染项目卡片，这个 label 只是给
+ * descriptor 的叶子一个说得清来源的 group 名。
+ */
+const PROJECT_GROUP_LABEL = '项目清单'
+
+/**
+ * 造一个项目字段叶子（`projects[]` 内部用）。
+ *
+ * 与 `descriptorLeaf` 分开是因为这里没有 `CONFIG_FIELDS` 声明可查：
+ * `projects` 是结构化数组，字段形状由 `validateProject()` 决定。
+ *
+ * @param {'string'|'boolean'|'string-array'} type
+ * @param {string} label
+ * @param {string} description
+ * @param {Record<string, unknown>} [extra]
+ * @returns {any}
+ */
+function projectLeaf (type, label, description, extra = {}) {
+  /** @type {Record<string, unknown>} */
+  const meta = { volatile: true, label, group: PROJECT_GROUP_LABEL, description, ...extra }
+  if (type === 'string-array') return descriptorNode({ type: 'array', meta, inner: { type: 'string', meta: {} } })
+  if (type === 'boolean') return descriptorNode({ type: 'boolean', meta })
+  return descriptorNode({ type: 'string', meta })
+}
+
+/**
+ * 造 `projects` 节点后面的那个元素节点（object）。
+ *
+ * `dict` 必须覆盖 `validateProject()` 能接受的全部键：宿主写的是**深层路径**
+ * （`['projects','0','repo','path']`），`applyPathOp()` 中途靠
+ * `node.dict[head]` 往下找节点，少一个键就在那一段丢类型信息（更糟的是
+ * 面板那边会显示「这个字段改不了」）。
+ *
+ * @param {Record<string, any>} dict
+ * @param {Record<string, unknown>} [meta]
+ * @returns {any}
+ */
+function projectObject (dict, meta = {}) {
+  return descriptorNode({ type: 'object', meta, dict })
+}
+
+/**
+ * 由 `validateProject()` 接受的形状造出 `projects` 的 descriptor 节点。
+ *
+ * ## 为什么这个节点必须自己标 `meta.volatile`
+ *
+ * 宿主的 `isVolatilePath(schema, path)` 只沿 `schema.dict` 下钻，**完全不认
+ * `inner`**：
+ *
+ * ```js
+ * function isVolatilePath(schema, path) {
+ *   if (schema.meta.volatile) return true
+ *   const [key, ...rest] = path
+ *   const child = key === void 0 ? void 0 : schema.dict?.[key]
+ *   return child !== void 0 && isVolatilePath(child, rest)
+ * }
+ * ```
+ *
+ * 而 `projects` 是数组：`['projects','0','repo','path']` 的 `'0'` 那一段只能
+ * 从 `inner` 走。所以把 volatile 标在**数组节点自己**身上 —— `isVolatilePath`
+ * 在第一步就短路返回 true，`write()` 的路径校验与 `validatePaths()` 都放行。
+ *
+ * ## 为什么子节点也标 volatile
+ *
+ * 宿主当前版本不检查（上游一个 volatile 就短路了），但 `scripts/client-check.mjs`
+ * 的 `auditProjectsNode()` 会逐层查：将来宿主如果改成「沿途每段都要声明」，
+ * 这里已经是对的，不用回头再补一遍。多标不改变 `volatileForm()` 的行为
+ * （它遇到 volatile 就直接 `plainSchema` 整棵子树）。
+ *
+ * ## 为什么整数组替换是被禁止的
+ *
+ * `mutate` 只发改动字段的深层路径，绝不发 `path: ['projects']` —— 整块替换会把
+ * 别的项目条目、以及配置文件里手写的 `appToken` 一起抹掉。这条约束写在
+ * `lib/client.js` 的 `collectOps()` 里，这里只保证深层路径写得进去。
+ *
+ * @returns {any}
+ */
+function buildProjectsDescriptor () {
+  const matchNode = projectObject({
+    platform: projectLeaf('string', '平台', '决定用哪个 ticket-source 适配器收票', { enum: [...PLATFORMS] }),
+    appToken: projectLeaf('string', '飞书 appToken', '飞书多维表格的 app_token（显式绑定）；面板不画它，要改请改 profile'),
+    tableId: projectLeaf('string', '工单表 tableId', '飞书多维表格的 table id；与 appToken 一起构成显式绑定'),
+    viewId: projectLeaf('string', '视图 viewId', '可选：只扫某个视图'),
+    docNamePattern: projectLeaf('string', '表名匹配', '没有显式 appToken/tableId 时，按文件名模糊匹配工单表'),
+    statusValues: projectLeaf('string-array', '在处理中的状态值', '状态列取这些值时才算「在处理中」，是收票条件'),
+    recordIds: projectLeaf('string-array', '只处理这些工单', '收窄到指定 record id；留空表示整张表'),
+    allowedImageHosts: projectLeaf('string-array', '允许的截图主机', '截图链接来自工单表（外部输入），不在白名单里的一律拒绝'),
+    sheetUrl: projectLeaf('string', '表格链接', '金山文档表格的分享链接（wps 平台）'),
+    sheetName: projectLeaf('string', '工作表名', '金山文档里的工作表名（wps 平台）'),
+    statusColumn: projectLeaf('string', '状态列名', '「是否处理」列名（wps 平台）'),
+    statusValue: projectLeaf('string', '在处理中的取值', 'wps 平台单值形态；飞书用 statusValues'),
+    mediaPrefix: projectLeaf('string', '附件前缀', '截图 fileToken 的前缀（wps 平台）'),
+  })
+
+  const gitlabNode = projectObject({
+    enabled: projectLeaf('boolean', '开 draft MR', '关掉只做本地提交，不需要 GITLAB_TOKEN'),
+    baseUrl: projectLeaf('string', 'GitLab 站点', '自建站点或子组路径时用它'),
+    remote: projectLeaf('string', 'GitLab remote', '仓库 remote 的 URL，用于推导 projectId'),
+    projectId: projectLeaf('string', 'GitLab projectId', '数字 id 或 group/project 路径'),
+  })
+
+  const repoNode = projectObject({
+    path: projectLeaf('string', '仓库路径', '本地 git 检出根目录，绝对路径或相对 DSH 工作目录'),
+    remote: projectLeaf('string', '远端名', '缺省 origin'),
+    baseBranch: projectLeaf('string', '基准分支', '从哪条分支切出工作分支'),
+    targetBranch: projectLeaf('string', '目标分支', 'MR 的目标分支'),
+    gitlab: gitlabNode,
+  })
+
+  const verifyNode = projectObject({
+    build: projectLeaf('string', '构建命令', '留空跳过构建'),
+    test: projectLeaf('string', '验证命令', '留空跳过验证'),
+  })
+
+  const entry = projectObject({
+    name: projectLeaf('string', '项目名', 'projectId，必须唯一；工单里的项目要靠它对上仓库'),
+    description: projectLeaf('string', '说明', '会进 agent 的定位提示'),
+    match: matchNode,
+    repo: repoNode,
+    verify: verifyNode,
+  }, { volatile: true, label: '项目条目', group: PROJECT_GROUP_LABEL })
+
+  return descriptorNode({
+    type: 'array',
+    meta: {
+      volatile: true,
+      label: '项目清单',
+      group: PROJECT_GROUP_LABEL,
+      description: '一个项目 = 一张工单表 + 一个仓库。面板只发改过字段的深层路径，不会整块替换。',
+    },
+    inner: entry,
+  })
+}
+
+/**
  * 由 `CONFIG_FIELDS` 造出给设置面板用的 schema 树。
  *
  * 点号键（`pushplus.token`）按 `.` 逐层拆成嵌套 object，和配置的真实形状一致：
  * `{ pushplus: { token } }`。
+ *
+ * `projects` 单独造（`buildProjectsDescriptor`）：它不在 `CONFIG_FIELDS` 里
+ * —— 那张表是**标量配置**的声明，`projects` 是结构化数组，由
+ * `validateProjects()` 单独校验。但设置面板要能编辑它，就得进 descriptor，
+ * 所以这里挂上去。
  */
 function buildConfigDescriptor () {
   /** @type {any} */
@@ -853,7 +1022,35 @@ function buildConfigDescriptor () {
     if (last !== undefined) cursor.dict[last] = leaf
   }
 
+  root.dict.projects = buildProjectsDescriptor()
+
   return root
+}
+
+/**
+ * `projects` 子树的字段路径清单（去掉 `projects[i].` 前缀）。
+ *
+ * 给自测与面板对账用：面板手抄的字段表必须能在这个集合里逐项找到，缺一项
+ * 的后果是「那个字段在界面上根本改不了」或者「保存被宿主拒」。
+ *
+ * @returns {string[]}
+ */
+export function listProjectDescriptorPaths () {
+  /** @type {any} */
+  const projects = getConfigDescriptor().dict.projects
+  /** @type {string[]} */
+  const out = []
+  /** @param {any} node @param {string[]} path */
+  const visit = (node, path) => {
+    if (node === undefined || node === null) return
+    if (node.dict) {
+      for (const [key, child] of Object.entries(node.dict)) visit(child, path.concat([key]))
+      return
+    }
+    out.push(path.join('.'))
+  }
+  visit(projects?.inner, [])
+  return out
 }
 
 /** 设置面板用的 schema 树（惰性造一次，被 `Config` 与自测共用）。 */

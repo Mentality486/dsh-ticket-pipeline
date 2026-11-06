@@ -29,10 +29,36 @@ import { fingerprintOf } from './types.js'
  */
 
 /**
+ * 回填一张工单的处理结果（用户 2026-11-06 拍板）。
+ *
+ * 分工写死在这里，适配器不要自作主张：
+ * - `是否处理` → `status`（默认 `是`，可被配置覆盖）
+ * - `处理结果` → 一段「怎么处理的」人话
+ * - `处理日期` → `handledAt`（毫秒时间戳，适配器自己按平台格式落格）
+ *
+ * @typedef {Object} WriteBackResult
+ * @property {string} [status] `是否处理` 列要写的值，缺省 `是`
+ * @property {string} result `处理结果` 列要写的内容
+ * @property {number} [handledAt] `处理日期` 的时间戳（毫秒），缺省取当前时间
+ */
+
+/**
+ * 回填结果。
+ *
+ * @typedef {Object} WriteBackReceipt
+ * @property {boolean} written 是否真的写成功了（平台不支持/没开开关时 false）
+ * @property {string[]} [fields] 实际写了哪几列（排障时看）
+ * @property {string} [note] 没写的原因，或写成功时的补充说明
+ */
+
+/**
  * `TicketSource` 契约。
  *
  * 实现必须满足：
- * - `scan` **不得**写任何远端状态（表格只读，这是用户拍板的硬约束）。
+ * - `scan` **不得**写任何远端状态。表格只读是扫描的硬约束 —— 扫描期间任何一次写
+ *   都会把「人在改表」和「插件在读表」搅在一起，指纹也会跟着抖。
+ * - **唯一的写入口是 `writeResult`**（用户 2026-11-06 明确要求处理完回填）。
+ *   它只在票跑完 done/skipped 之后被调用一次，绝不在扫描/重试中间调用。
  * - `scan` 抛错 = 本轮扫描失败。**不要返回空数组假装成功** —— 内核要区分「没变化」与「扫失败了」。
  * - `signal.aborted` 时必须尽快抛 `PipelineError('aborted')`，分页循环里每页检查一次。
  * - 适配器自己维护「见过什么」的水位，内核不参与比对。
@@ -42,6 +68,7 @@ import { fingerprintOf } from './types.js'
  * @property {string} id 稳定标识：'feishu' | 'wps' | 'xlsx' | 'mock'。用于存储分区与日志前缀。
  * @property {(signal: AbortSignal) => Promise<ScanResult>} scan
  * @property {(ref: ScreenshotRef, signal: AbortSignal) => Promise<LoadedScreenshot>} loadScreenshot
+ * @property {(recordId: string, result: WriteBackResult, signal: AbortSignal) => Promise<WriteBackReceipt>} [writeResult]
  * @property {((cb: (hint: { recordIds?: string[] }) => void) => () => void)} [onExternalChange]
  */
 
@@ -71,6 +98,9 @@ export function assertTicketSource (candidate, label = 'TicketSource') {
   }
   if (source.onExternalChange !== undefined && typeof source.onExternalChange !== 'function') {
     throw new Error(`${label}("${source.id}"): onExternalChange 必须是函数或不存在`)
+  }
+  if (source.writeResult !== undefined && typeof source.writeResult !== 'function') {
+    throw new Error(`${label}("${source.id}"): writeResult 必须是函数或不存在`)
   }
   return /** @type {TicketSource} */ (source)
 }

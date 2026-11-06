@@ -95,8 +95,8 @@ function makeSchemaEnvelope () {
         logLevel: 6,
       },
     },
-    1: { type: 'boolean', meta: { label: '总开关', description: '装上不会自动开始扫表。', default: false } },
-    2: { type: 'number', meta: { label: '轮询间隔（分钟）', description: '飞书只能轮询。', default: 3, min: 1, max: 60 } },
+    1: { type: 'boolean', meta: { label: '总开关', description: '装上不会自动开始扫表。', default: false, group: '杂项' } },
+    2: { type: 'number', meta: { label: '轮询间隔（分钟）', description: '飞书只能轮询。', default: 3, min: 1, max: 60, group: '扫描与队列' } },
     3: {
       type: 'object',
       meta: {},
@@ -113,14 +113,49 @@ function makeSchemaEnvelope () {
         user: 10,
       },
     },
-    5: { type: 'array', meta: { label: '发通知的 phase', default: ['done', 'failed'] }, inner: { type: 'string', meta: {} } },
-    6: { type: 'string', meta: { label: '日志级别', enum: ['debug', 'info', 'warn', 'error'], default: 'info' } },
-    7: { type: 'string', meta: { label: 'PushPlus token', description: '建议走凭据。', role: 'secret' } },
-    8: { type: 'string', meta: { label: 'PushPlus 模板', enum: ['txt'], default: 'txt' } },
-    9: { type: 'string', meta: { label: 'SMTP 主机', default: 'smtp.qq.com' } },
-    10: { type: 'string', meta: { label: '发件邮箱', default: '' } },
+    5: { type: 'array', meta: { label: '发通知的 phase', default: ['done', 'failed'], group: '通知' }, inner: { type: 'string', meta: {} } },
+    6: { type: 'string', meta: { label: '日志级别', enum: ['debug', 'info', 'warn', 'error'], default: 'info', group: '杂项' } },
+    7: { type: 'string', meta: { label: 'PushPlus token', description: '建议走凭据。', role: 'secret', group: '通知' } },
+    8: { type: 'string', meta: { label: 'PushPlus 模板', enum: ['txt'], default: 'txt', group: '通知' } },
+    9: { type: 'string', meta: { label: 'SMTP 主机', default: 'smtp.qq.com', group: '通知' } },
+    10: { type: 'string', meta: { label: '发件邮箱', default: '', group: '通知' } },
   }
   return { uid: 0, refs }
+}
+
+/**
+ * 宿主的 `ticketPipeline.projects()` 只读投影（`describeProject` 的扁平记录）。
+ *
+ * 注意它**没有** appToken 明文，只有 hasAppToken / appTokenPreview —— 面板绝不能
+ * 因此提供明文输入框。
+ */
+function makeProjectRecord (index) {
+  return {
+    index,
+    name: 'pms',
+    description: 'PMS 工单',
+    platform: 'feishu',
+    tableId: 'tbl123',
+    viewId: '',
+    docNamePattern: 'PMS项目管理系统工单',
+    hasAppToken: true,
+    appTokenPreview: 'basc…Cnhh',
+    sheetUrl: '',
+    sheetName: '',
+    statusColumn: '',
+    statusValue: '',
+    mediaPrefix: '',
+    statusValues: ['否'],
+    recordIds: ['rec1'],
+    allowedImageHosts: ['cdn.example.com'],
+    repoPath: 'D:/WorkSpace/.repos/mgiot-pms',
+    repoRemote: 'origin',
+    repoBaseBranch: 'v2.x',
+    repoTargetBranch: 'v2.x',
+    remoteMrEnabled: true,
+    verifyBuild: 'pnpm build',
+    verifyTest: 'pnpm test',
+  }
 }
 
 function makeSettingsResponse () {
@@ -172,7 +207,7 @@ function makeSettingsResponse () {
  * 属性式 `ctx.remote.settings` 反而要**取不到**（取到就说明插件又退回了坏写法）。
  */
 function makeHost () {
-  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0 }
+  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0 }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
   // gateway 服务自己维护的命名空间表（namespace → { service }）。
@@ -182,6 +217,12 @@ function makeHost () {
     describe: async () => makeSettingsResponse(),
     mutate: async (ns, ops, revision) => {
       calls.mutate.push({ ns, ops, revision })
+      // 一次性脚本化的拒绝：用来验证「宿主原话 + 指路 profile」这条文案。
+      if (typeof calls.rejectNext === 'string') {
+        const message = calls.rejectNext
+        calls.rejectNext = undefined
+        return { ok: false, error: { code: 'SETTINGS_REJECTED', message } }
+      }
       return { ok: true, value: undefined }
     },
   }
@@ -203,7 +244,15 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到两个描述符', contribution.descriptors.length === 2, String(contribution.descriptors.length))
+      check('$mount 收到四个描述符', contribution.descriptors.length === 4, String(contribution.descriptors.length))
+      check('第三个描述符是 projects',
+        contribution.descriptors.some((item) => item.method === 'projects' &&
+          item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      check('第四个描述符是 branches',
+        contribution.descriptors.some((item) => item.method === 'branches' &&
+          item.result.typeSymbol === 'ticket-pipeline#BranchList'),
+        contribution.descriptors.map((item) => item.method).join(' | '))
       // 真实 gateway：$mount 会按 namespace 建一根兄弟 fiber，把命名空间服务
       // provide 成 'remote.ticketPipeline'，并记进自己的 namespaces 表。
       const service = {
@@ -212,6 +261,10 @@ function makeHost () {
           return { ok: true, value: { ok: true, problems: [], warnings: ['mock 执行器'], text: '【环境体检】通过\n✅ git：可用' } }
         },
         config: async () => ({ ok: true, value: { config: {}, projects: 1 } }),
+        projects: async () => {
+          calls.projects += 1
+          return { ok: true, value: { count: 1, projects: [makeProjectRecord(0)] } }
+        },
       }
       namespaces.set('ticketPipeline', { service })
       services['remote.ticketPipeline'] = service
@@ -226,10 +279,28 @@ function makeHost () {
   return { remote, calls, services }
 }
 
+/**
+ * 假 localStorage：面板用它记住分组折叠状态。
+ *
+ * 真实浏览器里有；沙箱里给一个内存版，顺便让断言能看到「有没有真的写进去」。
+ */
+let STORAGE = null
+
+function makeStorage () {
+  const data = Object.create(null)
+  return {
+    data,
+    getItem (key) { return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null },
+    setItem (key, value) { data[key] = String(value) },
+    removeItem (key) { delete data[key] },
+  }
+}
+
 /** 把 bundle 加载进一个受限的 vm 上下文，返回它注册的模块出口。 */
 async function loadBundle () {
   const source = await readFile(join(root, 'lib/client.js'), 'utf8')
   let registered
+  STORAGE = makeStorage()
   const context = {
     window: {
       __ModuleLoader__: {
@@ -240,6 +311,7 @@ async function loadBundle () {
       createElement: () => ({ dataset: {}, textContent: '', remove () {} }),
       head: { append () {} },
     },
+    localStorage: STORAGE,
     console,
     // 插件会等宿主通道就绪（每 500ms 轮询一次），沙箱里没有定时器会直接 ReferenceError。
     setTimeout,
@@ -335,6 +407,24 @@ function findInput (tree, predicate) {
   return inputs.find(predicate)
 }
 
+/** 所有分组折叠按钮（`.tp-toggle`）。 */
+function findToggles (tree) {
+  return findAll(tree, (node) => node.type === 'button' &&
+    String(node.props.className || '').indexOf('tp-toggle') >= 0)
+}
+
+/** 把还收着的分组一一点开，返回展开后的树。 */
+async function openAllGroups (Panel, tree) {
+  let current = tree
+  for (let round = 0; round < 12; round += 1) {
+    const collapsed = findToggles(current).filter((node) => node.props['aria-expanded'] === 'false')
+    if (collapsed.length === 0) break
+    collapsed[0].props.onClick()
+    current = await render(Panel, { view: 'page' })
+  }
+  return current
+}
+
 // ── 断言 ──────────────────────────────────────────────────────
 
 async function main () {
@@ -396,21 +486,52 @@ async function main () {
   // ① 整页渲染：能读到配置、能列出叶子、分组正确。
   resetRender()
   let tree = await render(Panel, { view: 'page' })
-  const inputs = findAll(tree, (node) => node.type === 'input' || node.type === 'select')
-  check('渲染出输入控件', inputs.length >= 7, '只有 ' + inputs.length + ' 个')
   check('渲染了体检按钮', findButton(tree, '立即体检') !== undefined)
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
+
+  // 33 个配置项一屏放不下，默认只展开「扫描与队列」，其余收着。
+  const toggles = findToggles(tree)
+  check('每个分组都有折叠标题', toggles.length === 3, String(toggles.length))
+  const toggleOf = (label) => toggles.find((node) => textOf(node).indexOf(label) >= 0)
+  check('默认展开「扫描与队列」', toggleOf('扫描与队列') !== undefined &&
+    toggleOf('扫描与队列').props['aria-expanded'] === 'true')
+  check('默认收起「通知」', toggleOf('通知') !== undefined &&
+    toggleOf('通知').props['aria-expanded'] === 'false')
+
+  // 收着的分组不该把字段渲染出来（否则折叠只是视觉假象）。
+  check('收起的分组不渲染字段', textOf(tree).indexOf('日志级别') < 0)
+
+  tree = await openAllGroups(Panel, tree)
+  const inputs = findAll(tree, (node) => node.type === 'input' || node.type === 'select')
+  check('展开后渲染出输入控件', inputs.length >= 7, '只有 ' + inputs.length + ' 个')
   const bodyText = textOf(tree)
   check('显示分组标题「通知」', bodyText.indexOf('通知') >= 0)
   check('显示布尔字段', bodyText.indexOf('总开关') >= 0)
   check('显示 enum 字段', bodyText.indexOf('日志级别') >= 0)
   check('显示点号键的嵌套叶子', bodyText.indexOf('SMTP 主机') >= 0)
 
+  // 折叠状态记进 localStorage，下次打开还是上次的样子。
+  const openRaw = STORAGE.getItem('ticket-pipeline:open-groups')
+  check('折叠状态写进了 localStorage', typeof openRaw === 'string' && openRaw.indexOf('通知') >= 0, String(openRaw))
+
   // ② 改一个数字字段再保存 → 生成一条 path 是数组的 set op。
   const interval = findInput(tree, (node) => node.props.type === 'number')
   check('找到数字输入框', interval !== undefined)
+  check('数字字段带 min/max 约束', interval.props.min === 1 && interval.props.max === 60,
+    String(interval.props.min) + '–' + String(interval.props.max))
+  check('数字字段渲染出约束提示', bodyText.indexOf('1–60') >= 0, bodyText.slice(0, 200))
+
+  // 越界 → 即时标红 + 禁用保存，而不是等宿主拒绝。
+  interval.props.onChange({ target: { value: '99' } })
+  tree = await render(Panel, { view: 'page' })
+  check('数字越界时给出「不能大于 60」', textOf(tree).indexOf('不能大于 60') >= 0, textOf(tree).slice(0, 300))
+  const outOfRange = findButton(tree, '保存', 'tp-primary')
+  check('数字越界时保存被禁用', outOfRange !== undefined && outOfRange.props.disabled === true,
+    outOfRange === undefined ? '没找到保存按钮' : String(outOfRange.props.disabled))
+
+  tree = await render(Panel, { view: 'page' })
   // 控件是真实 DOM 元素，onChange 收的是事件对象而不是裸值。
-  interval.props.onChange({ target: { value: '9' } })
+  findInput(tree, (node) => node.props.type === 'number').props.onChange({ target: { value: '9' } })
   tree = await render(Panel, { view: 'page' })
   // 凭据行也有「保存」按钮，这里要的是配置区那个主按钮（tp-primary）。
   const save = findButton(tree, '保存', 'tp-primary')
@@ -449,7 +570,141 @@ async function main () {
   const secretInputs = findAll(tree, (node) => node.type === 'input' && node.props.type === 'password')
   check('凭据输入框是只写密码框', secretInputs.length >= 5, String(secretInputs.length))
 
-  // ⑤ summary 视图只给一句话，不渲染整页。
+  // ⑤ 项目清单：读的是 remote.projects() 的只读投影，写的是深层路径 mutate。
+  tree = await render(Panel, { view: 'page' })
+  check('渲染出「项目清单」', textOf(tree).indexOf('项目清单') >= 0)
+  check('项目卡片显示项目名', textOf(tree).indexOf('pms') >= 0)
+  check('项目卡片标注了 MR 开关', textOf(tree).indexOf('开 MR') >= 0)
+  check('appToken 只显示打码预览', textOf(tree).indexOf('basc…Cnhh') >= 0)
+  check('appToken 没有明文输入框',
+    findAll(tree, (node) => node.type === 'input' &&
+      typeof node.props.value === 'string' && node.props.value.indexOf('basc') >= 0).length === 0)
+  check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
+  // 21 个字段分 5 节，节标题得真的渲染出来，否则一屏全是输入框没法看。
+  check('项目卡片分了「仓库」一节', textOf(tree).indexOf('仓库') >= 0)
+  check('项目卡片分了「验证」一节', textOf(tree).indexOf('验证命令') >= 0)
+
+  const repoInput = findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms')
+  check('找到项目仓库路径输入框', repoInput !== undefined)
+  repoInput.props.onChange({ target: { value: 'D:/WorkSpace/.repos/mgiot-pms2' } })
+  tree = await render(Panel, { view: 'page' })
+  check('改过的项目字段标「已改」', textOf(tree).indexOf('已改') >= 0)
+  check('改过的项目字段有单字段撤销', findButton(tree, '撤销') !== undefined)
+
+  // 撤销只回退这一个字段，别的改动不受影响。
+  findButton(tree, '撤销').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  check('单字段撤销把值还原成 profile 里的值',
+    findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms') !== undefined,
+    '撤销后没回到原值')
+  findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms')
+    .props.onChange({ target: { value: 'D:/WorkSpace/.repos/mgiot-pms2' } })
+  tree = await render(Panel, { view: 'page' })
+
+  const saveProject = findButton(tree, '保存', 'tp-primary')
+  saveProject.props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  check('保存项目改动也走 settings.mutate', ctx.calls.mutate.length === 2, String(ctx.calls.mutate.length))
+  const projectCall = ctx.calls.mutate[1]
+  if (projectCall !== undefined) {
+    check('项目改动只发一条 op（只写改过的字段）', projectCall.ops.length === 1, JSON.stringify(projectCall.ops))
+    const op = projectCall.ops[0]
+    check('项目 op 是 set', op.op === 'set', op.op)
+    check('项目 op 走深层路径而不是整数组替换',
+      JSON.stringify(op.path) === JSON.stringify(['projects', '0', 'repo', 'path']), JSON.stringify(op.path))
+    check('项目 op 的值是改后的路径', op.value === 'D:/WorkSpace/.repos/mgiot-pms2', JSON.stringify(op.value))
+    check('项目 op 复用了读到的 revision', projectCall.revision === 7, String(projectCall.revision))
+    // 整笔 op 的共性约束：每条都是 projects 的深层路径，没有整数组替换。
+    // `['projects']` 会被宿主判成 not volatile 整笔拒掉；`['projects','0']` 则会抹掉
+    // 这个项目里没画出来的字段（appToken、repo.gitlab.* 这些）。
+    check('每条项目 op 都带 projects 前缀', projectCall.ops.every((item) => item.path[0] === 'projects'),
+      JSON.stringify(projectCall.ops.map((item) => item.path)))
+    check('每条项目 op 至少三段路径（项目下标 + 字段）', projectCall.ops.every((item) => item.path.length >= 3),
+      JSON.stringify(projectCall.ops.map((item) => item.path)))
+    check('没有整数组替换的浅路径 op',
+      projectCall.ops.every((item) => !(item.path.length === 1 && item.path[0] === 'projects') &&
+        !(item.path.length === 2 && item.path[0] === 'projects')),
+      JSON.stringify(projectCall.ops.map((item) => item.path)))
+  }
+
+  // 保存成功后草稿回到宿主刚读到的值（不是还留着刚才那笔改动）。
+  check('保存成功后不再显示「已改」',
+    findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms2') === undefined,
+    '草稿没被刷新')
+
+  // 兜底路径：宿主把 projects 整段判成不可写时，回的是 `Config field "projects"
+  // is not declared` 这种底层文案。原文要照贴（不然人不知道发生了什么），
+  // 还要补一句能照着做的。正常深层路径写入不会走到这里，这条是防回归。
+  findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms')
+    .props.onChange({ target: { value: 'D:/WorkSpace/.repos/mgiot-pms3' } })
+  tree = await render(Panel, { view: 'page' })
+  ctx.calls.rejectNext = 'Config field "projects" is not declared'
+  findButton(tree, '保存', 'tp-primary').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  const rejectedText = textOf(tree)
+  check('保存被拒时原样显示宿主文案', rejectedText.indexOf('Config field "projects" is not declared') >= 0,
+    rejectedText.slice(0, 300))
+  check('保存被拒时给一句能照着做的', rejectedText.indexOf('cordis.patch.yml') >= 0)
+
+  // 服务端的「字段级」拒绝：挂到具体字段下面，并且把保存锁住；
+  // 人重填这个字段之后旧抱怨必须消失，否则改对了也还是存不了。
+  findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms3')
+    .props.onChange({ target: { value: 'D:/WorkSpace/.repos/mgiot-pms4' } })
+  tree = await render(Panel, { view: 'page' })
+  ctx.calls.rejectNext = 'invalid config:\n'
+    + '  - projects[0].repo.path 必须是非空字符串（本地 git 检出根目录） (at projects.0.repo.path)'
+  findButton(tree, '保存', 'tp-primary').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  const fieldRejected = textOf(tree)
+  check('字段级拒绝挂到字段下方', fieldRejected.indexOf('必须是非空字符串（本地 git 检出根目录）') >= 0,
+    fieldRejected.slice(0, 300))
+  check('被服务端拒绝后保存被锁住',
+    findButton(tree, '保存', 'tp-primary').props.disabled === true)
+  findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms4')
+    .props.onChange({ target: { value: 'D:/WorkSpace/.repos/mgiot-pms5' } })
+  tree = await render(Panel, { view: 'page' })
+  check('重填字段后服务端旧抱怨被清掉',
+    textOf(tree).indexOf('必须是非空字符串（本地 git 检出根目录）') < 0, textOf(tree).slice(0, 300))
+  check('重填字段后保存重新可用',
+    findButton(tree, '保存', 'tp-primary').props.disabled === false)
+
+  // 列表字段（statusValues / recordIds / allowedImageHosts）界面上是逗号分隔的一行文本，
+  // 发出去的必须是数组 —— 宿主那边这两种形态都收，但数组才是它写的形状。
+  const listInput = findInput(tree, (node) => node.props.value === '否')
+  check('找到逗号分隔的列表字段', listInput !== undefined)
+  listInput.props.onChange({ target: { value: '否, 在处理 , 否' } })
+  tree = await render(Panel, { view: 'page' })
+  findButton(tree, '保存', 'tp-primary').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  const listCall = ctx.calls.mutate[ctx.calls.mutate.length - 1]
+  const listOp = listCall === undefined
+    ? undefined
+    : listCall.ops.find((item) => item.path.join('.') === 'projects.0.match.statusValues')
+  check('列表字段发出去的是数组', listOp !== undefined && Array.isArray(listOp.value),
+    JSON.stringify(listOp))
+  check('列表字段按逗号切分并去掉空白与重复项',
+    listOp !== undefined && JSON.stringify(listOp.value) === JSON.stringify(['否', '在处理']),
+    JSON.stringify(listOp && listOp.value))
+
+  // 平台是固定集合，界面上必须给下拉而不是自由文本 —— 手打错一个字母就要等宿主拒。
+  const platformSelect = findAll(tree, (node) => node.type === 'select' &&
+    Array.isArray(node.props.children)).map((node) => node.props.children.length)
+  check('平台字段渲染成下拉框', platformSelect.length >= 1, JSON.stringify(platformSelect))
+
+  // 必填项清空 → 即时校验标红 + 禁用保存 + 顶部「N 项待修」。
+  const nameInput = findInput(tree, (node) => node.props.value === 'pms')
+  check('找到项目名输入框', nameInput !== undefined)
+  nameInput.props.onChange({ target: { value: '' } })
+  tree = await render(Panel, { view: 'page' })
+  check('必填项为空时提示「项待修」', textOf(tree).indexOf('项待修') >= 0, textOf(tree).slice(0, 200))
+  const blocked = findButton(tree, '保存', 'tp-primary')
+  check('有必填项为空时保存被禁用', blocked !== undefined && blocked.props.disabled === true,
+    blocked === undefined ? '没找到保存按钮' : String(blocked.props.disabled))
+  check('必填项为空时字段标红',
+    findAll(tree, (node) => typeof node.props.className === 'string' &&
+      node.props.className.indexOf('tp-invalid') >= 0).length >= 1)
+
+  // ⑥ summary 视图只给一句话，不渲染整页。
   resetRender()
   tree = await render(Panel, { view: 'summary' })
   check('summary 视图简短', textOf(tree).length < 40, textOf(tree).slice(0, 40))

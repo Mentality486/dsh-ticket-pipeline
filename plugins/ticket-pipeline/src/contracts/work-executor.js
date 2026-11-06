@@ -41,6 +41,8 @@
  * @property {string} [testDetail] skipped 时必须写原因
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 走远程 GitLab 开出来的 MR
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 在工作区检出里做出来的本地提交
+ * @property {string} [sessionId] 这次执行用的会话 id。会话默认保留在项目工作区名下，
+ *   人可以在 GUI 里按这个 id 找回那张票的会话继续追问（见配置项 `keepSession`）。
  * @property {{ kind: ErrorKind, message: string, retryable: boolean }} [error]
  */
 
@@ -136,6 +138,8 @@ export function makeExecResult (input) {
       files: Array.isArray(input.commit.files) ? input.commit.files.filter((f) => typeof f === 'string') : [],
     }
   }
+  // 会话 id 只在真的起了会话时才有（mock 执行器没有会话），所以不校验、有就带上。
+  if (typeof input.sessionId === 'string' && input.sessionId.length > 0) result.sessionId = input.sessionId
   if (input.error) {
     result.error = {
       kind: input.error.kind,

@@ -28,6 +28,7 @@ import {
   commitLocally,
   collectChanges,
   createAgentExecutor,
+  createBaseline,
   filterSensitiveFiles,
   isAllowedGitCommand,
   isSensitivePath,
@@ -244,7 +245,7 @@ function createFakeAgent (options = {}) {
  * @returns {any}
  */
 function createFakeAgentCtx (options = {}) {
-  const state = { mounts: [], setCalls: [], attachCalls: [] }
+  const state = { mounts: [], setCalls: [], attachCalls: [], sessionCloseCalls: [], sessionDisposeCalls: [] }
   const presets = {
     list: async () => (options.presetIds ?? ['ptc', 'standard']).map((id) => ({ id })),
     mount: async (ctx, id) => {
@@ -260,10 +261,20 @@ function createFakeAgentCtx (options = {}) {
       attachSession: async (sessionId) => { state.attachCalls.push({ workspaceId: id, sessionId }) },
     }),
   }
+  // 会话服务：只有传了 sessionsService 才存在 —— 真实宿主里也不是每个 profile 都挂它，
+  // `closeSession` 必须能优雅处理「取不到」的情况。
+  const sessionsService = options.sessionsService
+    ? {
+        ...(options.sessionsService === 'close' ? { close: async (id) => { state.sessionCloseCalls.push(id) } } : {}),
+        ...(options.sessionsService === 'dispose' ? { dispose: async (id) => { state.sessionDisposeCalls.push(id) } } : {}),
+        ...(options.sessionsService === 'closeSession' ? { closeSession: async (id) => { state.sessionCloseCalls.push(id) } } : {}),
+      }
+    : undefined
   const agentCtx = {
     get (name) {
       if (name === 'agentPresets') return presets
       if (name === 'workspaceRegistry') return workspaceRegistry
+      if (name === 'sessions') return sessionsService
       if (name === 'workingDirectory') {
         // noWorkingDirectory = 模拟 headless profile：这个服务根本不存在。
         if (options.noWorkingDirectory) return undefined
@@ -370,9 +381,19 @@ function makeRunEnv (options = {}) {
 
   const git = async (argv, _opts) => {
     gitCalls.push(argv)
-    if (argv[0] === 'diff' && argv[1] === '--name-status') return { code: 0, stdout: renderNameStatus(changes), stderr: '' }
+    if (argv[0] === 'diff' && argv[1] === '--name-status') {
+      // 第三个参数是「跟谁比」：拍基线成功时是 baseline sha，否则是检出点 baseCommit。
+      // `changesFor(ref)` 让用例按 ref 给出不同的改动清单 —— 这正是「有基线时人的改动
+      // 不该出现在 diff 里」这件事可被验证的方式。
+      const ref = String(argv[3] ?? '')
+      const list = typeof options.changesFor === 'function' ? options.changesFor(ref) : changes
+      return { code: 0, stdout: renderNameStatus(list), stderr: '' }
+    }
     if (argv[0] === 'diff' && argv[1] === '--name-only') return { code: 0, stdout: files.join('\n'), stderr: '' }
-    if (argv[0] === 'status') return { code: 0, stdout: options.gitStatusOutput ?? renderPorcelain(changes), stderr: '' }
+    if (argv[0] === 'status') {
+      const statusOut = typeof options.gitStatusOutput === 'function' ? options.gitStatusOutput() : options.gitStatusOutput
+      return { code: 0, stdout: statusOut ?? renderPorcelain(changes), stderr: '' }
+    }
     if (argv[0] === 'add') return { code: 0, stdout: '', stderr: '' }
     // 本地提交：记下 commit 的 argv（paths 在 `--` 之后），供断言核对「只提交非敏感文件」。
     if (argv[0] === 'commit') {
@@ -381,7 +402,20 @@ function makeRunEnv (options = {}) {
       return { code: options.commitFails ? 1 : 0, stdout: '', stderr: options.commitFails ? 'nothing to commit' : '' }
     }
     if (argv[0] === 'rev-parse' && argv[1] === 'HEAD') {
+      if (options.revParseFails) return { code: 128, stdout: '', stderr: 'fatal: not a git repository' }
       return { code: 0, stdout: options.headSha ?? 'deadbeefcafe1234567890abcdef1234567890ab', stderr: '' }
+    }
+    // 拍基线：`git stash create` 真实语义是「有未提交改动就回一个 stash commit 的 sha，
+    // 工作区干净就回**空串**」。用 stashSha 显式模拟这两种，别让假 git 静默回空。
+    if (argv[0] === 'stash' && argv[1] === 'create') {
+      if (options.stashFails) return { code: 128, stdout: '', stderr: 'fatal: stash create failed' }
+      return { code: 0, stdout: options.stashSha ?? 'stash0000000000000000000000000000000001', stderr: '' }
+    }
+    // 未跟踪文件的内容哈希：哈希变了 = agent 动过，哈希没变 = 人本来就有的。
+    if (argv[0] === 'hash-object') {
+      const sep = argv.indexOf('--')
+      const path = sep >= 0 ? argv[sep + 1] : argv[1]
+      return { code: 0, stdout: `${options.hashFor?.(path) ?? `hash:${path}`}\n`, stderr: '' }
     }
     if (argv[0] === 'show') {
       const path = String(argv[1]).replace(/^:0:/, '')
@@ -406,6 +440,9 @@ function makeRunEnv (options = {}) {
     provider: '',
     model: '',
     maxTokens: 4096,
+    // keepSession 是**全局**行为开关（core/config.js），不是项目级配置 —— 所以放在
+    // 这一层。不传就是 undefined，等于走缺省 true（保留会话）。
+    ...(options.keepSession === undefined ? {} : { keepSession: options.keepSession }),
     projects: [{
       name: 'demo',
       match: { platform: 'mock' },
@@ -424,6 +461,8 @@ function makeRunEnv (options = {}) {
   }
 
   const controller = new AbortController()
+  /** @type {string[]} */
+  const logs = []
   const ctx = {
     signal: controller.signal,
     worktreePath: '/repo/.agents/worktrees/ticket-demo-rec-9-r1',
@@ -442,11 +481,11 @@ function makeRunEnv (options = {}) {
     content: [{ type: 'text', text: '任务书正文' }],
     images: [],
     config,
-    log: () => {},
+    log: (message) => { logs.push(String(message)) },
     onPhase: async (phase) => { phases.push(phase) },
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, logs, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -1032,6 +1071,21 @@ export async function runGitlabChecks (check) {
     assert.equal(isAllowedGitCommand(['restore', '--staged', '--']), false, '空列表没意义')
   })
 
+  await check('执行器：git 白名单只放行 stash create 与带 -- 的 hash-object', async () => {
+    // 拍基线要用这两条。风险点都在「子命令选错就会动工作区/动对象库」：
+    // - stash pop / apply / drop 会改工作区（pop 还会把人的改动糊回去），绝不能放行；
+    //   只有 `stash create` 是纯读的 —— 它造一个 commit 对象、写进 stdout，不动 ref、不动工作区。
+    assert.equal(isAllowedGitCommand(['stash', 'create']), true)
+    assert.equal(isAllowedGitCommand(['stash', 'pop']), false, 'pop 会动工作区，放行等于能把人的改动搞乱')
+    assert.equal(isAllowedGitCommand(['stash']), false)
+    assert.equal(isAllowedGitCommand(['stash', 'create', 'x']), false)
+    // hash-object 必须带 `--`：缺了它，文件名会被当成 flag（比如 -w 会把内容写进对象库）。
+    assert.equal(isAllowedGitCommand(['hash-object', '--', 'a.txt']), true)
+    assert.equal(isAllowedGitCommand(['hash-object', 'a.txt']), false, '不带 -- 时 -w 之类的 flag 会被当成文件名前缀')
+    assert.equal(isAllowedGitCommand(['hash-object', '--']), false, '空列表没意义')
+    assert.equal(isAllowedGitCommand(['hash-object', '--', '']), false, '空路径没意义')
+  })
+
   await check('执行器：collectChanges 把未跟踪的新文件也算进改动（git diff 看不见它们）', async () => {
     // 这是本改造最致命的一条：缺省模式下 baseCommit 必然有值，
     // 只跑 `git diff <baseCommit>` 就会漏掉 agent 新建的所有文件 ——
@@ -1080,6 +1134,106 @@ export async function runGitlabChecks (check) {
       },
     }, { cwd: '/repo', baseCommit: '', signal: new AbortController().signal })
     assert.deepEqual(result.changes, [{ path: 'a.js', status: 'create' }])
+  })
+
+  await check('执行器：有基线时只收 agent 的改动，人自己未提交的改动一个都不进提交', async () => {
+    // 这是「不提交不是你修改的文件」的核心一条。没有基线时 diff 的右端点是检出点
+    // （baseCommit = 检出 HEAD），人早先攒下的未提交改动会一起出现在 diff 里，
+    // 然后被当成 agent 的产物提交掉。有基线（stash create 的 sha）之后，
+    // 那些改动在基线快照里已经有了，diff 出来就是空的。
+    const calls = []
+    const result = await collectChanges({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'diff') return { code: 0, stdout: 'A\0agent.txt\0', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: ' M user-edit.txt\0?? user-new.txt\0?? agent.txt\0', stderr: '' }
+        if (argv[0] === 'hash-object') {
+          const path = argv[argv.indexOf('--') + 1]
+          return { code: 0, stdout: `${path === 'user-new.txt' ? 'h1' : 'h-other'}\n`, stderr: '' }
+        }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: 'base123',
+      baseline: { sha: 'stashsha1', head: 'head1', untracked: new Map([['user-new.txt', 'h1']]) },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result.changes, [{ path: 'agent.txt', status: 'create' }], '人的改动一个都不能进提交')
+    assert.deepEqual(result.files, ['agent.txt'])
+    const diffCall = calls.find((argv) => argv[0] === 'diff')
+    assert.equal(diffCall[3], 'stashsha1', '有基线时必须跟基线比，不能跟检出点比（否则人的改动全被算成 agent 的）')
+    assert.ok(!diffCall.includes('base123'), '有基线就不该再拿 baseCommit 当端点')
+  })
+
+  await check('执行器：agent 改了人正在改的那个未跟踪文件，照样提交（内容哈希变了）', async () => {
+    // 不能因为「这个路径在基线里」就一概跳过：人改了一半、agent 接着改，
+    // 内容已经变了，那确实是这次要交付的活。
+    const result = await collectChanges({
+      git: async (argv) => {
+        if (argv[0] === 'status') return { code: 0, stdout: '?? draft.md\0', stderr: '' }
+        if (argv[0] === 'hash-object') return { code: 0, stdout: 'h2\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: '',
+      baseline: { sha: undefined, head: 'head1', untracked: new Map([['draft.md', 'h1']]) },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result.changes, [{ path: 'draft.md', status: 'create' }])
+    // 顺带：baseline.sha 为空（工作区干净时 stash create 回空串）就别跑 diff，
+    // 只靠 status —— 干净工作区也没有已跟踪改动可收集。
+    assert.equal(result.changes.length, 1)
+  })
+
+  await check('执行器：agent 改了人也在改的已跟踪文件，照样提交', async () => {
+    // 基线记的是「人改到一半」的那一版；agent 接着改，文件与基线之间就有差异，
+    // 那是本次真要交付的东西，必须收下（只是「别把人的改动算进来」，不是「一律不碰」）。
+    const result = await collectChanges({
+      git: async (argv) => {
+        if (argv[0] === 'diff') return { code: 0, stdout: 'M\0user-edit.txt\0', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: 'base123',
+      baseline: { sha: 'stashsha1', head: 'head1', untracked: new Map() },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result.changes, [{ path: 'user-edit.txt', status: 'update' }])
+  })
+
+  await check('执行器：createBaseline 无 git 运行器返回 undefined，stash create 回空串时 sha 记 undefined', async () => {
+    assert.equal(await createBaseline({}, '/repo', new AbortController().signal), undefined, '没有 git 就没有可拍的基线')
+    const clean = await createBaseline({
+      git: async (argv) => {
+        if (argv[0] === 'stash') return { code: 0, stdout: '', stderr: '' } // 干净工作区的真实返回值是空串
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'head123\n', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, '/repo', new AbortController().signal)
+    assert.ok(clean, '有 git 就要回一个基线对象')
+    assert.equal(clean.sha, undefined, '空串必须当成「没有基线」，否则 git diff "" 会直接 fatal')
+    assert.equal(clean.head, 'head123')
+    assert.equal(clean.untracked.size, 0)
+    assert.equal(clean.dirtyCount, 0)
+
+    // 脏工作区：stash create 回 sha，未跟踪文件记下内容哈希。
+    const dirty = await createBaseline({
+      git: async (argv) => {
+        if (argv[0] === 'stash') return { code: 0, stdout: 'stashsha1\n', stderr: '' }
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'head123\n', stderr: '' }
+        if (argv[0] === 'status') return { code: 0, stdout: ' M a.txt\0?? b.txt\0', stderr: '' }
+        if (argv[0] === 'hash-object') return { code: 0, stdout: 'hh-b\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, '/repo', new AbortController().signal)
+    assert.equal(dirty.sha, 'stashsha1')
+    assert.deepEqual([...dirty.untracked.keys()], ['b.txt'], '只有未跟踪文件需要记内容哈希')
+    assert.equal(dirty.untracked.get('b.txt'), 'hh-b')
+    assert.equal(dirty.dirtyCount, 2, '日志里要能说「用户已有 N 个未提交改动」')
   })
 
   await check('执行器：本地提交对删除与重命名分别给对 pathspec', async () => {
@@ -1399,6 +1553,66 @@ export async function runGitlabChecks (check) {
     const env = makeRunEnv()
     await env.executor.run(env.ticket, env.target, env.ctx)
     assert.equal(env.state.disposed, true, '宿主里 agents.create 返回 {agent, dispose}，必须走 dispose 才拆得掉')
+  })
+
+  await check('执行器：整条跑下来只提交 agent 改过的文件，人未提交的改动不进提交', async () => {
+    // 端到端一条：假 git 按「跟谁比」给不同的改动清单 —— 跟基线比只有 agent 的文件，
+    // 跟检出点比会多出人自己未提交的那个。断言最终 commit 的 pathspec 里没有它。
+    const env = makeRunEnv({
+      stashSha: 'stashsha1',
+      changesFor: (ref) => (ref === 'stashsha1'
+        ? [{ path: 'src/login.js', status: 'update' }]
+        : [{ path: 'src/login.js', status: 'update' }, { path: 'src/user-wip.js', status: 'update' }]),
+    })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.deepEqual(result.changedFiles, ['src/login.js'], '只有 agent 改的文件算本次改动')
+    assert.equal(env.commits.length, 1)
+    const committedPaths = env.commits[0].paths
+    assert.ok(!committedPaths.includes('src/user-wip.js'), `人未提交的改动绝不能进 commit：${JSON.stringify(committedPaths)}`)
+    assert.deepEqual(committedPaths, ['src/login.js'])
+    const diffCall = env.gitCalls.find((argv) => argv[0] === 'diff' && argv[1] === '--name-status')
+    assert.equal(diffCall[3], 'stashsha1', '收集改动必须跟基线比')
+    // 日志必须把「谁的改动进了提交」写清楚，否则人只看到自己改的文件没进提交，会以为执行器丢了东西。
+    assert.ok(env.logs.some((line) => line.includes('基线') && line.includes('本次只提交')), `缺少基线日志：${env.logs.join(' | ')}`)
+  })
+
+  await check('执行器：拍基线失败时退回检出点收集，票照样跑完（基线失败不能让整票失败）', async () => {
+    // 老 git / 仓库有锁之类会让 `git stash create` 失败。这时候宁可退化成老行为
+    // （可能把人的改动一起提交），也不能让一张本来能跑通的票直接失败。
+    const env = makeRunEnv({ stashFails: true })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done', '拍不到基线不是失败')
+    const diffCall = env.gitCalls.find((argv) => argv[0] === 'diff' && argv[1] === '--name-status')
+    assert.equal(diffCall[3], 'base123', '没有基线就退回检出点，行为与改造前一致')
+  })
+
+  await check('执行器：keepSession 缺省（保留会话）只释放 agent，不动会话', async () => {
+    // 缺省是「保留」：agent 必须释放（否则每次跑票泄漏一个 agent 实例），
+    // 但会话不能收 —— 会话要留在项目工作区名下，人可以在 GUI 里点进去继续追问。
+    // 所以这里给上 sessions 服务，断言它一次都没被调用。
+    const env = makeRunEnv({ sessionsService: 'close' })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.state.disposed, true, 'agent 永远要释放，跟 keepSession 无关')
+    assert.deepEqual(env.setupState.sessionCloseCalls, [], 'keepSession 缺省为 true，绝不能偷收会话')
+    assert.deepEqual(env.setupState.sessionDisposeCalls, [], 'keepSession 缺省为 true，绝不能偷收会话')
+    assert.ok(typeof result.sessionId === 'string' && result.sessionId.length > 0, '会话留在工作区名下，id 必须带回去')
+  })
+
+  await check('执行器：keepSession=false 时额外把会话收掉（agent 照样释放）', async () => {
+    const env = makeRunEnv({ keepSession: false, sessionsService: 'close' })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.state.disposed, true, '关会话不能顶替释放 agent')
+    assert.equal(env.setupState.sessionCloseCalls.length, 1, 'keepSession=false 必须把会话关掉一次')
+    assert.equal(env.setupState.sessionCloseCalls[0], result.sessionId, '关的必须是这次用的那个会话')
+  })
+
+  await check('执行器：keepSession=false 但本机没有会话服务时只记日志，不影响票的结论', async () => {
+    const env = makeRunEnv({ keepSession: false })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.state.disposed, true)
+    assert.equal(result.phase, 'done', '拿不到会话服务不能把已经跑成的票判成失败')
+    assert.equal(result.sessionId.length > 0, true)
   })
 
   await check('agent 失败原因：限流判定、重置时刻解析、最后一轮 turn/end', () => {

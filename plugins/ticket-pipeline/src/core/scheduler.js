@@ -473,9 +473,29 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         testDetail: result.testDetail,
         commit: result.commit,
         mr: result.mr,
+        sessionId: result.sessionId,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
       })
+
+      // 回填工单表：只在「真的改完了」的时候写。failed 不写 —— 表里那一行还是
+      // 「处理中」，人一眼就能看出这票没成，等着重新拨进队列。
+      const writeBackReceipt = await writeBackFor(source, ticket, {
+        phase: finalPhase,
+        result,
+        plan: result.plan ?? row.plan,
+        commit: result.commit,
+        mr: result.mr,
+        changedFiles: result.changedFiles ?? row.changedFiles,
+        worktreePath: ws.worktreePath,
+        sessionId: result.sessionId,
+        verification: { outcome: result.testOutcome, detail: result.testDetail },
+      }, handle.signal)
+      if (writeBackReceipt !== undefined) {
+        // 回填结果落库：面板与状态工具能显示「表格写没写成功」，
+        // 写失败时人不用去表格里一行行找。
+        await store.setPhase(key, finalPhase, { writeBack: writeBackReceipt })
+      }
 
       // 不铺 ...result：ExecResult 里的 error 是对象，铺进来会污染整个通知载荷。
       // 逐字段显式搬运，通知里读到的就是这次执行的结果而不是运行前的快照。
@@ -654,6 +674,84 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     }
     if (saved > 0) logInfo(`已存 ${saved} 张截图`, { projectId: ticket.projectId, recordId: ticket.recordId })
     return images
+  }
+
+  // ── 回填工单表 ──────────────────────────────────────────
+
+  /**
+   * 票跑成之后把结果写回工单表（用户 2026-11-06 要求）。
+   *
+   * 三条设计约束，每条都对应一个真实坑：
+   *
+   * 1. **只写 done / skipped**。failed 不写：表里那行还留着「处理中」，人一眼看出
+   *    这票没成、等着重新拨进队列。写回去反而让人以为处理完了。
+   * 2. **回填失败绝不影响票态**。表格写不进去是我们的网络/权限问题，不是这票白干了；
+   *    票该是 done 还是 done，只在 `writeBack.note` 里记一句为什么没写成。
+   * 3. **不传 handle.signal 之外的信号，且被取消就不写**。人按了取消，说明他不想
+   *    这条链路再动任何远端状态。
+   *
+   * 源没实现 `writeResult`（比如 webform / 老适配器）或配置里 `writeBack: false`
+   * 时直接返回 undefined —— 调用方据此知道「什么都没发生」，不必落库。
+   *
+   * @param {TicketSource | undefined} source
+   * @param {Ticket} ticket
+   * @param {{
+   *   phase: Phase,
+   *   result: import('../contracts/work-executor.js').ExecResult,
+   *   plan?: any,
+   *   commit?: { sha: string, branch: string, files: string[] },
+   *   mr?: { iid: number, url: string, draft: boolean },
+   *   changedFiles?: string[],
+   *   worktreePath?: string,
+   *   sessionId?: string,
+   *   verification?: { outcome?: string, detail?: string },
+   * }} input
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<import('../contracts/ticket-source.js').WriteBackReceipt | undefined>}
+   */
+  async function writeBackFor (source, ticket, input, signal) {
+    // 关掉就完全不碰表格 —— 有人就是要「表格只读」，这个开关是他们唯一的出口。
+    if (config.writeBack === false) return undefined
+    if (typeof source?.writeResult !== 'function') return undefined
+    if (input.phase !== 'done' && input.phase !== 'skipped') return undefined
+    if (signal?.aborted) {
+      return { written: false, note: '这张票被取消了，按约定不回填表格' }
+    }
+
+    const status = typeof config.writeBackStatus === 'string' && config.writeBackStatus.trim().length > 0
+      ? config.writeBackStatus.trim()
+      : '是'
+    const result = renderWriteBackResult(ticket, { ...input, status })
+    const handledAt = nowFn()
+
+    try {
+      const receipt = await source.writeResult(ticket.recordId, { status, result, handledAt }, signal)
+      const written = receipt?.written === true
+      const normalized = {
+        written,
+        fields: Array.isArray(receipt?.fields) ? receipt.fields.map(String) : [],
+        at: handledAt,
+      }
+      if (typeof receipt?.note === 'string' && receipt.note.length > 0) normalized.note = receipt.note
+      logInfo(written ? '已回填工单表' : '工单表没写成', {
+        projectId: ticket.projectId,
+        recordId: ticket.recordId,
+        status,
+        fields: normalized.fields,
+        note: normalized.note,
+      })
+      return normalized
+    } catch (error) {
+      // 回填是「顺手做的事」：它挂了不能反过来把一张已经干完的票判失败。
+      const reason = toPipelineError(error)
+      logInfo('回填工单表失败（不影响票据状态）', {
+        projectId: ticket.projectId,
+        recordId: ticket.recordId,
+        kind: reason.kind,
+        reason: reason.message,
+      })
+      return { written: false, note: `${reason.kind}: ${reason.message}` }
+    }
   }
 
   // ── 通知 ────────────────────────────────────────────────
@@ -923,6 +1021,64 @@ function renderNotifyBody (ticket, row, phase) {
     lines.push(`需要补充：${row.lastError ?? '截图取不到'}`)
     lines.push('', '把截图重新贴一次（或填可访问的路径/链接），下一轮会自动继续。')
   }
+
+  return lines.join('\n')
+}
+
+/**
+ * 回填进「处理结果」列的那段话。
+ *
+ * 写给人看的，不是写日志的：人打开表格只想知道「这票到底动了什么、能不能合」。
+ * 所以顺序按人的关心程度排：改了什么 → 验证过没有 → 提交在哪 → 怎么继续追问。
+ *
+ * 长度控制在一屏内（飞书单元格塞几千字会很难读），最多列 8 个文件。
+ *
+ * @param {Ticket} ticket
+ * @param {{
+ *   phase: Phase,
+ *   status?: string,
+ *   result: import('../contracts/work-executor.js').ExecResult,
+ *   commit?: { sha: string, branch: string, files: string[] },
+ *   mr?: { iid: number, url: string, draft: boolean },
+ *   changedFiles?: string[],
+ *   worktreePath?: string,
+ *   sessionId?: string,
+ *   verification?: { outcome?: string, detail?: string },
+ * }} input
+ * @returns {string}
+ */
+function renderWriteBackResult (ticket, input) {
+  const lines = []
+  const files = Array.isArray(input.changedFiles) ? input.changedFiles : []
+  const where = input.worktreePath ? `（${input.worktreePath}）` : ''
+
+  if (input.phase === 'skipped') {
+    lines.push('已按工单改完并提交，但验证没跑通，需要人工确认。')
+  } else {
+    lines.push('已按工单改完并提交。')
+  }
+
+  if (files.length > 0) {
+    lines.push(`改动 ${files.length} 个文件：`)
+    for (const file of files.slice(0, 8)) lines.push(`- ${file}`)
+    if (files.length > 8) lines.push(`- …还有 ${files.length - 8} 个`)
+  } else {
+    lines.push('改动文件：无（见下方提交说明）')
+  }
+
+  const outcome = input.verification?.outcome
+  if (outcome === 'passed') lines.push('验证：通过（build/test 退出码 0）')
+  else if (outcome === 'failed') lines.push('验证：未通过')
+  else if (outcome === 'skipped') lines.push(`验证：未跑成 —— ${input.verification?.detail ?? '原因未记录'}`)
+
+  if (input.commit?.sha) {
+    lines.push(`本地提交：${String(input.commit.sha).slice(0, 12)}${input.commit.branch ? ` @ ${input.commit.branch}` : ''}${where}`)
+  }
+  if (input.mr?.url) lines.push(`draft MR：${input.mr.url}`)
+  if (input.sessionId) {
+    lines.push(`处理会话：${input.sessionId}（保留在项目工作区名下，可在 GUI 里点进去继续追问）`)
+  }
+  lines.push('', '要进一步修改，把这个单元格清空、把「是否处理」拨回「处理中」即可重跑。')
 
   return lines.join('\n')
 }

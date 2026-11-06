@@ -41,7 +41,7 @@
 | D3 | **探测结果缓存进 `tableCache`，形状升级为带 `kind`** | 一轮扫描只探测一次；`kind` 决定后续走哪条读表路径 | 改了配置要重建实例才生效（现状如此） |
 | D4 | **电子表格的身份 = 序号列值优先，行号兜底**，两种形态用 `match.sheetIdentity` 显式选 | 序号列是人手填的、插行不重排，比行号稳；行号是最后的兜底 | 序号被重填 / 重复时会换身份；必须检测重复并**拒绝启动**，不能静默取第一个 |
 | D5 | **电子表格分支不做早停**，改成「一次读全表 + 逐行指纹比对」 | 电子表格**没有行级 mtime**，`safePageRun` 早停没有依据；而且读值接口**没有分页**（`has_more` 字段根本不存在） | 大表每次轮询都读全量，撞 10 MB 响应上限；需要在配置里支持限定读取范围 |
-| D6 | **代码落在新文件 `src/adapters/source-feishu/sheets.js`**，主 `index.js` 只做分派 | 与金山源同构（`source-wps/index.js` + `source-wps/xlsx.js`）；`index.js` 已 1274 行，不该再胖 | 多一个文件，读代码要跳两处 |
+| D6 | **代码落在新文件 `src/adapters/source-feishu/sheets.js`**，主 `index.js` 只做分派 | 与金山源同构（`source-wps/index.js` + `source-wps/xlsx.js`）；`index.js` 已 1384 行，不该再胖 | 多一个文件，读代码要跳两处 |
 
 ### 2.1 备选方案与否决理由
 

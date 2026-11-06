@@ -351,30 +351,32 @@ export async function inspectCheckout (gitRunner, repoPath) {
 }
 
 /**
- * 检出不干净就拒绝这张票。
+ * 不干净时给人看的提醒文案（**不抛错**）。
  *
- * 为什么必须硬拒而不是只警告：缺省模式（不开 `isolateWorktree`）下 agent 直接在
- * 项目工作区里改代码，最后 `git add -- <改动文件>` + `commit -- <改动文件 ∪ 旧路径>`
- * 会把**收集到的那些改动**一起提交。收集口径是「相对 baseCommit 的 diff ∪ status」，
- * 一旦人和 agent 改了同一个文件，人的半成品就会被并进工单提交 —— 提交已经成型，
- * 再想把它从工单改动里择出来基本不可能。
+ * 用户 2026-11-06 拍板：工作区脏也能跑票，只提交 agent 真正改过的那些文件
+ * （机制见 `adapters/executor-agent` 的基线快照 `createBaseline`）。
  *
- * 所以这里只做一件事：把「为什么不干净、怎么办」说清楚，让人能一步解决。
+ * 这里曾经是 `assertCleanCheckout()`，脏就直接抛 `invalid-input` 拒跑 —— 那是
+ * 「收集口径 = 相对 baseCommit 的 diff」时代的必然选择：人和 agent 改了同一个文件
+ * 就分不开了。现在有了基线快照，脏不再等于「分不开」，硬拒反而挡住真实用法
+ * （谁手上没点半成品？）。删掉那个函数而不是留着备用，是因为留着它一定会有人
+ * 再把它接回主路径，而它描述的是已经作废的规则。
  *
- * @param {{ dirty: string[] }} snapshot `inspectCheckout` 的结果
+ * 但「脏」这件事仍然要说：人得知道这次是在脏检出里动的工，而且他那些未提交
+ * 改动会原样留在工作区、不会被带进工单提交。
+ *
+ * @param {{ dirty?: string[] }} snapshot `inspectCheckout` 的结果
  * @param {string} repoPath
+ * @returns {string | undefined} 干净时返回 undefined
  */
-export function assertCleanCheckout (snapshot, repoPath) {
+export function describeDirtyCheckout (snapshot, repoPath) {
   const dirty = Array.isArray(snapshot?.dirty) ? snapshot.dirty : []
-  if (dirty.length === 0) return
+  if (dirty.length === 0) return undefined
   const shown = dirty.slice(0, 10).join('、')
   const more = dirty.length > 10 ? `等 ${dirty.length} 个` : ''
-  throw new PipelineError(
-    'invalid-input',
-    `项目工作区不干净，拒绝在这张票里改代码：${repoPath} 有未提交改动（${shown}${more}）。`
-    + '插件会把改动直接提交在这个检出里，混着走会把你的半成品一起提交掉。'
-    + '请先把这些改动提交或 stash，或者打开配置项 isolateWorktree 让每张票用独立的隔离 worktree。',
-  )
+  return `项目工作区有 ${dirty.length} 个未提交改动（${shown}${more}），本次照跑：`
+    + `插件会先给 ${repoPath} 拍一份基线，结束后只提交 agent 真正改过的文件，`
+    + '你自己这些未提交改动会原样留在工作区。'
 }
 
 /**
@@ -810,9 +812,12 @@ export async function apply (ctx, config) {
     }
 
     if (config.isolateWorktree !== true) {
-      // 缺省路径：就在项目工作区里改。除非工作区干净，否则一步都不走。
+      // 缺省路径：就在项目工作区里改。工作区脏也照跑 —— 谁手上没点半成品？
+      // 靠执行器的基线快照把「agent 改的」与「人本来就有的」分开（见
+      // `adapters/executor-agent` 的 createBaseline）。这里只把情况说清楚。
       const snapshot = await inspectCheckout(gitRunner, repoPath)
-      assertCleanCheckout(snapshot, repoPath)
+      const notice = describeDirtyCheckout(snapshot, repoPath)
+      if (notice) log('工作区不干净，仍然照跑（只提交 agent 改过的文件）', { projectId, recordId, notice })
       log('在项目工作区里改代码（未开隔离 worktree）', {
         projectId,
         recordId,

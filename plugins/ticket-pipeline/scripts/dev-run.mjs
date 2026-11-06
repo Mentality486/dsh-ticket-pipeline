@@ -41,7 +41,7 @@ import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
-import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, assertCleanCheckout } from '../src/index.js'
+import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
 import {
   comparePluginTrees,
@@ -54,6 +54,12 @@ import {
   readLocalDependency,
   resolveSpecPath,
 } from '../src/core/plugin-version.js'
+import {
+  BRANCH_REF_ARGS,
+  listBranches,
+  mergeBranchChoices,
+  parseBranchRefs,
+} from '../src/core/branches.js'
 
 // ── 小工具 ────────────────────────────────────────────────
 
@@ -2347,7 +2353,7 @@ function makeFakeCtx ({ domain, registered }) {
   section('14. 项目工作区：有则复用、无则登记、服务缺失降级')
   await runWorkspaceChecks(check)
 
-  section('15. 改代码落点：缺省在工作区检出里改（要求干净）')
+  section('15. 改代码落点：缺省在工作区检出里改（脏也能跑，只提交 agent 改的）')
   await check('inspectCheckout：干净 / 脏 / 拿不到状态三种情况都说清', async () => {
     const clean = async (argv) => {
       if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
@@ -2407,19 +2413,26 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(w.dirty, ['?? 新建文件.txt', '?? space name.txt'], '中文名与空格名都不能被转义')
   })
 
-  await check('assertCleanCheckout：脏工作区拒跑，报错要能照着做', async () => {
-    assertCleanCheckout({ dirty: [] }, 'D:/repo') // 干净时什么都不做
-    let error = null
-    try {
-      assertCleanCheckout({ dirty: ['M a.ts', '?? b.ts'] }, 'D:/repo')
-    } catch (err) {
-      error = err
-    }
-    assert.ok(error, '不干净必须抛')
-    assert.equal(error.kind, 'invalid-input')
-    assert.ok(error.message.includes('M a.ts'), `要点名具体文件：${error.message}`)
-    assert.ok(error.message.includes('stash'), '要告诉人怎么办')
-    assert.ok(error.message.includes('isolateWorktree'), '要给出旁路配置项')
+  await check('describeDirtyCheckout：脏工作区只提醒不拒跑，文案要能照着理解', async () => {
+    // 干净时什么都不说（不刷无意义的提示）。
+    assert.equal(describeDirtyCheckout({ dirty: [] }, 'D:/repo'), undefined)
+    assert.equal(describeDirtyCheckout(undefined, 'D:/repo'), undefined)
+
+    const notice = describeDirtyCheckout({ dirty: ['M a.ts', '?? b.ts'] }, 'D:/repo')
+    assert.equal(typeof notice, 'string', '不干净必须给出一句提醒')
+    assert.ok(notice.includes('M a.ts'), `要点名具体文件：${notice}`)
+    assert.ok(notice.includes('2 个未提交改动'), `要报出总数：${notice}`)
+    assert.ok(notice.includes('照跑'), '这是「照跑」而不是拒跑')
+    assert.ok(notice.includes('基线'), '要说明会拍基线')
+    assert.ok(notice.includes('只提交 agent 真正改过的文件'), '要说明只提交 agent 改的')
+    assert.ok(notice.includes('原样留在工作区'), '人得知道自己那些改动不会被带走')
+
+    // 超过 10 个文件时不能把整张清单铺出来。
+    const many = Array.from({ length: 13 }, (_, i) => `M f${i}.ts`)
+    const long = describeDirtyCheckout({ dirty: many }, 'D:/repo')
+    assert.ok(long.includes('13 个未提交改动'), `要报出真实总数：${long}`)
+    assert.ok(long.includes('等 13 个'), `超量要折叠：${long}`)
+    assert.ok(!long.includes('M f12.ts'), '第 11 个之后的文件名不该出现')
   })
 
   await check('isIsolatedWorktreePath：只认插件自己开的 .agents/worktrees/<name>', async () => {
@@ -2489,6 +2502,259 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(String(row.worktreePath ?? '').length > 0, '缺省模式仍要给出改代码的目录（工作区根）')
     assert.equal(row.branch, 'v2.x', '就地改代码时分支就是检出当前分支，不该另开票分支')
     assert.equal(row.baseCommit, 'base0001', '基线提交要记下来，改动靠它算 diff')
+  })
+
+  section('16. 处理完回填工单表 + 保留工作区会话')
+
+  await check('跑成 done → 回填表格：是否处理 / 处理结果 / 处理日期三列都写', async () => {
+    // 用户 2026-11-06 的口径：改完需求要把「处理中」改成「是」，并写明怎么处理的、
+    // 哪天处理的。这条钉住「真的调了 writeResult，且三列都给了」。
+    const { scheduler, store, source } = harness()
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done')
+    assert.deepEqual(source.writes.length, 1, 'done 必须回填一次')
+    const write = source.writes[0]
+    assert.equal(write.recordId, 'rec-mock-001')
+    assert.equal(write.status, '是', '「是否处理」缺省写「是」')
+    assert.ok(Number.isFinite(write.handledAt) && write.handledAt > 0, '「处理日期」要是毫秒时间戳')
+    assert.ok(write.result.includes('已按工单改完并提交'), `处理结果要说清做了什么：${write.result}`)
+    assert.ok(write.result.includes('本地提交：'), '处理结果里要写提交在哪')
+    assert.ok(write.result.includes('要进一步修改'), '要告诉人怎么重跑')
+
+    assert.equal(row.writeBack?.written, true, '票据上要记下回填成功')
+    assert.ok(Array.isArray(row.writeBack.fields) && row.writeBack.fields.length === 3, '要记下写了哪三列')
+  })
+
+  await check('回填的「是否处理」值可配：writeBackStatus 说了算，空白回落「是」', async () => {
+    const custom = createMockSource()
+    const { scheduler: s1 } = harness({
+      source: custom,
+      config: { writeBackStatus: '已完成' },
+      prepareWorkspace: async () => ({ path: 'D:/wt/a', branch: 'b-a', baseCommit: 'c-a' }),
+    })
+    await s1.tick()
+    assert.equal(custom.writes[0].status, '已完成', '配置项要能换成「已完成」这种表常用值')
+
+    const blank = createMockSource()
+    const { scheduler: s2 } = harness({
+      source: blank,
+      config: { writeBackStatus: '   ' },
+      prepareWorkspace: async () => ({ path: 'D:/wt/b', branch: 'b-b', baseCommit: 'c-b' }),
+    })
+    await s2.tick()
+    assert.equal(blank.writes[0].status, '是', '空白要回落「是」，不能写一个空单元格')
+  })
+
+  await check('writeBack=false 就完全不写表格（退化成只读）', async () => {
+    const source = createMockSource()
+    const { scheduler, store } = harness({ source, config: { writeBack: false } })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done')
+    assert.equal(source.writes.length, 0, '关掉开关就一个写请求都不许发')
+    assert.equal(row.writeBack, undefined, '不写就别记回执')
+  })
+
+  await check('failed 的票不回填：表里那一行留在「处理中」是刻意留的信号', async () => {
+    // 失败也写「是」会让人以为处理完了 —— 这个信号比「表格字段整齐」重要得多。
+    const source = createMockSource()
+    const { scheduler, store } = harness({ source, executor: createMockExecutor({ outcome: 'failed' }) })
+    await scheduler.tick()
+    assert.equal(store.getTicket(k('rec-mock-001')).phase, 'failed')
+    assert.equal(source.writes.length, 0, '失败的票绝不能回填')
+  })
+
+  await check('回填失败只记在票据上，票态不回退、不影响通知', async () => {
+    // 回填是「改完之后的附加动作」。表结构对不上（缺列）、应用没写权限 —— 这些都
+    // 不该把一张已经改完的票判成失败，但也不能让「表没更新」无声无息。
+    const source = createMockSource()
+    source.setFailWrite(true)
+    const { scheduler, store, push } = harness({ source })
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '回填失败不能把票拖回 failed')
+    assert.equal(row.writeBack?.written, false, '要记下「没写成」')
+    assert.match(row.writeBack.note ?? '', /network|模拟回填失败/, `要留下失败原因：${row.writeBack?.note}`)
+    assert.equal(push.messages.length, 1, '通知照发')
+  })
+
+  await check('工单源没提供 writeResult（老适配器）时静默跳过，不报错', async () => {
+    // 契约里 writeResult 是可选方法：第三方适配器没实现它，流水线照样要跑。
+    const source = createMockSource()
+    delete source.writeResult
+    const { scheduler, store } = harness({ source })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '缺写回能力不该让票失败')
+    assert.equal(row.writeBack, undefined)
+  })
+
+  await check('执行器返回 sessionId → 落到票据上，状态里能看到去哪找会话', async () => {
+    // 「处理完保留会话」的另一半：得把 sessionId 记下来，否则人根本找不到那次会话。
+    const withSession = {
+      id: 'with-session',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: [],
+          testOutcome: 'passed',
+          commit: { sha: 'mocksession1', branch: ctx.branch ?? '', files: [] },
+          sessionId: 'ticket-demo-rec-session-1',
+        })
+      },
+    }
+    const { scheduler, store } = harness({ executor: withSession })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.sessionId, 'ticket-demo-rec-session-1', '会话 id 要存下来')
+
+    const tool = createPipelineStatusTool({ store, getConfig: () => validateConfig({}).value })
+    const out = await tool.execute({ includeDone: true }, {})
+    assert.match(out.text, /处理会话：ticket-demo-rec-session-1/, `状态里要指出会话在哪：${out.text}`)
+    assert.equal(out.tickets[0].sessionId, 'ticket-demo-rec-session-1', '返回体也要带 sessionId')
+  })
+
+  await check('pipeline_status：回填结果成功/失败都要能一眼看到', async () => {
+    const rows = [
+      { key: k('r-ok'), projectId: DEMO, recordId: 'r-ok', phase: 'done', attempt: 0, writeBack: { written: true, fields: ['是否处理', '处理结果', '处理日期'], at: 1 } },
+      { key: k('r-no'), projectId: DEMO, recordId: 'r-no', phase: 'done', attempt: 0, writeBack: { written: false, note: 'auth: 应用没有写权限' } },
+    ]
+    const tool = createPipelineStatusTool({ store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value })
+    const out = await tool.execute({ includeDone: true }, {})
+    assert.match(out.text, /回填表格：成功（是否处理、处理结果、处理日期）/, `成功要写清三列：${out.text}`)
+    assert.match(out.text, /回填表格：没写成 —— auth: 应用没有写权限/, `失败要带原因：${out.text}`)
+  })
+
+  await check('skipped 的回填首句要说「验证没跑通，需要人工确认」', async () => {
+    // skipped 是「提交做了、验证没跑通」。回填如果写成「已改完」，
+    // 人看到表里那行「是」就不会再去看验证报告了。
+    const { scheduler, source } = harness({ executor: createMockExecutor({ outcome: 'skipped' }) })
+    await scheduler.tick()
+    assert.equal(source.writes.length, 1, 'skipped 也要回填')
+    assert.match(source.writes[0].result, /验证没跑通，需要人工确认/, `首句要提示人工确认：${source.writes[0].result}`)
+  })
+
+  // ── 收尾 ────────────────────────────────────────────────
+  section('17. 选择分支：把检出里的分支列成下拉候选')
+
+  await check('branches：解析 for-each-ref 输出，丢掉 origin/HEAD 这类符号引用', async () => {
+    const parsed = parseBranchRefs([
+      'refs/heads/main',
+      'refs/heads/v2.x',
+      'refs/remotes/origin/HEAD',
+      'refs/remotes/origin/v2.x',
+      'refs/remotes/origin/feature/login',
+      '',
+    ].join('\n'))
+    assert.deepEqual(parsed.local, ['main', 'v2.x'], `本地分支：${JSON.stringify(parsed.local)}`)
+    assert.deepEqual(
+      parsed.remote,
+      [{ branch: 'v2.x', remote: 'origin' }, { branch: 'feature/login', remote: 'origin' }],
+      `远端分支要剥掉 remote 名、保留分支名里的斜杠、丢掉 HEAD：${JSON.stringify(parsed.remote)}`,
+    )
+  })
+
+  await check('branches：候选顺序是 当前分支 → 远端默认分支 → 本地 → 其余远端', async () => {
+    const parsed = parseBranchRefs([
+      'refs/heads/main',
+      'refs/heads/v2.x',
+      'refs/remotes/origin/v2.x',
+      'refs/remotes/origin/dev',
+    ].join('\n'))
+    const choices = mergeBranchChoices(parsed, { current: 'v2.x', defaultBranch: 'main' })
+    assert.deepEqual(choices, ['v2.x', 'main', 'dev'], `顺序与去重：${JSON.stringify(choices)}`)
+  })
+
+  await check('branches：listBranches 拿到分支、当前分支与主干', async () => {
+    const calls = []
+    const gitRunner = async (argv, opts) => {
+      calls.push({ argv, cwd: opts && opts.cwd })
+      if (argv[0] === 'for-each-ref') {
+        return { code: 0, stdout: 'refs/heads/v2.x\nrefs/remotes/origin/v2.x\nrefs/remotes/origin/dev\n', stderr: '' }
+      }
+      if (argv[0] === 'rev-parse') return { code: 0, stdout: 'v2.x\n', stderr: '' }
+      return { code: 1, stdout: '', stderr: 'unexpected' }
+    }
+    const out = await listBranches(gitRunner, 'D:/WorkSpace/mgiot-pms', {
+      detectDefaultBranch: async () => 'v2.x',
+    })
+    assert.equal(out.ok, true, `应该成功：${JSON.stringify(out)}`)
+    assert.equal(out.current, 'v2.x', '当前分支')
+    assert.equal(out.defaultBranch, 'v2.x', '主干分支')
+    assert.deepEqual(out.branches, ['v2.x', 'dev'], `候选：${JSON.stringify(out.branches)}`)
+    assert.deepEqual(out.remote, ['v2.x', 'dev'], '远端清单')
+    assert.equal(calls.length, 2, '只该跑两条 git 命令')
+    assert.deepEqual(calls[0].argv, BRANCH_REF_ARGS, '第一条必须是 for-each-ref')
+    assert.equal(calls[0].cwd, 'D:/WorkSpace/mgiot-pms', 'git 要在项目检出里跑')
+  })
+
+  await check('branches：各种拿不到分支的情况都不抛，只返回 ok:false + 原因', async () => {
+    const noPath = await listBranches(async () => ({ code: 0, stdout: '', stderr: '' }), '  ')
+    assert.equal(noPath.ok, false, 'repo.path 空要失败')
+    assert.match(noPath.reason, /repo\.path/, `要说清是没配路径：${noPath.reason}`)
+
+    const noRunner = await listBranches(undefined, 'D:/x')
+    assert.equal(noRunner.ok, false, 'gitRunner 缺席要失败')
+    assert.match(noRunner.reason, /gitRunner|执行链路/, `要说清是宿主没给执行链路：${noRunner.reason}`)
+
+    const notRepo = await listBranches(async () => ({
+      code: 128,
+      stdout: '',
+      stderr: 'fatal: not a git repository (or any of the parent directories): .git\n',
+    }), 'D:/nowhere')
+    assert.equal(notRepo.ok, false, '非 git 检出要失败')
+    assert.match(notRepo.reason, /not a git repository/, `要把 git 原话带出来：${notRepo.reason}`)
+
+    const throws = await listBranches(async () => { throw new Error('EPERM: spawn git') }, 'D:/x')
+    assert.equal(throws.ok, false, 'gitRunner 抛错也不能炸')
+    assert.match(throws.reason, /EPERM/, `要把原因带出来：${throws.reason}`)
+  })
+
+  await check('branches：游离 HEAD 不算分支名，候选里也不会冒出一个 HAND', async () => {
+    const gitRunner = async (argv) => {
+      if (argv[0] === 'for-each-ref') return { code: 0, stdout: 'refs/heads/main\n', stderr: '' }
+      return { code: 0, stdout: 'HEAD\n', stderr: '' }
+    }
+    const out = await listBranches(gitRunner, 'D:/x')
+    assert.equal(out.ok, true)
+    assert.equal(out.current, '', `游离 HEAD 不该当成分支名：${JSON.stringify(out.current)}`)
+    assert.deepEqual(out.branches, ['main'], `候选：${JSON.stringify(out.branches)}`)
+  })
+
+  await check('branches：宿主 remote 暴露 branches()，项目路径配错不影响别的项目', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const gitRunner = async (argv, opts) => {
+      if (argv[0] === 'for-each-ref') {
+        if (String(opts && opts.cwd).includes('good')) {
+          return { code: 0, stdout: 'refs/heads/main\nrefs/remotes/origin/dev\n', stderr: '' }
+        }
+        return { code: 128, stdout: '', stderr: 'fatal: not a git repository\n' }
+      }
+      return { code: 0, stdout: 'main\n', stderr: '' }
+    }
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({
+        projects: [
+          { name: 'good', repo: { path: 'D:/good' } },
+          { name: 'bad', repo: { path: 'D:/bad' } },
+          { name: 'nopath', repo: {} },
+        ],
+      }),
+      doctorOptions: { gitRunner },
+    })
+    const result = await remote.branches()
+    assert.equal(result.count, 3, '三个项目都要有一条记录')
+    assert.equal(result.branches[0].ok, true, `good 项目要成功：${JSON.stringify(result.branches[0])}`)
+    assert.deepEqual(result.branches[0].branches, ['main', 'dev'], `good 候选：${JSON.stringify(result.branches[0].branches)}`)
+    assert.equal(result.branches[1].ok, false, 'bad 项目要失败但不抛')
+    assert.equal(result.branches[2].ok, false, '没配路径的项目也要有记录')
+    assert.match(result.branches[2].reason, /repo\.path/, `要说清是没配路径：${result.branches[2].reason}`)
   })
 
   // ── 收尾 ────────────────────────────────────────────────

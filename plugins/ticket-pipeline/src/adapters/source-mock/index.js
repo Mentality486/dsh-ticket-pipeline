@@ -86,6 +86,15 @@ export const DEFAULT_SEEDS = Object.freeze([
 ])
 
 /**
+ * 回填到「表格」上的三列（与飞书适配器的 `FEISHU_COLUMNS` 同名同义）。
+ *
+ * 为什么 mock 也要有：自测要去断言「跑完一张票之后确实回填了三列」。
+ * 只在飞书适配器里实现的话，这条链路在 dev-run 里就完全没覆盖 ——
+ * 而它恰恰是唯一会**写远端**的动作，最该在离线环境里先跑通一遍。
+ */
+const WRITE_BACK_FIELDS = Object.freeze(['是否处理', '处理结果', '处理日期'])
+
+/**
  * 造一个 mock 工单源。
  *
  * `seeds` 是可变数组 —— 测试里可以直接往里推、改字段，再调 `scan` 看内核反应。
@@ -95,12 +104,15 @@ export const DEFAULT_SEEDS = Object.freeze([
  * @param {MockTicketSeed[]} [options.seeds]
  * @param {boolean} [options.failScan] 强制扫描失败（用来验证「扫失败要暴露出来」）
  * @param {boolean} [options.failScreenshot] 强制截图取不到（用来验证 needs-info 分支）
+ * @param {boolean} [options.failWrite] 强制回填失败（用来验证「回填失败不影响票态」）
  * @param {number} [options.screenshotBytes] 假截图的目标字节数（只用于「大图」场景，边界见 loadScreenshot）
  * @returns {import('../../contracts/ticket-source.js').TicketSource & {
  *   projectId: string,
  *   seeds: MockTicketSeed[],
+ *   writes: Array<{ recordId: string, status: string, result: string, handledAt: number }>,
  *   setFailScan: (v: boolean) => void,
  *   setFailScreenshot: (v: boolean) => void,
+ *   setFailWrite: (v: boolean) => void,
  *   removeSeed: (recordId: string) => void,
  * }}
  */
@@ -119,7 +131,17 @@ export function createMockSource (options = {}) {
 
   let failScan = Boolean(options.failScan)
   let failScreenshot = Boolean(options.failScreenshot)
+  let failWrite = Boolean(options.failWrite)
   const screenshotBytes = Number(options.screenshotBytes ?? 64)
+
+  /**
+   * 回填记录（只进内存，不碰任何真实系统）。
+   *
+   * 形状与真实适配器写出去的字段一一对应，自测直接断言它就知道「回填了什么」：
+   * `status` 是落进「是否处理」的值，`result` 是「处理结果」，`handledAt` 是「处理日期」的时间戳。
+   * @type {Array<{ recordId: string, status: string, result: string, handledAt: number }>}
+   */
+  const writes = []
 
   /** mock 的「删除行需连续几轮」—— 固定 3，与 `Config.goneAfterScans` 默认值一致。 */
   const GONE_AFTER_SCANS = 3
@@ -157,6 +179,7 @@ export function createMockSource (options = {}) {
     id: `mock:${projectId}`,
     projectId,
     seeds,
+    writes,
 
     /** @param {AbortSignal} signal */
     async scan (signal) {
@@ -251,12 +274,51 @@ export function createMockSource (options = {}) {
       return { data, mediaType: /** @type {const} */ ('image/png'), name: `${ref.kind}-shot.png` }
     },
 
+    /**
+     * 把回填记到内存里，返回与真实适配器同形状的回执。
+     *
+     * 缺省值与真实适配器保持一致（`status` 缺省「是」、`handledAt` 缺省当前时间），
+     * 否则「用 mock 试跑一张票」的验收路径会跟线上行为对不上。
+     *
+     * @param {string} recordId
+     * @param {import('../../contracts/ticket-source.js').WriteBackResult} payload
+     * @param {AbortSignal} [signal]
+     * @returns {Promise<import('../../contracts/ticket-source.js').WriteBackReceipt>}
+     */
+    async writeResult (recordId, payload, signal) {
+      if (signal?.aborted) throw new PipelineError('aborted', '回填被取消')
+      const id = String(recordId ?? '').trim()
+      if (!id) throw new PipelineError('invalid-input', '回填缺 recordId，无法定位要写哪一行')
+      if (!payload || typeof payload !== 'object' || typeof payload.result !== 'string') {
+        throw new PipelineError('invalid-input', '回填内容必须是对象且带 result（「处理结果」要写什么）')
+      }
+      if (failWrite) {
+        // 故意抛错：验证「回填失败只记日志，票态不回退」这条边界。
+        throw new PipelineError('network', 'mock：模拟回填失败')
+      }
+
+      const status = typeof payload.status === 'string' && payload.status.trim().length > 0
+        ? payload.status.trim()
+        : '是'
+      const handledAt = payload.handledAt === undefined ? Date.now() : Number(payload.handledAt)
+      if (!Number.isFinite(handledAt) || handledAt <= 0) {
+        throw new PipelineError('invalid-input', `回填的处理日期不是合法毫秒时间戳：${String(payload.handledAt)}`)
+      }
+
+      writes.push({ recordId: id, status, result: payload.result, handledAt })
+      return { written: true, fields: [...WRITE_BACK_FIELDS] }
+    },
+
     setFailScan (value) {
       failScan = Boolean(value)
     },
 
     setFailScreenshot (value) {
       failScreenshot = Boolean(value)
+    },
+
+    setFailWrite (value) {
+      failWrite = Boolean(value)
     },
 
     removeSeed (recordId) {

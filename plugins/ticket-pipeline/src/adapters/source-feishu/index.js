@@ -1,14 +1,17 @@
 /**
  * `source-feishu` —— 飞书多维表格工单源（真实实现，地图票 #12）。
  *
- * 它做四件事，其余全在别处：
+ * 它做五件事，其余全在别处：
  * 1. **认证**：用 `app_id` + `app_secret` 换 `tenant_access_token`，过期前自动刷新。
  * 2. **扫描**：`records/search` 按「最后更新时间」降序翻页，客户端比水位 + 内容指纹。
  * 3. **取字节**：截图三种形态（附件 / 本地路径 / http 链接）都归一成 `Uint8Array`。
  * 4. **绑定表**：`appToken` + `tableId` 直接给，或用 `docNamePattern` 猜（猜不准就报错）。
+ * 5. **回填**：票跑完后把「是否处理 / 处理结果 / 处理日期」写回那一行（`writeResult`）。
  *
- * 硬约束（用户 2026-11-03 拍板）：
- * - **绝不写回表格**。本文件里没有任何 PUT / POST 到记录接口的调用。
+ * 硬约束：
+ * - **扫描绝不写表格**（用户 2026-11-03 拍板）：`scan` 里没有任何 PUT / POST 到记录接口的调用。
+ * - **唯一的写入口是 `writeResult`**（用户 2026-11-06 拍板：处理完要回填结果）。
+ *   它只在票跑完 done / skipped 之后被调用一次，绝不在扫描或重试中间被调用。
  * - **只认 `是否处理 = 处理中`** 的行进入流水线；不叠加任何别的条件。
  * - 表格是触发器，流水线状态只存在插件自己的存储里。
  *
@@ -102,6 +105,37 @@ const AUTH_ERROR_CODES = new Set([99991663, 99991664, 99991665, 99991668, 999916
 const NOT_FOUND_ERROR_CODES = new Set([1254043, 1254045, 1254290])
 const INVALID_INPUT_ERROR_CODES = new Set([1254005, 1254006, 1254007])
 const RATE_LIMIT_ERROR_CODES = new Set([99991400, 99991403])
+
+/**
+ * 「字段不存在」的业务码（回填专用）。
+ *
+ * 为什么单独列出来：回填是我们**主动写**一个表，表里没有「处理结果」列是
+ * **配置问题而不是故障** —— 人把插件接到一张不含这三列的表上时，应该退回只读并
+ * 在回执里说清楚，而不是让这张票判失败（票其实已经处理完了）。
+ *
+ * 飞书这一族错误码的写法在不同接口版本里不一致（1254045 是 FieldNameNotFound 的
+ * 常见取值，部分版本把同类问题报成 1254040），所以除了码表还看 msg 里的关键词，
+ * 见 `isFieldMissingError`。宁可多认，也不要因为一个码没对上就把整票写失败。
+ */
+const FIELD_MISSING_ERROR_CODES = new Set([1254040, 1254045])
+
+/**
+ * 判断一个错误是不是「表里没有这个字段」。
+ *
+ * 两种证据任一成立就算：业务码在白名单里，或 msg 里同时出现字段与「不存在」的意思。
+ * 第二条是兜底：错误码表是飞书侧的闭源约定，写死一套总有对不上的时候。
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isFieldMissingError (error) {
+  if (!error || typeof error !== 'object') return false
+  const message = String(/** @type {any} */ (error).message ?? '')
+  const codeMatch = message.match(/(?:报错|错误码)\s*(\d+)/)
+  if (codeMatch && FIELD_MISSING_ERROR_CODES.has(Number(codeMatch[1]))) return true
+  if (/FieldNameNotFound/i.test(message)) return true
+  return /字段/.test(message) && /(不存在|找不到|未找到|not found)/i.test(message)
+}
 
 /**
  * 把飞书单元格的值归一成字符串。
@@ -1229,11 +1263,87 @@ export function createFeishuSource (options = {}) {
     throw new PipelineError('invalid-input', `截图链接重定向过多：${rawUrl}`)
   }
 
+  /**
+   * 把一张工单的处理结果回填到表格里（**本文件唯一的写操作**）。
+   *
+   * 分工写死在契约里（`contracts/ticket-source.js` 的 `WriteBackResult`）：
+   * - `是否处理` ← `status`（缺省 `是`；有的表用「已完成」，由调用方传，适配器不改词）
+   * - `处理结果` ← `result`（「怎么处理的」一段人话）
+   * - `处理日期` ← `handledAt`（毫秒时间戳；飞书的日期字段就吃这个数字，不用格式化成字符串）
+   *
+   * 为什么用 PUT `records/{recordId}` 而不是 `records/batch_update`：一次只回填一张票，
+   * 批量接口要额外拼 record_id 数组和权限，反而更容易错；单条 PUT 也是飞书文档里
+   * 语义最直白的那一个（整条记录按字段名合并更新）。
+   *
+   * 错误处理的边界（重要）：
+   * - **网络 / 鉴权 / 限流等真故障一律抛出**，让 `apiCall` 的 `PipelineError` 一路上去。
+   *   调度器会兜住它并只记日志 —— 票态已经定了（done / skipped），回填失败不该反悔。
+   *   吞掉异常会让「表格压根没更新」这件事无声无息，人对着没回填的表以为插件没跑。
+   * - **表里没有那几列**不是故障，是配置不匹配：返回 `{ written: false }` 并在 `note`
+   *   里说清楚缺哪一列。让一张已经处理完的票因为「表少一列」判失败，是本末倒置。
+   *
+   * @param {string} recordId
+   * @param {import('../../contracts/ticket-source.js').WriteBackResult} result
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<import('../../contracts/ticket-source.js').WriteBackReceipt>}
+   */
+  async function writeResult (recordId, result, signal) {
+    if (signal?.aborted) throw new PipelineError('aborted', '回填被取消')
+
+    const id = String(recordId ?? '').trim()
+    if (!id) throw new PipelineError('invalid-input', '回填缺 recordId，无法定位要写哪一行')
+
+    if (!result || typeof result !== 'object') {
+      throw new PipelineError('invalid-input', '回填内容必须是对象 { status?, result, handledAt? }')
+    }
+    if (typeof result.result !== 'string') {
+      throw new PipelineError('invalid-input', '回填内容缺 result（「处理结果」要写什么）')
+    }
+
+    // 缺省值在这里落一次，别让调用方各自拼：契约说「status 缺省 是、handledAt 缺省当前时间」。
+    const status = typeof result.status === 'string' && result.status.trim().length > 0
+      ? result.status.trim()
+      : '是'
+    // 处理日期：飞书日期字段接受毫秒时间戳数字，直接传数字，传格式化字符串反而要按表时区猜。
+    const handledAt = result.handledAt === undefined ? now() : Number(result.handledAt)
+    if (!Number.isFinite(handledAt) || handledAt <= 0) {
+      throw new PipelineError('invalid-input', `回填的处理日期不是合法毫秒时间戳：${String(result.handledAt)}`)
+    }
+
+    const table = await resolveTable(signal)
+    const fields = {
+      [FEISHU_COLUMNS.status]: status,
+      [FEISHU_COLUMNS.result]: result.result,
+      [FEISHU_COLUMNS.handledAt]: handledAt,
+    }
+    const written = Object.keys(fields)
+
+    try {
+      await apiCall(
+        `/open-apis/bitable/v1/apps/${table.appToken}/tables/${table.tableId}/records/${encodeURIComponent(id)}`,
+        { method: 'PUT', body: { fields }, signal },
+      )
+    } catch (error) {
+      // 只有「表里没这几列」退化成只读回执；其余（网络 / 鉴权 / 限流 / 参数）照样抛。
+      if (isFieldMissingError(error)) {
+        return {
+          written: false,
+          note: `工单表里没有「${FEISHU_COLUMNS.status} / ${FEISHU_COLUMNS.result} / ${FEISHU_COLUMNS.handledAt}」这几列，本次不回填（票本身已处理完）。`
+            + `请确认表结构，或关掉 writeBack 退化成只读：${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+      throw error
+    }
+
+    return { written: true, fields: written }
+  }
+
   return assertTicketSource({
     id: sourceId,
     projectId,
     scan,
     loadScreenshot,
+    writeResult,
   })
 }
 

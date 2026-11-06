@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
-> 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `b7424d7` + 「陈旧工作区坐标不得复用」修复）
+> 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
+> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `59c8708` + 工作树未提交的四项改造与选择分支）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -44,7 +44,7 @@
 | 约束 | 内容 | 出处 |
 |---|---|---|
 | 运行形态 | DSH Host 插件常驻，不写独立守护进程 | 地图 Notes |
-| 工单表 | **只读**，绝不回写任何列 | 地图 Decisions（用户 2026-11-03） |
+| 工单表 | **扫描只读**；唯一的写入口是 `TicketSource.writeResult()`，只在票跑成 done/skipped 后回填三列（是否处理 / 处理结果 / 处理日期），开关 `writeBack` | 地图 Decisions（用户 2026-11-03 定为只读 → **2026-11-06 改口径要求回填**） |
 | 收票信号 | 「是否处理」列取值命中 `match.statusValues`（**缺省 `['处理中']`**；真实表用的是「否」，见 §9）。下拉三值是 / 否 / 处理中 | 地图 Decisions + 实表核实 |
 | 代码仓库 | 项目清单维护在 `projects[]` 配置，每项目一个仓库 | 地图 Decisions |
 | 交付物 | **默认是项目工作区检出里的一次本地提交**（`ExecResult.commit`）；远程 draft MR 是可选出口，只有项目显式 `repo.gitlab.enabled: true` 才开 | 2026-11-06 用户拍板（本阶段交付形态） |
@@ -264,6 +264,29 @@ export interface TicketSource {
    * 回调里的 recordIds 只是**提示**，内核不会因此跳过轮询 —— 事件可能丢、可能重复。
    */
   onExternalChange? (cb: (hint: { recordIds?: string[] }) => void): () => void
+
+  /**
+   * 可选：把处理结果回填到工单表。**这是唯一的写入口**（`scan` 依旧只读）。
+   *
+   * 契约：
+   * - 只在票跑成 `done` / `skipped` 之后被调用**一次**，绝不在扫描或重试中间调。
+   * - 写不进去不算失败：目标表没有这几列、应用没写权限，都返回 `{ written: false, note }`
+   *   而不是抛 —— 票已经处理完了，回填是附加动作。
+   * - 只有真正的传输 / 鉴权异常才抛，内核会把它记进 `writeBack.note`，票态不回退。
+   * - 不实现也行（老适配器），内核静默跳过。
+   */
+  writeResult? (
+    recordId: string,
+    result: { status?: string, result: string, handledAt?: number },
+    signal: AbortSignal,
+  ): Promise<WriteBackReceipt>
+}
+
+/** 回执：写了没、写了哪些列、为什么没写成。落到票据的 `writeBack` 上。 */
+export type WriteBackReceipt = {
+  written: boolean
+  fields?: string[]      // 实际写成功的列名，pipeline_status 直接列出来
+  note?: string          // written=false 时的原因
 }
 
 export type ScanResult = {
@@ -279,6 +302,8 @@ export type ScanResult = {
 **为什么分开返回三类**：内核要做的动作完全不同（入队 / 修订排队尾 / 退役并释放租约）。合成一个数组内核还得自己 diff 两遍，而适配器**本来就在比对 `seen` 表**，顺手分类几乎零成本。
 
 **为什么 `loadScreenshot` 在适配器而不是内核**：飞书要拿 `file_token` 调 media 接口、本地路径要读文件、URL 要下载 —— 每种平台的取法完全不同。内核统一做 `saveImage` 就够了。
+
+**为什么回填是 `writeResult` 而不是把写藏在 `scan` 里**：`scan` 是高频、可重试、可能在任意时刻被取消的只读动作；写必须低频（一票一次）、只在真出结果之后发生。混在一起的后果是「扫一半就把表写了」和「重试一轮写一次」。所以契约拆成两半：`scan` 只读、`writeResult` 是唯一写入口。决策记录见 [ADR 0006](../adr/0006-处理完回填工单表.md)。
 
 ### 5.3 `RepoLocator` — 工单项目到仓库
 
@@ -355,6 +380,7 @@ export type ExecResult = {
   testDetail?: string                      // skipped 时必须写原因
   commit?: { sha: string; branch: string; files: string[] }  // 在工作区检出里做出来的本地提交（本阶段交付形态）
   mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
+  sessionId?: string                       // 这一轮处理用的 agent 会话 id（记到票据上，人可以直接点进去追问）
   error?: { kind: ErrorKind; message: string; retryable: boolean }
 }
 ```
@@ -362,6 +388,10 @@ export type ExecResult = {
 **`phase = done/skipped` 时 `commit` 与 `mr` 至少给一个**（`makeExecResult` 会校验，两个都没有直接抛）。
 这是本轮改造的核心：原来契约要求「必须给 `mr`」，等于把「有远端的 GitLab」写进了内核契约；
 现在默认交付形态是**工作区检出里的一次本地提交**，远程 MR 降级成 `repo.gitlab.enabled: true` 才走的可选出口。
+
+**`sessionId` 是可选但推荐返回的**：`run()` 的三个出口（done / skipped / failed）都带它，
+`executor-agent` 用 `buildSessionId(ticket, ctx)` 生成同一个人能认出来的名字，落到票据的 `sessionId`。
+有了它，`pipeline_status` 才会打出「处理会话：…（可在会话列表里点进去继续问）」，通知正文里也会带上。
 
 **`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然做本地提交，但**必须把原因写进提交说明**，不能默默略过 —— 人 `git show` 才知道「这个改动没被真跑过」。
 
@@ -375,13 +405,17 @@ export type ExecResult = {
 换成 `worktreePath`（只追加事件、不改 header.cwd，两者可以共存）。缺 `workspacePath`
 （升级前入队的老票据）时退回「cwd = worktreePath」。
 
-**隔离层是可选的，缺省关**：`isolateWorktree` 默认 `false`，`prepareWorkspace` 走缺省分支 ——
+**隔离层是可选的，缺省关；检出脏也能跑**：`isolateWorktree` 默认 `false`，`prepareWorkspace` 走缺省分支 ——
 `inspectCheckout()` 读 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>` + `git rev-parse --abbrev-ref HEAD`，
-`assertCleanCheckout()` 发现有未提交改动就直接抛 `invalid-input` 拒绝跑这张票（报错点名文件，
-并提示「提交或 stash，或者打开 `isolateWorktree` 让每票用独立隔离 worktree」），
-干净则 `{ path: workspacePath, branch: 检出当前分支, baseCommit: 检出当前 HEAD }`
+`describeDirtyCheckout()` 发现未提交改动**只提醒不拒跑**（文案说清：本次照跑、会先给项目工作区拍一份基线、
+结束后只提交 agent 真正改过的文件、你自己的未提交改动原样留在工作区），
+然后 `{ path: workspacePath, branch: 检出当前分支, baseCommit: 检出当前 HEAD }`
 —— **就在项目工作区的检出里改、就地提交**，不建 worktree、不另开票分支。
 只有 `isolateWorktree: true` 才 `git fetch` + `git worktree add -b <branch> .agents/worktrees/<branch>`。
+
+> 早先这里是 `assertCleanCheckout()`：检出一脏就抛 `invalid-input` 拒跑。2026-11-06 用户要求
+> 「脏工作区也得能跑，但只提交 agent 改过的那些文件」之后，拒跑改成了**基线快照**（见 §11 的
+> `createBaseline`），`assertCleanCheckout` 已从源码里删掉。
 
 读检出状态这件事有三个容易踩的坑（都实测过，缺陷详情与修法见 `feature-checklist.md` §1.4）：`-uall` 不能省（否则未跟踪目录折叠成一个目录名，
 里面的文件路径全丢，`application.yml` 这类敏感文件就绕过了拦截）；`-z` 不能省（否则中文名输出八进制转义、
@@ -531,6 +565,8 @@ type TicketRecordRow = {
   testOutcome?: 'passed' | 'failed' | 'skipped'
   commit?: { sha: string; branch: string; files: string[] }  // 工作区检出里的本地提交（本阶段交付形态）
   mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
+  sessionId?: string                   // 这一轮处理用的 agent 会话 id（会话留在项目工作区名下）
+  writeBack?: { written: boolean; fields?: string[]; at: number; note?: string }  // 回填工单表的回执
   attempt: number                      // 失败重试计数
   startedAt?: number                   // epoch ms
   finishedAt?: number
@@ -822,7 +858,8 @@ draft MR：{url}                ← 只有开了远程出口（repo.gitlab.enabl
 
 用 `export const Config`（standard-schema 形状，见 `src/core/config.js`，不是 schemastery）。
 值存在 profile 的 `cordis.patch.yml` 里本插件那一行，升级不丢。字段清单与默认值
-以 `src/core/config.js` 的 `CONFIG_FIELDS` 为准，下面是概览：
+以 `src/core/config.js` 的 `CONFIG_FIELDS` 为准（**33 个键、7 个分组**，设置页按 `CONFIG_GROUPS`
+分组渲染；`projects` 子树另有 25 个字段，不在这 33 个里），下面是概览：
 
 ```ts
 export const Config = {
@@ -882,11 +919,18 @@ export const Config = {
   // ── 执行 ────────────────────────────────────────────
   workExecutor: 'mock' | 'agent', // 默认 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 在工作区检出里做本地提交）
   ticketTimeoutMinutes: number,  // 默认 40，5..180
-  isolateWorktree: boolean,      // 默认 false：直接在项目工作区的检出里改代码（要求检出干净）；
+  isolateWorktree: boolean,      // 默认 false：直接在项目工作区的检出里改代码（检出脏也能跑，只提交 agent 改过的）；
                                  // true 才每票 `git worktree add -b <branch> .agents/worktrees/<branch>` 开隔离检出
   fetchBeforeCreate: boolean,    // 默认 true；只有 isolateWorktree: true 建隔离 worktree 时才用得上
   branchPrefix: string,          // 默认 'ticket-'，后接 <projectId>-<recordId>-r<修订号>（只在 isolateWorktree: true 时用于票分支）
   worktreeRetentionHours: number,// 默认 24，0..720（只有 isolateWorktree: true 才有 worktree 可清）
+  keepSession: boolean,          // 默认 true：处理完把那次 agent 会话留在项目工作区名下（GUI 里能点进去继续追问）；
+                                 // agent 实例无论如何都会释放，设 false 才连会话一起收掉
+
+  // ── 回填工单表 ──────────────────────────────────────
+  writeBack: boolean,            // 默认 true：票跑成 done/skipped 后回填「是否处理/处理结果/处理日期」三列；
+                                 // 关掉就退回纯只读，一个写请求都不发
+  writeBackStatus: string,       // 默认 '是'：回填时「是否处理」列写的值（空串回落 '是'）
 
   // ── agent 与模型 ────────────────────────────────────
   provider: string,              // 默认 'workbuddy'
@@ -921,6 +965,15 @@ export const Config = {
 不发任何 GitLab 请求，交付物就是工作区检出里的一次本地提交；只有项目显式写 `true` 且配了 `repo.remote`，
 才走原来的 GitLab Commits API 开 draft MR。`config.js` 的 `validateProject` 只在严格 `=== true` 时把它透传下去。
 
+**`writeBack` 默认 `true`，而 `enabled` 默认 `false`**：这两个默认值方向相反是有意的。
+`enabled` 是「要不要开始干活」的总闸，必须人显式打开；`writeBack` 是「干完之后要不要把结果写回表里」——
+用户就是不想再手工去表里更新状态才要这个插件，所以干完就该写。担心写错表就把 `writeBack` 关掉，
+退回纯只读；`writeBackStatus` 只是换「是否处理」写的那个值（有的表用「已完成」）。
+
+**`keepSession` 默认 `true`**：处理完那次会话留在项目工作区名下（宿主 GUI 的会话列表里能看到并点进去追问
+「为什么这么改」），而 **agent 实例无论如何都会在 `finally` 里释放** —— 保留的是会话记录，不是模型占用。
+设成 `false` 才调宿主的 `sessions` 服务把会话一起收掉（`close` / `dispose` / `closeSession` 三选一，取到哪个用哪个）。
+
 ---
 
 ## 10. 可替换点（文件级）
@@ -950,7 +1003,7 @@ src/
 │   └── types.js                   ← Ticket / ScreenshotRef / Phase / 状态机
 ├── adapters/                      ← 唯一允许按平台改的地方
 │   ├── source-mock/               ← 内存里造票，用于开发与自测
-│   ├── source-feishu/             ← 飞书多维表格（分页 + 水位 + 指纹 + 截图）
+│   ├── source-feishu/             ← 飞书多维表格（分页 + 水位 + 指纹 + 截图；写回三列走 writeResult）
 │   ├── source-wps/                ← 金山文档（xlsx/zip 自解析 + 可选 sheetUrl 取数）
 │   │   ├── index.js               ← 平台适配（扫表、收票、截图归一）
 │   │   ├── xlsx.js                ← 零依赖 xlsx 解析（表头定位、列别名、行号 recordId）
@@ -958,7 +1011,7 @@ src/
 │   ├── source-webform/            ← 网页表单（内存 records，最小实现）
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
 │   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 在工作区检出里做本地提交（可选出口才开 draft MR）
-│   │   ├── index.js               ← 主流程（起 agent、preset、collect、verify、commitLocally、可选 openDraftMr）
+│   │   ├── index.js               ← 主流程（起 agent、preset、基线快照、collect、verify、commitLocally、keepSession、可选 openDraftMr）
 │   │   └── agent-failure.js       ← 从 session.log / agent/error 里读真实失败原因
 │   ├── executor-mock/             ← 不发真改动的执行器，自测用（返回假的 commit）
 │   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端（只在 repo.gitlab.enabled=true 时被调用）
@@ -1018,6 +1071,32 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 
 静态表只多一行 import，换来可检查、可打包、可跳转。**「换适配器只需一行注册」的验收标准依然满足** —— 那一行就是表里的一行。
 
+### 设置面板与 Remote 描述符
+
+面板全在 `lib/client.js`（浏览器侧，不碰内核）。宿主 → 浏览器这条链路走自建的 typert Remote，
+描述符在 `plugins/ticket-pipeline/src/remote/descriptors.js`：**不 import 任何宿主包**，所以注册与
+`$mount` 共用同一份纯 JSON，不需要 codegen。四个无参 direct 方法：
+
+| 方法 | 返回 | 用途 |
+|---|---|---|
+| `ticketPipeline.doctor()` | 体检报告 | 设置页「立即体检」按钮 |
+| `ticketPipeline.config()` | 配置快照 | 渲染整棵设置表单 |
+| `ticketPipeline.projects()` | 项目清单的**扁平视图** | 渲染项目卡片；`appToken` 只给 `hasAppToken` + `appTokenPreview`（前 4…后 4），**明文绝不下发** |
+| `ticketPipeline.branches()` | 每个项目检出的分支清单 | 给 `repo.baseBranch` / `repo.targetBranch` 当候选（`listBranches()` 跑 `git for-each-ref`）；按项目 index 对齐，某个项目配错只让它自己空着 |
+
+**`projects` 子树必须自己标 `meta.volatile = true`**（`config.js` 的 `buildProjectsDescriptor`）。
+宿主的 `isVolatilePath(schema, path)` 只沿 `schema.dict` 下钻、**完全不认 `inner`**，而 `projects` 是数组 ——
+深层路径 `['projects','0','repo','path']` 的 `'0'` 那一段只能从 `inner` 走。所以 volatile 必须标在
+**数组节点自己**身上让它在第一步短路；子节点也一并标（宿主当前版本上游一个 volatile 就够，
+但 `scripts/client-check.mjs` 的 `auditProjectsNode()` 会逐层查，将来宿主改成「沿途每段都要声明」时不用回头补）。
+
+**写配置只发深层路径**（`{op:'set', path:['projects','0','repo','path'], value}`），
+**绝不整数组替换** —— 整块替换会把别的项目条目、以及配置文件里手写的 `appToken` 一起抹掉。
+`lib/client.js` 的 `collectOps()` 里守着这条。
+
+项目清单在面板上可编辑（5 个分区 21 个字段，`projects` 子树共 25 个可写字段），
+字段约束即时校验（必填 / 数字 min-max / enum / 列表按逗号切分），分组可折叠、脏字段有「已改」徽标与单字段撤销。
+
 ### 判定标准（改完自己验一遍）
 
 > 删掉 `src/adapters/source-feishu/` 整个目录 + `src/index.js` 里那个 import 和表里那一行，
@@ -1048,10 +1127,10 @@ T+0:01  drainOne() 取出票A（并发 1，一轮只跑一票）
         │                                    candidatePaths:[], ambiguous:false }
         ├─ 组合根的 prepareWorkspace 先确保**项目工作区**（`repo.path` 这个目录在宿主
         │    workspaceRegistry 里有登记：已登记就复用，没登记就补一条，见 §7.7）
-        ├─ isolateWorktree !== true（**缺省**）：inspectCheckout → assertCleanCheckout，
+        ├─ isolateWorktree !== true（**缺省**）：inspectCheckout → describeDirtyCheckout，
         │    读状态统一用 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>`；
-        │    检出脏就直接抛 invalid-input 拒跑这张票（点名文件）；
-        │    干净则 path = 工作区根、branch = 检出当前分支、baseCommit = 检出当前 HEAD
+        │    检出脏**只提醒不拒跑**（日志一句「工作区不干净，仍然照跑（只提交 agent 改过的文件）」），
+        │    path = 工作区根、branch = 检出当前分支、baseCommit = 检出当前 HEAD
         │    —— 就在这份检出里改代码、就地提交，不建 worktree
         ├─ isolateWorktree === true：若 fetchBeforeCreate → git fetch <项目 baseBranch>，
         │    再跑 git worktree add -b <branch> `<repoPath>/.agents/worktrees/<branch>`
@@ -1076,6 +1155,12 @@ T+0:02  onPhase('planning')，起超时定时器（40 min）
              setup 里做三件事：挂 preset、追加 sandbox/mode 与 approval/policy、
              attachSession 归属工作区；只有 worktreePath !== workspacePath
              （即 isolateWorktree 打开）时才把工作目录钉到隔离检出（workingDirectory.set）
+           ★ 在 followup **之前**拍基线：createBaseline() 跑 `git stash create`
+             （只造一个 commit 对象并回 sha，不写 ref、不动工作区、不动索引，
+             `git stash list` 仍是空的）+ `git rev-parse HEAD` +
+             `git status --porcelain -z -uall` 数人自己的未提交改动 +
+             对每个 `??` 跑 `git hash-object -- <path>` 存内容哈希
+             拍不下来就降级：日志里说明「人原本未提交的改动可能被一起提交」，票不失败
 
 T+0:03  … agent 在改代码落点里读代码、定位、规划（缺省就是项目工作区的检出）
         └─ 报「定位完成」→ onPhase('editing')，存 Plan
@@ -1085,10 +1170,14 @@ T+0:30  … agent 改完 → onPhase('testing')
            （没配 verify 就跳过验证，验证结论记为「未跑成」，仍然做本地提交）
 
 T+0:35  onPhase('mr-opening', '在工作区检出里做本地提交')
-        ├─ 收集改动：`git diff --name-status -z <baseCommit> -- . <排除>` ∪
-        │    `git status --porcelain -z -uall -- . <排除>`
+        ├─ 收集改动：有基线时 `git diff --name-status -z <baseline.sha> -- . <排除>`
+        │    （比的是「agent 动手前」，所以人自己的未提交改动一个都不会进来；
+        │     没有基线才退回 `git diff <baseCommit>`，此时两者等价）
+        │    ∪ `git status --porcelain -z -uall -- . <排除>`
         │    ⚠️ `git diff` 看不见未跟踪新文件，而「新建文件」是工单最常见产物；
         │       漏了会连 committable.length === 0 一起判 failed
+        │    ⚠️ 未跟踪文件再比一次内容哈希：与基线里那份相同 → 是人早就放在那儿的，跳过；
+        │       人是 `git add` 进索引的改动同样被排除
         │    ⚠️ 一律走 `-z`：非 `-z` 下中文名是八进制转义、含空格名一定带引号，
         │       旧解析器会把引号写进提交路径 → git 找不到文件
         ├─ 敏感文件过滤后，若 agent 自己把它们 `git add` 过：
@@ -1111,7 +1200,18 @@ T+0:35  onPhase('mr-opening', '在工作区检出里做本地提交')
              开完断言 draft === true
 
 T+0:36  onPhase('done') / onPhase('skipped')
-        ├─ 存 commit.sha / commit.branch / commit.files（有远程出口时一并存 mr.iid / mr.url）
+        ├─ 存 commit.sha / commit.branch / commit.files、sessionId
+        │    （有远程出口时一并存 mr.iid / mr.url）
+        ├─ 释放 agent 实例（finally 里无条件 dispose）；keepSession !== false 时
+        │    只记一句「agent 已释放，会话保留」，会话留在项目工作区名下 —— 宿主 GUI
+        │    的会话列表里能看到并点进去继续问；keepSession === false 才调宿主
+        │    sessions 服务的 close / dispose / closeSession（三选一，永不抛）
+        ├─ writeBackFor()：`writeBack !== false` 且适配器实现了 writeResult
+        │    且终态是 done/skipped 时，调一次 writeResult(recordId,
+        │    { status: writeBackStatus, result: renderWriteBackResult(...), handledAt })
+        │    → 回执落到票据 writeBack = { written, fields, at, note? }
+        │    ⚠️ failed 不回填（表里留在「处理中」是刻意留的信号）；
+        │       被取消就不写；回填失败只记日志，票态不回退、通知照发
         ├─ push.send({ title, body, level:'info' })：正文首行是
         │    「本地提交：<sha 前 12 位> @ <branch>（<worktreePath>）」；有 mr 时才多带 link
         ├─ 释放租约、清超时定时器
@@ -1216,7 +1316,7 @@ fatal: unable to fork
 
 | 项 | 影响 | 何时定 |
 |---|---|---|
-| Web UI 面板 | 不影响架构，纯增量（`lib/client.js` 已有设置页三处挂载点） | 有人真的想看队列时 |
+| Web UI 面板 | 设置页已落地（33 个字段 / 7 组 + 项目清单可编辑 + 分支下拉、4 个 Remote 方法）；队列看板仍未做（`lib/client.js` 已有挂载点） | 有人真的想看队列时 |
 | 多张工单指向同一模块的冲突 | 当前靠串行天然规避，但是「时间换安全」 | 出现真冲突时 |
 | 处理人绑定规则 | 当前不绑（只看 `statusValues`） | 有人抱怨「谁都能被派活」时 |
 | 金山文档的开放平台取数通道 | 现在只能靠 `match.sheetUrl` + 全局 fetch（大概率要登录态），或宿主注入 `fetchSheet` | 要真跑多张金山表时 |
@@ -1232,7 +1332,11 @@ fatal: unable to fork
 - 自动合并 MR —— 人验收后自己合（本阶段连 MR 都不开，交付物是本地提交）
 - `projects[]` 未配置的仓库
 - `pms-miniapp` 小程序的自动化测试
-- **工单表状态回写** —— 用户明确只要只读
+
+> **已从「明确不做」里移出**：工单表状态回写曾经写在这一条下面（「用户明确只要只读」）。
+> 用户 2026-11-06 改了口径：**处理完要回填表格** —— 「是否处理」改成「是」、
+> 「处理结果」写清楚怎么处理的、「处理日期」写当天。落地方式见 §12.8，开关是配置项
+> `writeBack`；关掉它就退回纯只读。扫描仍然只读，写只有一个入口 `TicketSource.writeResult`。
 
 ### 12.7 飞书适配器的落地细节（票 `12` 已实现）
 
@@ -1300,10 +1404,26 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | HTTP 401 / 403 | `auth` | 否 |
 | 其它 | `internal` | 是 |
 
-**绝不写回**：本文件里没有任何对记录的写操作。自测里有一条断言专门盯着这件事 ——
-扫描全程只允许出现 `GET` / `POST /auth/...` / `POST /records/search` 三种请求，
-一旦出现 `records/update|batch_update|delete|create` 就失败。
-（实测过：当前飞书应用对该表只有读权限，写回会返回 `code 91403 Forbidden` ——刚好与「只读」的设计一致。）
+**扫描只读、回填是唯一写入口**（2026-11-06 起）：
+
+- `scan()` 全程只发 `GET` / `POST /auth/...` / `POST /records/search`，自测里有断言盯着：
+  一旦出现 `records/update|batch_update|delete|create` 就失败。
+- 唯一的写入口是 `TicketSource.writeResult()`，只在票据跑成 `done` / `skipped` 之后
+  被调用**一次**（绝不在扫描/重试中间调），实现在飞书适配器里：
+  `PUT /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/:record_id`，
+  body `{ fields: { 是否处理, 处理结果, 处理日期 } }`。
+- 写回由 `src/core/scheduler.js` 的 `writeBackFor()` 驱动，三条硬约束：
+  ①**只写 done/skipped** —— failed 不写，表里那行还是「处理中」，人一眼看出这票没成；
+  ②**回填失败绝不影响票态** —— 表格写不进去是网络/权限问题，不是这票白干了，只在
+  `writeBack.note` 里记原因；③**被取消就不写**。
+- 开关是配置项 `writeBack`（缺省 `true`）与 `writeBackStatus`（缺省 `是`）。
+  关掉 `writeBack` 就退回纯只读。
+- 字段缺失不算失败：表里没有这三列时适配器返回 `{written:false, note}` 而不抛
+  （回填是附加动作，票已经处理完了）。
+
+> ⚠️ 飞书应用对该表要有**写权限**。实测过只有读权限时写回返回 `code 91403 Forbidden` ——
+> 这时票仍然是 `done`，只是 `writeBack.written === false`，`pipeline_status` 会显示
+> 「回填表格：没写成 —— …」。
 
 ### 12.8 飞书凭据与授权前置
 
