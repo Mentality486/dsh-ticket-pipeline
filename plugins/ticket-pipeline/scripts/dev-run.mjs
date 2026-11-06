@@ -40,6 +40,7 @@ import { runFeishuChecks } from './feishu-checks.mjs'
 import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
+import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy } from '../src/index.js'
 
 // ── 小工具 ────────────────────────────────────────────────
@@ -779,11 +780,21 @@ async function main () {
       },
     }
     let prepares = 0
+    const seenOpts = []
     const { scheduler, store } = harness({
       executor,
-      prepareWorkspace: async () => {
+      prepareWorkspace: async (opts) => {
         prepares += 1
-        return { path: 'D:/wt/new', branch: 'b-new', baseCommit: 'c2' }
+        seenOpts.push(opts)
+        // 已有 worktree 时只补工作区登记，不重建分支 —— 和真实实现一样原样回传坐标
+        return {
+          path: opts.worktreePath,
+          branch: opts.branch,
+          baseCommit: opts.baseCommit,
+          repoPath: 'D:/WorkSpace/demo-repo',
+          workspacePath: 'D:/WorkSpace/demo-repo',
+          workspaceId: 'ws-keep',
+        }
       },
     })
     const source = createMockSource()
@@ -793,10 +804,111 @@ async function main () {
     // 把它送回可跑的阶段：planning 不是 pickNext 取得到的中间态，先回 pending
     await store.setPhase(k('rec-mock-001'), 'pending')
     await scheduler.tick()
-    assert.equal(prepares, 0, '已经有工作区就不该再建')
+    // 会调一次 prepareWorkspace：老票据没有工作区坐标，要补登记（宿主 Workspace）。
+    // 但「补登记」和「重建 worktree」是两件事 —— 传下去的 worktreePath 让实现知道别重建。
+    assert.equal(prepares, 1, '缺工作区坐标时要补一次登记')
+    assert.equal(seenOpts[0].worktreePath, 'D:/wt/keep', '要把已有 worktree 传给 prepareWorkspace，它才知道不用重建')
     assert.equal(seenCtx.worktreePath, 'D:/wt/keep', '应该沿用存储里的路径')
     assert.equal(seenCtx.branch, 'b-keep')
     assert.equal(seenCtx.baseCommit, 'c1')
+  })
+
+  await check('工作区坐标已经在票据上：不再调 prepareWorkspace', async () => {
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    let prepares = 0
+    const { scheduler, store } = harness({
+      executor,
+      prepareWorkspace: async () => {
+        prepares += 1
+        return { path: 'D:/wt/other', branch: 'b-other', baseCommit: 'c3' }
+      },
+    })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/wt/ready',
+      branch: 'b-ready',
+      baseCommit: 'c4',
+      workspacePath: 'D:/WorkSpace/demo-repo',
+      workspaceId: 'ws-42',
+    })
+    await store.setPhase(k('rec-mock-001'), 'pending')
+    await scheduler.tick()
+    assert.equal(prepares, 0, '工作区与 worktree 都有了，一次都不该重建')
+    assert.equal(seenCtx.worktreePath, 'D:/wt/ready')
+    assert.equal(seenCtx.workspacePath, 'D:/WorkSpace/demo-repo', '执行器必须拿到项目工作区路径（会话 cwd 用它）')
+    assert.equal(seenCtx.workspaceId, 'ws-42', '工作区 id 要透传，执行器要用它 attach 会话')
+  })
+
+  await check('prepareWorkspace 建出来的工作区坐标会落库并传给执行器', async () => {
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler, store } = harness({
+      executor,
+      prepareWorkspace: async () => ({
+        path: 'D:/repo/.agents/worktrees/ticket-demo-rec-mock-001-r1',
+        branch: 'ticket-demo-rec-mock-001-r1',
+        baseCommit: 'abc123',
+        repoPath: 'D:/repo',
+        workspacePath: 'D:/repo',
+        workspaceId: 'ws-7',
+      }),
+    })
+    await scheduler.tick()
+    assert.equal(seenCtx.workspacePath, 'D:/repo', '工作区路径要传给执行器')
+    assert.equal(seenCtx.workspaceId, 'ws-7')
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.workspacePath, 'D:/repo', '工作区路径要落库，下一轮才能复用')
+    assert.equal(row.workspaceId, 'ws-7')
+  })
+
+  await check('prepareWorkspace 只补登记时，不覆盖票据上已有的 worktree 坐标', async () => {
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler } = harness({
+      executor,
+      prepareWorkspace: async (opts) => ({
+        // 只补登记：原样回传传进来的 worktree 坐标
+        path: opts.worktreePath,
+        branch: opts.branch,
+        baseCommit: opts.baseCommit,
+        repoPath: 'D:/repo',
+        workspacePath: 'D:/repo',
+        workspaceId: 'ws-9',
+      }),
+    })
+    await scheduler.tick()
+    assert.equal(seenCtx.workspacePath, 'D:/repo')
+    assert.equal(seenCtx.workspaceId, 'ws-9')
   })
 
   await check('首次运行就失败：通知里必须带上刚建好的工作区路径', async () => {
@@ -1666,6 +1778,9 @@ function makeFakeCtx ({ domain, registered }) {
   await runGitlabChecks(check)
   await runQqmailChecks(check)
   await runWpsChecks(check)
+
+  section('14. 项目工作区：有则复用、无则登记、服务缺失降级')
+  await runWorkspaceChecks(check)
 
   // ── 收尾 ────────────────────────────────────────────────
   console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)

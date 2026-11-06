@@ -44,6 +44,8 @@ export const TABLES = Object.freeze({
  * @property {string} [worktreePath]
  * @property {string} [branch]
  * @property {string} [baseCommit]
+ * @property {string} [workspacePath] 项目工作区目录（宿主 Workspace 的路径；会话 cwd 挂这里）
+ * @property {string} [workspaceId] 宿主的 WorkspaceId（用于把会话归属到工作区；headless 下为空）
  * @property {import('../contracts/types.js').Plan} [plan]
  * @property {string[]} [changedFiles]
  * @property {'passed'|'failed'|'skipped'} [testOutcome]
@@ -170,6 +172,10 @@ export class TicketStore {
       row.worktreePath = existing.worktreePath
       row.branch = existing.branch
       row.baseCommit = existing.baseCommit
+      // 项目工作区坐标（宿主 Workspace）：不继承就会每轮重新查/登记一遍，
+      // 而且执行器拿不到它，会话就挂不上项目。
+      row.workspacePath = existing.workspacePath
+      row.workspaceId = existing.workspaceId
       row.plan = existing.plan
       row.changedFiles = existing.changedFiles
       row.testOutcome = existing.testOutcome

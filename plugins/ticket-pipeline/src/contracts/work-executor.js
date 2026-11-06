@@ -22,6 +22,10 @@
  * @property {(msg: string) => void} log 写进插件日志，带 recordId 前缀
  * @property {string} [baseCommit]
  * @property {string} [repoPath]
+ * @property {string} [workspacePath] 项目工作区目录（宿主 Workspace 的路径）。会话的 cwd 必须挂在这个目录上，
+ *   否则 `Workspace.attachSession` 会拒绝（它要求会话 header 的规范 cwd 等于工作区路径），
+ *   人在 GUI 里也就看不到这张票的会话属于哪个项目。缺省时退化成用 `worktreePath` 当 cwd。
+ * @property {string} [workspaceId] 宿主的 WorkspaceId，用于把会话显式归属到工作区（headless 下为空）
  * @property {string} prompt 已经渲染好的任务书（纯文本）
  * @property {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图
  * @property {unknown[]} images 截图引用数组（saveImage 的返回值），content 里只用到了非空项

@@ -28,6 +28,7 @@ import { Config } from './core/config.js'
 import { makeDomainSpec } from './core/domain.js'
 import { TicketStore, makeDomainRepo } from './core/store.js'
 import { createScheduler } from './core/scheduler.js'
+import { createProjectWorkspaceManager } from './core/workspace.js'
 import { recoverPending, checkWorktreeByGit } from './core/recover.js'
 import { UNTRUSTED_TICKET_NOTICE } from './core/prompts.js'
 import { sanitizeBranchName } from './core/branch-name.js'
@@ -651,6 +652,9 @@ export async function apply (ctx, config) {
     // executor-agent 的宿主依赖：全部惰性/弱取，缺了就由适配器自己优雅降级或报错，
     // 组合根不在这里按平台或执行器名做 if 分支。
     agents: getService(ctx, 'agents'),
+    // executor-agent 要把工单会话归属到项目工作区（`attachSession`）。
+    // 宿主只在 web-app 层挂 `workspaceRegistry`，agentCtx 里未必拿得到 —— 这里显式注入。
+    workspaceRegistry: getService(ctx, 'workspaceRegistry'),
     // 宿主当前默认模型。配置里 provider/model 留空是常态，缺了 model 宿主会在
     // {{model}} 模板上崩（票全变成「没有产生任何文件改动」），所以必须能读到它。
     agentDefaultModel: getService(ctx, 'agentDefaultModel'),
@@ -666,30 +670,81 @@ export async function apply (ctx, config) {
   // ── 3. scheduler 的宿主钩子 ───────────────────────────
   const gitRunner = makeGitRunner(ctx)
 
+  // 项目工作区：宿主 `workspaceRegistry` 里「这个项目在本机检出在哪」的那条登记。
+  // 两个宿主服务都惰性取 —— headless profile 里可能没有，缺了就退化成「只有目录」。
+  const projectWorkspaces = createProjectWorkspaceManager({
+    workspaceRegistry: getService(ctx, 'workspaceRegistry'),
+    fs: getService(ctx, 'fs'),
+    log,
+  })
+
   /**
-   * 建 worktree：切新分支并 checkout 到隔离目录。
+   * 准备本项目的工作区 + 本票的隔离 worktree。
    *
-   * 优先走 `ctx.worktrees.create`（它还会把「调用方 agent」的 cwd 切进去）。
-   * 这个插件的 executor-agent 还没实现，所以这里只做「能跑 git」的降级实现；
-   * 等 executor-agent 落地时，应当改成：新建 agent → 用该 agent 调
-   * `ctx.worktrees.create(agent, { name, from })`，避免把人主会话的 cwd 拽走。
+   * 两件事，顺序不能反：
+   *
+   * 1. **项目工作区**（`repoPath` 所在的目录）：先在宿主里登记成 Workspace，
+   *    已登记就直接复用。这是「这张工单属于哪个项目」在宿主侧的落点，
+   *    会话要挂到它名下，人才能在 GUI 里看到「这个项目的工单会话」。
+   *    飞书表里没有「待修改项目」列，归属本来就只能由 `projects[].match`
+   *    （表 = 项目）决定 —— 所以这里用项目的 `repo.path`，不依赖工单正文。
+   *
+   * 2. **隔离 worktree**（`.agents/worktrees/<branch>`）：每票一个分支一份检出，
+   *    互不踩踏。它**不是**工作区 —— 宿主 `attachSession` 要求会话 cwd 等于
+   *    工作区路径，worktree 子目录不满足，所以会话 cwd 必须是工作区根
+   *    （见 executor-agent 的 setup）。
    *
    * 通用化后，仓库路径与基准分支都来自 `located`（按 projectId 查 `projects[]`），
    * 不再读全局 `config.repoPath` / `config.baseRef`。
    *
-   * @type {(opts: any) => Promise<{ path?: string, branch?: string, baseCommit?: string, repoPath?: string }>}
+   * @type {(opts: any) => Promise<{ path?: string, branch?: string, baseCommit?: string, repoPath?: string, workspacePath?: string, workspaceId?: string }>}
    */
   async function prepareWorkspace (opts) {
-    if (!gitRunner) {
-      log('没有 subprocess，无法建 worktree，本轮只推进阶段不落盘工作区')
-      return {}
-    }
-
-    const { located, projectId, recordId, revisionCount, fetch } = opts
+    const { located, projectId, recordId, revisionCount, fetch, signal, title } = opts
     const repoPath = located?.repoPath
     if (!repoPath) {
       throw new Error('定位结果缺少 repoPath，无法建 worktree')
     }
+
+    // 先确保工作区，再谈 worktree：没有工作区，后面 agent 起的会话就没有归属，
+    // 人也不知道这张票在动哪个项目。这一步与 git 无关，所以放在 gitRunner 判空之前。
+    const workspace = await projectWorkspaces.ensureProjectWorkspace({
+      path: repoPath,
+      title: title ?? projectId,
+      signal,
+    })
+
+    const workspaceCoords = {
+      workspacePath: workspace.workspacePath,
+      workspaceId: workspace.workspaceId,
+    }
+
+    if (!gitRunner) {
+      log('没有 subprocess，无法建 worktree，本轮只推进阶段不落盘工作区')
+      return workspaceCoords
+    }
+
+    const existingWorktree = typeof opts.worktreePath === 'string' && opts.worktreePath.length > 0
+      ? opts.worktreePath
+      : undefined
+    if (existingWorktree) {
+      // 已有 worktree：这次只补工作区登记，绝不动分支与检出。
+      // 重建会撞上「分支已存在」（`git worktree add -b` 直接失败），
+      // 而且那张票可能已经有未提交的改动躺在里面 —— 抹掉等于毁掉半成品。
+      log('已有工作区，本次只补登记（不重建 worktree）', {
+        projectId,
+        recordId,
+        worktreePath: existingWorktree,
+      })
+      return {
+        path: existingWorktree,
+        branch: typeof opts.branch === 'string' && opts.branch.length > 0 ? opts.branch : undefined,
+        baseCommit: typeof opts.baseCommit === 'string' && opts.baseCommit.length > 0 ? opts.baseCommit : undefined,
+        repoPath,
+        ...workspaceCoords,
+      }
+    }
+
     const baseRef = located?.baseBranch ?? await detectBaseBranch(gitRunner, repoPath, log)
 
     // recordId 来自工单表（外部输入），可能带空格/中文/git 拒绝的字符 —— 统一过清洗器（A5）。
@@ -717,6 +772,8 @@ export async function apply (ctx, config) {
       branch,
       baseCommit: revParse.stdout.trim(),
       repoPath,
+      workspacePath: workspace.workspacePath,
+      workspaceId: workspace.workspaceId,
     }
   }
 

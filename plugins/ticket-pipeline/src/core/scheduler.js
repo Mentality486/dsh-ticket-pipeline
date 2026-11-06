@@ -272,6 +272,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       branch: row.branch,
       baseCommit: row.baseCommit,
       repoPath: row.repoPath,
+      // 项目工作区（宿主 Workspace 的落点）：会话要挂它名下，见 core/workspace.js。
+      // 老票据上没有这两个字段，undefined 就是「还没查过」，下一轮会补。
+      workspacePath: row.workspacePath,
+      workspaceId: row.workspaceId,
     }
 
     /**
@@ -313,7 +317,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 工作区是「能开工」的前提，阶段机不允许 pending → planning 直接跳。
       // 没有注入 `prepareWorkspace`（离线 mock 跑）时也照样走这一步，
       // 只是 worktreePath 留空 —— 阶段语义比「有没有目录」更基础。
-      if (!row.worktreePath && typeof prepareWorkspace === 'function') {
+      //
+      // 判断条件里带上 workspacePath：老票据（升级前入队的）只有 worktreePath、
+      // 没有工作区坐标，重启恢复后如果只看 worktreePath 就永远不会补登记，
+      // 那张票的会话在 GUI 里始终挂不上项目 —— 所以缺工作区坐标时也要跑一次，
+      // 由 prepareWorkspace 自己判断该复用已有 worktree 还是新建。
+      if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'function') {
         const prepared = await prepareWorkspace({
           ticket,
           located,
@@ -322,6 +331,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           revisionCount: row.revisionCount,
           signal: handle.signal,
           fetch: config.fetchBeforeCreate !== false,
+          // 已有 worktree 时把它传下去：工作区要补登，但分支与检出不该重建。
+          worktreePath: row.worktreePath,
+          branch: row.branch,
+          baseCommit: row.baseCommit,
+          // 宿主工作区在 GUI 里显示的名字就是项目名。
+          title: projectId,
         })
         if (prepared?.path) {
           ws.worktreePath = prepared.path
@@ -333,7 +348,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             branch: ws.branch,
             baseCommit: ws.baseCommit,
             repoPath: ws.repoPath,
+            ...(prepared.workspacePath ? { workspacePath: prepared.workspacePath } : {}),
+            ...(prepared.workspaceId ? { workspaceId: prepared.workspaceId } : {}),
           })
+        }
+        if (prepared?.workspacePath) {
+          ws.workspacePath = prepared.workspacePath
+          ws.workspaceId = prepared.workspaceId
         }
       }
       if (store.getTicket(key)?.phase === 'pending') {
@@ -351,6 +372,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         branch: ws.branch,
         baseCommit: ws.baseCommit,
         repoPath: ws.repoPath,
+        // 项目工作区：执行器用它决定会话的 cwd 与归属（见 core/workspace.js 的说明）。
+        workspacePath: ws.workspacePath,
+        workspaceId: ws.workspaceId,
         // prompt 是纯文本，content 是同一份任务书外加截图块。
         // 两个都传：老适配器只认 prompt，新适配器按 content 才能看见图。
         prompt: renderTicketPrompt(ticket, located),

@@ -146,6 +146,19 @@ export function createAgentExecutor (options = {}) {
         throw new PipelineError('invalid-input', '执行上下文里没有 worktreePath：没有隔离工作区就不能让 agent 改代码')
       }
 
+      // 会话的 cwd 用**项目工作区**，不是 worktree。
+      //
+      // 两个原因，缺一不可：
+      // 1. 宿主 `Workspace.attachSession` 要求会话 header 的规范 cwd 正好等于
+      //    工作区路径，worktree 子目录（`<repo>/.agents/worktrees/<branch>`）挂不上；
+      // 2. 人要在 GUI 里看到「这张票的会话属于哪个项目」—— 挂不上工作区，
+      //    会话就只是散落的孤儿会话。
+      //
+      // 真正的改代码目录由 `setupAgent` 里的 `workingDirectory.set` 钉到 worktree，
+      // 它只改「这一轮的工作目录」，不动 header.cwd，两者可以共存。
+      const workspacePath = String(ctx?.workspacePath ?? '')
+      const sessionCwd = workspacePath.length > 0 ? workspacePath : worktreePath
+
       const config = ctx.config ?? {}
       const signal = ctx.signal
       const project = findProject(config, ticket, target)
@@ -153,14 +166,15 @@ export function createAgentExecutor (options = {}) {
       const sessionId = buildSessionId(ticket, ctx)
       const messages = buildMessages(ticket, ctx, options.prompts?.untrustedNotice)
 
-      ctx.log?.(`executor-agent：起 agent（sessionId=${sessionId}，cwd=${worktreePath}）`)
+      ctx.log?.(`executor-agent：起 agent（sessionId=${sessionId}，cwd=${sessionCwd}，改动目录=${worktreePath}）`)
 
       // ── 1. 起 agent ─────────────────────────────────────
       const created = await agents.create({
         sessionId,
-        // cwd 必须是 worktree：agent 的读写工具按这个目录解析相对路径，
-        // 指到别处就会在人的主目录里改代码。
-        meta: { cwd: worktreePath },
+        // cwd = 项目工作区根：会话要能挂到工作区名下（见上面 sessionCwd 的说明）。
+        // 真正的改代码目录由 setup 里的 workingDirectory.set 钉到 worktree ——
+        // agent 的读写工具按那个目录解析相对路径，指错了就会在人的主检出里改代码。
+        meta: { cwd: sessionCwd },
         // 模型参数：配置优先，缺的用宿主当前默认补齐。缺了 model 宿主会在
         // {{model}} 模板上崩，票全变成「没有产生任何文件改动」。
         agentOptions: resolveAgentOptions(config, { agentDefaultModel: options.agentDefaultModel, log }),
@@ -171,6 +185,10 @@ export function createAgentExecutor (options = {}) {
           agentCtx,
           agent,
           worktreePath,
+          workspacePath,
+          workspaceId: ctx?.workspaceId,
+          // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
+          workspaceRegistry: options.workspaceRegistry,
           presetId: config.agentPreset,
           signal,
           sessionId,
@@ -560,6 +578,9 @@ async function waitForAgentIdle (agent, signal, cancelAgent) {
  *   agentCtx: any,
  *   agent: any,
  *   worktreePath: string,
+ *   workspacePath?: string,
+ *   workspaceId?: string,
+ *   workspaceRegistry?: any,
  *   presetId?: string,
  *   signal?: AbortSignal,
  *   sessionId: string,
@@ -622,16 +643,72 @@ export async function setupAgent (options, input) {
     }
   }
 
-  // ── 3. 钉 cwd ───────────────────────────────────────
+  // ── 3. 钉 cwd 到 worktree ───────────────────────────
+  //
+  // 只有「会话 header 的 cwd 被设成了项目工作区根」这一种情况才需要钉：
+  // 那时如果不换成 worktree，agent 就会直接在人的主检出里改代码 ——
+  // 那是最坏的一种破坏，set 失败必须抛。
+  //
+  // 没有工作区坐标时 `meta.cwd` 本来就是 worktree（见 run 里的 sessionCwd），
+  // header 已经对了，不需要额外动作，也不该因为「本机没有 workingDirectory 服务」
+  // 就判失败 —— 离线/headless 环境里这条链路本来就是直接用 worktree 当 cwd。
   const workingDirectory = agentCtx?.get?.('workingDirectory')
-  if (workingDirectory && typeof workingDirectory.set === 'function' && worktreePath.length > 0) {
+  const workspaceRoot = input.workspacePath ?? ''
+  const needsPin = worktreePath.length > 0 && workspaceRoot.length > 0 && workspaceRoot !== worktreePath
+  if (needsPin) {
+    if (!workingDirectory || typeof workingDirectory.set !== 'function') {
+      throw new PipelineError(
+        'invalid-input',
+        'executor-agent：会话的 cwd 是项目工作区根，需要把工作目录钉到 worktree，' +
+        '但本机没有 workingDirectory 服务。继续跑会在项目主检出里改代码，' +
+        '所以这里直接停下。请确认宿主装了 workingDirectory（桌面版自带），' +
+        '或把 projects[].repo.path 直接指向一个可以随便改的检出。',
+      )
+    }
     try {
       const current = typeof workingDirectory.get === 'function' ? workingDirectory.get(agent.session) : undefined
       if (current !== worktreePath) await workingDirectory.set(agent, worktreePath, signal)
+      log('executor-agent：工作目录已钉到 worktree', { sessionId, worktreePath })
     } catch (error) {
-      // meta.cwd 已经写进 session header，set 失败只是没能再钉一遍，不必判失败。
-      log('executor-agent：把 cwd 钉到 worktree 失败（继续用 session header 里的 cwd）', { sessionId, worktreePath, reason: String(error) })
+      throw new PipelineError(
+        'internal',
+        `executor-agent：把工作目录从工作区根切到 worktree 失败（${error?.message ?? String(error)}）。` +
+        `继续跑会在 ${workspaceRoot} 里改代码，所以这里停下。`,
+      )
     }
+  }
+
+  // ── 4. 把会话归属到项目工作区 ─────────────────────────
+  //
+  // 只有 `attachSession` 会让 GUI 把这会话列在「这个项目」名下；不调的话
+  // 会话照样存在（`agents.create` 不要求工作区），但人是散的、找不到。
+  //
+  // 顺序必须在钉完 cwd 之后：`attachSession` 校验的是 session header 的
+  // canonical cwd，而 `workingDirectory.set` 只追加事件、不改 header ——
+  // 所以先钉后挂、挂的是「工作区根」这个 header 值，两者不冲突。
+  const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId : ''
+  if (workspaceId.length > 0) {
+    // 优先用组合根注入的 registry：宿主只在 web-app 层挂 `workspaceRegistry`，
+    // agentCtx 里不一定拿得到。两条路都弱取，取不到就只记日志。
+    const registry = input.workspaceRegistry ?? agentCtx?.get?.('workspaceRegistry')
+    if (registry && typeof registry.get === 'function') {
+      try {
+        const workspace = registry.get(workspaceId)
+        if (workspace && typeof workspace.attachSession === 'function') {
+          await workspace.attachSession(sessionId)
+          log('executor-agent：会话已归属到项目工作区', { sessionId, workspaceId, workspacePath: input.workspacePath })
+        }
+      } catch (error) {
+        // 挂不上工作区不影响改代码，只是 GUI 里少一层分组 —— 记下来，不判失败。
+        log('executor-agent：会话归属到工作区失败（会话照常可用，只是 GUI 里不在该工作区分组下）', {
+          sessionId,
+          workspaceId,
+          reason: String(error),
+        })
+      }
+    }
+  } else {
+    log('executor-agent：没有工作区坐标，会话不归属到任何项目工作区', { sessionId })
   }
 }
 

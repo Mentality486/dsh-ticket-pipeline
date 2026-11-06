@@ -237,7 +237,7 @@ function createFakeAgent (options = {}) {
  * @returns {any}
  */
 function createFakeAgentCtx (options = {}) {
-  const state = { mounts: [], setCalls: [] }
+  const state = { mounts: [], setCalls: [], attachCalls: [] }
   const presets = {
     list: async () => (options.presetIds ?? ['ptc', 'standard']).map((id) => ({ id })),
     mount: async (ctx, id) => {
@@ -246,10 +246,20 @@ function createFakeAgentCtx (options = {}) {
       return { id }
     },
   }
+  const workspaceRegistry = {
+    get: (id) => ({
+      id,
+      path: options.workspacePath ?? '/repo',
+      attachSession: async (sessionId) => { state.attachCalls.push({ workspaceId: id, sessionId }) },
+    }),
+  }
   const agentCtx = {
     get (name) {
       if (name === 'agentPresets') return presets
+      if (name === 'workspaceRegistry') return workspaceRegistry
       if (name === 'workingDirectory') {
+        // noWorkingDirectory = 模拟 headless profile：这个服务根本不存在。
+        if (options.noWorkingDirectory) return undefined
         return {
           get: () => undefined,
           set: async (_agent, path) => { state.setCalls.push(path); return path },
@@ -258,7 +268,7 @@ function createFakeAgentCtx (options = {}) {
       return undefined
     },
   }
-  return { agentCtx, state }
+  return { agentCtx, state, workspaceRegistry }
 }
 
 const TICKET = Object.freeze({
@@ -324,7 +334,7 @@ function makeRunEnv (options = {}) {
 
   // 宿主的 setup 是「publish 之前」调用的：这里照样在返回 agent 之前 await 它，
   // 这样断言能看到 preset 挂载与会话策略事件的真实顺序。
-  const { agentCtx, state: setupState } = createFakeAgentCtx(options)
+  const { agentCtx, state: setupState, workspaceRegistry } = createFakeAgentCtx(options)
   let disposed = false
   Object.defineProperty(state, 'disposed', { get () { return disposed } })
   const agents = {
@@ -363,6 +373,8 @@ function makeRunEnv (options = {}) {
     getSecret: async () => 'glpat-test',
     createGitlabClient: async (cfg) => createGitlabClient({ ...cfg, fetch: gitServer.fetchImpl }),
     prompts: { untrustedNotice: NOTICE },
+    // 组合根真实注入的就是这个（宿主只在 web-app 层挂 registry，agentCtx 里未必有）。
+    workspaceRegistry: options.workspaceRegistry ?? workspaceRegistry,
   })
 
   const config = {
@@ -384,6 +396,14 @@ function makeRunEnv (options = {}) {
     branch: 'ticket-demo-rec-9-r1',
     baseCommit: 'base123',
     repoPath: '/repo',
+    // 项目工作区：默认给上（这是「工单有项目工作区」的正常形态）；
+    // 传 workspacePath: null 可以模拟「升级前的老票据，只有 worktree」。
+    ...(options.workspacePath === null
+      ? {}
+      : {
+          workspacePath: options.workspacePath ?? '/repo',
+          workspaceId: options.workspaceId ?? 'ws-1',
+        }),
     prompt: '任务书正文',
     content: [{ type: 'text', text: '任务书正文' }],
     images: [],
@@ -623,8 +643,62 @@ export async function runGitlabChecks (check) {
     const env = makeRunEnv()
     await env.executor.run(env.ticket, env.target, env.ctx)
     assert.equal(env.created.length, 1)
-    assert.equal(env.created[0].meta.cwd, env.ctx.worktreePath, 'agent 的 cwd 必须是 worktree，不能在主目录里改代码')
     assert.match(env.created[0].sessionId, /^ticket-demo-rec-9-\d+$/)
+  })
+
+  await check('执行器：会话 cwd 用项目工作区根，改代码目录靠 workingDirectory 钉到 worktree', async () => {
+    // 为什么必须这样分：宿主 `attachSession` 要求会话 header 的 canonical cwd
+    // 正好等于工作区路径，worktree 子目录挂不上；但 agent 又必须在 worktree 里改代码。
+    // 所以 header.cwd = 工作区根，workingDirectory.set 把「这一轮的工作目录」换成 worktree。
+    const env = makeRunEnv()
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.created[0].meta.cwd, '/repo', 'header.cwd 必须是项目工作区根，否则会话挂不上工作区')
+    assert.deepEqual(env.setupState.setCalls, [env.ctx.worktreePath], '工作目录必须被钉到 worktree，否则会在主检出里改代码')
+  })
+
+  await check('执行器：没有工作区坐标时退回「cwd = worktree」，行为与改造前一致', async () => {
+    // 升级前入队的老票据只有 worktreePath。这时没有工作区可挂，也不该需要
+    // workingDirectory 服务 —— 直接把 worktree 当 cwd 就是改造前的正确行为。
+    const env = makeRunEnv({ workspacePath: null, noWorkingDirectory: true })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.created[0].meta.cwd, env.ctx.worktreePath, '没有工作区时 cwd 就该是 worktree')
+    assert.deepEqual(env.setupState.setCalls, [], '不需要钉，header 已经对了')
+  })
+
+  await check('执行器：有工作区但本机没有 workingDirectory 服务时，拒绝在项目主检出里改代码', async () => {
+    // 这是最危险的一种降级：不报错就继续跑，agent 会直接改人的检出。
+    // 宁可这张票失败，也不能偷偷污染主工作区。
+    const env = makeRunEnv({ noWorkingDirectory: true })
+    await assert.rejects(
+      () => env.executor.run(env.ticket, env.target, env.ctx),
+      (error) => {
+        assert.equal(error.kind, 'invalid-input', '缺服务重试也没用')
+        assert.match(error.message, /workingDirectory/)
+        assert.match(error.message, /会在项目主检出里改代码/)
+        return true
+      },
+    )
+  })
+
+  await check('执行器：会话归属到项目工作区（attachSession 用的是 workspaceId）', async () => {
+    const env = makeRunEnv({ workspaceId: 'ws-77' })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.setupState.attachCalls.length, 1, '必须把会话挂到工作区名下，否则 GUI 里是散落的孤儿会话')
+    assert.equal(env.setupState.attachCalls[0].workspaceId, 'ws-77')
+    assert.equal(env.setupState.attachCalls[0].sessionId, env.created[0].sessionId)
+  })
+
+  await check('执行器：attachSession 失败不影响改代码（只记日志）', async () => {
+    const failing = { get: () => ({ id: 'ws-x', attachSession: async () => { throw new Error('宿主：attach 失败') } }) }
+    const env = makeRunEnv({ workspaceRegistry: failing })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done', '挂不上工作区只是 GUI 少一层分组，不该让票失败')
+  })
+
+  await check('执行器：没有 workspaceId 时不尝试 attach（headless / 老票据）', async () => {
+    const env = makeRunEnv({ workspaceId: '' })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.setupState.attachCalls.length, 0)
   })
 
   await check('执行器：provider/model 留空时不下发（跟随宿主默认）', async () => {
@@ -839,6 +913,9 @@ export async function runGitlabChecks (check) {
     // 这条用例只验「读文件拼 worktree 根」，刻意给一个没有 agentPresets 的 ctx；
     // 因此把 agentPreset 留空（=不挂 preset），否则会被「缺 preset 服务」的新闸门拦住。
     env.ctx.config.agentPreset = ''
+    // 这条不测工作区：去掉工作区坐标，走「cwd = worktree」那条老路径，
+    // 否则会被「有工作区但没 workingDirectory 服务」的闸门拦住（那是另一条用例）。
+    const { workspacePath: _wp, workspaceId: _wid, ...ctxWithoutWorkspace } = env.ctx
     const executor = createAgentExecutor({
       agents: { create: async (input) => { await input.setup?.({ get: () => undefined }, env.agent); return { agent: env.agent } } },
       git: async (argv) => { if (argv[0] === 'diff') return { code: 0, stdout: 'M\tsrc/login.js', stderr: '' }; return { code: 0, stdout: '', stderr: '' } },
@@ -848,7 +925,7 @@ export async function runGitlabChecks (check) {
       createGitlabClient: async (cfg) => createGitlabClient({ ...cfg, fetch: env.gitServer.fetchImpl }),
       prompts: { untrustedNotice: NOTICE },
     })
-    await executor.run(env.ticket, env.target, env.ctx)
+    await executor.run(env.ticket, env.target, ctxWithoutWorkspace)
     assert.equal(read.length, 1)
     // Windows 上 path.join 会输出反斜杠，统一成正斜杠再断言。
     const normalized = read[0].replace(/\\/g, '/')
