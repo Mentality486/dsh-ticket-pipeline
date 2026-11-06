@@ -922,6 +922,23 @@ export async function apply (ctx, config) {
     await gitRunner(['worktree', 'prune'], { cwd: repoPath })
   }
 
+  /**
+   * 票据上记的工作区目录现在还是个有效工作区吗？
+   *
+   * 两处要用，必须是同一个判定（否则会出现「恢复说没了、调度器说还在」这种最难查的分歧）：
+   * 1. 启动恢复（`recoverPending`）—— 只覆盖 pending 与中间态；
+   * 2. 调度器复用一个已有工作区之前 —— failed 是终态，人工重开之后仍然会带着
+   *    陈旧坐标回到调度器，恢复流程管不到它。
+   *
+   * 没有 git 链路时一律回 true：问不到不等于没有，不能因此把已有工作区推倒重来。
+   *
+   * @type {(path: string) => Promise<boolean>}
+   */
+  const worktreeExists = async (path) => {
+    if (!gitRunner) return true
+    return checkWorktreeByGit(gitRunner, path)
+  }
+
   const scheduler = createScheduler({
     store,
     sources,
@@ -933,6 +950,8 @@ export async function apply (ctx, config) {
     prepareWorkspace: gitRunner ? prepareWorkspace : undefined,
     saveImage,
     removeWorktree: gitRunner ? removeWorktree : undefined,
+    // 只判「目录还在不在」：复用已有工作区之前的那道闸（见 core/scheduler.js 的 isStaleWorkspaceCoords）。
+    worktreeExists: gitRunner ? worktreeExists : undefined,
   })
 
   // ── 4. 工具 ───────────────────────────────────────────
@@ -990,10 +1009,6 @@ export async function apply (ctx, config) {
 
   // ── 5. 启动恢复 ───────────────────────────────────────
   try {
-    const worktreeExists = async (path) => {
-      if (!gitRunner) return true
-      return checkWorktreeByGit(gitRunner, path)
-    }
     await recoverPending({ store, worktreeExists, log, now: () => Date.now() })
   } catch (error) {
     log('启动恢复失败（不影响后续轮询）', error)

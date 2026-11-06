@@ -141,6 +141,38 @@ fix(pms): [pms] ##1 rec-probe-1
 `collectChanges` 收齐 9 条且不含插件自有目录，`unstageSensitiveFiles` 把 `application.yml` 退回 `??`，
 `commitLocally` 产出的 `log --name-status` 精确等于期望（含 `R100 to-rename.txt renamed.txt`），提交后工作区只剩 `?? .agents/worktrees/...` 与 `?? application.yml`。
 
+### 1.5 陈旧工作区坐标不得复用（2026-11-06 真实事故）
+
+**事故**：`pms|reczz28VWNWVbpgL` 连续两次失败，通知里的错误是
+`internal: executor-agent：把工作目录从工作区根切到 worktree 失败（working-directory: directory does not exist: "D:/WorkSpace/dsh-ticket-pipeline/.repos/mgiot-pms/.agents/worktrees/ticket-pms-reczz28VWNWVbpgL-r1"）。继续跑会在 D:\WorkSpace\mgiot-pms 里改代码，所以这里停下。`
+
+**根因**：`core/scheduler.js` 的工作区守卫只看「字段有没有值」：
+
+```js
+if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'function') { ... }
+```
+
+这两个字段都非空时整段跳过 `prepareWorkspace`。而这一行恰好是**跨配置时代的混合坐标**：`workspacePath` / `repoPath` 是 11-06 新配置的 `D:/WorkSpace/mgiot-pms`，
+`worktreePath` / `branch` 是 11-04 老配置时代的 `.repos/mgiot-pms/.agents/worktrees/…`，那个目录早就随旧仓库一起没了。
+陈旧路径原样进执行器 → `setupAgent` 里 `needsPin` 成立 → `workingDirectory.set(agent, <不存在的目录>)` → 抛 `internal`。
+
+**两个放大器**：
+1. `store.resetByHuman()` 只把 phase 拨回 `pending`，**不清工作区坐标** —— 人照着通知「拨走再拨回处理中」重开，会带着同一份死坐标原样再失败一次；
+2. `recoverPending()` 只在启动时遍历 `store.listActive()`（pending 与中间态），**`failed` 是终态、不在其中** —— 恢复流程永远修不好这张票。
+
+**修法**（`core/scheduler.js`）：
+- 新增 `isStaleWorkspaceCoords({ worktreePath, repoPath, currentRepoPath, worktreeExists })`，两种情形判为失效：
+  ① 票据上的 `repoPath` 与本次定位到的 `repoPath` 不一致（换了仓库，旧目录可能是另一个仓库的有效检出）；
+  ② `worktreeExists(worktreePath)` 明确回 `false`（目录确实没了）。
+  **探测本身抛错不算失效** —— 问不到不等于没有，宁可复用旧坐标让人看见真实错误，也不要每轮把已有工作区推倒重来。
+- 守卫条件加上 `|| staleCoords`，并且失效时必须把 `worktreePath / branch / baseCommit` **摘成 `undefined`** 再传 `prepareWorkspace`：
+  否则它会走「已有 worktree，只补登记」那一支，把死路径原样回传。
+- `createScheduler` 新增可选依赖 `worktreeExists`（由 `src/index.js` 用 `checkWorktreeByGit` 提供），与启动恢复共用同一个判定
+  —— 两处口径不一致会出现「恢复说没了、调度器说还在」这种最难查的分歧。
+
+新增 3 条断言：目录已删要重建且不把死坐标传下去、换了仓库要重建、探测抛错时不重建。
+自测 285 → **288**。
+
 ---
 
 ## 2. 代码清单
@@ -401,7 +433,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **285** | 通过 285，失败 0（2026-11-06 实跑；262 → 274 → 285，最后 11 条是改动收集改走 `git -z` 的缺陷修复断言） |
+| `node scripts/dev-run.mjs` | **288** | 通过 288，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288，最后 3 条是「陈旧工作区坐标不得复用」的守卫断言） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
 `dev-run.mjs` 分 22 个小节：
@@ -419,7 +451,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 8 | 工作区清理 | 过期 worktree 回收（只有开了 `isolateWorktree` 才有 worktree 可清）、`isIsolatedWorktreePath` 前缀校验 |
 | 9 | 飞书适配器（离线打桩） | 52 项：状态值、recordIds、指纹、早停退役 |
 | 10 | P0 修复 | 租约心跳、注入时钟、送达回执配置、人工取消 |
-| 11 | §5.1 A 组链路断点 | 截图进 prompt、真实工作区、失败原因、人工重开 |
+| 11 | §5.1 A 组链路断点 | 截图进 prompt、真实工作区、失败原因、人工重开；**陈旧工作区坐标不复用**（目录已删要重建且不把死坐标传下去 / 换了仓库要重建 / 探测抛错时不重建） |
 | 11.6 | `onPhase` 的第二参 | 字符串是「说明」，不能被当字段补丁写进票据 |
 | 11.5 | `pipeline_doctor` | 环境体检 |
 | 12 | 组合根接线 | 工具真注册进 ctx、真拿到 store |
@@ -519,7 +551,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | 285 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | 288 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -541,7 +573,8 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「本地提交」改造（**已完成**，2026-11-06） | 交付形态从远程 draft MR 换成本地提交：`commitLocally`、`ExecResult.commit`、`repo.gitlab.enabled` 总开关、通知/状态/体检三处文案 | ✅ 自测 269/269（新增 7 条）；`gitlab-checks` 51 → 58 |
 | 「改代码落点」改造（**已完成**，2026-11-06 晚） | 缺省直接在项目工作区的检出里改代码、就地提交（要求检出干净），新增 `isolateWorktree`（默认 `false`）把隔离 worktree 降级成可选项；`isIsolatedWorktreePath` 堵住清理误删主检出 | ✅ 自测 274/274（新增 5 条，`dev-run.mjs` 第 15 节）；见 §1.3 |
 | 「改动收集改 `git -z`」缺陷修复（**已完成**，2026-11-06 深夜） | 未跟踪新文件漏提交、路径被引号/八进制转义、未跟踪目录折叠导致敏感文件绕过、`.agents/worktrees` 污染检出 —— 四个坑一并修；新增契约 `src/contracts/git-status.js`、新增 `unstageSensitiveFiles`、删除三个非 `-z` 解析导出 | ✅ 自测 285/285（新增 11 条）；`gitlab-checks` 58 → 68；真实 git 端到端探针通过；见 §1.4 |
+| 「陈旧工作区坐标不得复用」缺陷修复（**已完成**，2026-11-06） | 守卫只看字段有没有值 → 目录已删/换了仓库仍复用死路径，`workingDirectory.set` 对着空气报错；`resetByHuman` 不清坐标、`recoverPending` 不管 failed，两处放大器让票重置后必然复现 | ✅ 自测 288/288（新增 3 条）；见 §1.5 |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 285 → 305；一张真表读出一张真票 |
+| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 288 → 308；一张真表读出一张真票 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

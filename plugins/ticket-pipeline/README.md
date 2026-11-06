@@ -177,7 +177,7 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**285 项断言，全绿 exit 0**，共 22 个小节（编号到 15，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节）。
+**288 项断言，全绿 exit 0**，共 22 个小节（编号到 15，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，但宿主服务全部打桩），
 其余测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 

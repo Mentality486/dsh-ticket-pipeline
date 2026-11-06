@@ -115,6 +115,7 @@ function harness (options = {}) {
     saveImage: options.saveImage,
     prepareWorkspace: options.prepareWorkspace,
     removeWorktree: options.removeWorktree,
+    worktreeExists: options.worktreeExists,
   })
   return { repo, store, source, executor, push, locator, config, scheduler }
 }
@@ -866,6 +867,121 @@ async function main () {
     assert.equal(seenCtx.worktreePath, 'D:/wt/ready')
     assert.equal(seenCtx.workspacePath, 'D:/WorkSpace/demo-repo', '执行器必须拿到项目工作区路径（会话 cwd 用它）')
     assert.equal(seenCtx.workspaceId, 'ws-42', '工作区 id 要透传，执行器要用它 attach 会话')
+  })
+
+  // 这一组用例对应真实事故 pms|reczz28VWNWVbpgL（2026-11-06）：票据上 worktreePath 与
+  // workspacePath 都「有值」，但那个目录早被删了、仓库也换了，旧守卫整段跳过
+  // prepareWorkspace，陈旧路径原样进执行器 → workingDirectory.set 对着空气报错 → 票 failed。
+  // 更糟的是 resetByHuman 不清工作区坐标，人工重开之后还会原样再失败一次。
+  const makeSeenExecutor = (holder) => ({
+    id: 'spy',
+    async run (ticket, target, ctx) {
+      holder.ctx = ctx
+      await ctx.onPhase('editing')
+      await ctx.onPhase('testing')
+      await ctx.onPhase('mr-opening')
+      return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+    },
+  })
+
+  await check('票据上的工作区目录已被删：不能复用，必须重建成新的', async () => {
+    const holder = {}
+    let prepares = 0
+    const seenOpts = []
+    const { scheduler, store } = harness({
+      executor: makeSeenExecutor(holder),
+      // 目录已不在
+      worktreeExists: async () => false,
+      prepareWorkspace: async (opts) => {
+        prepares += 1
+        seenOpts.push(opts)
+        return { path: 'D:/WorkSpace/demo-repo', branch: 'v2.x', baseCommit: 'fresh1', repoPath: 'D:/WorkSpace/demo-repo', workspacePath: 'D:/WorkSpace/demo-repo', workspaceId: 'ws-new' }
+      },
+    })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/gone/.agents/worktrees/ticket-demo-rec-mock-001-r1',
+      branch: 'ticket-demo-rec-mock-001-r1',
+      baseCommit: 'dead',
+      repoPath: 'D:/WorkSpace/demo-repo',
+      workspacePath: 'D:/WorkSpace/demo-repo',
+      workspaceId: 'ws-old',
+    })
+    await store.setPhase(k('rec-mock-001'), 'pending')
+    await scheduler.tick()
+    assert.equal(prepares, 1, '目录没了就必须重新准备，不能抱着死路径往下跑')
+    assert.equal(seenOpts[0].worktreePath, undefined, '失效坐标不能传给 prepareWorkspace，否则它只会补登记、把死路径原样回传')
+    assert.equal(seenOpts[0].branch, undefined)
+    assert.equal(seenOpts[0].baseCommit, undefined)
+    assert.equal(holder.ctx.worktreePath, 'D:/WorkSpace/demo-repo', '执行器拿到的是重建成的新路径')
+    assert.equal(holder.ctx.baseCommit, 'fresh1')
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.worktreePath, 'D:/WorkSpace/demo-repo', '新坐标要落库，下一轮才不会再重建')
+  })
+
+  await check('项目换了仓库：旧坐标指向的是别的仓库，也要重生', async () => {
+    const holder = {}
+    let prepares = 0
+    const seenOpts = []
+    const { scheduler, store } = harness({
+      executor: makeSeenExecutor(holder),
+      // 目录本身还在（旧仓库还在磁盘上），只是不再是这次要改的仓库
+      worktreeExists: async () => true,
+      prepareWorkspace: async (opts) => {
+        prepares += 1
+        seenOpts.push(opts)
+        return { path: 'D:/WorkSpace/mgiot-pms', branch: 'v2.x', baseCommit: 'm1', repoPath: 'D:/WorkSpace/mgiot-pms', workspacePath: 'D:/WorkSpace/mgiot-pms', workspaceId: 'ws-m' }
+      },
+    })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/WorkSpace/dsh-ticket-pipeline/.repos/mgiot-pms/.agents/worktrees/ticket-pms-rec-1-r1',
+      branch: 'ticket-pms-rec-1-r1',
+      baseCommit: 'old',
+      // 当年是从 .repos/mgiot-pms 建的；现在项目 repo.path 已经指向 D:/WorkSpace/mgiot-pms
+      repoPath: 'D:/WorkSpace/dsh-ticket-pipeline/.repos/mgiot-pms',
+      workspacePath: 'D:/WorkSpace/dsh-ticket-pipeline/.repos/mgiot-pms',
+      workspaceId: 'ws-old',
+    })
+    await store.setPhase(k('rec-mock-001'), 'pending')
+    await scheduler.tick()
+    assert.equal(prepares, 1, '换了仓库就必须重来：旧目录可能是另一个仓库的有效检出')
+    assert.equal(seenOpts[0].worktreePath, undefined, '异仓库的坐标不能传给 prepareWorkspace')
+    assert.equal(holder.ctx.repoPath, 'D:/WorkSpace/mgiot-pms')
+  })
+
+  await check('探测本身出错时不算失效：宁可复用也别把已有工作区推倒重来', async () => {
+    const holder = {}
+    let prepares = 0
+    const { scheduler, store } = harness({
+      executor: makeSeenExecutor(holder),
+      worktreeExists: async () => {
+        throw new Error('git 不在 PATH 里')
+      },
+      prepareWorkspace: async () => {
+        prepares += 1
+        return { path: 'D:/wt/other', branch: 'b', baseCommit: 'c' }
+      },
+    })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/wt/keep',
+      branch: 'b-keep',
+      baseCommit: 'c1',
+      repoPath: 'D:/WorkSpace/demo-repo',
+      workspacePath: 'D:/WorkSpace/demo-repo',
+      workspaceId: 'ws-keep',
+    })
+    await store.setPhase(k('rec-mock-001'), 'pending')
+    await scheduler.tick()
+    assert.equal(prepares, 0, '问不到 ≠ 没有了，不该重建')
+    assert.equal(holder.ctx.worktreePath, 'D:/wt/keep', '照旧复用票据上的坐标')
   })
 
   await check('prepareWorkspace 建出来的工作区坐标会落库并传给执行器', async () => {

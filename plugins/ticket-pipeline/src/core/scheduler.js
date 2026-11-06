@@ -60,6 +60,47 @@ function backoffDelayMs (attempt, retryAfterMs, random) {
 }
 
 /**
+ * 票据上存的工作区坐标还作数吗？
+ *
+ * 两个独立的失效来源，任一成立就不能复用：
+ *
+ * 1. **目录没了**。`isolateWorktree` 时代每票一个 `.agents/worktrees/<branch>`，
+ *    人手工删过、`worktree prune` 清过、磁盘搬过家都会留下一条指向空气的路径。
+ *    复用它会一路传到 `executor-agent` 的 `workingDirectory.set`，在那里才炸。
+ * 2. **换了仓库**。配置里的 `repo.path` 从 A 改成 B 之后，票据上的旧坐标仍然
+ *    指向 A 的目录 —— 那个目录可能好好存在，只是**不是这次要改的仓库**。
+ *    只看「文件系统里有没有」会漏掉这一类，所以还要比 repoPath。
+ *
+ * `worktreeExists` 没注入时（离线自测、或本机没有 git 链路）跳过存在性检查，
+ * 只做 repoPath 比对：不能因为「问不到」就一律判失效，那会让每轮都重建。
+ *
+ * @param {Object} input
+ * @param {string | undefined} input.worktreePath
+ * @param {string | undefined} input.repoPath 票据上记的仓库根
+ * @param {string} input.currentRepoPath 这次定位出来的仓库根
+ * @param {((path: string) => Promise<boolean>) | undefined} input.worktreeExists
+ * @returns {Promise<boolean>}
+ */
+async function isStaleWorkspaceCoords ({ worktreePath, repoPath, currentRepoPath, worktreeExists }) {
+  if (typeof worktreePath !== 'string' || worktreePath.length === 0) return false
+
+  const normalize = (value) => String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const ticketRepo = normalize(repoPath)
+  const locatedRepo = normalize(currentRepoPath)
+  if (ticketRepo.length > 0 && locatedRepo.length > 0 && ticketRepo !== locatedRepo) return true
+
+  if (typeof worktreeExists !== 'function') return false
+  try {
+    const exists = await worktreeExists(worktreePath)
+    return exists === false
+  } catch {
+    // 探测本身出错（git 不在、路径不可读）：不作为「失效」的理由。
+    // 宁可复用旧坐标让人看见真实错误，也不要每轮把已有工作区推倒重来。
+    return false
+  }
+}
+
+/**
  * 扫描结果里「这一轮发生了什么」的摘要，给日志和 `pipeline_scan` 工具返回用。
  * @typedef {Object} TickResult
  * @property {'ok'|'scan-failed'|'already-running'|'disabled'} status
@@ -85,8 +126,12 @@ function backoffDelayMs (attempt, retryAfterMs, random) {
  * @param {(opts: any) => Promise<{ path?: string, branch?: string, baseCommit?: string, repoPath?: string }>} [options.prepareWorkspace]
  * @param {(opts: { data: Uint8Array, mediaType: string, name?: string }) => Promise<unknown>} [options.saveImage]
  * @param {(opts: { path: string, branch: string, repoPath?: string }) => Promise<void>} [options.removeWorktree]
+ * @param {(path: string) => Promise<boolean>} [options.worktreeExists]
+ *   票据上记的工作区目录还在不在。启动恢复（core/recover.js）用的是同一个判定，
+ *   但那只覆盖 pending 与中间态 —— failed 是终态，人工重开之后仍然会带着陈旧坐标
+ *   回到调度器，所以这里必须再判一次。不注入时跳过存在性检查（只比 repoPath）。
  */
-export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree }) {
+export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists }) {
   const logInfo = log ?? (() => {})
   const nowFn = now ?? (() => Date.now())
   const randomFn = random ?? (() => Math.random())
@@ -322,7 +367,36 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 没有工作区坐标，重启恢复后如果只看 worktreePath 就永远不会补登记，
       // 那张票的会话在 GUI 里始终挂不上项目 —— 所以缺工作区坐标时也要跑一次，
       // 由 prepareWorkspace 自己判断该复用已有 worktree 还是新建。
-      if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'function') {
+      //
+      // 光看「字段有没有值」不够，必须再验一次它**现在还算不算数**。真实事故
+      // （pms|reczz28VWNWVbpgL，2026-11-06）：票据上 worktreePath 还是旧配置时代
+      // `.repos/mgiot-pms/.agents/worktrees/…` 下的隔离 worktree，那个目录早被删了，
+      // 而 repoPath 已经改成 `D:\WorkSpace\mgiot-pms`。两个字段都「有值」，旧守卫
+      // 整段跳过 prepareWorkspace，陈旧路径原样传给执行器 → executor-agent 的
+      // `workingDirectory.set` 对着不存在的目录报错 → 票 failed；更糟的是
+      // `resetByHuman` 不清工作区坐标，人工重开之后还会原样再失败一次。
+      //
+      // 所以复用前过两道闸：路径还在不在、是不是同一个仓库。任一不成立就当
+      // 「没有工作区」重建，并把旧坐标从传给 prepareWorkspace 的入参里摘掉
+      // —— 否则它会走「已有 worktree，只补登记」那条分支，把死路径原样回传。
+      const currentRepoPath = typeof located?.repoPath === 'string' ? located.repoPath : ''
+      const staleCoords = await isStaleWorkspaceCoords({
+        worktreePath: ws.worktreePath,
+        repoPath: ws.repoPath,
+        currentRepoPath,
+        worktreeExists,
+      })
+      if (staleCoords && typeof logInfo === 'function') {
+        logInfo('票据上的工作区坐标已失效，这次重新准备', {
+          projectId,
+          recordId,
+          worktreePath: ws.worktreePath,
+          ticketRepoPath: ws.repoPath,
+          currentRepoPath,
+        })
+      }
+
+      if ((!row.worktreePath || !ws.workspacePath || staleCoords) && typeof prepareWorkspace === 'function') {
         const prepared = await prepareWorkspace({
           ticket,
           located,
@@ -331,10 +405,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           revisionCount: row.revisionCount,
           signal: handle.signal,
           fetch: config.fetchBeforeCreate !== false,
-          // 已有 worktree 时把它传下去：工作区要补登，但分支与检出不该重建。
-          worktreePath: row.worktreePath,
-          branch: row.branch,
-          baseCommit: row.baseCommit,
+          // 已有 worktree **且坐标还有效**时把它传下去：工作区要补登，
+          // 但分支与检出不该重建。坐标失效时一律不传，让实现重新建。
+          worktreePath: staleCoords ? undefined : row.worktreePath,
+          branch: staleCoords ? undefined : row.branch,
+          baseCommit: staleCoords ? undefined : row.baseCommit,
           // 宿主工作区在 GUI 里显示的名字就是项目名。
           title: projectId,
         })
