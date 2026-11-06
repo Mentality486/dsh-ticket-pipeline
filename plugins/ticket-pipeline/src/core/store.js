@@ -272,17 +272,24 @@ export class TicketStore {
     }
 
     const now = this.now()
-    // 过滤掉值为 undefined 的键：{...row, ...patch} 遇到 undefined 会**覆盖**旧值，
-    // 而「patch 里没提」与「patch 里显式写了 undefined」在对象展开下区分不出来。
-    // 偏偏调用方大量用 undefined 表达「清掉它」（recover 清 mr、清理工作区清 branch），
-    // 那些地方靠显式写；这里再兜一道，是为了让「顺手多传一个 undefined」不至于
-    // 悄悄抹掉存储里的真实字段（例如把 mr 抹掉却以为只是更新了 lastError）。
-    const defined = {}
-    for (const [field, value] of Object.entries(patch ?? {})) {
-      if (value !== undefined) defined[field] = value
-    }
+    // 逐个字段应用补丁：**「键不存在」与「键在、值为 undefined」是两件事**。
+    //   · 键不存在       → 这轮没提到这个字段，保留存储里的旧值；
+    //   · 键在、值 undefined → 调用方明确要求「清掉它」，必须真的删掉。
+    // 早先这里把所有 undefined 一概过滤掉，于是调用方写下的每一种「清掉」
+    // 都是静默失效的：`lastError: undefined` 清不掉上一轮的失败原因（成功票上
+    // 还挂着「agent 这一轮以错误结束」），`worktreePath: undefined` 清不掉
+    // 已失效的工作区坐标（启动恢复以为重建了，其实还抱着死路径）。
+    // 用 hasOwnProperty 区分这两种意图，比在调用点各自写一遍 `delete` 更可靠。
     /** @type {TicketRecordRow} */
-    const next = { ...row, ...defined, phase: to }
+    const next = { ...row }
+    for (const [field, value] of Object.entries(patch ?? {})) {
+      if (value === undefined) {
+        delete next[field]
+      } else {
+        next[field] = value
+      }
+    }
+    next.phase = to
     if (row.phase !== to && !TERMINAL.includes(to)) {
       // 「已经开始跑了」的标记：第一次离开 pending 时打点
       if (next.startedAt === undefined && to !== 'pending') next.startedAt = now

@@ -2,7 +2,7 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 53 次提交，HEAD `2488036`），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-06，新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，开跑前要求检出干净；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 **285/285** 全绿；此前 2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
+> 最近一次更新：2026-11-06，新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 **294/294** 全绿；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，开跑前要求检出干净；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -173,26 +173,112 @@ if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'fun
 新增 3 条断言：目录已删要重建且不把死坐标传下去、换了仓库要重建、探测抛错时不重建。
 自测 285 → **288**。
 
+### 1.6 插件版本自检：跑的是不是最新代码（2026-11-06）
+
+**要解决的问题**：安装副本是**普通目录副本**（跨盘 `pnpm file:` 落成复制，不是软链），
+而 HMR 的 `root: []` 不监听源码目录、默认 `ignored` 还列着 `node_modules` ——
+所以改完源码不手工同步，宿主**一声不响地继续跑旧代码**。此前的表现是「明明改了却没生效」，
+只能靠人肉 `robocopy` + 重启，出错时完全看不出来。
+
+**做法**：新增 `src/core/plugin-version.js`（425 行），在 `pipeline_doctor` 里作第 5 节汇报。
+
+- **不比版本号**：两侧 `package.json` 的 `version` 都是 `0.1.0-test.1`，比了也没用。
+- **不跟 origin 比**：本阶段的交付形态是「工作区里的本地提交」，origin 长期落后本地，方向正好反了。
+  ⇒ 基准取 **profile `package.json` 里声明本包的那条 `file:` / `link:` 源码路径**。
+- **只比会真被加载的文件**：`src/**/*.js`、`lib/**/*.js`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`。
+  `README.md` / `scripts/` 改了不影响行为，不比 —— 否则每次改文档都误报「版本旧」。
+  根目录的 `COMPARED_FILES` 还会先 `readdir` 确认文件真的在，避免 `icon.svg` 缺失把「本来就是这么装的」误报成「比对失败」。
+- **链接安装直接判过**：`installedDir` 不含 `node_modules`（从源码直接跑），或两边 `realpath` 相同 ⇒ `linked: true`，不报落后。
+  profile 目录不是硬套三层相对路径，而是 `findProfileDir()` 沿路向上最多 6 层找「真的声明了本包」的那份 `package.json`。
+- **结论只进 `warnings`**：装旧版插件票照样能跑完，记成 `problems` 会让人以为流水线坏了。
+  落后时的文案直接给出可照做的命令：同步哪个目录到哪个目录、然后重启宿主。
+
+四种输出：`✅ 安装副本与源码一致（共比 N 个文件，指纹 xxx）` / `✅ 安装目录就是源码` /
+`⚠️ 插件不是最新：… （N 个文件内容不同，副本缺 N 个，副本多 N 个）+ 源码 fp ↔ 副本 fp` /
+`ℹ️ 无法比对（<原因>）`。
+
+**同一份逻辑两处生效**：`src/index.js` 的 `doctorOptions` 只构造一次，同时喂 agent 侧的
+`pipeline_doctor` 工具（`ctx.tools.register`）与 GUI 设置页的「立即体检」按钮（宿主 Remote），
+所以版本检查写在 `runDoctor()` 里两处自动都有，不存在两边口径不一致。
+
+新增 5 组断言：doctor 报落后并给出同步命令（另测一致态 / 链接态 / 比不出来态）、
+profile 声明解析与链接识别、能比出内容差异与缺文件多文件、坏输入不抛、`listComparedFiles` 只收会加载的文件。
+既有 7 个 doctor 用例全部注入 `comparePluginVersion` 桩，避免自测去读这台机器的真实安装状态。
+自测 288 → **293** → **294**（最后一条是 setPhase 真正清 lastError）。
+
+### 1.7 `setPhase` 清不掉字段：所有「清掉它」都静默失效（2026-11-06 真实事故）
+
+**事故现场**：飞书票 `pms|reczz28VWNWVbpgL` 跑成 `done`、本地提交 `0e62fe5` 已在
+`D:\WorkSpace\mgiot-pms` 里落地，但 `pipeline_status` 里这张「已完成」的票还挂着：
+
+```
+最近错误：internal: agent 这一轮以错误结束：pi-ai provider "workbuddy" has no configured model "deepseek-flash"
+```
+
+一条早就被修掉（改成显式 `provider`/`model`）的失败原因，跟着这张票走到了成功之后。
+
+**根因**（`src/core/store.js` `setPhase`）：补丁里所有值为 `undefined` 的键被一概过滤掉。
+
+```js
+// 修改前
+const defined = {}
+for (const [field, value] of Object.entries(patch ?? {})) {
+  if (value !== undefined) defined[field] = value
+}
+const next = { ...row, ...defined, phase: to }
+```
+
+而调用方**大量用 `undefined` 表达「清掉它」**，于是在这段代码之下，每一种清除都是静默失效的：
+
+| 调用点 | 意图 | 实际结果 |
+| --- | --- | --- |
+| `scheduler.js` 成功收尾 `setPhase(key, finalPhase, { lastError: finalError })` | 这一轮没出错 → 清掉上一轮的失败原因 | 旧 `lastError` 原地留着 |
+| `recover.js` 「工作区丢失」分支 `{ worktreePath: undefined, branch: undefined, mr: undefined, commit: undefined }` | 丢掉已失效的坐标，重新建 | 死坐标没被清掉，恢复等于白做 |
+| `scheduler.js` 清理过期 worktree 后 `{ worktreePath: undefined, branch: undefined }` | 清掉已删目录的坐标 | 同上 |
+
+**为什么自测没抓到**：`dev-run.mjs` 里那条「done 的通知不残留上一轮的失败原因」走的是
+`resetByHuman`（`put` 整行，本来就把 `lastError` 抹了），根本没碰到 `setPhase` 的清除逻辑 ——
+**清洗路径与断言路径不是同一条，测试是真绿、结论是假绿。**
+
+**修法**：区分「键不存在」与「键在、值为 `undefined`」。
+
+```js
+// 修改后：键不存在 → 不动；键在且值为 undefined → 删掉这个字段
+const next = { ...row }
+for (const [field, value] of Object.entries(patch ?? {})) {
+  if (value === undefined) delete next[field]
+  else next[field] = value
+}
+next.phase = to
+```
+
+这样「顺手多传一个 undefined」也不会误删字段（没传的键根本不进 `patch`），
+而不需要每个调用点各自写一遍 `delete`。
+
+**新增断言**（`dev-run.mjs`）：走**真实重试路径** —— 执行器抛可重试错误 → 票回 `pending`
+且写下 `lastError` → 下一轮跑成 → 断言 `row.lastError === undefined`。
+这条在修复前会红，修复后绿；原来那条 `resetByHuman` 的用例保留（它测的是另一件事）。
+
 ---
 
 ## 2. 代码清单
 
-`src/` 共 **41 个 .js / 12 916 行**；`scripts/` 共 9 个 .mjs / 7 437 行；`lib/client.js` 1 083 行（浏览器端设置面板）。
+`src/` 共 **42 个 .js / 13 544 行**；`scripts/` 共 9 个 .mjs / 7 941 行（`dev-run.mjs` 2 508 行）；`lib/client.js` 1 083 行（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 151 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹）、`ticket-source.js`、`work-executor.js`、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 3 044 | `scheduler.js`（调度核心）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/core/` | 3 606 | `scheduler.js`（调度核心）、`store.js`（持久化 + 租约）、`config.js`（配置校验 + 描述符）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
 | `src/adapters/` | 6 437 | 见下表 |
-| `src/tools/` | 1 094 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
+| `src/tools/` | 1 145 | `define.js`（工具范本）、`pipeline-scan.js`、`pipeline-status.js`、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
 | `src/remote/` | 151 | `descriptors.js`、`host.js`（宿主 Remote 通道） |
-| 根 | 1 039 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `assertCleanCheckout` 也在这里） |
+| 根 | 1 054 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `assertCleanCheckout` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | `source-feishu/` | 1 274 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单 |
 | `source-wps/` | 1 360 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet` |
-| `source-webform/` | 105 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
+| `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
 | `source-mock/` | 267 | 测试 | 离线源；也接 recordIds |
 | `executor-agent/` | 1 795 | **真实实现** | 真 agent 改码、`-z` 口径收集改动（未跟踪新文件也算进来）、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`、删除路径不进 add、重命名旧路径进 commit pathspec）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件 `restore --staged` 退回未跟踪；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 143 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
@@ -208,7 +294,7 @@ if ((!row.worktreePath || !ws.workspacePath) && typeof prepareWorkspace === 'fun
 | --- | --- |
 | `pipeline_scan` | 立刻扫一轮工单表 |
 | `pipeline_status` | 看队列与各票阶段 |
-| `pipeline_doctor` | 环境体检：git 链路、各项目仓库连通性、凭据、执行器与通知适配器 |
+| `pipeline_doctor` | 环境体检：git 链路、各项目仓库连通性、凭据、执行器与通知适配器，以及**正在跑的插件是不是比本地源码旧** |
 | `pipeline_reset` | 把 failed / needs-info / gone 的票放回队列重跑 |
 | `pipeline_cancel` | 取消正在跑的那张票（并发恒 1） |
 
@@ -245,7 +331,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 平台枚举：`src/core/config.js:447` `PLATFORMS = ['feishu', 'wps', 'mock', 'webform']`（表驱动，新增平台只加这一处）。
 
-### 3.4 契约层（6 个文件 / 970 行）
+### 3.4 契约层（8 个文件 / 1 151 行）
 
 | 契约 | 内容 |
 | --- | --- |
@@ -433,7 +519,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **288** | 通过 288，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288，最后 3 条是「陈旧工作区坐标不得复用」的守卫断言） |
+| `node scripts/dev-run.mjs` | **294** | 通过 294，失败 0（2026-11-06 实跑；262 → 274 → 285 → 288 → 293 → 294，倒数第 2 批 5 条是「插件版本自检」，最后 1 条是 setPhase 清 lastError） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
 `dev-run.mjs` 分 22 个小节：
@@ -453,7 +539,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 10 | P0 修复 | 租约心跳、注入时钟、送达回执配置、人工取消 |
 | 11 | §5.1 A 组链路断点 | 截图进 prompt、真实工作区、失败原因、人工重开；**陈旧工作区坐标不复用**（目录已删要重建且不把死坐标传下去 / 换了仓库要重建 / 探测抛错时不重建） |
 | 11.6 | `onPhase` 的第二参 | 字符串是「说明」，不能被当字段补丁写进票据 |
-| 11.5 | `pipeline_doctor` | 环境体检 |
+| 11.5 | `pipeline_doctor` | 环境体检；**插件版本自检**：落后时给出同步命令与两个指纹，一致/链接安装/比不出来三态各有断言，既有 7 个用例注入 `NO_VERSION_CHECK` 桩避免读真实磁盘 |
 | 12 | 组合根接线 | 工具真注册进 ctx、真拿到 store |
 | 12b | 注册表真的接上了适配器 | qqmail 推送、agent 执行器 |
 | 12c | 走宿主 shell 必须显式带 sandboxPolicy | 写授权 |
@@ -551,7 +637,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | 288 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | 294 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -574,7 +660,9 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「改代码落点」改造（**已完成**，2026-11-06 晚） | 缺省直接在项目工作区的检出里改代码、就地提交（要求检出干净），新增 `isolateWorktree`（默认 `false`）把隔离 worktree 降级成可选项；`isIsolatedWorktreePath` 堵住清理误删主检出 | ✅ 自测 274/274（新增 5 条，`dev-run.mjs` 第 15 节）；见 §1.3 |
 | 「改动收集改 `git -z`」缺陷修复（**已完成**，2026-11-06 深夜） | 未跟踪新文件漏提交、路径被引号/八进制转义、未跟踪目录折叠导致敏感文件绕过、`.agents/worktrees` 污染检出 —— 四个坑一并修；新增契约 `src/contracts/git-status.js`、新增 `unstageSensitiveFiles`、删除三个非 `-z` 解析导出 | ✅ 自测 285/285（新增 11 条）；`gitlab-checks` 58 → 68；真实 git 端到端探针通过；见 §1.4 |
 | 「陈旧工作区坐标不得复用」缺陷修复（**已完成**，2026-11-06） | 守卫只看字段有没有值 → 目录已删/换了仓库仍复用死路径，`workingDirectory.set` 对着空气报错；`resetByHuman` 不清坐标、`recoverPending` 不管 failed，两处放大器让票重置后必然复现 | ✅ 自测 288/288（新增 3 条）；见 §1.5 |
+| 「插件版本自检」（**已完成**，2026-11-06） | 宿主加载的是 profile 下的目录副本（跨盘 `file:` 落成复制），HMR `root: []` 不监听源码 ⇒ 改完不同步就静默跑旧代码；新增 `src/core/plugin-version.js`，`pipeline_doctor` 比对安装副本与源码的**文件内容**，落后时给出同步命令，只进「提醒」 | ✅ 自测 288 → 293（新增 5 组断言）；见 §1.6 与 `architecture.md` §12.11 |
+| 「`setPhase` 清不掉字段」缺陷修复（**已完成**，2026-11-06） | `setPhase` 把补丁里所有 `undefined` 一概过滤，于是调用方写的每一种「清掉」都静默失效：成功票上挂着上一轮 `lastError`（真实事故：`pms\|reczz28VWNWVbpgL` 跑成 done 却显示 `provider "workbuddy" has no configured model`），启动恢复以为清了死坐标其实没清。改为「键不存在 = 不动 / 键在值为 undefined = 删掉」 | ✅ 自测 293 → 294（新增 1 条走真实重试路径 —— 旧的那条是 `resetByHuman` 兜的假绿）；见 §1.7 |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 288 → 308；一张真表读出一张真票 |
+| 第二步半 | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | 5 人日；`dev-run` 294 → 314；一张真表读出一张真票 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

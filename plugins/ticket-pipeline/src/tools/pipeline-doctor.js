@@ -16,6 +16,17 @@
  *    （走 `git ls-remote` 握手；连不上意味着 fetch/MR 全部失败）。
  * 3. **凭据**：用 credentials.describe()（只说配没配，绝不返回值）。
  * 4. **执行器/通知适配器**：是否还是 mock（mock 能跑通链路但不会真的改代码、发通知）。
+ * 5. **插件版本**：正在跑的这份安装副本，是不是比本地源码旧（见下）。
+ *
+ * ## 为什么要查版本
+ *
+ * 插件装进 profile 时落的是**目录副本**（跨盘 pnpm 不落硬链接），而 HMR 不监听
+ * 源码目录、`pnpm install` 也不会刷新它。于是「改完代码忘了同步」表现为
+ * **跑的是旧代码、但一句报错都没有** —— 最难查的一类故障。这一节把它变成
+ * 体检里的一行字，并给出同步命令。详见 `core/plugin-version.js`。
+ *
+ * 这一项只进 `warnings`、不进 `problems`：装的是旧版插件，票照样能跑完，
+ * 只是跑的可能是旧逻辑。把它算成「必须修复」会让人以为流水线不可用。
  *
  * ## 边界
  *
@@ -35,6 +46,7 @@
 
 import { defineTool, textBlocks } from './define.js'
 import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ } from '../contracts/git-status.js'
+import { comparePluginTrees, needsUpdate } from '../core/plugin-version.js'
 
 /**
  * @typedef {Object} DoctorOptions
@@ -43,6 +55,7 @@ import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ 
  * @property {{ describe?: (ref: string) => Promise<{ configured: boolean, source?: string } | undefined> } | null} [credentials]
  * @property {(runner: any, repoPath: string) => Promise<string>} [detectBaseBranch]
  * @property {(remote: string) => Promise<{ ok: boolean, reason?: string }>} [probeRemote]
+ * @property {() => Promise<any>} [comparePluginVersion] 覆盖版本比对（自测用；缺省读真实文件系统）
  */
 
 /**
@@ -248,6 +261,43 @@ lines.push(config.isolateWorktree === true
   ? 'ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）'
   : 'ℹ️ 改代码落点：项目工作区检出里（要求检出干净）')
 
+// ── 5. 插件版本 ──────────────────────────────────
+// 「跑的是旧代码」不会报错，只表现为旧行为，所以必须主动比一次。
+// 基准是 profile 里声明的 file:/link: 源码目录，比的是会真被加载的那些文件。
+// 只进 warnings：装旧版插件票照样跑得完，算成 problems 会让人以为流水线坏了。
+try {
+  const compare = typeof options.comparePluginVersion === 'function'
+    ? options.comparePluginVersion
+    : () => comparePluginTrees()
+  const version = await compare()
+  if (version?.ok === true && version.linked === true) {
+    lines.push(`✅ 插件版本：${version.reason || '安装目录就是源码'}`)
+  } else if (version?.ok === true) {
+    const needs = needsUpdate(version)
+    if (needs) {
+      const parts = []
+      if (version.stale.length > 0) parts.push(`${version.stale.length} 个文件内容不同`)
+      if (version.missing.length > 0) parts.push(`副本缺 ${version.missing.length} 个`)
+      if (version.extra.length > 0) parts.push(`副本多 ${version.extra.length} 个`)
+      const shown = [...version.stale, ...version.missing, ...version.extra].slice(0, 5).join('、')
+      warnings.push(
+        `插件不是最新：正在跑的安装副本比源码旧（${parts.join('，')}：${shown}`
+        + `${version.stale.length + version.missing.length + version.extra.length > 5 ? ' 等' : ''}）——`
+        + `此时跑的是旧代码，改动没生效。把 ${version.sourceDir} 同步到 ${version.installedDir}，然后重启宿主。`,
+      )
+      lines.push(`⚠️ 插件版本：安装副本比源码旧（${parts.join('，')}）`)
+      lines.push(`　源码 ${version.sourceFingerprint} ↔ 副本 ${version.installedFingerprint}（共比 ${version.checked} 个文件）`)
+    } else {
+      lines.push(`✅ 插件版本：安装副本与源码一致（共比 ${version.checked} 个文件，指纹 ${version.sourceFingerprint}）`)
+    }
+  } else {
+    // 比不出来不算故障：可能是从 registry 装的、或 profile 结构不是预期的。
+    lines.push(`ℹ️ 插件版本：无法比对（${String(version?.reason ?? '').trim() || '原因未知'}）`)
+  }
+} catch (error) {
+  lines.push(`ℹ️ 插件版本：检查失败（${error?.message ?? String(error)}）`)
+}
+
 // ── 汇总 ─────────────────────────────────────────
 const ok = problems.length === 0
 const summary = ok
@@ -279,7 +329,8 @@ export function createPipelineDoctorTool (options) {
   return defineTool({
     name: 'pipeline_doctor',
     description:
-      '体检当前机器环境：git 执行链路、各项目仓库路径与 remote、凭据配置、执行器与通知适配器状态。'
+      '体检当前机器环境：git 执行链路、各项目仓库路径与 remote、凭据配置、执行器与通知适配器状态，'
+      + '以及正在跑的插件是不是比本地源码旧。'
       + '安装插件后或跑票连续失败时先跑一次这个，一次看到全部环境问题。只读，不改任何东西。',
     parameters: {},
     outputSchema: { type: 'object' },

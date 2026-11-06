@@ -49,7 +49,11 @@ lib/
 插件详情页里本插件那一行有「配置」按钮，点进去是一整页：
 
 - **环境体检**：「立即体检」按钮跑 `runDoctor`（与对话里的 `pipeline_doctor` 同一份逻辑），
-  结果按「必须修复 / 提醒」分段显示。
+  结果按「必须修复 / 提醒」分段显示。最后一节是**插件版本自检**：比安装副本与本目录的
+  **文件内容**（`src/**/*.js`、`lib/**/*.js`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`），
+  落后时直接给出「把哪个目录同步到哪个目录，然后重启宿主」。
+  它只进「提醒」不进「必须修复」—— 旧版插件照样能把票跑完，只是行为不是你刚改的那份。
+  为什么不比版本号 / 不跟 origin 比 / 为什么 HMR 不会自己发现：见 `docs/ticket-pipeline/architecture.md` §12.11。
 - **凭据**：飞书 App ID / App Secret、QQ 邮箱授权码、PushPlus token；GitLab Token 也在这里，
   但只有项目打开 `repo.gitlab.enabled: true` 才需要（本阶段用不到），
   只写不读回（写入走 `ctx.get('remote.credentials')`，界面只显示「已配置 / 未配置」）。
@@ -177,7 +181,7 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**288 项断言，全绿 exit 0**，共 22 个小节（编号到 15，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节）。
+**294 项断言，全绿 exit 0**，共 22 个小节（编号到 15，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，但宿主服务全部打桩），
 其余测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 

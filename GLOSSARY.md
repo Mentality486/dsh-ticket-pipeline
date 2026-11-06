@@ -10,7 +10,8 @@
 | 指纹 | fingerprint | 工单内容的哈希。内容变了指纹就变，扫描靠它区分「新工单」和「旧工单被修订」 |
 | 水位 | watermark | 每个工单源的扫描进度记忆（见过的 recordId、上次扫描时间），支持持久化；适配器没接持久化时退化为进程内内存 |
 | 租约 | lease | 处理一张票前先从 `TicketStore` 拿的独占锁，带 TTL 与心跳续期，防止多个进程同时处理同一张票 |
-| 工作区 | worktree | 为一张票检出的独立 git worktree（默认 `<repo>/.agents/worktrees/`），改码、跑验证、提交都在里面，失败也不污染主工作区 |
+| 项目工作区 | project workspace | 一个项目对应的**固定本地检出**（`projects[].repo.path`，如 `D:/WorkSpace/mgiot-pms`），同时登记成宿主 Workspace。缺省（`isolateWorktree: false`）就在这份检出里改码、跑验证、本地提交 —— 所以开跑前要求它干净 |
+| 隔离 worktree | isolated worktree | 打开 `isolateWorktree: true` 时，为一张票单独开的 git worktree（`<repo>/.agents/worktrees/`），失败也不污染项目工作区。默认**不开** |
 | 仓库定位器 | repo locator | 把「工单里的模块名」翻译成「本地仓库路径 + 代码位置」的适配器（`locator-table`，配置驱动的映射表） |
 | 执行器 | work executor | 真正拿工单干活的角色（`executor-agent`）：读提示与截图、改码、跑验证、提交、开 MR。mock 执行器只演不动真格 |
 | 推送 | push | 把结果（完成 / 失败 / 需要补信息）通知人的适配器（PushPlus / QQ 邮箱 / mock） |
@@ -22,3 +23,5 @@
 | 工作表 | sheet | 电子表格里的一个页签（`sheet_id` / `title`）。对应多维表格里的「数据表」（`table_id`） |
 | 表头行 | header row | 电子表格里写着列名的那一行（默认第 1 行，`match.sheetHeaderRow` 可改）。不自动往下扫 —— 行号身份下表头行一变身份就变 |
 | 行身份 | row identity | 电子表格没有 `record_id`，身份由插件自造：`sh-seq-<序号值>`（默认，取序号列）或 `sh-row-<物理行号>`（序号为空时的兜底）。插行会让行号身份整体漂移 |
+| 安装副本 | installed copy | 宿主真正加载的那份插件代码，位于 profile 下（`~/.dsh/profiles/desktop/node_modules/@local/ticket-pipeline`）。**它不等于本仓库的源码目录**：跨盘 `file:` 依赖落成目录复制，改源码不会自动进去 |
+| 插件版本自检 | plugin version check | `pipeline_doctor` 第 5 节：按 profile 里声明的 `file:`/`link:` 源码路径，比对**安装副本与源码的文件内容**（只比会真被加载的那些文件）。落后就提示同步，结论只进「提醒」 |

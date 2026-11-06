@@ -43,6 +43,17 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, assertCleanCheckout } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
+import {
+  comparePluginTrees,
+  fingerprintOfEntries,
+  listComparedFiles,
+  needsUpdate,
+  normalizeForCompare,
+  pluginRootFromModuleUrl,
+  profileDirFromInstalledDir,
+  readLocalDependency,
+  resolveSpecPath,
+} from '../src/core/plugin-version.js'
 
 // ── 小工具 ────────────────────────────────────────────────
 
@@ -1129,6 +1140,49 @@ async function main () {
     assert.ok(!doneMsg.body.includes('失败原因'), '已完成的通知不该出现「失败原因」这一节')
   })
 
+  await check('可重试失败退避后跑成：setPhase 必须真的清掉上一轮的 lastError', async () => {
+    // 上一条用例走的是 resetByHuman —— 那条路径直接 put 整行，本来就把 lastError 抹了，
+    // 所以它根本碰不到 setPhase 的清除逻辑，用「清掉」与否都能通过（假绿）。
+    // 这里走真实的重试路径：执行器抛可重试错误 → 票回 pending 且写下 lastError，
+    // 下一轮跑成 → scheduler 传 `lastError: undefined` 表达「清掉」，必须真的生效。
+    // 真实事故：2026-11-06 的 pms 票跑成了 done，却还挂着上一轮
+    // `provider "workbuddy" has no configured model` —— 因为 setPhase 把 undefined 过滤掉了。
+    let boom = true
+    const flaky = {
+      id: 'flaky',
+      async run (ticket, target, ctx) {
+        if (boom) throw new PipelineError('rate-limit', '上游限流了，稍后再来')
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: [],
+          testOutcome: 'passed',
+          commit: { sha: 'mockflaky01', branch: ctx.branch ?? '', files: [] },
+        })
+      },
+    }
+    const { scheduler, store } = harness({ executor: flaky })
+
+    await scheduler.tick()
+    const retried = store.getTicket(k('rec-mock-001'))
+    assert.equal(retried.phase, 'pending', '可重试错误要让票留在队列里')
+    assert.match(retried.lastError ?? '', /rate-limit/, '退避时要写下这一轮的原因')
+
+    // 退避到期，再跑一轮 —— 这次成功
+    boom = false
+    await store.setPhase(k('rec-mock-001'), 'pending', { enqueuedAt: 0 })
+    store.listTickets()
+      .filter((r) => r.recordId !== 'rec-mock-001')
+      .forEach((r) => { r.phase = 'skipped' })
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '第二轮应该跑成')
+    assert.equal(row.lastError, undefined, '成功之后必须真的清掉上一轮的失败原因（不是靠 resetByHuman 兜的）')
+  })
+
   await check('pipeline_reset 把 failed 票放回队列，下一轮真的重跑', async () => {
     const { scheduler, store, executor } = harness({ executor: createMockExecutor({ outcome: 'failed' }) })
     await scheduler.tick()
@@ -1212,8 +1266,27 @@ async function main () {
 
   section('11.5 pipeline_doctor：环境体检')
 
+  // 版本比对缺省会读真实磁盘（安装副本 + profile 的 package.json）。自测要离线、
+  // 要不认这台机器的安装状态，所以每处都注入固定结果；真实比对另有 11.7 用假文件系统测。
+  const NO_VERSION_CHECK = {
+    comparePluginVersion: async () => ({
+      ok: false,
+      linked: false,
+      reason: '自测：不读真实磁盘',
+      sourceDir: '',
+      installedDir: '',
+      checked: 0,
+      stale: [],
+      missing: [],
+      extra: [],
+      sourceFingerprint: '',
+      installedFingerprint: '',
+    }),
+  }
+
   await check('pipeline_doctor 全绿：git 可用 + 仓库正常 + 凭据齐', async () => {
     const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       // status --porcelain 必须回空串：缺省模式下「检出干净」是能跑票的前提，
       // 回 'true' 会被当成一堆未提交改动（这条断言就是被它绊过）。
       gitRunner: async (argv) => ({
@@ -1235,6 +1308,7 @@ async function main () {
 
   await check('pipeline_doctor 报 git 不可用 + remote 连不上 + mock 提醒', async () => {
     const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async () => ({ code: 1, stdout: '', stderr: 'fatal: not a git repository' }),
       // 只有显式打开远程出口（repo.gitlab.enabled）才会去握手探测 remote。
       getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/nope', remote: 'http://gitlab.example.com/mk/pms.git', gitlab: { enabled: true } } }], workExecutor: 'mock', pushAdapter: 'mock' }),
@@ -1253,6 +1327,7 @@ async function main () {
     // gitlab.example.com 在有些内网部署里就是真服务器：按域名判占位符会把健康配置报成故障，
     // 而真正连不上的地址反而不一定长得像占位符。
     const make = (probeRemote) => createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => (argv[0] === 'ls-remote'
         ? { code: 0, stdout: '', stderr: '' }
         : { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
@@ -1273,6 +1348,7 @@ async function main () {
     // 没打开远程出口 -> 一次握手都不该发，且要说明「只做本地提交」。
     let probed = 0
     const noRemote = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
       getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
       credentials: { describe: async () => ({ configured: true }) },
@@ -1285,6 +1361,7 @@ async function main () {
 
   await check('pipeline_doctor 检出脏时要提醒（缺省模式每票都会被拒）', async () => {
     const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => {
         if (argv[0] === 'status') return { code: 0, stdout: ' M a.ts\0?? b.ts\0', stderr: '' }
         return { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }
@@ -1296,6 +1373,7 @@ async function main () {
     assert.ok(out.warnings.some((w) => w.includes('未提交改动')), `脏检出要提醒：${JSON.stringify(out.warnings)}`)
     // 打开隔离开关后就不该再拿「检出脏」说事：那时每票有自己的目录。
     const isolated = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
       getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: true }),
       credentials: { describe: async () => ({ configured: true }) },
@@ -1308,6 +1386,7 @@ async function main () {
   await check('pipeline_doctor 会显示自动识别出的基准分支，并在回退 main 时提醒', async () => {
     // 分支名猜错是这个插件最贵的一种错：fetch 第一步就失败，错误里看不出是分支名问题。
     const base = {
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
       credentials: { describe: async () => ({ configured: true }) },
       getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
@@ -1326,6 +1405,7 @@ async function main () {
   await check('pipeline_doctor 显式配了 repo.baseBranch 就不再去识别', async () => {
     let called = false
     const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
       credentials: { describe: async () => ({ configured: true }) },
       detectBaseBranch: async () => { called = true; return 'main' },
@@ -1338,6 +1418,7 @@ async function main () {
 
   await check('pipeline_doctor 在 gitRunner 缺席时给出明确指引', async () => {
     const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
       gitRunner: null,
       getConfig: () => ({ projects: [] }),
       credentials: null,
@@ -1346,6 +1427,313 @@ async function main () {
     assert.equal(out.ok, false)
     assert.ok(out.text.includes('git'), '要点出 git 不可用')
     assert.ok(out.text.includes('projects 为空') === false || out.warnings.length > 0, '空项目要提醒')
+  })
+
+  // 版本检查这一节的三种结论都要能看见：一致 / 落后 / 比不出来。
+  // 落后者必须同时进 warnings（人要被告知）和正文（同一份 text 给 GUI 与 agent）。
+  await check('pipeline_doctor 报告插件版本落后，并给出同步命令', async () => {
+    const stale = (extra = {}) => ({
+      ok: true,
+      linked: false,
+      reason: '',
+      sourceDir: 'D:/src/plugins/ticket-pipeline',
+      installedDir: 'C:/Users/x/.dsh/profiles/desktop/node_modules/@local/ticket-pipeline',
+      checked: 12,
+      stale: ['src/index.js', 'src/tools/pipeline-doctor.js'],
+      missing: ['src/core/plugin-version.js'],
+      extra: [],
+      sourceFingerprint: 'a1b2c3d4',
+      installedFingerprint: 'e5f6a7b8',
+      ...extra,
+    })
+    const tool = createPipelineDoctorTool({
+      comparePluginVersion: async () => stale(),
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    // 装的是旧版插件，票照样跑得完 —— 不能算成「必须修复」。
+    assert.equal(out.ok, true, `版本落后不该挡住跑票：${out.text}`)
+    assert.equal(out.problems.length, 0, '不该进 problems')
+    assert.ok(out.warnings.some((w) => w.includes('插件不是最新')), `要提醒插件不是最新：${JSON.stringify(out.warnings)}`)
+    assert.ok(out.text.includes('src/index.js'), '要点名哪些文件不同')
+    assert.ok(out.text.includes('重启宿主'), '要给出它该怎么做')
+    assert.ok(out.text.includes('a1b2c3d4') && out.text.includes('e5f6a7b8'), '要印两边的指纹，方便贴到对话里')
+
+    // 一致时说一致，不制造噪音。
+    const same = createPipelineDoctorTool({
+      comparePluginVersion: async () => stale({ stale: [], missing: [] }),
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [] }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out2 = await same.execute({}, {})
+    assert.ok(!out2.warnings.some((w) => w.includes('插件不是最新')), '一致时不该提醒更新')
+    assert.ok(out2.text.includes('安装副本与源码一致'), `一致要说清：${out2.text}`)
+
+    // 链接安装（源码目录就是运行目录）永远是最新，不能说它落后。
+    const linked = createPipelineDoctorTool({
+      comparePluginVersion: async () => stale({ linked: true, reason: '安装目录是指向源码的链接，改完即生效', stale: [], missing: [] }),
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [] }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out3 = await linked.execute({}, {})
+    assert.ok(!out3.warnings.some((w) => w.includes('插件不是最新')), '链接安装不该报落后')
+    assert.ok(out3.text.includes('链接'), `链接安装要说清为什么不用更新：${out3.text}`)
+
+    // 比不出来（从 registry 装的、profile 结构不认识）只说明一句，不算故障。
+    const unknown = createPipelineDoctorTool({
+      comparePluginVersion: async () => ({ ok: false, linked: false, reason: 'profile 里没有 file:/link: 声明', sourceDir: '', installedDir: '', checked: 0, stale: [], missing: [], extra: [], sourceFingerprint: '', installedFingerprint: '' }),
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [] }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out4 = await unknown.execute({}, {})
+    assert.equal(out4.ok, true, '比不出来不该算问题')
+    assert.ok(out4.text.includes('无法比对'), `要说清是比不出来：${out4.text}`)
+    assert.ok(!out4.text.includes('插件不是最新'), '比不出来不能说它落后')
+  })
+
+  // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
+  await check('plugin-version：profile 声明解析与链接安装识别', async () => {
+    // profile 的 package.json 只认 file:/link:，版本号形态说明来自 registry。
+    assert.deepEqual(
+      readLocalDependency('{"dependencies":{"@local/ticket-pipeline":"file:D:/src/plugins/ticket-pipeline"}}', '@local/ticket-pipeline'),
+      { kind: 'file', specPath: 'D:/src/plugins/ticket-pipeline' },
+    )
+    assert.deepEqual(
+      readLocalDependency('{"devDependencies":{"@local/x":"link:../x"}}', '@local/x'),
+      { kind: 'link', specPath: '../x' },
+    )
+    assert.equal(readLocalDependency('{"dependencies":{"@local/x":"^1.0.0"}}', '@local/x'), null, '版本号形态没有本地源码可比')
+    assert.equal(readLocalDependency('{"dependencies":{}}', '@local/x'), null)
+    assert.equal(readLocalDependency('not json', '@local/x'), null, '坏 JSON 不能抛')
+    assert.equal(readLocalDependency('{"dependencies":{"@local/x":"workspace:*"}}', '@local/x'), null, 'workspace: 不是本地目录')
+
+    // 相对路径按 profile 目录解析；盘符绝对路径原样用。
+    assert.ok(resolveSpecPath('C:/p', 'D:/src').toUpperCase().startsWith('D:'), '盘符绝对路径要原样用')
+    assert.ok(resolveSpecPath('C:/p', '../x').replace(/\\/g, '/').endsWith('/x'), '相对路径要按 profile 目录解析')
+    assert.ok(!resolveSpecPath('C:/p', '../x').includes('..'), '解析完不该还留着 ..')
+
+    // 安装路径 → profile 路径：往上是 scope、node_modules、profile。
+    const profileDir = profileDirFromInstalledDir('C:/p/node_modules/@local/x').replace(/\\/g, '/')
+    assert.equal(profileDir, 'C:/p')
+
+    // 模块 URL → 插件根：src/core/xxx.js 往上两级。
+    assert.equal(pluginRootFromModuleUrl('file:///D:/src/plugins/ticket-pipeline/src/core/plugin-version.js').replace(/\\/g, '/'), 'D:/src/plugins/ticket-pipeline')
+  })
+
+  await check('plugin-version：能比出内容差异、缺文件、多文件', async () => {
+    /** 造一个内存假文件系统：{ 绝对路径: 内容 } 与 { 绝对路径: [子项] }。 */
+    const makeIo = (files, dirs) => ({
+      async readFile (path) {
+        const key = String(path).replace(/\\/g, '/')
+        if (!(key in files)) throw new Error(`ENOENT: ${key}`)
+        return files[key]
+      },
+      async readdir (path) {
+        const key = String(path).replace(/\\/g, '/')
+        if (!(key in dirs)) throw new Error(`ENOENT: ${key}`)
+        return dirs[key]
+      },
+      async realpath (path) { return String(path).replace(/\\/g, '/') },
+    })
+
+    const src = 'D:/src/plugins/ticket-pipeline'
+    const ins = 'C:/p/node_modules/@local/ticket-pipeline'
+    const dir = (names) => names.map((name) => ({ name, isDirectory: !name.includes('.') }))
+
+    const files = {
+      // 源码
+      [`${src}/src/index.js`]: 'export const a = 1\n',
+      [`${src}/src/core/stale.js`]: 'export const b = 1\n',
+      [`${src}/src/core/missing.js`]: 'export const c = 1\n',
+      [`${src}/cordis.patch.yml`]: 'insert: []\n',
+      [`${src}/icon.svg`]: '<svg/>\n',
+      [`${src}/locale/zh.json`]: '{"a":1}\n',
+      // 副本：index.js 一致、stale.js 内容不同（且是 CRLF，要被视为相同行尾而非差异）、
+      // missing.js 不存在、多出一个 old.js、README 不参与比对。
+      [`${ins}/src/index.js`]: 'export const a = 1\n',
+      [`${ins}/src/core/stale.js`]: 'export const b = 2\n',
+      [`${ins}/src/core/old.js`]: 'export const gone = 1\n',
+      [`${ins}/cordis.patch.yml`]: 'insert: []\r\n',
+      [`${ins}/icon.svg`]: '<svg/>\n',
+      [`${ins}/locale/zh.json`]: '{"a":1}\n',
+      [`${ins}/README.md`]: '# 文档变了不算落后\n',
+    }
+    const dirs = {
+      [`${src}`]: [
+        { name: 'src', isDirectory: true },
+        { name: 'locale', isDirectory: true },
+        { name: 'cordis.patch.yml', isDirectory: false },
+        { name: 'icon.svg', isDirectory: false },
+      ],
+      [`${src}/src`]: [{ name: 'index.js', isDirectory: false }, { name: 'core', isDirectory: true }],
+      [`${src}/src/core`]: [{ name: 'stale.js', isDirectory: false }, { name: 'missing.js', isDirectory: false }],
+      [`${src}/locale`]: [{ name: 'zh.json', isDirectory: false }],
+      [`${ins}`]: [
+        { name: 'src', isDirectory: true },
+        { name: 'locale', isDirectory: true },
+        { name: 'cordis.patch.yml', isDirectory: false },
+        { name: 'icon.svg', isDirectory: false },
+        { name: 'README.md', isDirectory: false },
+      ],
+      [`${ins}/src`]: [{ name: 'index.js', isDirectory: false }, { name: 'core', isDirectory: true }],
+      [`${ins}/src/core`]: [{ name: 'stale.js', isDirectory: false }, { name: 'old.js', isDirectory: false }],
+      [`${ins}/locale`]: [{ name: 'zh.json', isDirectory: false }],
+    }
+
+    const result = await comparePluginTrees({ sourceDir: src, installedDir: ins, io: makeIo(files, dirs) })
+    assert.equal(result.ok, true, `比对该成功：${result.reason}`)
+    assert.equal(result.linked, false)
+    assert.deepEqual(result.stale, ['src/core/stale.js'], `只有内容真不同的才算旧：${JSON.stringify(result.stale)}`)
+    assert.deepEqual(result.missing, ['src/core/missing.js'], '源码有、副本没有 = 缺')
+    assert.deepEqual(result.extra, ['src/core/old.js'], '副本有、源码没有 = 多（旧模块留着照样会被 import）')
+    assert.ok(result.checked > 0, '要记一共比了几个')
+    assert.notEqual(result.sourceFingerprint, result.installedFingerprint, '不一致时两个指纹必须不同')
+    assert.equal(needsUpdate(result), true, '有差异就要更新')
+
+    // 行尾差异不算差异：robocopy / git clone 会给出 CRLF，内容其实一样。
+    assert.equal(normalizeForCompare('a\r\nb'), 'a\nb')
+    assert.equal(normalizeForCompare('a\nb'), 'a\nb')
+    assert.notEqual(normalizeForCompare('a\nb'), normalizeForCompare('a\n b'), '空白差异仍算差异')
+
+    // 完全一致时指纹相同、不需要更新。
+    // 造法：源码那一份照旧，副本那一份**逐字复制源码内容**（清单也照源码的，
+    // 免得副本多出来的 old.js 让「一致」这句话失真）。
+    const sameFiles = { ...files }
+    for (const [key, value] of Object.entries(files)) {
+      if (key.startsWith(src)) sameFiles[`${ins}${key.slice(src.length)}`] = value
+    }
+    delete sameFiles[`${ins}/README.md`]
+    const sameDirs = {
+      ...dirs,
+      [`${ins}/src/core`]: [{ name: 'stale.js', isDirectory: false }, { name: 'missing.js', isDirectory: false }],
+    }
+    const identical = await comparePluginTrees({
+      sourceDir: src,
+      installedDir: ins,
+      io: makeIo(sameFiles, sameDirs),
+    })
+    assert.equal(identical.ok, true, `一致场景的比对也该成功：${identical.reason}`)
+    assert.deepEqual(identical.stale, [])
+    assert.deepEqual(identical.missing, [])
+    assert.deepEqual(identical.extra, [])
+    assert.equal(identical.sourceFingerprint, identical.installedFingerprint, '内容一致时指纹必须相同')
+    assert.equal(needsUpdate(identical), false, '一致就不该催更新')
+
+    // 指纹对内容敏感、对顺序稳定。
+    assert.equal(fingerprintOfEntries([{ path: 'a.js', text: 'x' }]), fingerprintOfEntries([{ path: 'a.js', text: 'x' }]))
+    assert.notEqual(fingerprintOfEntries([{ path: 'a.js', text: 'x' }]), fingerprintOfEntries([{ path: 'a.js', text: 'y' }]))
+    assert.notEqual(fingerprintOfEntries([{ path: 'a.js', text: 'xy' }]), fingerprintOfEntries([{ path: 'a.js', text: 'x' }, { path: 'b.js', text: 'y' }]), '路径也要参与指纹')
+  })
+
+  await check('plugin-version：链接安装 / 目录不存在 / 声明缺失都不抛', async () => {
+    const src = 'D:/src/plugins/ticket-pipeline'
+    const ins = 'C:/p/node_modules/@local/ticket-pipeline'
+    const io = {
+      async readFile (path) {
+        const key = String(path).replace(/\\/g, '/')
+        if (key === 'C:/p/package.json') return '{"dependencies":{"@local/ticket-pipeline":"file:D:/src/plugins/ticket-pipeline"}}'
+        throw new Error(`ENOENT: ${key}`)
+      },
+      async readdir (path) {
+        const key = String(path).replace(/\\/g, '/')
+        if (key === `${src}/src`) return [{ name: 'index.js', isDirectory: false }]
+        if (key === `${ins}/src`) return [{ name: 'index.js', isDirectory: false }]
+        throw new Error(`ENOENT: ${key}`)
+      },
+      // 副本是源码的链接：realpath 归一后相同，必须判成「改完即生效」。
+      async realpath (path) { return String(path).replace(/\\/g, '/').replace(ins, src) },
+    }
+    const linked = await comparePluginTrees({ installedDir: ins, io })
+    assert.equal(linked.ok, true, `链接安装该判成功：${linked.reason}`)
+    assert.equal(linked.linked, true, '要认出是链接')
+    assert.equal(needsUpdate(linked), false, '链接安装永远不需要更新')
+
+    // profile 里没有本地来源声明（例如从 registry 装的）：说明原因，别抛。
+    const noDecl = await comparePluginTrees({
+      installedDir: ins,
+      io: {
+        async readFile () { return '{"dependencies":{"@local/ticket-pipeline":"1.0.0"}}' },
+        async readdir () { throw new Error('不该走到这') },
+        async realpath (path) { return path },
+      },
+    })
+    assert.equal(noDecl.ok, false)
+    assert.ok(noDecl.reason.includes('file:/link:'), `要说清为什么比不了：${noDecl.reason}`)
+    assert.equal(needsUpdate(noDecl), false, '比不出来不能说它落后')
+
+    // profile 的 package.json 读不到。
+    const noManifest = await comparePluginTrees({
+      installedDir: ins,
+      io: {
+        async readFile () { throw new Error('ENOENT: package.json') },
+        async readdir () { throw new Error('不该走到这') },
+        async realpath (path) { return path },
+      },
+    })
+    assert.equal(noManifest.ok, false)
+    assert.ok(noManifest.reason.includes('package.json'), `要指出读不到哪个文件：${noManifest.reason}`)
+
+    // 源码目录根本列不出来。
+    const noSource = await comparePluginTrees({
+      installedDir: ins,
+      sourceDir: 'D:/nope',
+      io: {
+        async readFile () { throw new Error('ENOENT') },
+        async readdir () { throw new Error('ENOENT: 目录不存在') },
+        async realpath (path) { return path },
+      },
+    })
+    assert.equal(noSource.ok, false)
+    assert.ok(noSource.reason.length > 0, '失败必须带原因，不能只是 ok:false')
+
+    // 空源码目录（配错路径）：说清是路径可能配错了，而不是「一致」。
+    const emptySource = await comparePluginTrees({
+      installedDir: ins,
+      sourceDir: src,
+      io: {
+        async readFile () { throw new Error('ENOENT') },
+        async readdir () { return [] },
+        async realpath (path) { return path },
+      },
+    })
+    assert.equal(emptySource.ok, false)
+    assert.ok(emptySource.reason.includes('配错'), `空目录要说可能是路径配错：${emptySource.reason}`)
+  })
+
+  await check('plugin-version：listComparedFiles 只收会加载的文件', async () => {
+    // README.md、scripts/ 变了不影响行为 —— 报出来只会让人以为必须重装。
+    const root = 'D:/p'
+    const io = async (path) => {
+      const key = String(path).replace(/\\/g, '/')
+      if (key === root) {
+        // 根目录决定单文件清单：icon.svg 这里故意不给，验证「只有真存在的才比」。
+        return [
+          { name: 'src', isDirectory: true },
+          { name: 'lib', isDirectory: true },
+          { name: 'locale', isDirectory: true },
+          { name: 'cordis.patch.yml', isDirectory: false },
+          { name: 'README.md', isDirectory: false },
+        ]
+      }
+      if (key === `${root}/src`) return [{ name: 'index.js', isDirectory: false }, { name: 'core', isDirectory: true }, { name: 'README.md', isDirectory: false }]
+      if (key === `${root}/src/core`) return [{ name: 'a.js', isDirectory: false }, { name: 'b.ts', isDirectory: false }]
+      if (key === `${root}/lib`) return [{ name: 'client.js', isDirectory: false }]
+      if (key === `${root}/locale`) return [{ name: 'zh.json', isDirectory: false }, { name: 'notes.txt', isDirectory: false }]
+      throw new Error(`ENOENT: ${key}`)
+    }
+    const listed = await listComparedFiles(root, io)
+    assert.deepEqual(listed, [
+      'cordis.patch.yml',
+      'lib/client.js',
+      'locale/zh.json',
+      'src/core/a.js',
+      'src/index.js',
+    ], `要比的文件清单：${JSON.stringify(listed)}`)
   })
 
   section('12. 组合根接线：工具真的注册进 ctx、真的拿到 store')

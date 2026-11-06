@@ -172,7 +172,7 @@ flowchart TD
 flowchart LR
     T1[pipeline_scan<br/>立刻扫一轮] --> Q([队列])
     T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch] --> Q
-    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>GITLAB_TOKEN 未配只提示不告警] --> Q
+    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警] --> Q
     T4[pipeline_reset<br/>failed/needs-info/gone 放回重跑] --> Q
     T5[pipeline_cancel<br/>取消正在跑的那张票] --> Q
 ```
@@ -181,7 +181,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线：HEAD `b7424d7`（2026-11-06）+ 工作区坐标失效复检（陈旧 `worktreePath` 不再被复用），自测 288/288 + 链路冒烟 11/11。
+状态基线：HEAD `2158e41`（2026-11-06）+ 插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码），自测 294/294 + 链路冒烟 11/11。
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |

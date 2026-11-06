@@ -396,7 +396,7 @@ window.__ModuleLoader__.load({
             }, props.busy ? '体检中…' : '立即体检'))),
         props.available
           ? h('p', { className: 'tp-note' },
-            '检查 git 链路、项目仓库与远端、凭据配置、执行器与通知适配器。只读，不改任何东西。')
+            '检查 git 链路、项目仓库与远端、凭据配置、执行器与通知适配器，以及正在跑的插件是不是比本地源码旧。只读，不改任何东西。')
           : h('p', { className: 'tp-err' },
             '宿主 Remote 没挂上（typert 服务缺席）。命令行里仍然可以跑 pipeline_doctor 工具。'),
         report

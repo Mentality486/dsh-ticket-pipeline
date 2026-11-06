@@ -22,6 +22,7 @@
 11. [一次完整跑的时序](#11-一次完整跑的时序)
 12. [已知约束与未决](#12-已知约束与未决)
     - [12.10 飞书电子表格支持（设计待实施）](#1210-飞书电子表格支持设计待实施)
+    - [12.11 插件改动为什么会静默不生效](#1211-插件改动为什么会静默不生效pipeline_doctor-第-5-节)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -188,7 +189,7 @@ async function tick () {
 | `pipeline_status` | 只读查队列与历史 | 不改任何状态 |
 | `pipeline_cancel` | 取消当前在跑的那一票 | 落 `failed` + `lastError='cancelled by user'`，**不通知**，工作区保留；空闲时返回 `cancelled:false` |
 | `pipeline_reset` | 人工重开一张卡住的票 | 只对 `failed` / `needs-info` / `gone` 生效；同名 recordId 冲突时要求补 `projectId`，不猜 |
-| `pipeline_doctor` | 环境体检（只读） | 查 git 链路 / 每个项目仓库能否 `ls-remote` / 凭据有没有 / 执行器与通知器配的是哪个；不改任何东西 |
+| `pipeline_doctor` | 环境体检（只读） | 查 git 链路 / 每个项目仓库能否 `ls-remote` / 凭据有没有 / 执行器与通知器配的是哪个；以及**正在跑的安装副本是不是比本地源码旧**（只进「提醒」，不改任何东西） |
 
 `pipeline_reset` 与「把表格里『是否处理』拨走再拨回 `statusValues` 里的值」是**同一个底层动作**（`store.resetByHuman`），区别只在于一个在表格里做、一个在插件里做。
 
@@ -933,6 +934,7 @@ src/
 │   ├── config.js                  ← Config 校验（CONFIG_FIELDS + projects[]）
 │   ├── workspace.js               ← 项目工作区：repo.path ↔ 宿主 workspaceRegistry 的登记
 │   ├── worktree-path.js           ← isIsolatedWorktreePath（清理前的前缀校验，防误删主检出）
+│   ├── plugin-version.js          ← 安装副本 vs 源码的文件级比对（判断「跑的是不是最新代码」）
 │   ├── domain.js                  ← 平台无关的小工具（ID 归一、时间等）
 │   ├── branch-name.js             ← 分支名 sanitize
 │   ├── prompt.js                  ← 给 agent 的 task 文案拼装（纯文本 + 图片块）
@@ -971,7 +973,7 @@ src/
 │   ├── pipeline-status.js         ← 工具 pipeline_status（只读查询队列与历史）
 │   ├── pipeline-cancel.js         ← 工具 pipeline_cancel（人工取消在跑的那一票）
 │   ├── pipeline-reset.js          ← 工具 pipeline_reset（人工重开 failed / needs-info / gone）
-│   ├── pipeline-doctor.js         ← 工具 pipeline_doctor（环境体检：git / 仓库 / 凭据 / 通知）
+│   ├── pipeline-doctor.js         ← 工具 pipeline_doctor（环境体检：git / 仓库 / 凭据 / 通知 / 插件版本）
 │   └── define.js                  ← 工具定义的最小封装（名字校验、文本块渲染）
 └── index.js                       ← 组合根：三张注册表 + 能力装配器 + apply
 ```
@@ -1432,6 +1434,39 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 
 完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`；
 决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
+
+### 12.11 插件改动为什么会静默不生效（`pipeline_doctor` 第 5 节）
+
+宿主加载的不是本仓库的源码目录，而是 profile 下的一份**目录副本**
+（`~/.dsh/profiles/desktop/node_modules/@local/ticket-pipeline`）。三件事叠起来，导致「改了没生效」且**没有任何报错**：
+
+1. **`file:` 依赖是复制不是软链**。profile 的 `package.json` 写的是
+   `"@local/ticket-pipeline": "file:D:/WorkSpace/dsh-ticket-pipeline/plugins/ticket-pipeline"`，
+   但源在 `D:`、pnpm store 在 `C:` —— 跨盘时 pnpm 落成目录副本（同盘才会硬链接）。
+   实测两侧 `src/index.js` 的 `fsutil file queryfileid` 是两个不同 ID，`LinkType` 为空。
+2. **`pnpm install` 不会刷新它**：输出 `Lockfile is up to date` / `Already up to date`，一个字节都不动。
+3. **HMR 不会自己发现**：base 组合里 `hmr` 的 `root: []`（不监听源码目录），默认 `ignored` 还含 `node_modules`。
+   只有 profile 重组（改 `cordis.patch.yml` / 走 Plugin Manager 操作）时才会比对
+   `node_modules` 下已加载文件的 mtime/size 并替换 —— 也就是**偶然**生效，不能依赖。
+   另外浏览器侧模块图走独立加载机制，`lib/client.js` 改了必须刷新页面。
+
+⇒ 所以 `runDoctor()` 第 5 节（`src/core/plugin-version.js`）比的是**安装副本与源码的文件内容**：
+
+- **基准是 profile 里声明本包的那条 `file:` / `link:` 路径**，不是 `package.json` 的 `version`
+  （两侧都是 `0.1.0-test.1`，比了没用），也不是 `origin`（本阶段交付形态是工作区里的本地提交，
+  origin 长期落后本地，方向反了）。
+- **只比会真被加载的文件**：`src/**/*.js`、`lib/**/*.js`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`。
+  `README.md` / `scripts/` 不比，否则改文档就误报。
+- **链接安装直接判过**：`installedDir` 不含 `node_modules`（从源码直接跑）或两侧 `realpath` 相同 ⇒ `linked: true`。
+  profile 目录不硬套三层相对路径，`findProfileDir()` 沿路向上最多 6 层找真的声明了本包的那份 `package.json`。
+- **只进 `warnings` 不进 `problems`**：装旧版插件票照样能跑完，记成 `problems` 会让人以为流水线坏了。
+  落后时文案直接给出「把 `<sourceDir>` 同步到 `<installedDir>`，然后重启宿主」。
+- 比对器**绝不抛**：路径不存在、profile 声明缺失、源码目录里没有可比文件，全部走 `ok: false` + `reason`，
+  `runDoctor` 把它渲染成 `ℹ️ 插件版本：无法比对（<原因>）`。
+
+同一份 `doctorOptions` 同时喂 `ctx.tools.register(createPipelineDoctorTool(...))` 与
+`new TicketPipelineRemote({ doctorOptions })`（`src/index.js:974-1004`），所以对话里的
+`pipeline_doctor` 与设置页「立即体检」按钮的版本结论天然一致，不需要两处维护。
 
 ## 13. 事实来源
 

@@ -116,7 +116,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 | 区块 | 干什么 |
 |---|---|
-| 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知），结果按「必须修复」「提醒」分段 |
+| 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
 | 配置 | 30 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
 | 项目清单 | `projects[]` 是结构化数组，**不在表单里**，仍按下文手改配置 |
@@ -273,7 +273,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 | `pipeline_status` | 看所有票的当前阶段、本地提交（sha + 分支）与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
-| `pipeline_doctor` | 体检：git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知，结论按「必须修复」「提醒」分段 |
+| `pipeline_doctor` | 体检：git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**，结论按「必须修复」「提醒」分段 |
 
 ### 4.3 切换真执行
 
@@ -332,7 +332,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 288 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 294 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -450,6 +450,31 @@ descriptor 没挂上，或字段没标 `meta.volatile`。宿主对这种情况�
 **Q：在设置页改了配置，为什么行为没立刻变？**
 本插件 `~standard.vendor` 不是 `schemastery`，loader 判定为「整对象换掉」而非按 volatile 字段热更，
 所以保存后插件会重新加载一次。跑票中途保存不影响已经发出的那次 tick。
+
+**Q：怎么知道插件跑的是不是最新代码？**
+跑一次 `pipeline_doctor`（或设置页点「立即体检」），看最后一行：
+
+| 输出 | 含义 |
+|---|---|
+| `✅ 插件版本：安装副本与源码一致（共比 N 个文件，指纹 xxx）` | 最新，不用管 |
+| `✅ 插件版本：安装目录就是源码（…）` | 从源码目录直接跑（`link:` 安装），本来就没有副本要同步 |
+| `⚠️ 插件不是最新：…（N 个文件内容不同，副本缺 N 个，副本多 N 个）` | **正在跑旧代码**，改动没生效；报告里直接给出同步命令 |
+| `ℹ️ 插件版本：无法比对（<原因>）` | profile 里没找到本包的 `file:` / `link:` 声明，或源码目录不在原位 |
+
+这条只进「提醒」不进「必须修复」：旧版插件照样能把票跑完，只是行为不是你刚改的那份。
+比的是**文件内容**（`src/**/*.js`、`lib/**/*.js`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`），
+不看 `package.json` 的 `version` —— 源码和副本的版本号本来就一样，也比不出新旧。
+
+**Q：改了插件代码，怎么让宿主跑上新代码？**
+三件事，少一件都不生效：
+
+1. **把源码同步到安装副本**（改的是 `D:/WorkSpace/dsh-ticket-pipeline/plugins/ticket-pipeline`，
+   宿主加载的是 `~/.dsh/profiles/desktop/node_modules/@local/ticket-pipeline`）。
+   `file:` 依赖是**跨盘复制**，不是软链；`pnpm install` 会说 `Already up to date` 而什么都不刷，别指望它。
+2. **让宿主重新加载**（重启宿主最稳；HMR 的 `root` 是空的，不监听源码目录，不会自己发现）。
+3. 如果改的是 `lib/client.js`（浏览器端），**还要刷新页面** —— 那一侧走独立的加载机制。
+
+同步完再跑一次 `pipeline_doctor`，看到 `✅ 插件版本：安装副本与源码一致` 就是真生效了。
 
 ---
 

@@ -189,7 +189,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 | `pipeline_status` | 看所有票的当前阶段、本地提交（sha + 分支）与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
-| `pipeline_doctor` | 环境体检：git 链路、各项目仓库与 remote、凭据、执行器与通知适配器 |
+| `pipeline_doctor` | 环境体检：git 链路、各项目仓库与 remote、凭据、执行器与通知适配器，以及**正在跑的插件是不是比本地源码旧** |
 
 ### 4.3 切换真执行
 
@@ -244,7 +244,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 288 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 294 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
