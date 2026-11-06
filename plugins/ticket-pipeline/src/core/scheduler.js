@@ -467,6 +467,30 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 另外执行器返回成功时不带 error，此时必须显式写 undefined，
       // 否则上一次失败的原因会一直挂在票上骗人。
       const finalLastError = result.error ? `${result.error.kind}: ${result.error.message}` : undefined
+      // 终态先落库，回填/通知后做 —— 这两步之间进程崩掉的话，票已经是 done 了，
+      // 而表格没回填、通知也没发。谁都发现不了：票在队列里看起来一切正常。
+      //
+      // 所以把「还没做完的事后动作」和终态**同一次写入**落库（pendingEffects），
+      // 各自成功后再逐个清掉。崩在中间时，下次启动 `replayPendingEffects()` 会补做。
+      // 只登记真的会去做的动作：writeBack 被配置关掉、或源没有 writeResult 时不算。
+      /** @type {any} */
+      const pendingEffects = {}
+      let writeBackPlanned = false
+      if (willWriteBack(source, finalPhase)) {
+        writeBackPlanned = true
+        pendingEffects.writeBack = {
+          phase: finalPhase,
+          plan: result.plan ?? row.plan,
+          commit: result.commit,
+          mr: result.mr,
+          changedFiles: result.changedFiles ?? row.changedFiles,
+          worktreePath: ws.worktreePath,
+          sessionId: result.sessionId,
+          verification: { outcome: result.testOutcome, detail: result.testDetail },
+        }
+      }
+      if (willNotify(finalPhase)) pendingEffects.notify = true
+
       await store.setPhase(key, finalPhase, {
         changedFiles: result.changedFiles ?? row.changedFiles,
         testOutcome: result.testOutcome,
@@ -476,6 +500,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         sessionId: result.sessionId,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
+        pendingEffects: Object.keys(pendingEffects).length > 0 ? pendingEffects : undefined,
       })
 
       // 回填工单表：只在「真的改完了」的时候写。failed 不写 —— 表里那一行还是
@@ -496,6 +521,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 写失败时人不用去表格里一行行找。
         await store.setPhase(key, finalPhase, { writeBack: writeBackReceipt })
       }
+      if (writeBackPlanned) await clearPendingEffect(key, 'writeBack')
 
       // 不铺 ...result：ExecResult 里的 error 是对象，铺进来会污染整个通知载荷。
       // 逐字段显式搬运，通知里读到的就是这次执行的结果而不是运行前的快照。
@@ -514,7 +540,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         mr: result.mr,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
+        // 回填结果要传给通知：表格没写成时通知正文里要如实写出来，
+        // 否则人只看通知会以为这票整条链路都成了。
+        writeBack: writeBackReceipt,
       }, handle.signal)
+      if (pendingEffects.notify) await clearPendingEffect(key, 'notify')
       await store.releaseLease(key)
       return true
     } catch (error) {
@@ -538,8 +568,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 既不标 failed 也不通知人，只是安静地再跑一遍，再超时一遍。
       if (isAbortError(normalized) || timedOut) {
         // 人工取消不通知；超时要通知（人不在电脑前，得知道卡住了）。
+        // 超时同样是「落库了但通知没发」的窗口，登记待办（取消路径不通知，不登记）。
         await store.setPhase(key, 'failed', {
           lastError: timedOut ? `超时 ${timeoutMinutes} 分钟` : 'cancelled by user',
+          pendingEffects: timedOut && willNotify('failed') ? { notify: true } : undefined,
         })
         if (timedOut) {
           // 这里**故意不传 handle.signal**：走到这一行时它必然已经 aborted，
@@ -555,6 +587,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             phase: 'failed',
             lastError: `超时 ${timeoutMinutes} 分钟`,
           })
+          if (willNotify('failed')) await clearPendingEffect(key, 'notify')
         }
         logInfo(timedOut ? '超时，已标 failed' : '被取消，已标 failed', { projectId, recordId, worktreePath: row.worktreePath })
         await store.releaseLease(key)
@@ -579,9 +612,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         })
         logInfo('可重试错误，退避后再来', { projectId, recordId, attempt, kind: normalized.kind, retryInMs: waitMs })
       } else {
+        // 失败也是终态，同样有「落库了但通知没发」的窗口：DSH 重启一次，
+        // 人就永远不知道这票失败了。所以和 done/skipped 一样先登记待办。
+        // 失败不回填（表里那行留在「处理中」是刻意留的信号），所以只有 notify。
         await store.setPhase(key, 'failed', {
           attempt,
           lastError: `${normalized.kind}: ${normalized.message}`,
+          pendingEffects: willNotify('failed') ? { notify: true } : undefined,
         })
         // 工作区坐标要带 ws 的值，不能用 ...row：row 是进 runOne 时的快照，
         // 首次运行时里面根本没有 worktreePath，失败的票明明留着工作区，
@@ -594,6 +631,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           phase: 'failed',
           lastError: `${normalized.kind}: ${normalized.message}`,
         }, handle.signal)
+        if (willNotify('failed')) await clearPendingEffect(key, 'notify')
         logInfo('失败，已通知', { projectId, recordId, kind: normalized.kind, worktreePath: ws.worktreePath })
       }
       await store.releaseLease(key)
@@ -674,6 +712,102 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     }
     if (saved > 0) logInfo(`已存 ${saved} 张截图`, { projectId: ticket.projectId, recordId: ticket.recordId })
     return images
+  }
+
+  // ── 事后动作（回填 / 通知）的登记与补偿 ────────────────
+
+  /**
+   * 这个终态会不会真的去回填工单表。
+   *
+   * 只登记**真的会执行**的动作：`writeBack: false` 或源没实现 `writeResult` 时
+   * 不写 pendingEffects —— 否则每次启动都会捞到一批永远做不完的票。
+   *
+   * @param {TicketSource | undefined} source
+   * @param {Phase} phase
+   * @returns {boolean}
+   */
+  function willWriteBack (source, phase) {
+    if (config.writeBack === false) return false
+    if (typeof source?.writeResult !== 'function') return false
+    if (phase !== 'done' && phase !== 'skipped') return false
+    return true
+  }
+
+  /**
+   * 这个阶段会不会真的发通知（同一份 notifyOn 判定，登记与执行必须一致）。
+   * @param {Phase | undefined} phase
+   * @returns {boolean}
+   */
+  function willNotify (phase) {
+    if (!phase) return false
+    const notifyOn = Array.isArray(config.notifyOn) ? config.notifyOn : ['done', 'skipped', 'failed', 'needs-info']
+    return notifyOn.includes(phase)
+  }
+
+  /**
+   * 清掉一个事后动作标记（不动 finishedAt —— 那是「何时到终态」，补做动作不该改它）。
+   * @param {string} key
+   * @param {'writeBack'|'notify'} name
+   */
+  async function clearPendingEffect (key, name) {
+    await store.clearPendingEffect(key, name)
+  }
+
+  /**
+   * 启动补偿：把「已经到了终态、但事后动作没做完」的票补做一遍（用户 2026-11-06 要求）。
+   *
+   * 场景是真会发生的：终态 `setPhase` 落库之后、回填/通知之前，进程被关掉（DSH 重启、
+   * 崩溃、机器休眠后被杀）。没有这一步的话，票在队列里看起来一切正常，表格却永远停在
+   * 「处理中」，人也从来没收到通知 —— 而且没有任何地方会提示这一点。
+   *
+   * 两条纪律：
+   * 1. **回填幂等**：写的是同样的「是否处理 / 处理结果 / 处理日期」三列，补做只是再写一次；
+   * 2. **通知补发要在日志里说清楚**：人可能已经看过一次通知，重发时必须能看出这是补发，
+   *    否则会以为是新的一轮。
+   *
+   * @param {{ signal?: AbortSignal }} [options]
+   * @returns {Promise<number>} 补做了几个动作（给日志/自测用）
+   */
+  async function replayPendingEffects (options = {}) {
+    const signal = options.signal
+    const pending = store.listTickets().filter((row) => (
+      row.pendingEffects && TERMINAL.includes(row.phase)
+    ))
+    if (pending.length === 0) return 0
+
+    logInfo(`启动补偿：有 ${pending.length} 张票的事后动作没做完，开始补做`, {
+      keys: pending.map((row) => `${row.projectId}/${row.recordId}`),
+    })
+
+    let replayed = 0
+    for (const row of pending) {
+      if (signal?.aborted) break
+      const ticket = rowToTicket(row)
+      const source = sourceByProject.get(row.projectId) ?? (sources.length === 1 ? sources[0] : undefined)
+      const effects = row.pendingEffects ?? {}
+
+      if (effects.writeBack) {
+        const receipt = await writeBackFor(source, ticket, effects.writeBack, signal)
+        if (receipt !== undefined) {
+          await store.setPhase(row.key, row.phase, { writeBack: receipt })
+        }
+        await clearPendingEffect(row.key, 'writeBack')
+        replayed += 1
+      }
+
+      if (effects.notify) {
+        const current = store.getTicket(row.key) ?? row
+        logInfo('补发通知（上次进程在回填/通知之间退出了，这条是补发不是新一轮）', {
+          projectId: row.projectId,
+          recordId: row.recordId,
+          phase: current.phase,
+        })
+        await notifyFor(ticket, { ...current, phase: current.phase }, signal)
+        await clearPendingEffect(row.key, 'notify')
+        replayed += 1
+      }
+    }
+    return replayed
   }
 
   // ── 回填工单表 ──────────────────────────────────────────
@@ -926,6 +1060,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     scanAndEnqueue,
     cleanupExpiredWorktrees,
     cancelActive,
+    replayPendingEffects,
     get isRunning () {
       return running
     },
@@ -1012,6 +1147,12 @@ function renderNotifyBody (ticket, row, phase) {
     if (row.testOutcome === 'passed') lines.push('验证：通过')
     else if (row.testOutcome === 'skipped') lines.push(`验证：未跑成 —— ${row.testDetail ?? '原因未记录'}`)
     else if (row.testOutcome === 'failed') lines.push('验证：未通过')
+    // 回填失败必须在通知里说：代码改完了，但表格里那一行还是「处理中」——
+    // 不说的话人以为流程全绿，回去看表格又发现没回填，只能翻日志猜。
+    // 只报失败：成功回填是预期行为，多写一行只是噪音。
+    if (row.writeBack && row.writeBack.written === false) {
+      lines.push(`回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}（表格里那一行可能还停在「处理中」，请手工改一下）`)
+    }
     if (phase === 'skipped') lines.push('', '（改动已提交到工作区，但验证没跑通，请人工确认）')
   } else if (phase === 'failed') {
     lines.push(`失败原因：${row.lastError ?? '未记录'}`)

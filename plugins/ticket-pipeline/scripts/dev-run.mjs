@@ -2648,7 +2648,300 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(source.writes[0].result, /验证没跑通，需要人工确认/, `首句要提示人工确认：${source.writes[0].result}`)
   })
 
-  // ── 收尾 ────────────────────────────────────────────────
+  section('16b. 事后动作补偿（pendingEffects）与租约诚实化')
+
+  await check('回填失败要在通知里说，不能只躺在日志里', async () => {
+    // 回填是附加动作：表格没写成时票照样 done。人如果不主动去翻表格，
+    // 就完全不知道「表里那行还停在处理中」—— 通知正文必须带上这一句。
+    const source = createMockSource()
+    source.setFailWrite(true)
+    const { scheduler, push } = harness({ source })
+    await scheduler.tick()
+
+    assert.equal(push.messages.length, 1, '通知照发')
+    const body = push.messages[0].body
+    assert.match(body, /回填表格：没写成 —— /, `通知正文要写明回填失败：${body}`)
+    assert.match(body, /模拟回填失败/, `要带上是哪一类失败：${body}`)
+    assert.match(body, /手工改一下/, '要告诉人怎么补救')
+  })
+
+  await check('回填成功时通知里不写回填行（成功是预期行为，多一行只是噪音）', async () => {
+    const { scheduler, push } = harness()
+    await scheduler.tick()
+    assert.equal(push.messages.length, 1)
+    assert.doesNotMatch(push.messages[0].body, /回填表格/, `成功时不该有回填行：${push.messages[0].body}`)
+  })
+
+  await check('一场跑完，pendingEffects 必须清干净（不清下次启动会重复补做）', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done')
+    assert.equal(row.pendingEffects, undefined, `事后动作做完就该把标记删掉：${JSON.stringify(row.pendingEffects)}`)
+  })
+
+  await check('clearPendingEffect：只清报上来的那一项，两项都清完就把字段整个删掉', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.setPhase(key, 'failed', { pendingEffects: { writeBack: { phase: 'done' }, notify: true } })
+
+    await store.clearPendingEffect(key, 'notify')
+    assert.equal(store.getTicket(key).pendingEffects.notify, undefined, '通知标记要清掉')
+    assert.ok(store.getTicket(key).pendingEffects.writeBack, '另一项要留着')
+
+    await store.clearPendingEffect(key, 'writeBack')
+    assert.equal(store.getTicket(key).pendingEffects, undefined, '两项都清完就删字段，不留空对象')
+  })
+
+  await check('启动补偿：残留的终态票把回填和通知补做完，并清掉标记', async () => {
+    // 真实事故：终态 setPhase 落库之后、回填/通知之前进程退出（DSH 重启、
+    // 崩溃、机器被杀）。没有补偿的话，票在队列里看起来一切正常，表格却永远
+    // 停在「处理中」，人也从没收到通知 —— 而且没有任何地方提示这一点。
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const source = createMockSource()
+    const push = createMockPush()
+    const scheduler = createScheduler({
+      store,
+      sources: [source],
+      locator: createTableLocator({ projects: [{ name: DEMO, repo: { path: 'D:/WorkSpace/demo-repo' } }] }),
+      executor: createMockExecutor(),
+      push,
+      config: {
+        enabled: true,
+        maxAttempts: 2,
+        leaseTtlMinutes: 10,
+        leaseHeartbeatSeconds: 60,
+        ticketTimeoutMinutes: 40,
+        worktreeRetentionHours: 24,
+        notifyOn: ['done', 'skipped', 'failed', 'needs-info'],
+      },
+      log: silent,
+    })
+
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    const commit = { sha: 'deadbee1234', branch: 'v2.x', files: ['src/a.js'] }
+    await store.setPhase(key, 'done', {
+      commit,
+      testOutcome: 'passed',
+      pendingEffects: {
+        writeBack: { phase: 'done', commit, changedFiles: ['src/a.js'], verification: { outcome: 'passed' } },
+        notify: true,
+      },
+    }, { force: true })
+
+    const replayed = await scheduler.replayPendingEffects({})
+    assert.equal(replayed, 2, '回填 + 通知各算一个动作')
+    assert.equal(source.writes.length, 1, '回填要补做')
+    assert.equal(source.writes[0].recordId, 'rec-mock-001')
+    assert.equal(push.messages.length, 1, '通知要补发')
+    assert.equal(store.getTicket(key).pendingEffects, undefined, '补完就把标记清掉')
+    assert.equal(store.getTicket(key).phase, 'done', '补偿不能改票态')
+    assert.equal(store.getTicket(key).writeBack?.written, true, '补做的回执也要落库')
+  })
+
+  await check('重新入队（enqueue）不继承上一轮的 pendingEffects', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.setPhase(key, 'done', { pendingEffects: { notify: true } }, { force: true })
+    assert.equal(store.getTicket(key).pendingEffects.notify, true, '先确认标记真的落库了')
+
+    // 工单在表格里被修订 → 重新入队。这票要重新跑一遍，跑完会重新登记待办；
+    // 把旧标记带过来会让启动补偿在一张 pending 票上做终态动作。
+    await store.enqueue(ticket)
+    assert.equal(store.getTicket(key).pendingEffects, undefined, '新一轮不该带着上一轮待办')
+  })
+
+  await check('resetByHuman 不把 pendingEffects 带进新一轮', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.setPhase(key, 'failed', { pendingEffects: { notify: true } })
+
+    assert.equal(await store.resetByHuman(key), true)
+    const row = store.getTicket(key)
+    assert.equal(row.phase, 'pending')
+    assert.equal(row.pendingEffects, undefined, '人工重开的票不该继承上一轮的待办')
+  })
+
+  await check('租约：别的 owner 连试两次都拿不到，续租按 token 判定', async () => {
+    // 租约不是原子 CAS（read→判断→put→回读）。这条钉住的是**可观察语义**：
+    // 抢不到就要稳定地抢不到，而不是时好时坏；续租只看 token，不是自己的就失败。
+    const repo = makeMemoryRepo()
+    const a = new TicketStore({ repo, log: silent })
+    const b = new TicketStore({ repo, log: silent })
+    const key = k('rec-mock-001')
+
+    assert.equal(await a.acquireLease(key, 60_000), true, '第一个 owner 拿到')
+    assert.equal(await b.acquireLease(key, 60_000), false, '第二个 owner 拿不到')
+    assert.equal(await b.acquireLease(key, 60_000), false, '再试一次仍然拿不到（不是偶尔能抢到）')
+    assert.equal(await b.renewLease(key, 60_000), false, '不是自己的租约，续租必须失败')
+    assert.equal(await a.renewLease(key, 60_000), true, '自己的租约照常续')
+
+    await a.releaseLease(key)
+    assert.equal(await b.acquireLease(key, 60_000), true, '释放之后别人才能拿到')
+  })
+
+  await check('就地重跑：起点与票面记录不一致时，日志要说明「被判没有改动是预期」', async () => {
+    // 就地模式每轮把检出的当前 HEAD 当起点。重跑时它已经是上一轮的提交，
+    // 与票面记的 baseCommit 不同 → 这一轮 diff 基线变了，agent 没有新改动就会被判
+    // failed。判定不改（用户 2026-11-06 确认），但必须把这件事说清楚，
+    // 否则人只会看到一句「没有产生任何文件改动」而不知道是从哪来的。
+    const { domain } = makeFakeDomain()
+    const registered = []
+    const logs = []
+    const shell = {
+      resolve: (request) => ({ ...request }),
+      execute: async (spec) => {
+        const command = String(spec?.command ?? '')
+        let stdout = ''
+        if (command.includes('rev-parse --abbrev-ref HEAD')) stdout = 'v2.x'
+        else if (command.includes('rev-parse HEAD')) stdout = 'round2head'
+        else if (command.includes('--is-inside-work-tree')) stdout = 'true'
+        else if (command.includes('--version')) stdout = 'git version 2.45.1'
+        return { result: async () => ({ exitCode: 0, stdout: { text: stdout }, stderr: { text: '' } }) }
+      },
+    }
+    const ctx = {
+      ...makeFakeCtx({ domain, registered }),
+      get: (name) => {
+        if (name === 'shell') return shell
+        if (name === 'logger') {
+          return { debug: silent, info: (msg) => { logs.push(String(msg)) }, warn: silent, error: silent }
+        }
+        return undefined
+      },
+    }
+    const { value: config } = validateConfig({
+      projects: [{ name: 'demo', match: { platform: 'mock' }, repo: { path: 'D:/repo' } }],
+      workExecutor: 'mock',
+      pushAdapter: 'mock',
+      isolateWorktree: false,
+      enabled: true,
+    })
+    await apply(ctx, config)
+
+    const byName = new Map(registered.map((tool) => [tool.name, tool]))
+    const store = new TicketStore({ repo: makeDomainRepo(domain), log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    // 上一轮留下的坐标：没有工作区登记、baseCommit 记的是更早的起点。
+    await store.setPhase(key, 'pending', { worktreePath: 'D:/repo', branch: 'v2.x', baseCommit: 'oldbase0001' })
+
+    await byName.get('pipeline_scan').execute({ skipScan: true }, {})
+    const deadline = Date.now() + 5000
+    let row = store.getTicket(key)
+    while (Date.now() < deadline && (!row || row.phase === 'pending')) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      row = store.getTicket(key)
+    }
+
+    assert.ok(row, '这张票应该已经被跑过')
+    assert.equal(row.baseCommit, 'round2head', '就地模式的起点取检出当前 HEAD')
+    const notice = logs.find((line) => line.includes('这次起点是'))
+    assert.ok(notice, `重跑起点与票面不一致时要打日志：${logs.join(' | ')}`)
+    assert.match(notice, /round2head/, '要说清这次起点是什么')
+    assert.match(notice, /oldbase0001/, '要说清票面记的是什么（全是空值就没人能对上）')
+    assert.match(notice, /预期行为/, '要说明被判「没有产生任何文件改动」是预期')
+  })
+
+  await check('failed 也是终态：通知发完同样把 pendingEffects 清掉', async () => {
+    // 失败路径同样有「落库了但通知没发」的窗口。它不回填（表里那行留在「处理中」
+    // 是刻意留的信号），所以只登记 notify；发完必须清掉，否则每次启动都会补发一遍。
+    const { scheduler, store, push } = harness({ executor: createMockExecutor({ outcome: 'failed' }) })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed')
+    assert.equal(push.messages.length, 1, '失败要通知')
+    assert.equal(row.pendingEffects, undefined, `通知发完就该清标记：${JSON.stringify(row.pendingEffects)}`)
+    assert.equal(row.writeBack, undefined, '失败的票不回填，也就不该有回执')
+  })
+
+  await check('启动补偿只捞终态票，pending 票上的标记不动（那是上一轮的残留，不该抢跑）', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const source = createMockSource()
+    const push = createMockPush()
+    const scheduler = createScheduler({
+      store,
+      sources: [source],
+      locator: createTableLocator({ projects: [{ name: DEMO, repo: { path: 'D:/WorkSpace/demo-repo' } }] }),
+      executor: createMockExecutor(),
+      push,
+      config: {
+        enabled: true,
+        maxAttempts: 2,
+        leaseTtlMinutes: 10,
+        leaseHeartbeatSeconds: 60,
+        ticketTimeoutMinutes: 40,
+        worktreeRetentionHours: 24,
+        notifyOn: ['done', 'skipped', 'failed', 'needs-info'],
+      },
+      log: silent,
+    })
+
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    // 人为造一张 pending 票还挂着待办：补做只该针对**已经到终态**的票。
+    await store.setPhase(key, 'pending', { pendingEffects: { notify: true } })
+
+    const replayed = await scheduler.replayPendingEffects({})
+    assert.equal(replayed, 0, '没钱可补就不该动')
+    assert.equal(push.messages.length, 0, 'pending 票不补通知')
+    assert.equal(store.getTicket(key).pendingEffects.notify, true, '标记也不能替它清掉')
+  })
+
+  await check('pipeline_status：待补做的事后动作要能看见（否则表格停在处理中没人知道）', async () => {
+    const rows = [
+      {
+        key: k('r-todo'),
+        projectId: DEMO,
+        recordId: 'r-todo',
+        phase: 'done',
+        attempt: 0,
+        pendingEffects: { writeBack: { phase: 'done' }, notify: true },
+      },
+    ]
+    const tool = createPipelineStatusTool({ store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value })
+    const out = await tool.execute({ includeDone: true }, {})
+    assert.match(out.text, /待补做：回填表格、发通知/, `要列出还没做完的动作：${out.text}`)
+    assert.deepEqual(out.tickets[0].pendingEffects, { writeBack: true, notify: true }, '返回体只暴露布尔，不摊内部载荷')
+    assert.equal(out.tickets[0].writeBack, undefined, '还没回填就没有回执')
+
+    // 干净票不带这一行：每张终态票都挂一句「待补做」只会教人忽略它。
+    const clean = [{ key: k('r-clean'), projectId: DEMO, recordId: 'r-clean', phase: 'done', attempt: 0 }]
+    const tool2 = createPipelineStatusTool({ store: { listTickets: () => clean }, getConfig: () => validateConfig({}).value })
+    const out2 = await tool2.execute({ includeDone: true }, {})
+    assert.doesNotMatch(out2.text, /待补做/, `干净票不该有待补做行：${out2.text}`)
+    assert.equal(out2.tickets[0].pendingEffects, undefined)
+  })
+
+  await check('修订（revise）也不继承上一轮的 pendingEffects', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.setPhase(key, 'done', { pendingEffects: { notify: true } }, { force: true })
+
+    const revised = { ...ticket, revisionCount: (ticket.revisionCount ?? 1) + 1, fingerprint: 'changed-fp' }
+    const { restarted } = await store.revise(revised)
+    assert.equal(restarted, false, 'done 票收到修订不改 phase')
+    assert.equal(store.getTicket(key).pendingEffects, undefined, '修订后不该带着上一轮的待办')
+  })
+
   section('17. 选择分支：把检出里的分支列成下拉候选')
 
   await check('branches：解析 for-each-ref 输出，丢掉 origin/HEAD 这类符号引用', async () => {

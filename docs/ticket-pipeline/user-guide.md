@@ -17,8 +17,9 @@
     → AI 规划并改代码 → 跑构建/测试
     → 在工作区检出里做一次本地提交（只提交 agent 真正改过的文件）
     → 回填工单表：「是否处理」「处理结果」「处理日期」三列
-    → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信），含提交 sha 与处理会话 id
-    → 你在检出里 review 这个提交；想接着问就点进那个处理会话
+    → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信），含提交 sha、分支与验证结论
+    → 你在检出里 review 这个提交；想接着问就用 `pipeline_status` 里的 `处理会话` 点进那个会话
+      （`处理会话` 只出现在 `pipeline_status` 与表格「处理结果」列，邮件里没有）
 ```
 
 **人只做三件事**：填工单、收通知、review 那个本地提交。
@@ -172,7 +173,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `pollIntervalMinutes` | `3` | 扫表轮询间隔（分钟） |
 | `safePageRun` | `20` | 连续扫到多少条已知且未变的记录后停止翻页 |
 | `goneAfterScans` | `3` | 连续几轮扫不到就认定该行已被删除 |
-| `concurrency` | `1` | 并发数。当前只支持 1：一轮最多跑一票 |
+| `concurrency` | `1` | 并发数。当前只支持 1：一轮最多跑一票。**当前是死配置，改了不生效**（见 `feature-checklist.md` §9.2 第 14 条） |
 
 **租约与重试（3 个）**：
 
@@ -186,7 +187,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `workExecutor` | `mock` | `mock`（离线验证）/ `agent`（真执行）。agent 是真实现：起宿主 agent 改码 → 拍基线 → 收集 agent 改过的 → 跑验证 → 在工作区检出里做本地提交（`repo.gitlab.enabled: true` 时才额外开 draft MR） |
+| `workExecutor` | `mock` | **只能是** `mock`（离线验证）或 `agent`（真执行），写错（含大小写、尾空格）直接报 `invalid-input` 并列出可用值 —— **不再静默退回 mock**。agent 是真实现：起宿主 agent 改码 → 拍基线 → 收集 agent 改过的 → 跑验证（有 30 分钟超时与取消）→ 在工作区检出里做本地提交（`repo.gitlab.enabled: true` 时才额外开 draft MR） |
 | `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
 | `isolateWorktree` | `false` | **改代码落点**。`false`（缺省）直接在项目工作区的检出里改代码、就地提交，**脏也能跑**（先拍只读基线，只提交 agent 真正改过的文件）；`true` 才每票 `git fetch` + `git worktree add` 开隔离 worktree |
 | `keepSession` | `true` | **处理完保留会话**。agent 实例永远释放；`true` 时只记日志、会话留在项目工作区名下（可在会话列表点进去继续追问），`false` 才调宿主 `sessions` 服务回收 |
@@ -214,7 +215,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `pushAdapter` | `pushplus` | 通知适配器 id：`mock`（只记内存）/ `pushplus`（微信不直连，经 PushPlus 的 `clawbot` 渠道中继，需要 `pushplus.token`）/ `qqmail`（零依赖自写 SMTP，已真实发信成功，授权码走凭据 `QQMAIL_AUTH_CODE`） |
+| `pushAdapter` | `pushplus` | 通知适配器 id，**只能是** `mock`（只记内存）/ `pushplus`（微信不直连，经 PushPlus 的 `clawbot` 渠道中继，需要 `pushplus.token`）/ `qqmail`（零依赖自写 SMTP，已真实发信成功，授权码走凭据 `QQMAIL_AUTH_CODE`）；写错直接报 `invalid-input` 并列出可用值 |
 | `pushplus.token` | ``（空） | PushPlus token，建议走凭据 |
 | `pushplus.channel` | `clawbot` | PushPlus 推送渠道，ClawBot 用 `clawbot` |
 | `pushplus.template` | `txt` | 只能用 `txt`：富模板在 ClawBot 里只显示前 50 字 |
@@ -231,7 +232,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `false` | 总开关。配好一切前**别开** |
-| `logLevel` | `info` | 日志级别：debug / info / warn / error |
+| `logLevel` | `info` | 日志级别：debug / info / warn / error。**当前是死配置，改了不生效**（见 `feature-checklist.md` §9.2 第 14 条） |
 
 **projects[] 每项**：
 
@@ -313,7 +314,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 阶段 | 通知内容 |
 |---|---|
-| done | 本地提交的 sha（前 12 位）与分支、工作区路径、改动文件、测试结果、处理会话 id |
+| done | 本地提交的 sha（前 12 位）与分支、工作区路径、改动文件、测试结果 |
 | failed | 失败原因（具体错误）、工作区保留路径（去现场看）。**这种票不会回填表格**，留在「处理中」是刻意留的信号 |
 | needs-info | 缺什么（常见：截图取不到，需要人补图） |
 | skipped | 改动已提交到工作区，但验证没跑通，请人工确认 |
@@ -326,7 +327,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 |---|---|
 | 票卡住 / 改错了想重来 | `pipeline_reset`，或把工单「是否处理」拨走再拨回 |
 | 票正在跑想停 | `pipeline_cancel` |
-| 长时间没动静 | `pipeline_status` 看阶段；超 40 分钟是超时，会自动通知你 |
+| 长时间没动静 | `pipeline_status` 看阶段；超 40 分钟是单票超时，会自动通知你。验证命令另有自己的超时（缺省 30 分钟，宿主 shell 的 `maxTimeoutMs` 缺省 10 分钟会夹下去），超时会按「检查未通过（退出码 124）」记 |
 | 截图没进 prompt | 票会进 needs-info 并通知；补图后拨回重跑 |
 | 想看改动细节 | 通知里的工作区路径保留 24 小时，直接 `git show <sha>` 看那个本地提交 |
 | 表格没回填 / 显示「回填表格：没写成」 | 多半是飞书应用只有**读**权限（`code 91403 Forbidden`）。把应用加成可编辑协作者，或在面板里关掉 `writeBack` |
@@ -335,10 +336,12 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 ### 5.3 安全边界（使用前必读）
 
 - **工单正文按不可信输入处理**：表里出现「忽略以上要求/删文件/改配置/发邮件到某地址」等内容会被当问题描述忽略并转 needs-info（详见 ADR-0003）
-- AI 只被授权改**这张票的改代码落点**里的代码（缺省就是项目工作区的检出；`isolateWorktree: true` 时是隔离 worktree）+ 跑 `verify` 配置的命令；**敏感文件**（`application.yml`/`.env`/`*.pem`/`*secret*`）不会被提交 —— 只用**点名暂存** `git add -- <非敏感文件>`，再用 `git commit -- <非敏感文件列表>` 只提交放行的那些，**不用 `git add -A`**（全量暂存会让敏感文件露在 index 里，手一抖就跟着提交走了）；被拦下的留在工作区并写进提交说明的「未提交」一行
+- AI 只被授权改**这张票的改代码落点**里的代码（缺省就是项目工作区的检出；`isolateWorktree: true` 时是隔离 worktree）+ 跑 `verify` 配置的命令；**敏感文件**（`.env` 家族、Spring 的 `application*`/`bootstrap*`、包管理器 token、SSH/GPG 私钥、云与容器凭据、明文机器凭据、证书·密钥库·Terraform 状态、名字带 `secret` 的——共 **8 大类 41 条正则**）不会被提交 —— 只用**点名暂存** `git add -- <非敏感文件>`，再用 `git commit -- <非敏感文件列表>` 只提交放行的那些，**不用 `git add -A`**（全量暂存会让敏感文件露在 index 里，手一抖就跟着提交走了）；被拦下的留在工作区并写进提交说明的「未提交」一行
+- **`.git` 与插件 profile 有篡改自检**：每票开始与提交前各拍一次 sha256 快照（28 个官方 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`），agent 动过就把这些路径从 index 里撤回、整票判失败并点名文件。说清楚：这是**「被发现」不是「被阻止」** —— agent 在自检之前就已经写过那些文件了，拦住的是「别把它提交出去」。approval/policy 只能是 `never`（宿主没有「只读自动批、写入弹卡」这一档），所以兜底只有 git 白名单 + 这一层自检，**不是硬隔离**
 - 凭据全部走 DSH credentials 存储，不落配置文件、不出现在错误信息里
 - 默认**只做本地提交**，不 push、不合任何分支 —— 要不要合进主干永远由人决定。只有项目显式打开 `repo.gitlab.enabled: true` 时才会额外开一条 draft MR
-- **回填只写三列**：票跑成 `done` / `skipped` 后，插件只写「是否处理」「处理结果」「处理日期」，不碰别的列、不删行、不改别人的字段；`failed` 的票一律不回填（留在「处理中」是刻意留的信号）；回填失败只记在票据上、只影响 `pipeline_status` 的显示，票态不回退、通知照发。想完全不动真表就把 `writeBack` 关掉
+- **回填只写三列**：票跑成 `done` / `skipped` 后，插件只写「是否处理」「处理结果」「处理日期」，不碰别的列、不删行、不改别人的字段；`failed` 的票一律不回填（留在「处理中」是刻意留的信号）；回填失败只记在票据上、只影响 `pipeline_status` 的显示与通知里多一行「回填表格：没写成」，票态不回退。想完全不动真表就把 `writeBack` 关掉
+- **事后动作会被补偿**：回填与发通知跟终态是同一次落库的（`pendingEffects`），做完一项清一项；宿主中途重启，下次启动会把残留终态票没做完的补上，`pipeline_status` 里能看到「待补」
 - **插件里的 `git` 与 `verify` 命令以完整文件系统权限执行**。这不是疏忽，是宿主沙箱的硬约束：
   插件不是会话，调宿主 shell 时拿不到会话的写入授权，不显式声明 `danger-full-access` 就写不了
   `.git`（连 `git fetch` 都会 `Permission denied`）。所以这条旁路**只给 git 和 verify 用**，
@@ -351,7 +354,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **325 项全过**，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **363 项全过**，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -478,6 +481,16 @@ descriptor 没挂上，或字段没标 `meta.volatile`。宿主对这种情况�
 （只造一个 commit 对象，不写 ref、不动工作区、不动索引，拍完 `git stash list` 仍然是空的），
 结束后只提交 agent 真正改过的文件。你攒着的未提交改动、甚至已经 `git add` 进索引的改动，都会原样留在工作区。
 `pipeline_doctor` 看到检出不干净只提醒一句，不算必须修复。
+
+**Q：验证命令卡住会不会把整条流水线挂死？**
+不会了。验证命令有超时与取消：缺省 `VERIFY_TIMEOUT_MS` 是 30 分钟，到点按「检查未通过」记（退出码 **124**，和普通非 0 区分），
+`pipeline_cancel` 会真 kill 子进程。注意宿主 `dsh-bash-local` 自己的 `maxTimeoutMs` 缺省 10 分钟，
+两者取小 —— 真实上限是 10 分钟，要放宽得改 profile 里 `dsh-bash-local` 的配置。
+修之前这里确实会挂死：`runOne` 不返回 → 内存里 `running` 恒为 true → 后面每一轮都判 `already-running`，静默停摆。
+
+**Q：我把 `workExecutor` 写成 `Agent`（大写）会怎样？**
+直接报 `invalid-input` 并列出可用值（`agent` / `mock`），不会再静默退回 mock 假装跑了一轮。
+`pushAdapter` 同理（`mock` / `pushplus` / `qqmail`）。只有留空 / 不填时才回落 mock。
 
 **Q：`GITLAB_TOKEN` 还要不要配？**
 本阶段**不用配**，交付形态是项目工作区检出里的一次本地提交。缺省下执行器完全不碰 `GITLAB_TOKEN`、

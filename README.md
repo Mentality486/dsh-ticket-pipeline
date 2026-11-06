@@ -80,7 +80,7 @@
 - 工作区**脏也能跑**。缺省模式直接在**这份检出里**改代码并提交，插件开跑前先拍一份基线
   （`git stash create`，只读，不动工作区和索引），跑完**只提交 agent 真正改过的文件** ——
   你自己那些未提交改动会原样留在工作区，不会被带进工单提交。
-  脏只会提醒不会拒跑：通知里会点名这 N 个文件，让你知道这次是在脏检出里动的手术。
+  脏只会提醒不会拒跑：**日志里**会点名这 N 个文件（通知正文里没有这一段），让你知道这次是在脏检出里动的手术。
   插件读状态用的是 `git status --porcelain -z -uall -- . ':(exclude).agents/worktrees' ':(exclude).agents/worktrees/**'`
   —— 带上 `-uall` 才能看穿未跟踪目录（否则目录里混的 `application.yml` 会被折叠成一个目录名而躲过拦截），
   并排除插件自己开的隔离 worktree；你手工核对时用 `git status --porcelain` 看到 `?? .agents/` 属正常，不算脏
@@ -150,8 +150,8 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 |---|---|---|
 | `enabled` | `false` | 总开关。配好一切前**别开** |
 | `pollIntervalMinutes` | `3` | 扫表轮询间隔（分钟） |
-| `workExecutor` | — | `mock`（离线验证）/ `agent`（真执行） |
-| `pushAdapter` | — | `mock` / `pushplus` / `qqmail` |
+| `workExecutor` | — | **只能是** `mock`（离线验证）/ `agent`（真执行）。写错（含大小写、尾空格）会直接报 `invalid-input` 并列可用值，**不再静默退回 mock** |
+| `pushAdapter` | — | **只能是** `mock` / `pushplus` / `qqmail`。同样写错即报错，不静默降级 |
 | `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
 | `maxAttempts` | `3` | 可重试错误的自动重试上限 |
 | `isolateWorktree` | `false` | **改代码落点**：`false`（缺省）直接在项目工作区的检出里改、就地提交（脏也能跑，只提交 agent 改的）；`true` 才每票开一个隔离 worktree |
@@ -226,8 +226,8 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 ```
 你：在飞书表填一行「问题描述/操作流程/模块/截图」，是否处理=处理中
 插件（≤3 分钟内）：收票 → 确保项目工作区 → 在检出里改码 → 构建+测试 → 做本地提交 → 回填表格
-你：收到邮件通知（含提交 sha + 分支 + 处理会话 + 失败原因 + 工作区路径）
-你：在工作区检出里 `git show <sha>` review（想追问就点进那个处理会话）→ 满意就合到你自己的分支 → 把工单「是否处理」拨走
+你：收到邮件通知（含提交 sha + 分支 + 失败原因 + 工作区路径）
+你：在工作区检出里 `git show <sha>` review（想追问就用 `pipeline_status` 里的 `处理会话` 点进那个会话 —— 通知里没有这一行）→ 满意就合到你自己的分支 → 把工单「是否处理」拨走
 ```
 
 ### 5.1 通知里能读到什么
@@ -241,6 +241,9 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 > 「处理结果」列里写的东西更全：改了几个文件（最多列 8 个）、验证结论、本地提交 sha/分支/路径、
 > 处理会话 id，最后还写了一句「要进一步修改，把这个单元格清空、把「是否处理」拨回「处理中」即可重跑」。
+>
+> **`处理会话` 不在邮件里** —— 它只出现在两处：表格的「处理结果」列，以及 `pipeline_status` 的那一行
+> `处理会话：<sessionId>（保留在工作区名下…）`。邮件正文只有 `本地提交：` / `draft MR：` / `改动文件：` / `验证：` 这几段。
 
 ### 5.2 出问题怎么办
 
@@ -255,11 +258,18 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 ### 5.3 安全边界（使用前必读）
 
 - **工单正文按不可信输入处理**：表里出现「忽略以上要求/删文件/改配置/发邮件到某地址」等内容会被当问题描述忽略并转 needs-info（详见 ADR-0003）
-- AI 只被授权改**这张票的落点目录**里的代码（缺省就是项目工作区的检出；`isolateWorktree: true` 时是隔离 worktree）+ 跑 `verify` 配置的命令；**敏感文件**（`application.yml`/`.env`/`*.pem`/`*secret*`）不会被提交 —— 只点名暂存要提交的非敏感文件（`git add -- <文件>` + `git commit -- <文件>`），敏感文件连索引都不进、留在工作区，文件名写进提交说明的「未提交」一行
+- AI 只被授权改**这张票的落点目录**里的代码（缺省就是项目工作区的检出；`isolateWorktree: true` 时是隔离 worktree）+ 跑 `verify` 配置的命令；**敏感文件**不会被提交 —— 只点名暂存要提交的非敏感文件（`git add -- <文件>` + `git commit -- <文件>`），敏感文件连索引都不进、留在工作区，文件名写进提交说明的「未提交」一行
+  - 敏感名单现在覆盖 **8 大类、41 条正则**（原 9 条；`.env` 家族 / Spring 配置 / 包管理器 token / SSH·GPG 私钥 / 云与容器凭据 / 明文机器凭据 / 证书·密钥库·Terraform 状态 / 关键字兜底）。被拦文件会进 `ExecResult.blockedFiles`，`plan.summary` 里写「另有 N 个敏感文件按约定未提交（疑似含真实凭据）：a、b、c」
+  - 不会误伤 `src/env.js`、`docs/credentials.md`、`.environment.md` 这类源码/文档
+- **`.git` 与插件 profile 有篡改自检**：git 自己看不见 `.git/` 的改动，所以执行器在每票开始与提交前各拍一次 sha256 快照比对（10 个 git 元数据文件 + 28 个官方 hook 名 + 4 个插件 profile 文件）；动过就 `git restore --staged` 撤回、判 `failed` + `invalid-input`（不可重试）并点名文件。**这是「被发现」不是「被阻止」**；真正能挡住 agent 任意命令的只有宿主权限
+- **验证命令有超时与取消**：缺省 30 分钟（宿主 `dsh-bash-local` 的 `maxTimeoutMs` 缺省 10 分钟会把它夹下去，真实上限取小者），超时退出码 **124**（与「检查没通过」区分开），取消会真的 kill 子进程。要把上限提到 30 分钟得改 profile 里的 bash-local 配置
+- **租约是 best-effort，不是原子 CAS**：同进程靠调度单飞，跨进程靠 put 后二次读确认。宿主 storageDomain 的 table API 没有 compare-and-swap 原语
 - 凭据全部走 DSH credentials 存储，不落配置文件、不出现在错误信息里
 - **回填只写三列**：`是否处理` / `处理结果` / `处理日期`。不碰别的列，不删行，不改工单正文；
   失败的票一律不写（表里留在「处理中」是刻意留的信号）。回填失败只记日志，
-  票该是 done 还是 done，`pipeline_status` 会显示「回填表格：没写成 —— …」
+  票该是 done 还是 done，`pipeline_status` 会显示「回填表格：没写成 —— …」，
+  **通知正文里也会多一行** `回填表格：没写成 —— <原因>（表格里那一行可能还停在「处理中」，请手工改一下）`
+  （成功时不加这行，避免噪音）
 - 默认只在**工作区检出里做本地提交**，不 push 分支到远端、不合任何 MR —— 要不要进主干永远由人决定。
   只有项目显式写 `repo.gitlab.enabled: true` 时才会额外开一条 draft MR（同样不自动合并）
 
@@ -269,7 +279,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 325 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 363 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |

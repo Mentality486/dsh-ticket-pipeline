@@ -12,6 +12,7 @@
  * - 截图按 `drawing` 锚点挂到正确行，且同一行的多张图按出现顺序排
  * - 收票只认「是否处理 = 处理中」，水位语义与飞书源一致（指纹只在收进 updated 时推进）
  * - 取数通道没配时报清楚的错，而不是返回空表
+ * - 取数通道的超时 / 取消 / 字节上限 / 重定向逐跳校验（假 fetch 注入，不联网）
  * - 坏文件（不是 zip / 缺工作表 / 没有描述列）报 invalid-input
  * - 绝不写回表格（这个适配器只有读，断言它连可选写接口都没挂）
  */
@@ -21,7 +22,11 @@ import { crc32, deflateRawSync } from 'node:zlib'
 
 import {
   createWpsSource,
+  DEFAULT_SHEET_MAX_BYTES,
+  DEFAULT_SHEET_TIMEOUT_MS,
+  downloadSheetLimited,
   IN_PROGRESS_VALUE,
+  MAX_SHEET_REDIRECTS,
   wpsOptionsFromMatch,
 } from '../src/adapters/source-wps/index.js'
 import {
@@ -301,6 +306,87 @@ function numberCell (reference, value) {
 
 function escapeXml (text) {
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// ── 假 fetch：不联网地验证取数通道的坏情况 ────────────────────────
+
+/**
+ * 假响应体。返回的 `state` 记录「实际被读走几块 / 有没有被取消」。
+ *
+ * 为什么要记这两件事：只断言「抛了错」太便宜了 —— 一句 `throw` 就能让断言通过，
+ * 而这次要修的是「超限之后还在继续读」。`reads` 与 `cancelled` 才是真正的证据。
+ */
+function fakeBody (chunks) {
+  const state = { reads: 0, cancelled: false, finished: false }
+  return {
+    state,
+    body: {
+      getReader () {
+        let index = 0
+        return {
+          async read () {
+            if (index >= chunks.length) {
+              state.finished = true
+              return { done: true, value: undefined }
+            }
+            const value = chunks[index]
+            index += 1
+            state.reads += 1
+            return { done: false, value }
+          },
+          async cancel () {
+            state.cancelled = true
+          },
+        }
+      },
+    },
+  }
+}
+
+/**
+ * 假响应：状态码 + 响应头 + 分块响应体。`arrayBuffer()` 也实现了，
+ * 免得断言「没有流式 body 的老实现」时还要另写一份桩。
+ */
+function fakeResponse ({ status = 200, headers = {}, chunks } = {}) {
+  const fake = chunks === undefined ? null : fakeBody(chunks)
+  return {
+    state: fake ? fake.state : null,
+    response: {
+      status,
+      ok: status >= 200 && status < 300,
+      headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+      body: fake ? fake.body : undefined,
+      async arrayBuffer () {
+        const list = chunks ?? []
+        const out = new Uint8Array(list.reduce((total, chunk) => total + chunk.byteLength, 0))
+        let offset = 0
+        for (const chunk of list) {
+          out.set(chunk, offset)
+          offset += chunk.byteLength
+        }
+        return out.buffer
+      },
+    },
+  }
+}
+
+/**
+ * 造一个「永远不 settle，直到 signal 被中止」的假 fetch —— 真 fetch 就是这么表现的。
+ *
+ * 里面那个 `keepAlive` 定时器不是装饰：`AbortSignal.timeout()` 用的定时器是 **unref'd**
+ * 的（Node 特意这样设计，免得一个超时信号拖住进程退出）。假 fetch 又没有真 socket
+ * 可挂，于是「一个永不 settle 的 Promise + 一个不吊住事件循环的定时器」= 事件循环提前
+ * 变空 = node 直接 exit 0 **静默退出**，断言根本没跑完，dev-run 看起来还是「全绿」。
+ * 真 fetch 有 socket 句柄吊着循环，所以生产代码里没这个坑 —— 只会在测试桩上踩到。
+ */
+function hangingFetch () {
+  return (url, init) => new Promise((resolve, reject) => {
+    const keepAlive = setTimeout(() => {}, 60_000)
+    init.signal.addEventListener('abort', () => {
+      clearTimeout(keepAlive)
+      reject(init.signal.reason)
+    }, { once: true })
+  })
 }
 
 // ── 断言 ────────────────────────────────────────────────────
@@ -613,6 +699,182 @@ export async function runWpsChecks (check) {
       (error) => error.kind === 'invalid-input',
       '金山源不该代替内核去下载外链'
     )
+  })
+
+  // ── 取数通道：超时 / 取消 / 字节上限 / 跳转逐跳校验 ──────────────
+  //
+  // 这一组全部用假 fetch 注入：不联网、不依赖真实响应时间、不拖慢 dev-run。
+  // 超时那一拨把 timeoutMs 传成 20ms —— 断言的是「超时会中断并分类成 network」，
+  // 不是「等 30 秒看它会不会超时」，所以不需要真等。
+
+  await check('downloadSheetLimited：正常一次 200 就把字节原样交回来，且强制 manual 跳转', async () => {
+    const payload = new Uint8Array([1, 2, 3, 4, 5])
+    const fake = fakeResponse({ status: 200, chunks: [payload] })
+    /** @type {any[]} */
+    const calls = []
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init })
+      return fake.response
+    }
+
+    const bytes = await downloadSheetLimited(fetchImpl, 'https://www.kdocs.cn/l/abc', { timeoutMs: 5000 })
+    assert.deepEqual(Array.from(bytes), [1, 2, 3, 4, 5], '下载回来的字节必须和响应体一致')
+    assert.equal(calls.length, 1, '没有跳转就只该发一次请求')
+    assert.equal(calls[0].init.redirect, 'manual',
+      '必须自己跟跳：交给 fetch 跟就等于放弃了逐跳校验，远端能把我们导去任意主机/协议')
+    assert.ok(calls[0].init.signal, '每次请求都得挂超时信号，否则连不上时 Promise 永不 settle')
+  })
+
+  await check('downloadSheetLimited：连接卡住会按超时中断，报 network（可重试）而不是永远挂着', async () => {
+    // 真 fetch 在连接卡住时就是「不 resolve 也不 reject」，直到 signal 触发 —— 用假 fetch 复现。
+    const startedAt = Date.now()
+    await assert.rejects(
+      () => downloadSheetLimited(hangingFetch(), 'https://www.kdocs.cn/l/abc', { timeoutMs: 20 }),
+      (error) => error.kind === 'network' && /超时/.test(error.message),
+      '卡死的连接必须变成一条可重试的 network 错误；挂在这儿的话 scan 永不返回 → running 恒真 → 整条流水线停摆'
+    )
+    assert.ok(Date.now() - startedAt < 5000, '注入 20ms 超时就不该真的等几十秒')
+  })
+
+  await check('downloadSheetLimited：调用方取消算 aborted（不是可重试超时），且能立刻断', async () => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 20)
+    await assert.rejects(
+      () => downloadSheetLimited(hangingFetch(), 'https://www.kdocs.cn/l/abc',
+        { timeoutMs: 60_000, signal: controller.signal }),
+      (error) => error.kind === 'aborted',
+      '内核要求停就停下：判成 network 会被当成可重试，白等一轮还会拖着收尾'
+    )
+  })
+
+  await check('downloadSheetLimited：content-length 谎报超大就当场拒绝，一个字节都不用读', async () => {
+    const fake = fakeResponse({
+      status: 200,
+      headers: { 'content-length': String(DEFAULT_SHEET_MAX_BYTES + 1) },
+      chunks: [new Uint8Array(10)],
+    })
+    await assert.rejects(
+      () => downloadSheetLimited(async () => fake.response, 'https://www.kdocs.cn/l/abc'),
+      (error) => error.kind === 'invalid-input' && /超过上限/.test(error.message),
+      '头里报了大小就先用上，省一次把几十 MB 拉进内存'
+    )
+    assert.equal(fake.state.reads, 0, '预检拦下的就不该再读响应体')
+  })
+
+  await check('downloadSheetLimited：没 content-length 时边读边计数，超限立刻断连', async () => {
+    // 40 块 × 1KiB = 40KiB，上限给 4KiB：第 5 块就该炸，后面的块不该被读走。
+    /** @type {Uint8Array[]} */
+    const chunks = []
+    for (let i = 0; i < 40; i += 1) chunks.push(new Uint8Array(1024))
+    const fake = fakeResponse({ status: 200, chunks })
+
+    await assert.rejects(
+      () => downloadSheetLimited(async () => fake.response, 'https://www.kdocs.cn/l/abc',
+        { maxBytes: 4096 }),
+      (error) => error.kind === 'invalid-input' && /已读超过上限/.test(error.message),
+      'chunked / 无 content-length 的响应只能靠边读边计数挡住'
+    )
+    assert.equal(fake.state.cancelled, true, '超限后必须 cancel 掉 reader，否则对方还在往这条流里灌数据')
+    assert.ok(fake.state.reads <= 6, '超限就该停，不该把 40 块全读完（实际读了 ' + fake.state.reads + ' 块）')
+    assert.equal(fake.state.finished, false, '流没被读完 —— 这才叫「中止下载」')
+  })
+
+  await check('downloadSheetLimited：跳转最多跟 ' + MAX_SHEET_REDIRECTS + ' 跳，第 ' + (MAX_SHEET_REDIRECTS + 1) + ' 跳就当作可疑链接拒绝', async () => {
+    let count = 0
+    const fetchImpl = async () => {
+      count += 1
+      // 永远回同一个相对跳转 → 无限循环。适配器必须自己数着跳。
+      const fake = fakeResponse({ status: 302, headers: { location: '/l/next' } })
+      return fake.response
+    }
+    await assert.rejects(
+      () => downloadSheetLimited(fetchImpl, 'https://www.kdocs.cn/l/abc'),
+      (error) => error.kind === 'invalid-input' && /重定向超过/.test(error.message),
+      '登录墙一般一两跳就到位；再多就是循环或钓鱼链路，重试没用，要人看'
+    )
+    assert.equal(count, MAX_SHEET_REDIRECTS + 1, '请求次数应该是「起点 + 跟 ' + MAX_SHEET_REDIRECTS + ' 跳」')
+  })
+
+  await check('downloadSheetLimited：跳转目标逐跳校验协议与主机（file: / 未放行主机都拒）', async () => {
+    const toFile = async () => fakeResponse({ status: 302, headers: { location: 'file:///C:/Windows/win.ini' } }).response
+    await assert.rejects(
+      () => downloadSheetLimited(toFile, 'https://www.kdocs.cn/l/abc'),
+      (error) => error.kind === 'invalid-input' && /只允许 http \/ https/.test(error.message),
+      '跟着共享链接跳到 file: 就等于让一段配置去读服务器本地文件'
+    )
+
+    const toOtherHost = async () => fakeResponse({ status: 302, headers: { location: 'https://evil.example.com/x.xlsx' } }).response
+    await assert.rejects(
+      () => downloadSheetLimited(toOtherHost, 'https://www.kdocs.cn/l/abc'),
+      (error) => error.kind === 'invalid-input' && /未放行的主机/.test(error.message),
+      '缺省只放行起点链接自己的主机：跳转目标是远端返回的，不是人写进配置的'
+    )
+
+    // 显式放行之后就允许跨主机 —— 有正当需求时不该被彻底堵死。
+    const payload = new Uint8Array([7, 7, 7])
+    const crossHost = async (url) => (url.includes('evil.example.com')
+      ? fakeResponse({ status: 200, chunks: [payload] }).response
+      : fakeResponse({ status: 302, headers: { location: 'https://evil.example.com/x.xlsx' } }).response)
+    const bytes = await downloadSheetLimited(crossHost, 'https://www.kdocs.cn/l/abc',
+      { allowedHosts: ['www.kdocs.cn', 'evil.example.com'] })
+    assert.deepEqual(Array.from(bytes), [7, 7, 7], '显式放行后跨主机跳转应该能走通')
+  })
+
+  await check('scan：取数通道会收到 signal（内核取消时下载要能立刻断，不是等它自己超时）', async () => {
+    /** @type {any[]} */
+    const seen = []
+    const source = createWpsSource({
+      sourceId: 'wps-1',
+      fetchSheet: async (signal) => {
+        seen.push(signal)
+        return { bytes }
+      },
+    })
+    const controller = new AbortController()
+    await source.scan(controller.signal)
+    assert.equal(seen.length, 1)
+    assert.ok(seen[0] instanceof AbortSignal, '注入了 signal 就必须传下去，否则取数通道无从得知「别取了」')
+
+    // 取数通道真的照信号停了，这一轮就该以 aborted 收场，而不是把半截数据当成功。
+    // 这里的 keepAlive 与 hangingFetch 里的是同一个理由：不吊住事件循环的话，
+    // 「永不 settle 的 Promise」会让 node 提前静默退出。
+    const hanging = createWpsSource({
+      sourceId: 'wps-2',
+      fetchSheet: (signal) => new Promise((resolve, reject) => {
+        const keepAlive = setTimeout(() => {}, 60_000)
+        signal.addEventListener('abort', () => {
+          clearTimeout(keepAlive)
+          reject(signal.reason)
+        }, { once: true })
+      }),
+    })
+    const cancel = new AbortController()
+    setTimeout(() => cancel.abort(), 20)
+    await assert.rejects(
+      () => hanging.scan(cancel.signal),
+      (error) => error.kind === 'aborted' || error.kind === 'network',
+      '取消后这一轮必须结束，而不是让 scan 永不返回'
+    )
+  })
+
+  await check('wpsOptionsFromMatch：翻译出的取数通道带超时与字节上限（不是裸 fetch）', async () => {
+    const options = wpsOptionsFromMatch({ sheetUrl: 'https://www.kdocs.cn/l/abcdef' })
+    assert.equal(typeof options.fetchSheet, 'function')
+
+    // **不联网**地用已取消的信号探一下：受限下载器在发请求之前就会先看 signal，
+    // 所以它会立刻以 PipelineError('aborted') 收场；而原来那句
+    // `fetch(sheetUrl, { redirect: 'follow' })` 根本没有 signal 参数，会真发一次请求
+    // （然后挂到 DNS / 登录墙上）。这条断言因此同时验了两件事：走的是新实现，且真的收 signal。
+    const aborted = new AbortController()
+    aborted.abort()
+    await assert.rejects(
+      () => options.fetchSheet(aborted.signal),
+      (error) => error.name === 'PipelineError' && error.kind === 'aborted',
+      '默认取数通道必须走 downloadSheetLimited（并且接住调用方的 signal）'
+    )
+
+    assert.ok(DEFAULT_SHEET_TIMEOUT_MS >= 1000 && DEFAULT_SHEET_MAX_BYTES >= 1024 * 1024,
+      '缺省值得是「30 秒量级 / 十 MB 量级」，别有人手滑改成 1ms 或 1 字节')
   })
 
   await check('wpsOptionsFromMatch：把规则里的一段链接翻译成适配器配置', async () => {

@@ -161,6 +161,13 @@ export const CONFIG_FIELDS = Object.freeze({
   workExecutor: {
     type: 'string',
     default: 'mock',
+    // 必须是 `src/index.js` 里 `EXECUTORS` 的键，一个不多一个不少。
+    // 这里写字面量而不是从 index.js 反推：config.js 不能 import index.js
+    // （index.js → config.js 取 `Config`，反过来就成环），而「配错一个字母」
+    // 在上线事故里排第一 —— 以前没有这份名单时，`Agent` / `agents` / `agent `
+    // 都能过校验，然后被静默换成 mock 执行器：票跑完全绿、回填「已完成」，
+    // 实际一行代码没改。改 EXECUTORS 的键时，这里要同步改（自测脚本会盯着）。
+    enum: Object.freeze(['agent', 'mock']),
     description: '执行器 id（mock / agent）。mock 只跑通链路、不改代码；agent 会真的起一个 agent 改代码并开 draft MR',
   },
   ticketTimeoutMinutes: {
@@ -236,6 +243,9 @@ export const CONFIG_FIELDS = Object.freeze({
   pushAdapter: {
     type: 'string',
     default: 'pushplus',
+    // 与 `src/index.js` 的 `PUSHES` 键保持一致（理由同上面的 workExecutor）。
+    // 以前写错只会静默退回 mock 推送：人一封真通知都收不到，插件日志里也看不出来。
+    enum: Object.freeze(['mock', 'pushplus', 'qqmail']),
     description: '通知适配器 id（mock / pushplus / qqmail）',
   },
   'pushplus.token': {

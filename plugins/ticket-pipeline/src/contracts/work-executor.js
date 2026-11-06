@@ -43,6 +43,10 @@
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 在工作区检出里做出来的本地提交
  * @property {string} [sessionId] 这次执行用的会话 id。会话默认保留在项目工作区名下，
  *   人可以在 GUI 里按这个 id 找回那张票的会话继续追问（见配置项 `keepSession`）。
+ * @property {string[]} [blockedFiles] 被拦下**没有**提交的文件：命中敏感名单（疑似含凭据），
+ *   或者本轮动过受保护的元数据（`.git/hooks/*`、插件 profile）时整票不提交的那些路径。
+ *   和 `changedFiles` 分开是为了让人一眼看出「少了的东西去哪了」——只写日志的话，
+ *   通知里只显示「没有改动」，没人知道 agent 其实动过文件只是被拦了。
  * @property {{ kind: ErrorKind, message: string, retryable: boolean }} [error]
  */
 
@@ -140,6 +144,12 @@ export function makeExecResult (input) {
   }
   // 会话 id 只在真的起了会话时才有（mock 执行器没有会话），所以不校验、有就带上。
   if (typeof input.sessionId === 'string' && input.sessionId.length > 0) result.sessionId = input.sessionId
+  // 被拦下的文件同样只在真拦到东西时才出现：空数组不写进结果，
+  // 免得所有执行器的结果里都多一个恒空字段（下游 `'blockedFiles' in result` 就没意义了）。
+  if (Array.isArray(input.blockedFiles)) {
+    const blockedFiles = input.blockedFiles.filter((file) => typeof file === 'string' && file.length > 0)
+    if (blockedFiles.length > 0) result.blockedFiles = blockedFiles
+  }
   if (input.error) {
     result.error = {
       kind: input.error.kind,

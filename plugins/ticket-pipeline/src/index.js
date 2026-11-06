@@ -234,6 +234,41 @@ export const PUSHES = {
 }
 
 /**
+ * 从静态注册表里取一个适配器工厂，**取不到就抛，绝不静默换 mock**。
+ *
+ * 为什么这一条值得单独写个函数：`EXECUTORS[config.workExecutor] ?? EXECUTORS.mock`
+ * 这种写法在配置写错一个字母时不会报任何错 —— 用户写了 `Agent`（小写才对）、
+ * `agents`、或者带个尾空格，插件就悄悄用 mock 执行器跑完整条链路：不改一行代码，
+ * 却给票打上 `testOutcome: 'passed'`、写个假 commit sha、回填表格写
+ * 「已按工单改完并提交」，还能照常发通知。这类「看起来成功」的假执行是上线后
+ * 最难发现的事故，所以宁可激活期直接停。
+ *
+ * 语义刻意区分「没写」和「写错」：
+ * - `undefined` / `null` / 空串（含纯空白）→ 用 `mock`（离线自测与首次安装都靠它跑通链路）；
+ * - 写了任何别的值 → 必须是注册表里的键，否则抛 `invalid-input` 并列出可选值。
+ *
+ * @param {Record<string, Function>} table 静态注册表（`EXECUTORS` / `PUSHES`）
+ * @param {unknown} requested 配置里的值
+ * @param {string} fieldName 配置键名（报错文案用，例如 `workExecutor`）
+ * @param {string} label 中文说明（报错文案用，例如 `执行器`）
+ * @returns {Function}
+ */
+export function pickAdapterFactory (table, requested, fieldName, label) {
+  const available = Object.keys(table)
+  const raw = typeof requested === 'string' ? requested.trim() : requested
+  if (raw === undefined || raw === null || raw === '') {
+    return table.mock
+  }
+  const factory = table[raw]
+  if (typeof factory === 'function') return factory
+  throw new PipelineError(
+    'invalid-input',
+    `${label}名字写错了：${fieldName}="${String(requested)}"，可用的只有 ${available.join(' / ')}。`
+    + `写错会被静默换成 mock（不改代码却把「已完成」写回表格），所以这里直接停下。`,
+  )
+}
+
+/**
  * 造一份「不套沙箱」的执行策略，交给宿主 shell。
  *
  * 为什么必须显式给：
@@ -554,6 +589,24 @@ function getService (ctx, name) {
 }
 
 /**
+ * verify 命令的缺省墙钟上限：30 分钟。
+ *
+ * 宿主 `bash-local` 还会再按它自己的 `maxTimeoutMs`（缺省 10 分钟）夹一次
+ * （`clampTimeout` 取 `min(requested, max)`），所以真上限是两者里小的那个 ——
+ * 这里只负责「给出一个有界的值」，绝不留下「不设上限」这条路。
+ */
+export const VERIFY_TIMEOUT_MS = 30 * 60 * 1000
+
+/**
+ * verify 命令超时后返回的退出码。
+ *
+ * 沿用 coreutils `timeout` 的 124 约定：排障的人看到 124 就知道「命令没跑完」，
+ * 而不是「代码检查没通过」。返回而不是抛，是因为对票据来说这是一次
+ * 「验证没通过」（`runVerification` 会判 `failed` 并把 detail 写进票里）。
+ */
+export const VERIFY_TIMEOUT_EXIT_CODE = 124
+
+/**
  * 造一个「跑一条命令」的函数，供 executor-agent 的 verify 用。
  *
  * 与 gitRunner 同一条纪律：走宿主 shell 执行链路（Windows 下裸 spawn 会被拒），
@@ -563,15 +616,44 @@ function getService (ctx, name) {
  * 实现上把命令拼成单行交给宿主 shell，路径与参数统一单引号转义：
  * 这是唯一能在 PowerShell / bash 两种宿主 shell 下都成立的写法。
  *
+ * ## 为什么必须有超时、必须接 signal（这不是「这一票失败」的问题）
+ *
+ * 曾经这里既没有 `timeoutMs` 也不收 `signal`：`await execution.result()` 无上限等待。
+ * 一条卡住的 `npm test`（交互式提示、等 stdin、死循环）会让 `runOne` 永远停在
+ * `await` 上 —— 于是 `src/core/scheduler.js:601-616` 的 finally 走不到，
+ * `scheduler.js:140` 的单飞标记 `running` 恒为 `true`，之后每一次 tick 都在
+ * `scheduler.js:849-850` 直接返回 `already-running`：**整条流水线静默停摆**，
+ * 而且 `pipeline_cancel` 也取消不了它（票面超时只 abort 了 signal，子进程照跑）。
+ * 所以这里三件事缺一不可：
+ *
+ * 1. `timeoutMs` 传给 `shell.resolve`（宿主据此在到点时 SIGTERM→SIGKILL，
+ *    `bash-local` 的 `deadline()` 用的是 `onExpiry: 'kill'`）；
+ * 2. `signal` 传进同一次 resolve（宿主把它与自己的 deadline 用
+ *    `AbortSignal.any` 融合，用户取消能真的杀掉子进程）；
+ * 3. 再加一层 `Promise.race`：宿主版本如果忽略这两个字段，我们自己也必须能
+ *    走开（并调 `handle.kill()`），绝不能把「能不能返回」寄托在宿主实现上。
+ *
+ * 不传 `stdin` 是有意的：`bash-local` 的 `resolve()` 只在 `request.stdin !== undefined`
+ * 时透传，而 `spawnSpec()` 会把它包成 `{ data: spec.stdin }`；不传时它的缺省正是
+ * `stdin: 'ignore'`（子进程不会等输入挂死）。传 `'ignore'` 反而会变成喂字符串。
+ *
  * @param {any} ctx
- * @returns {((input: { argv: string[], cwd: string, signal?: AbortSignal }) => Promise<{ code: number, stdout: string, stderr: string }>) | undefined}
+ * @returns {((input: { argv: string[], cwd: string, signal?: AbortSignal, timeoutMs?: number }) => Promise<{ code: number, stdout: string, stderr: string }>) | undefined}
  */
 export function makeCommandRunner (ctx) {
   const shell = getService(ctx, 'shell')
   if (!shell || typeof shell.execute !== 'function' || typeof shell.resolve !== 'function') {
     return undefined
   }
-  return async ({ argv, cwd }) => {
+  return async ({ argv, cwd, signal, timeoutMs: requestedTimeoutMs }) => {
+    // 已经取消就不必起进程：调用方（executor-agent）在 signal.aborted 后会把这个
+    // 异常当「取消」处理，不会污染票据状态。
+    if (signal?.aborted) {
+      throw new PipelineError('aborted', '验证命令还没开始跑就被取消了。')
+    }
+    const timeoutMs = Number.isFinite(requestedTimeoutMs) && Number(requestedTimeoutMs) > 0
+      ? Number(requestedTimeoutMs)
+      : VERIFY_TIMEOUT_MS
     const [program, ...rest] = argv.map((part) => String(part ?? ''))
     if (!program) {
       throw new PipelineError('invalid-input', '验证命令为空：项目配置里的 verify.build / verify.test 需要写成「命令 参数」的形式。')
@@ -593,16 +675,89 @@ export function makeCommandRunner (ctx) {
     const command = cwd ? `cd ${quoteShellArg(cwd)}; ${quoted}` : quoted
     // 与 gitRunner 同一条纪律：不带显式策略就会被宿主当成「无 session 的调用」，
     // 拿不到任何写授权，verify 跑 npm test 连 node_modules 缓存都写不进去。
-    const execution = await shell.execute(shell.resolve({
+    //
+    // `signal` 与 `timeoutMs` 一起进 resolve：宿主 `bash-local.resolve()` 会把
+    // 它们分别落成 `deadline(upstream, timeoutMs, 'BASH_TIMEOUT')` 的融合 signal 与
+    // 上限（`onExpiry` 缺省 `'kill'`），到点/取消都会真的杀掉子进程。
+    const request = {
       command,
+      timeoutMs,
       sandboxPolicy: fullAccessSandboxPolicy(cwd),
-    }))
-    const result = await execution.result()
+    }
+    if (signal) request.signal = signal
+    const execution = await shell.execute(shell.resolve(request))
+    const result = await awaitCommandResult(execution, { signal, timeoutMs })
+    if (result.aborted === true) {
+      // 取消（票据超时 / 用户点取消）不是「验证没通过」：抛 aborted 让
+      // `runVerification` 与 `runOne` 走取消分支，票不会被错误地判成 failed-by-verify。
+      try {
+        execution?.kill?.()
+      } catch {}
+      throw new PipelineError('aborted', '验证命令执行期间票据被取消，进程已终止。')
+    }
+    if (result.timedOut === true) {
+      // 到点：主机按 timeoutMs 收尾（正常路径），或上面的兜底竞速抢到了（宿主没理
+      // timeoutMs）。两种都统一成「超时」，退出码用 124 让排障的人一眼区分
+      // 「命令没跑完」和「代码检查没通过」。
+      try {
+        execution?.kill?.()
+      } catch {}
+      return {
+        code: VERIFY_TIMEOUT_EXIT_CODE,
+        stdout: String(result.stdout?.text ?? ''),
+        stderr: `验证命令超过 ${Math.round(timeoutMs / 60000)} 分钟没有结束，已终止（退出码 ${VERIFY_TIMEOUT_EXIT_CODE} 表示超时，不是代码检查未通过）。`,
+      }
+    }
     return {
       code: Number(result?.exitCode ?? 0),
       stdout: String(result?.stdout?.text ?? ''),
       stderr: String(result?.stderr?.text ?? ''),
     }
+  }
+}
+
+/**
+ * 等 `execution.result()`，但同时盯着 signal 与 timeoutMs。
+ *
+ * 为什么要自己再包一层：`result()` 的语义在宿主 README 里写的是「绝不因超时/取消
+ * 而 reject，而是解析成带 `timedOut`/`aborted` 的结果」，但那是**当前版本**的实现
+ * 承诺；我们的返回值直接决定票是 done 还是 failed，不能把它押在宿主版本上。
+ * 这里只做「兜底走开」：抢到就返回 `{ timedOut }` / `{ aborted }`，让调用方去 kill。
+ *
+ * 正常路径（宿主按时收尾）只多一次 Promise.race，没有额外开销；定时器与监听器
+ * 一定在 `finally` 里清掉，不留悬挂的 `setTimeout`（它会让进程退出被推迟 30 分钟）。
+ *
+ * @param {{ result: () => Promise<any>, kill?: () => unknown }} execution
+ * @param {{ signal?: AbortSignal, timeoutMs: number }} options
+ */
+async function awaitCommandResult (execution, options) {
+  const { signal, timeoutMs } = options
+  let timer
+  let onAbort
+  const guards = []
+  guards.push(new Promise((resolve) => {
+    // 这里**不能** `unref()`：取消/超时是唯一的兜底出口，定时器一旦不参与事件循环，
+    // 「等一个永不 settle 的 result()」就没有任何东西再把进程撑着了 ——
+    // 实测这么写会让自测脚本在 await 处静默退出（exit 0、后面一条都不打印）。
+    // 代价只是这个定时器最多活到 timeoutMs；`finally` 里已经 clearTimeout，
+    // 正常路径（宿主按时收尾）一 settle 就清掉，不会拖住退出。
+    timer = setTimeout(() => resolve({ timedOut: true, exitCode: null, stdout: { text: '' }, stderr: { text: '' } }), timeoutMs)
+  }))
+  if (signal) {
+    guards.push(new Promise((resolve) => {
+      onAbort = () => resolve({ aborted: true, exitCode: null, stdout: { text: '' }, stderr: { text: '' } })
+      signal.addEventListener('abort', onAbort, { once: true })
+      // 挂在监听之后再看一次：signal 可能在「调用方查完 aborted」到「监听挂上」
+      // 这几微秒里就被取消 —— 不补这一句，这次取消就永远等不到事件，
+      // 白白拖到 timeoutMs 才被当成超时处理（票会从「被取消」变成「超时」）。
+      if (signal.aborted) onAbort()
+    }))
+  }
+  try {
+    return await Promise.race([execution.result(), ...guards])
+  } finally {
+    clearTimeout(timer)
+    if (onAbort) signal.removeEventListener('abort', onAbort)
   }
 }
 
@@ -691,8 +846,12 @@ export async function apply (ctx, config) {
   const store = new TicketStore({ repo, log })
 
   // ── 2. 适配器 ─────────────────────────────────────────
-  const executorFactory = EXECUTORS[config.workExecutor ?? 'mock'] ?? EXECUTORS.mock
-  const pushFactory = PUSHES[config.pushAdapter] ?? PUSHES.mock
+  // 这里**绝不能**用 `?? EXECUTORS.mock` 之类的静默兜底：写错一个字母（`Agent` /
+  // `agents` / `agent `）就会退回 mock 执行器 —— 票被「假装处理完」、回填表格
+  // 写「已按工单改完并提交」、通知也发一封，而代码一行没动，事后极难发现。
+  // 所以：没写（缺省/空串）才给 mock，写了但查不到就直接停机。
+  const executorFactory = pickAdapterFactory(EXECUTORS, config.workExecutor, 'workExecutor', '执行器')
+  const pushFactory = pickAdapterFactory(PUSHES, config.pushAdapter, 'pushAdapter', '通知适配器')
 
   /** 项目清单（校验后已含 name + match + repo + verify）。 */
   const projects = Array.isArray(config.projects) ? config.projects : []
@@ -824,6 +983,24 @@ export async function apply (ctx, config) {
         workspacePath: workspace.workspacePath,
         branch: snapshot.branch,
       })
+      // 就地模式下「起点」每轮都取检出的当前 HEAD。重跑（人工重置、或者上一轮已经
+      // 提交过）时这个 HEAD 已经是上一轮的提交，而票面记的 baseCommit 是更早的起点 ——
+      // 于是本轮的 diff 基线是「已经包含上一轮改动」的树。agent 若提不出新改动，
+      // 执行器会判「没有产生任何文件改动」并落 failed。
+      //
+      // 这是**预期**行为（用户 2026-11-06 确认不改判定）：真要重跑就该有新改动。
+      // 但它对人来说很费解 —— 明明上次是 done，重跑一次突然说「没有任何改动」。
+      // 所以把两边的起点都打出来，并直接点名这个后果，省下一次翻代码。
+      const recordedBase = typeof opts.baseCommit === 'string' && opts.baseCommit.length > 0
+        ? opts.baseCommit
+        : undefined
+      if (recordedBase !== undefined && snapshot.head !== recordedBase) {
+        log(
+          `这次起点是 ${String(snapshot.head).slice(0, 12)}，票面记的是 ${recordedBase.slice(0, 12)}（上一轮已提交过）；`
+          + '重跑时 agent 若没有新改动会被判成「没有产生任何文件改动」，这是预期行为',
+          { projectId, recordId, head: snapshot.head, recordedBaseCommit: recordedBase, branch: snapshot.branch },
+        )
+      }
       return {
         path: workspace.workspacePath ?? repoPath,
         branch: snapshot.branch,
@@ -1017,6 +1194,18 @@ export async function apply (ctx, config) {
     await recoverPending({ store, worktreeExists, log, now: () => Date.now() })
   } catch (error) {
     log('启动恢复失败（不影响后续轮询）', error)
+  }
+
+  // 补偿「已经到了终态、但回填/通知没做完」的票（用户 2026-11-06 要求）。
+  // 必须排在 recoverPending 之后：恢复会改写非终态票的 phase 与工作区坐标，
+  // 而这里只处理**已经到终态**的票，两者互不重叠 —— 但先恢复再补偿能保证
+  // 「上一轮跑到一半的票」先归位，补偿看到的终态集合才是稳定的。
+  // 失败不能挡住挂载：补做只是把该做的事再试一次，下次启动还会再试。
+  try {
+    const replayed = await scheduler.replayPendingEffects({})
+    if (replayed > 0) log(`启动补偿：补做了 ${replayed} 个事后动作（回填/通知）`)
+  } catch (error) {
+    log('启动补偿失败（不影响后续轮询）', error)
   }
 
   // ── 6. 轮询 ───────────────────────────────────────────

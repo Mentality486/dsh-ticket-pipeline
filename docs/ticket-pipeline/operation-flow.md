@@ -94,13 +94,14 @@ flowchart TD
     E3 --> E3c[3. 钉目录: workingDirectory.set → worktreePath<br/>✅ 仅 worktreePath ≠ workspacePath（isolateWorktree 打开）时才需要<br/>缺省模式两者相等,不需要这个服务]
     E3 --> E3d[4. attachSession 归属项目工作区<br/>失败只记日志,不影响改码]
     E3d --> E3e[createBaseline 拍基线<br/>git stash create 只造 commit 对象<br/>不写 ref / 不动工作区 / 不动索引<br/>拍不下来只记日志,降级按 baseCommit 收集]
-    E3e --> E4[agent.followup 推任务书<br/>⚠ inject 不唤醒,必须 followup]
+    E3e --> E3f[snapshotProtectedPaths 拍受保护路径快照<br/>28 个官方 hook 名 + 10 个 git 元数据文件 + 4 个 cordis.*<br/>拿不到 readFile 服务就跳过自检并记日志]
+    E3f --> E4[agent.followup 推任务书<br/>⚠ inject 不唤醒,必须 followup]
     E4 --> E5[waitForAgentIdle<br/>seq 连续静 2 次才认结束]
     E5 --> E6[collectChanges：有基线就对基线 git diff --name-status -z<br/>∪ git status --porcelain -z -uall；未跟踪文件哈希与基线相同则跳过<br/>✅ 人的改动一个都不进来；排除 .agents/worktrees]
     E6 --> E7{SENSITIVE_FILE_PATTERNS 命中?}
     E7 -->|是| E7a[✅ 拦下且写进提交说明的「未提交」一行,人 git show 就能看到]
     E7 -->|否| E8
-    E7a --> E8[runVerification<br/>verify.build / verify.test 注入]
+    E7a --> E8[runVerification<br/>verify.build / verify.test 注入<br/>缺省 30 分钟超时（宿主 bash-local 缺省 10 分钟会夹下去）<br/>取消真 kill 子进程 / 超时返回退出码 124]
     E8 --> E9{有验证命令?}
     E9 -->|无| E9a[outcome=skipped<br/>phase 仍按契约给 done,但 plan.summary 前置写「⚠ 未通过验证」]
     E9 -->|有| E10[splitCommand 认单双引号<br/>✅ 但刻意不解释 && / 管道 / 重定向]
@@ -110,7 +111,10 @@ flowchart TD
     E12 --> E14[commitLocally<br/>git restore --staged 退回 agent 自己暂存的敏感文件<br/>git add -- 非删除的文件（点名暂存,不用 add -A）<br/>→ git commit -m 说明 -- 改动文件 ∪ 重命名旧路径]
     E13 --> E14
     E9a --> E14
-    E14 --> E14a[git rev-parse HEAD<br/>取回 sha,并带出 branch / files / sessionId]
+    E14 --> E14b{compareProtectedSnapshots<br/>受保护路径动过?}
+    E14b -->|否| E14a[git rev-parse HEAD<br/>取回 sha,并带出 branch / files / sessionId]
+    E14b -->|是| E14c[unstageSensitiveFiles 撤回暂存<br/>转 failed + invalid-input（不可重试）并点名文件<br/>⚠ 「被发现」不是「被阻止」]
+    E14c --> E22
     E14a --> E15{repo.gitlab.enabled === true?}
     E15 -->|否（缺省）| E22[commit 就是交付物<br/>不发任何 GitLab 请求、不要 GITLAB_TOKEN]
     E15 -->|是（显式打开远程出口）| E16[openDraftMr → resolveGitlab project,target<br/>✅ repo.gitlab{baseUrl,remote,projectId,enabled} 已能透传]
@@ -128,6 +132,12 @@ flowchart TD
 > **基线（`createBaseline`）为什么在 `followup` 之前拍**：它拍的是「agent 动手前」的样子，之后 `collectChanges` 只比这一份，所以人在这个检出里攒着的未提交改动、甚至已经 `git add` 进索引的改动，都不会混进本次提交。`git stash create` 是唯一一个只读的取基线方式 —— 它只造一个 commit 对象，不写 ref、不动工作区、不动索引（拍完 `git stash list` 仍是空的）。拍不下来（比如仓库有锁）只记日志，降级成按 `baseCommit` 收集，票不会因为「拍不到基线」而失败。
 >
 > **`keepSession` 管的是会话、不是 agent 实例**：`finally` 里 agent 实例**永远** `dispose()`（否则宿主侧会一直挂着一个跑着的 agent）。`keepSession !== false`（缺省 `true`）时只记一行日志「agent 已释放，会话保留」，会话留在项目工作区名下，人能在会话列表里点进去继续追问；只有显式 `keepSession: false` 才去调宿主的 `sessions` 服务（`close` / `dispose` / `closeSession` 三选一，调用永不抛）。
+>
+> **验证命令为什么必须有超时**：`runVerification` 走 `makeCommandRunner`，缺省 `VERIFY_TIMEOUT_MS = 30 * 60 * 1000`，超时返回 `VERIFY_TIMEOUT_EXIT_CODE = 124`；调用方 `signal` 已 abort 时直接抛 `PipelineError('aborted')`，跑到一半取消会真 kill 子进程。没有这一层时一条卡住的 build 会让 `runOne` 永远不返回 → 内存里 `running` 恒为 true → 整条流水线后面每一轮都判 `already-running` 静默停摆，而且 `pipeline_cancel` 也取消不了。注意宿主 `dsh-bash-local` 自己的 `maxTimeoutMs` 缺省 10 分钟，`clampTimeout` 取两者较小值 —— 真实上限是 10 分钟，要 30 分钟得改 profile。
+>
+> **篡改自检是「被发现」不是「被阻止」**：`snapshotProtectedPaths` 用 `readFile` 拍指纹（拿不到服务就跳过并记日志 —— 这是安全降级），`compareProtectedSnapshots` 在提交前比对；动了 `.git/hooks`（28 个官方 hook 名）、git 元数据（`config` / `HEAD` / `packed-refs` 等 10 个）或插件 profile（4 个 `cordis.*`）就把这些路径从 index 里 `git restore --staged` 撤回、整票转 `failed` + `invalid-input`（不可重试）并点名文件。agent 在自检之前**已经**写过这些文件了 —— 拦住的是「别把它提交出去」，不是「别写」。兜底只有 git 白名单 + 这一层自检，**不是硬隔离**（approval/policy 仍只能是 `never`）。
+>
+> **事后动作补偿**：终态那次 `setPhase` 会把 `pendingEffects`（回填表格 / 发通知）与终态同一次落库；做完一项就 `clearPendingEffect(key, ...)`（刻意不走 `setPhase`，否则会重写 `finishedAt`）。宿主重启后 `replayPendingEffects()` 扫残留终态票把没做完的补上。`enqueue` / `revise` / `resetByHuman` 都不继承上一轮的 `pendingEffects`。
 
 ---
 
@@ -165,7 +175,7 @@ flowchart TD
     N2 -->|mock| N5[内存记录]
     N3 --> N6[送达?]
     N4 --> N6
-    N6 -->|QQ SMTP accepted| N7([人收到邮件,含本地提交 sha、分支与处理会话 id])
+    N6 -->|QQ SMTP accepted| N7([人收到邮件,含本地提交 sha 与分支<br/>回填失败时会多一行「回填表格:没写成」])
     N6 -->|PushPlus code 200| N8([仅受理,回执看 callbackUrl sendStatus])
     N7 --> H1([人在检出里 git show &lt;sha&gt; 验收])
     N8 --> H1
@@ -184,7 +194,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     T1[pipeline_scan<br/>立刻扫一轮] --> Q([队列])
-    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成] --> Q
+    T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成<br/>+ 待补:回填表格 / 通知（pendingEffects 没做完时）] --> Q
     T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警<br/>检出脏只提醒（照跑,会拍基线）] --> Q
     T4[pipeline_reset<br/>failed/needs-info/gone 放回重跑] --> Q
     T5[pipeline_cancel<br/>取消正在跑的那张票] --> Q
@@ -194,7 +204,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线：HEAD `0b9dcff`（2026-11-06），含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码）与「回填工单表 / 保留会话 / 只提交 agent 改过的文件 / 设置面板补齐」四项改造 + 选择分支，自测 325/325 + 链路冒烟 11/11。
+状态基线：HEAD `dbfa21f`（2026-11-06）+ 本轮未提交的上线加固，含插件版本自检（`pipeline_doctor` 第 5 节比对安装副本与源码）、「回填工单表 / 保留会话 / 只提交 agent 改过的文件 / 设置面板补齐」四项改造、选择分支，以及 5 条上线阻断项 + 4 条重要项的加固（适配器名强校验、验证超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 补偿、租约诚实化），自测 363/363 + 链路冒烟 11/11。
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |
@@ -207,14 +217,19 @@ flowchart LR
 | P1-14 | ~~GitLab Commits API 是改动唯一出口~~ | 契约耦合 | **已改**：交付形态改为工作区检出里的本地提交（`commitLocally`）；远程 Commits API 降级成 `repo.gitlab.enabled: true` 才走的可选出口 |
 | P2 | 上游模型配额（workbuddy 429 `quota_exceeded`） | 外部因素 | 与插件无关；执行器现在会如实报 `rate-limit` |
 | P1-16 | 飞书源只支持**多维表格**，电子表格进不来 | 取数缺口 | **设计已定，待实施**。当前是代码路径问题不是权限问题：`normalizeAppToken` 把 `obj_type:'bitable'` 硬写进 query（`source-feishu/index.js:763-766`），`:770-775` 把 `sheet` 判成「不是多维表格」；`config.js:494-501` 只认「appToken+tableId」或「docNamePattern」。方案见 `docs/ticket-pipeline/feishu-sheet-source.md` |
+| P1-17 | 回填工单表需要飞书应用有**编辑**权限 | 权限缺口 | **已实现、待真表验证**。只有读权限时写回返回 `code 91403 Forbidden`；这时票仍是 `done`，只是 `pipeline_status` 显示「回填表格：没写成 —— …」。把应用加成可编辑协作者再验一次即可（见 `feature-checklist.md` §8.2） |
+| P1-18 | `keepSession` 依赖宿主的 `sessions` 服务 | 依赖缺口 | **缺省不需要**：缺省 `keepSession: true`，只留会话不回收，完全不碰该服务；只有显式 `keepSession: false` 才调 `close` / `dispose` / `closeSession`（三选一，调不通也不影响票态） |
+| P1-22 | ~~验证命令没有超时，一条卡住的 build 会让整条流水线静默停摆~~ | 阻断 | **已修**：`VERIFY_TIMEOUT_MS` 30 分钟缺省、超时退出码 **124**、取消真 kill（宿主 `bash-local` 的 `maxTimeoutMs` 缺省 10 分钟会夹下去） |
+| P1-23 | ~~适配器名写错静默退回 mock（假执行却报成功）~~ | 阻断 | **已修**：`workExecutor` / `pushAdapter` 加 `enum`，`pickAdapterFactory()` 查不到抛 `invalid-input` 并列可用值 |
+| P1-24 | ~~agent 能改 `.git/hooks` 与插件 profile~~ | 阻断 | **已缓解**：提交前 `compareProtectedSnapshots` 自检（28 hook 名 + 10 git 元数据 + 4 `cordis.*`），动过就撤回暂存并整票 `failed`。**是「被发现」不是「被阻止」**，approval/policy 仍只能 `never` |
+| P1-25 | ~~终态与事后动作（回填 / 通知）不是同一次落库~~ | 健壮性 | **已修**：`pendingEffects` 与终态同一次 `setPhase`，启动时 `replayPendingEffects()` 补做 |
+
+> 本轮（上线加固）已关闭：**P1-22** 验证无超时、**P1-23** 适配器名静默退 mock、**P1-25** 事后动作可能永久丢；**P1-24** 从「完全没拦」改成「提交前发现并判失败」。另把租约口径从「CAS」正名为「best-effort 租约，不是原子 CAS」（宿主 storageDomain 的 table API 没有 compare-and-swap 原语）。明细见 `feature-checklist.md` §1.14。
 
 > 本轮已关闭（提交 `5b94a17` / `26f0391`）：**P0-1** `{{model}}` 模板崩（改为配置留空时向宿主 `agentDefaultModel` 补齐）、**P0-2** preset 挂不上改硬失败、**P0-4** `repo.gitlab` 透传、**P0-5** 金山「待修改项目」→ `targetProject`、**P0-6** `allowedImageHosts` 配置键、**P1-9/10** 敏感文件上报与 verify 命令认引号、**P1-11** `recordIds` 推广到 wps/mock/webform。
 >
 > 本轮（工作树改造）已关闭：**P1-14** 远程 Commits API 是唯一出口 —— 改为工作区检出里的本地提交优先，远程 MR 变成 `repo.gitlab.enabled: true` 才走的可选出口。
 >
-| P1-17 | 回填工单表需要飞书应用有**编辑**权限 | 权限缺口 | **已实现、待真表验证**。只有读权限时写回返回 `code 91403 Forbidden`；这时票仍是 `done`，只是 `pipeline_status` 显示「回填表格：没写成 —— …」。把应用加成可编辑协作者再验一次即可（见 `feature-checklist.md` §8.2） |
-| P1-18 | `keepSession` 依赖宿主的 `sessions` 服务 | 依赖缺口 | **缺省不需要**：缺省 `keepSession: true`，只留会话不回收，完全不碰该服务；只有显式 `keepSession: false` 才调 `close` / `dispose` / `closeSession`（三选一，调不通也不影响票态） |
-
 > 本轮（四项改造）已关闭：**P1-15** 处理完还得人工改表 → 回填工单表（`TicketSource.writeResult` 是唯一写入口，只写 done/skipped 三列）；**P1-19** 处理完会话找不回来 → `ExecResult.sessionId` + `keepSession` 把会话留在项目工作区名下；**P1-20** 检出不干净就拒跑 → 改成 `createBaseline()` 拍只读基线、只提交 agent 真正改过的文件；**P1-21** 设置页只能改全局配置 → `projects` 子树可编辑（25 字段）+ 第三个 Remote 方法 `ticketPipeline.projects()`。
 >
 > 本轮同时改掉「每票必开隔离 worktree」这个隐含前置：缺省直接在项目工作区的检出里改（**脏也能跑**，只提醒不拒跑），`isolateWorktree: true` 才退回 `git worktree add`；清理侧加 `isIsolatedWorktreePath()` 前缀校验，防止 `git worktree remove --force` 误删人的主检出。

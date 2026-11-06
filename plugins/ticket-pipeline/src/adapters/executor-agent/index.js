@@ -18,14 +18,45 @@
  *    只有项目显式打开 `repo.gitlab.enabled: true` 时才额外走 GitLab Commits API
  *    开一个 draft MR（`openDraftMr` 的 optional 出口）—— 本阶段用不到。
  *
+ * ── 三条安全取舍（都是「能力与代价」的权衡，不是随便定的）───────────
+ *
+ * 6. **只提交 agent 改过的文件**：动手前用 `git stash create` 拍一份工作区基线
+ *    （见 `createBaseline` / `collectChanges`）。人自己没收起来的改动物理上留在
+ *    工作区，但**一个都不会进提交**。基线拍失败就退化回「按检出点收集」——
+ *    那会把人的改动一起提交，但比整票失败强，日志里会写清。
+ *
+ * 7. **敏感文件用「宽进」的名单，宁可多拦**：漏提交一个普通文件的代价是「人补一次」，
+ *    误提交一个真实凭据的代价是「得去轮换密钥」——两种代价不对等，所以名单往宽了写
+ *    （见 `SENSITIVE_FILE_PATTERNS`：私钥、云凭据、证书、`*service-account*`、
+ *    `.env` 家族、Spring 的 `application*` / `bootstrap*` …）。被拦的文件一律
+ *    **连索引都不进**，并且清单会进 `ExecResult.blockedFiles` 与 `plan.summary` ——
+ *    只写日志等于没说，人平时不看插件日志。
+ *
+ * 8. **危险能力靠「白名单 + 提交前自检」兜底，不假装有权限隔离**：本适配器给会话
+ *    记的是 `sandbox/mode: danger-full-access` + `approval/policy: never`
+ *    （无头跑票必须如此，否则每一步都卡在等人点「批准」）。这意味着 agent 自己
+ *    的 shell 工具能执行任意命令、能写 `.git/hooks/*` 与插件 profile。本层的兜底是：
+ *    (a) 执行器**自己**的 git 调用全部走 `isAllowedGitCommand` 白名单（无 push / 无
+ *    fetch / 不改历史）；(b) 提交前自检 `.git` 元数据（hooks / config / info）与
+ *    profile 目录有没有被动过，命中就**不提交、票也不判 done**（见
+ *    `snapshotProtectedPaths` / `compareProtectedSnapshots`）。
+ *    注意：`.git/` 不在 `git diff` / `git status` 的视野里（git 不跟踪自己的元数据），
+ *    所以这部分只能靠「拍基线时给 hook/config 取内容哈希、干完再比对」来发现。
+ *    **这不是硬隔离**：真正能挡住 agent 任意命令的只有宿主权限。这里做的是
+ *    「被发现」而不是「被阻止」，日志里也是这么写的。
+ *    另外 `approval/policy` 只有 `ask` / `never` 两个合法值（`dsh-user-approval` 的
+ *    `APPROVAL_POLICIES`），**没有**「只读自动批 + 工作区内写」这一档；`ask` 在
+ *    无头场景下 fail-closed，会让定时跑票的每一步工具调用都失败。所以只能留
+ *    `never`，并在 `setupAgent` 里记一条显式 warn 日志说明这个后果。
+ *
  * 关于依赖注入：本文件**不 import 任何 `@deepseek-ai/*`**（插件目录里解析不到，
  * 离线自测会 ERR_MODULE_NOT_FOUND）。agent 服务、`createUserMessage`、`git`、
  * `runCommand`、`fetch` 全部从 `options` 进来，缺哪个就报一条说清缺什么的错，
  * 而不是等跑到一半才炸。组合根按 `src/index.js` 里 `executorOptions()` 的说明接线。
  */
 
-import { randomUUID } from 'node:crypto'
-import { isAbsolute, join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { isAbsolute, join, resolve } from 'node:path'
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
 import { assertWorkExecutor, makeExecResult } from '../../contracts/work-executor.js'
@@ -55,16 +86,87 @@ export const DEFAULT_AGENT_PRESET = 'ptc'
  *
  * 为什么用「宽进」的规则而不是精确白名单：漏提交一个普通文件的代价是「人补一次」，
  * 而误提交一个真实凭据的代价是「得去轮换密钥」。两种代价不对等，所以宁可多拦。
+ *
+ * 名单按「凭据真实的落盘形状」分类写，而不是按某个框架的约定写 —— 上线审计实测
+ * 之前只有 9 条，漏掉了 SSH 私钥、云厂商凭据、证书、K8s service-account 等
+ * 最常见的几种（它们全是**无扩展名**或**点目录**形态，原来的 `.key$` / `secret`
+ * 这类按扩展名与关键字的规则一条都命中不了）。下面每一类都写了「为什么是它」。
+ *
+ * 宽进也要有个限度：拦错一份普通源码，agent 改完就会因为「只动了敏感文件」直接
+ * 判失败，票永远跑不完。所以下面这几类刻意**不拦**（都有断言钉住）：
+ * - `src/id_rsa_helper.js` —— 规则锚定「文件名就叫 id_rsa」，不是「含 id_rsa」；
+ * - `docs/credentials.md` —— `credentials.*` 只收真正的凭据落盘格式（json/yaml/…），
+ *   不写 `.md` 这种文档扩展名；
+ * - `src/settings.json` —— 没有 `json` 通配规则，只点名了 application/bootstrap
+ *   与 service-account 这几种；
+ * - `.environment.md` —— `.env` 那条要求点后紧跟 `env`，且 `env` 之后只能是
+ *   结束 / `.` / `-` / `_`，后面直接接字母的是文档；
+ * - `src/env.js` / `src/environment.ts` —— `env.*` 那条只认已知环境名枚举。
+ *
+ * 剩下真的会被误伤的（例如名为 `credentials.txt` 的说明文件），代价是「人补一次」，
+ * 可以接受。
  */
 export const SENSITIVE_FILE_PATTERNS = Object.freeze([
-  /(^|\/)\.env(\..*)?$/i,
+  // ── 1. `.env` 家族 ────────────────────────────────
+  // `.env` / `.env.local` / `.env-production` / `.env_prod`（点开头，`env` 之后
+  // 只能是结束、`.`、`-`、`_`）—— 这一条**故意不会**匹配 `.environment.md`：
+  // 后者 `env` 后面直接接字母，是文档不是凭据。
+  /(^|\/)\.env($|[._-])/i,
+  // `env.local` / `env.production`：有些项目不带前导点。这里**只认已知的环境名后缀**，
+  // 不能用 `env\..+` 通配 —— 那会把 `src/env.js` 这种普通源码也拦掉。
+  /(^|\/)env\.(local|dev|development|prod|production|stage|staging|test|testing|qa|uat|preview|ci|beta|alpha|sandbox|demo)(\.[a-z0-9_-]+)*$/i,
+  // `prod.env` / `staging.env`：`.env` 结尾的另一种写法。
+  /\.env$/i,
+  // ── 2. Spring Boot 配置（里面常写数据库口令、密钥）────
+  // application*.yml/properties/json + bootstrap*.yml（bootstrap 是 Spring Cloud
+  // 的引导配置，同样带明文凭据，原规则只写 application 所以漏了）。
   /(^|\/)application[^/]*\.(ya?ml|properties|conf|json)$/i,
+  /(^|\/)bootstrap[^/]*\.(ya?ml|properties|conf|json)$/i,
+  // ── 3. 包管理器 token ─────────────────────────────
   /(^|\/)\.npmrc$/i,
+  /(^|\/)\.yarnrc\.yml$/i,
+  /(^|\/)\.pypirc$/i,
+  /(^|\/)\.gem\/credentials$/i,
+  /(^|\/)\.gemrc$/i,
+  // ── 4. SSH / GPG 私钥（无扩展名，原来完全拦不住）────
+  // 只认「文件名就叫 id_xxx」：`src/id_rsa_helper.js` 不会被误伤。
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/i,
+  /(^|\/)\.ssh\//i,
+  /(^|\/)\.gnupg\//i,
+  // ── 5. 云厂商 / 容器 / 注册表凭据（点目录）─────────
+  /(^|\/)\.aws\//i,
+  /(^|\/)aws_credentials[^/]*$/i,
+  /(^|\/)\.docker\//i,
+  /(^|\/)\.kube\//i,
+  /(^|\/)\.git-credentials$/i,
+  // ── 6. 其它明文的「机器凭据」文件 ───────────────────
+  /(^|\/)\.netrc$/i,
+  /(^|\/)_netrc$/i,
+  /(^|\/)\.htpasswd$/i,
+  /(^|\/)\.envrc$/i,
+  /(^|\/)token\.txt$/i,
+  // `credentials` / `credentials.json` / `credentials.yml`… 但**不要**拦
+  // `docs/credentials.md` 这类文档：只认下面这几种真正的凭据落盘格式。
+  /(^|\/)credentials(\.(json|ya?ml|xml|ini|conf|properties|txt|env|cfg|toml|dat))?$/i,
+  /(^|\/)service-account[^/]*$/i,
+  /(^|\/)[^/]*-service-account[^/]*\.json$/i,
+  // ── 7. 证书 / 密钥库 / 云资源状态（都可能含明文私钥）──
   /\.pem$/i,
   /\.p12$/i,
   /\.pfx$/i,
   /\.jks$/i,
+  /\.keystore$/i,
   /\.key$/i,
+  /\.p8$/i,
+  /\.crt$/i,
+  /\.cer$/i,
+  /\.jwk$/i,
+  /\.kdbx$/i,
+  /\.ovpn$/i,
+  // Terraform 的 tfvars / tfstate 里常直接写云账号密钥与资源输出。
+  /\.tfvars$/i,
+  /\.tfstate(\.backup)?$/i,
+  // ── 8. 关键字兜底（最后一道，宽但便宜）────────────────
   /secret/i,
 ])
 
@@ -77,6 +179,158 @@ export const SENSITIVE_FILE_PATTERNS = Object.freeze([
 export function isSensitivePath (filePath) {
   const normalized = String(filePath ?? '').replace(/\\/g, '/')
   return SENSITIVE_FILE_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
+/**
+ * git 会执行的那些 hook 文件名（`githooks(5)` 的固定清单）。
+ *
+ * 为什么要按名字列全而不是「列出目录里有什么」：执行器没有 fs 服务可用
+ * （插件的 fs 是宿主的，本文件坚持不 import 宿主包），能拿到的只有
+ * `options.readFile(path)` 这一个「按路径读内容」的原语。好消息是这份清单
+ * **是完备的** —— git 只会执行名字在这份清单里的 hook，agent 想留后门
+ * 只能占其中一个文件名（或改 `core.hooksPath` 指向别处，那是 `.git/config`
+ * 的改动，由 `PROTECTED_GIT_FILES` 兜住）。
+ */
+const GIT_HOOK_NAMES = Object.freeze([
+  'applypatch-msg', 'pre-applypatch', 'post-applypatch',
+  'pre-commit', 'pre-merge-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit',
+  'pre-rebase', 'post-checkout', 'post-merge', 'pre-push',
+  'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update',
+  'reference-transaction', 'push-to-checkout',
+  'pre-auto-gc', 'post-rewrite', 'sendemail-validate',
+  'fsmonitor-watchman', 'p4-changelist', 'p4-prepare-changelist',
+  'p4-post-changelist', 'p4-pre-submit', 'post-index-change',
+])
+
+/** `.git/` 下能改变「git 行为」的元数据。改这些等于劫持执行器自己的提交动作。 */
+const PROTECTED_GIT_FILES = Object.freeze([
+  'config', 'config.worktree', 'HEAD', 'commondir', 'shallow', 'packed-refs',
+  'info/attributes', 'info/exclude', 'info/grafts', 'info/sparse-checkout',
+])
+
+/** 插件 profile 里能改变「宿主行为」的文件（`cordis.patch.yml` 就是插件的装配清单）。 */
+const PROTECTED_PROFILE_FILES = Object.freeze([
+  'cordis.patch.yml', 'cordis.patch.yaml', 'cordis.yml', 'cordis.yaml',
+])
+
+/**
+ * 判断一个**仓库相对路径**是不是 git 元数据（`.git/**`）。
+ *
+ * 用途和 `isSensitivePath` 不同：敏感文件是「不进提交」，这里是「动过就不许提交」。
+ *
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+export function isProtectedGitPath (filePath) {
+  const normalized = String(filePath ?? '').replace(/\\/g, '/')
+  return normalized === '.git' || normalized.startsWith('.git/') || normalized.includes('/.git/')
+}
+
+/**
+ * 给「碰不得的元数据」拍一份内容快照，用来做「本轮动过没有」的比对。
+ *
+ * 为什么必须走这条路：`.git/` 不在 `git diff` / `git status` 的视野里（git 不跟踪
+ * 自己的元数据），profile 目录更是压根不在仓库里。所以没有「diff 里冒出来一行」
+ * 这种免费信号，只能自己在 agent 动手前记一份哈希、干完再算一遍。
+ *
+ * 为什么用 `options.readFile` 而不是 fs：
+ * 1. 本文件的原则是不 import 宿主包，fs 只有宿主的 `fs` 服务能给；
+ * 2. `makeTextFileReader` 已经由组合根注入成 `options.readFile`（见 `src/index.js`），
+ *    它内部优先走宿主 fs 服务、退回 `node:fs`，**读不存在会抛 ENOENT** ——
+ *    于是它同时也是一个「这个路径在不在」的探针，不需要额外的目录列举能力。
+ *
+ * 拿不到 `options.readFile`（老宿主/纯 mock）就返回 `undefined`，调用方据此跳过自检
+ * 并记一条日志。**跳过是安全的降级**：没有自检时，提交仍然只含 `committable`
+ * 里那些非敏感文件，只是少了「元数据被动过」这一层告警。
+ *
+ * @param {any} options
+ * @param {string} cwd
+ * @returns {Promise<{ gitDirs: string[], profileDir: string, entries: Map<string, string> } | undefined>}
+ */
+export async function snapshotProtectedPaths (options, cwd) {
+  if (typeof options?.readFile !== 'function') return undefined
+  const readFile = options.readFile
+
+  /** 读一个路径，返回内容哈希；不存在返回 `'absent'`。 */
+  const fingerprint = async (path) => {
+    try {
+      const text = await readFile(path)
+      // 用 sha256 而不是存原文：快照可能包含 `.git/config` 里的远程地址与
+      // 凭据片段，没必要在工作区里多留一份明文。
+      return `sha256:${createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')}`
+    } catch {
+      return 'absent'
+    }
+  }
+
+  // `.git` 可能是个文件（worktree 就是这样：`.git` 内容指向 `gitdir`）。
+  // 先问 git 自己在哪，比猜路径可靠。
+  const gitDirs = []
+  if (typeof options.git === 'function') {
+    for (const flag of ['--git-dir', '--git-common-dir']) {
+      try {
+        assertAllowedGit(['rev-parse', flag])
+        const result = await options.git(['rev-parse', flag], { cwd })
+        if (Number(result?.code ?? 1) !== 0) continue
+        const raw = String(result?.stdout ?? '').trim()
+        if (raw.length === 0) continue
+        const full = isAbsolute(raw) ? raw : resolve(cwd, raw)
+        if (!gitDirs.includes(full)) gitDirs.push(full)
+      } catch {
+        // 拿不到 git 目录不是致命错：`.git` 相对路径是绝大多数情况，
+        // 下面的兜底探测仍然能覆盖。
+      }
+    }
+  }
+  if (gitDirs.length === 0) gitDirs.push(resolve(cwd, '.git'))
+
+  /** @type {Map<string, string>} */
+  const entries = new Map()
+  for (const gitDir of gitDirs) {
+    for (const name of PROTECTED_GIT_FILES) {
+      const path = join(gitDir, ...name.split('/'))
+      entries.set(path, await fingerprint(path))
+    }
+    for (const hook of GIT_HOOK_NAMES) {
+      const path = join(gitDir, 'hooks', hook)
+      entries.set(path, await fingerprint(path))
+    }
+  }
+
+  // profile 目录：组合根能给就给，否则读环境变量（headless/worker 里都设了）。
+  // 拿不到就返回空路径 —— 这一块跳过，但 `.git` 那部分照常生效。
+  const profileDir = String(options?.profileDir ?? process.env.DSH_PROFILE_DIR ?? '')
+  if (profileDir.length > 0) {
+    for (const name of PROTECTED_PROFILE_FILES) {
+      const path = join(profileDir, name)
+      entries.set(path, await fingerprint(path))
+    }
+  }
+
+  return { gitDirs, profileDir, entries }
+}
+
+/**
+ * 比对两份快照，返回这一轮被动过（新增 / 改内容 / 删掉）的路径。
+ *
+ * 删除也算：把 `pre-push` 换成空壳之前先删掉再写，中途那一瞬是「删了」，
+ * 但最终状态是「有内容」，照样会被比对出来。真删掉一个 `core.hooksPath`
+ * 指向的 hook 同样是篡改（等于把防护摘了）。
+ *
+ * @param {ReturnType<typeof snapshotProtectedPaths>} before
+ * @param {ReturnType<typeof snapshotProtectedPaths>} after
+ * @returns {string[]}
+ */
+export function compareProtectedSnapshots (before, after) {
+  if (!before || !after) return []
+  const changed = []
+  for (const [path, hash] of after.entries) {
+    if (before.entries.get(path) !== hash) changed.push(path)
+  }
+  for (const path of before.entries.keys()) {
+    if (!after.entries.has(path)) changed.push(path)
+  }
+  return changed
 }
 
 /**
@@ -109,7 +363,13 @@ export function isAllowedGitCommand (argv) {
   if (command === 'commit') return true // 只允许本地提交，push 不在白名单里
   if (command === 'diff') return true
   // 提交要拿 sha：只放行 rev-parse HEAD 这一种读法。
-  if (command === 'rev-parse') return rest.length === 1 && rest[0] === 'HEAD'
+  // 另外放行 `--git-dir` / `--git-common-dir`：提交前自检要找到 `.git` 目录去比对
+  // hooks/config/info 的内容哈希（见 `snapshotProtectedPaths`）。这两个也是纯读，
+  // 而且必须带 `--` 前缀形态才认，避免 `rev-parse --all` 之类被顺手放进来。
+  if (command === 'rev-parse') {
+    if (rest.length !== 1) return false
+    return rest[0] === 'HEAD' || rest[0] === '--git-dir' || rest[0] === '--git-common-dir'
+  }
   // 拍基线：`git stash create` 只**造**一个 stash commit 对象并回它的 sha，
   // 不写 ref、不动工作区、不动索引（实测 `git stash create` 之后 `git stash list`
   // 仍是空的）。`stash` 的其它子命令都会改工作区 —— 尤其 `pop`/`apply` 会把
@@ -308,6 +568,23 @@ export function createAgentExecutor (options = {}) {
           return undefined
         })
 
+        // ── 2b. 拍「碰不得的元数据」快照 ──────────────────────
+        //
+        // agent 拿的是 danger-full-access，它**能**写 `.git/hooks/pre-commit`、
+        // 改 `.git/config` 的 `core.hooksPath`、改插件 profile 的 `cordis.patch.yml`。
+        // 这些路径全都不在 `git diff` 的视野里（git 不跟踪自己的元数据，profile 更
+        // 不在仓库里），所以「改没改过」只能自己拍哈希比对。
+        //
+        // 拿不到 `options.readFile` 就跳过，并明确记一条日志 —— 降级必须是可见的，
+        // 不能让人以为自检一直在跑。
+        const protectedBefore = await snapshotProtectedPaths(options, worktreePath).catch((error) => {
+          ctx.log?.(`executor-agent：拍受保护路径快照失败，本轮不做 .git/profile 篡改自检：${error?.message ?? String(error)}`)
+          return undefined
+        })
+        if (!protectedBefore) {
+          ctx.log?.('executor-agent：没有 readFile 服务，本轮跳过 .git/profile 篡改自检（只靠敏感文件名单兜底）')
+        }
+
         // ── 3. 推任务：必须 followup（inject 不唤醒 agent）──
         agent.followup(createUserMessage({ content: messages, source: { kind: 'user' } }))
         await ctx.onPhase('editing', 'agent 已接到任务书，开始改代码')
@@ -341,6 +618,45 @@ export function createAgentExecutor (options = {}) {
           await unstageSensitiveFiles(options, worktreePath, blocked, ctx)
         }
 
+        // ── 5b. 提交前自检：本轮动过 `.git/` 或插件 profile 吗 ──
+        //
+        // 这是 danger-full-access 的兜底。git 白名单只管**执行器自己**发的命令，
+        // 管不住 agent 的 shell —— 它完全可以直接 `echo > .git/hooks/pre-commit`
+        // 埋一个在下次 `git commit` 时执行的后门（而下次 commit 是我们发的），
+        // 或者改 profile 的 `cordis.patch.yml` 让插件下一轮加载到别的实现。
+        //
+        // 命中就整张票不提交：这时候**任何**提交都不安全 —— 索引里的东西已经
+        // 不可信了（agent 可能顺手 `git add` 过别的东西），硬提交等于替它签字。
+        if (protectedBefore) {
+          const protectedAfter = await snapshotProtectedPaths(options, worktreePath).catch((error) => {
+            ctx.log?.(`executor-agent：复拍受保护路径快照失败，本轮跳过篡改自检：${error?.message ?? String(error)}`)
+            return undefined
+          })
+          const tampered = compareProtectedSnapshots(protectedBefore, protectedAfter)
+          if (tampered.length > 0) {
+            // 先把 agent 可能塞进索引的东西退回去，别让人回来时看到一个脏索引。
+            // 这里传的是「被篡改的保护路径」，它们在索引里的可能性极低
+            // （`.git/` 根本不会进索引），但 profile 目录万一在仓库里就管用；
+            // 退回失败也不影响结论 —— 票已经是不提交了。
+            await unstageSensitiveFiles(options, worktreePath, tampered, ctx).catch(() => {})
+            const reason = `agent 改动了受保护的元数据（${tampered.join('、')}），按约定不提交；请人工核查这些文件后再决定是否重跑`
+            ctx.log?.(`executor-agent：${reason}`, { files: tampered })
+            // 用 failed + invalid-input（不可重试）而不是 needs-info：
+            // `PHASE_TRANSITIONS` 里 editing/mr-opening 都转不到 needs-info，
+            // `makeExecResult` 也只认 done/skipped/failed —— 写 needs-info 会被 store 拒。
+            await ctx.onPhase('failed')
+            return makeExecResult({
+              phase: 'failed',
+              sessionId,
+              changedFiles: [],
+              testOutcome: 'skipped',
+              testDetail: reason,
+              blockedFiles: tampered,
+              error: { kind: 'invalid-input', message: reason, retryable: false },
+            })
+          }
+        }
+
         if (committable.length === 0) {
           // 先问一句「agent 是失败了吗」：模型调用被拒（限流/配额）时它一个字
           // 都改不了，但从外面看跟「它觉得不用改」长得一模一样。以前这两种
@@ -367,6 +683,9 @@ export function createAgentExecutor (options = {}) {
             changedFiles: [],
             testOutcome: 'skipped',
             testDetail: reason,
+            // 被拦的文件必须能看见：只写日志的话，人在通知/MR 里只看到「没改动」，
+            // 完全不知道 agent 其实动过东西、只是被名单拦下了。
+            blockedFiles: collected.files,
             error: { kind: 'internal', message: reason, retryable: false },
           })
         }
@@ -407,8 +726,11 @@ export function createAgentExecutor (options = {}) {
         // 但 plan.summary 必须把「未跑过测试」写在最前面，不能让「完成」这个字眼
         // 替人默认测试过了 —— 工单需求里「完成后对问题功能进行测试」是硬要求。
         const phase = verification.outcome === 'failed' ? 'skipped' : 'done'
+        // 「疑似含真实凭据」这几个字是刻意的：名单是**宽进**的，被拦下的文件
+        // 大多数确实含凭据，但也会误伤（比如一份 `credentials.example.json`）。
+        // 写成「疑似」既让人知道要去核对，也免得让人以为插件确证了密钥。
         const blockedNote = blocked.length > 0
-          ? `；另有 ${blocked.length} 个敏感文件按约定未提交（${blocked.join('、')}）`
+          ? `；另有 ${blocked.length} 个敏感文件按约定未提交（疑似含真实凭据）：${blocked.join('、')}`
           : ''
         const verifyNote = verification.outcome === 'passed'
           ? `验证通过：${verification.detail}`
@@ -423,6 +745,9 @@ export function createAgentExecutor (options = {}) {
           testDetail: verification.detail,
           commit,
           mr,
+          // 被名单拦下的文件也要交出去。`changedFiles` 只放真提交了的，
+          // 这两者人得能分开看 —— 否则「少了两个文件」永远没有解释。
+          blockedFiles: blocked,
           plan: {
             summary: `按工单改动了 ${committable.length} 个文件；${verifyNote}${blockedNote}`,
             targetPaths: committable,
@@ -815,6 +1140,16 @@ export async function setupAgent (options, input) {
       session.append('sandbox/mode', { mode: 'danger-full-access' })
       session.append('approval/policy', { policy: 'never' })
       log('executor-agent：会话策略已记（danger-full-access / approval never）', { sessionId })
+      // 这条日志是**审计口**，不是闲聊。上面那两行等价于「把 agent 的缰绳放开」：
+      //   · danger-full-access = 它能读写本机任意路径（不止 worktree）；
+      //   · approval/policy: never = 任何需要审批的动作直接**自动拒绝**，
+      //     而不是弹卡给人点 —— 无人值守时弹卡会卡死整条流水线。
+      // 于是 agent 事实上可以执行任意命令、写 `.git/hooks/*`、改插件 profile。
+      // 宿主 `dsh-user-approval` 只认 'ask' 和 'never' 两个值
+      // （`APPROVAL_POLICIES = ['ask', 'never']`），**没有**「只读自动批、写入弹卡」
+      // 这一档可退；'ask' 在 headless/worker 里会 fail-closed，等于所有工具都失败，
+      // 定时跑票直接全灭。所以这里保留 never，但必须把风险留成可见的一条日志。
+      log('executor-agent：⚠ 警告：approval/policy 已退回 never —— agent 可自由执行任意命令（含写 .git/hooks 与插件 profile）。兜底只有 git 白名单 + 提交前篡改自检，不是硬隔离。', { sessionId })
     } catch (error) {
       log('executor-agent：写入会话策略事件失败，agent 可能改不动 worktree', { sessionId, reason: String(error) })
     }

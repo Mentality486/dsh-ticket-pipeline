@@ -170,6 +170,16 @@ export function createPipelineStatusTool (options) {
           }
           if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
           if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
+          // 待补做的事后动作：票已经是终态，但回填/通知还没做成（进程在中间退出了）。
+          // 不写出来，「表里那行还停在处理中」就永远没人知道该去看一眼。
+          if (row.pendingEffects) {
+            const todo = []
+            if (row.pendingEffects.writeBack) todo.push('回填表格')
+            if (row.pendingEffects.notify) todo.push('发通知')
+            if (todo.length > 0) {
+              lines.push(`  待补做：${todo.join('、')}（进程在到终态之后、动作完成之前退出了；下次启动会自动补做一次）`)
+            }
+          }
           if (row.revisionCount > 1) lines.push(`  这是第 ${row.revisionCount} 版（工单被改过 ${row.revisionCount - 1} 次）`)
         }
 
@@ -197,6 +207,11 @@ export function createPipelineStatusTool (options) {
           mrUrl: row.mr?.url,
           sessionId: row.sessionId,
           writeBack: row.writeBack,
+          // 只暴露「还有没有待补做」，不把整份 writeBack 输入摊给调用方：
+          // 那是内部载荷，对调用方没有意义，还会把工具输出撑大。
+          pendingEffects: row.pendingEffects
+            ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
+            : undefined,
           lastError: row.lastError,
           testDetail: row.testDetail,
           revisionCount: row.revisionCount,

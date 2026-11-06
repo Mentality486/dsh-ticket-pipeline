@@ -237,4 +237,198 @@ export async function runWorkspaceChecks (check) {
     assert.equal(calls.attach[0].workspaceId, workspaceId)
     assert.deepEqual(workspace.sessionIds, ['ticket-pms-rec-1-1700000000000'])
   })
+
+  await check('验证命令：signal 已经是 aborted 时根本不起子进程', async () => {
+    const { makeCommandRunner } = await import('../src/index.js')
+    let executed = 0
+    const runner = makeCommandRunner({
+      get: (name) => (name === 'shell'
+        ? {
+            resolve: (request) => request,
+            execute: async () => {
+              executed += 1
+              return { result: async () => ({ exitCode: 0 }) }
+            },
+          }
+        : undefined),
+    })
+    const controller = new AbortController()
+    controller.abort(new Error('cancel'))
+    await assert.rejects(
+      () => runner({ argv: ['node', '--version'], cwd: 'D:/repo', signal: controller.signal }),
+      (error) => {
+        assert.equal(error.kind, 'aborted', '取消要落到 aborted，而不是被当成「验证没通过」')
+        return true
+      },
+    )
+    assert.equal(executed, 0, '已经取消就不该再起子进程')
+  })
+
+  await check('验证命令：跑到一半被取消时立刻返回并 kill 掉子进程', async () => {
+    const { makeCommandRunner } = await import('../src/index.js')
+    /** @type {any} */
+    let request
+    let killed = 0
+    const runner = makeCommandRunner({
+      get: (name) => (name === 'shell'
+        ? {
+            resolve: (value) => {
+              request = value
+              return value
+            },
+            // result() 永不 settle，模拟一条卡住的 npm test。
+            execute: async () => ({
+              result: () => new Promise(() => {}),
+              kill: () => { killed += 1; return true },
+            }),
+          }
+        : undefined),
+    })
+    const controller = new AbortController()
+    const pending = runner({ argv: ['npm', 'run', 'test'], cwd: 'D:/repo', signal: controller.signal, timeoutMs: 60000 })
+    setTimeout(() => controller.abort(new Error('cancel')), 5)
+    await assert.rejects(pending, (error) => {
+      assert.equal(error.kind, 'aborted')
+      return true
+    })
+    assert.equal(request.timeoutMs, 60000, 'timeoutMs 必须进 shell.resolve')
+    assert.equal(request.signal, controller.signal, 'signal 也必须进 shell.resolve（宿主据此真的杀进程）')
+    assert.equal(killed, 1, '兜底返回后要显式 kill，别让进程继续写仓库')
+  })
+
+  await check('验证命令：取消恰好发生在起进程那一瞬间也不漏（listener 挂上前先补看一次）', async () => {
+    const { makeCommandRunner } = await import('../src/index.js')
+    const controller = new AbortController()
+    let killed = 0
+    const runner = makeCommandRunner({
+      get: (name) => (name === 'shell'
+        ? {
+            resolve: (value) => value,
+            // 关键：execute 里就把 signal 取消了。等 result() 被 await 时，
+            // abort 事件已经过去 —— 只靠 addEventListener 会永远等不到，
+            // 于是被拖到超时（票从「被取消」变成「超时」）。
+            execute: async () => {
+              controller.abort(new Error('cancel-race'))
+              return {
+                result: () => new Promise(() => {}),
+                kill: () => { killed += 1; return true },
+              }
+            },
+          }
+        : undefined),
+    })
+    await assert.rejects(
+      runner({ argv: ['npm', 'run', 'test'], cwd: 'D:/repo', signal: controller.signal, timeoutMs: 50 }),
+      (error) => {
+        assert.equal(error.kind, 'aborted', '必须是 aborted，不能退化成超时')
+        return true
+      },
+    )
+    assert.equal(killed, 1)
+  })
+
+  await check('验证命令：到点返回 124，不再无限等待（以前会让整条流水线停摆）', async () => {
+    const { makeCommandRunner, VERIFY_TIMEOUT_EXIT_CODE } = await import('../src/index.js')
+    let killed = 0
+    const runner = makeCommandRunner({
+      get: (name) => (name === 'shell'
+        ? {
+            resolve: (value) => value,
+            execute: async () => ({
+              result: () => new Promise(() => {}),
+              kill: () => { killed += 1; return true },
+            }),
+          }
+        : undefined),
+    })
+    const out = await runner({ argv: ['npm', 'run', 'test'], cwd: 'D:/repo', timeoutMs: 20 })
+    assert.equal(out.code, VERIFY_TIMEOUT_EXIT_CODE, '超时用 124，跟「检查未通过」区分开')
+    assert.equal(killed, 1)
+    assert.match(out.stderr, /超时/)
+  })
+
+  await check('验证命令：不传 timeoutMs 时用 30 分钟缺省值（绝不无上限）', async () => {
+    const { makeCommandRunner, VERIFY_TIMEOUT_MS } = await import('../src/index.js')
+    /** @type {any} */
+    let request
+    const runner = makeCommandRunner({
+      get: (name) => (name === 'shell'
+        ? {
+            resolve: (value) => {
+              request = value
+              return value
+            },
+            execute: async () => ({
+              result: async () => ({ exitCode: 0, stdout: { text: 'v20' }, stderr: { text: '' } }),
+            }),
+          }
+        : undefined),
+    })
+    const out = await runner({ argv: ['node', '--version'], cwd: 'D:/repo' })
+    assert.equal(out.code, 0)
+    assert.equal(out.stdout, 'v20')
+    assert.equal(request.timeoutMs, VERIFY_TIMEOUT_MS)
+    assert.equal(request.signal, undefined, '没给 signal 时不要把 undefined 塞进请求')
+  })
+
+  await check('配置：workExecutor 写错一个字要报错并列出可选值（以前会静默换成 mock）', async () => {
+    const { validateConfig } = await import('../src/core/config.js')
+    for (const bad of ['Agent', 'agents', 'agent ']) {
+      const result = validateConfig({ workExecutor: bad })
+      assert.ok(result.issues && result.issues.length > 0, `${JSON.stringify(bad)} 应当被配置校验拦下`)
+      const text = result.issues.map((issue) => issue.message).join('；')
+      // 不钉枚举列表的顺序：文案是 `field.enum.join(' / ')`，谁先谁后是配置表的
+      // 内部细节，钉顺序只会在有人调整 enum 顺序时得到一条与故障无关的红灯。
+      assert.match(text, /agent/)
+      assert.match(text, /mock/)
+    }
+    const ok = validateConfig({ workExecutor: 'agent' })
+    assert.ok(ok.value, `agent 是合法值：${JSON.stringify(ok.issues ?? [])}`)
+    const dflt = validateConfig({})
+    assert.ok(dflt.value, '缺省值也要过校验')
+    assert.equal(dflt.value.workExecutor, 'mock')
+  })
+
+  await check('配置：pushAdapter 写错一个字要报错并列出可选值（否则真通知一封都发不出去）', async () => {
+    const { validateConfig } = await import('../src/core/config.js')
+    const bad = validateConfig({ pushAdapter: 'nope' })
+    assert.ok(bad.issues && bad.issues.length > 0)
+    const text = bad.issues.map((issue) => issue.message).join('；')
+    for (const name of ['mock', 'pushplus', 'qqmail']) {
+      assert.match(text, new RegExp(name), `文案里要有可选值 ${name}`)
+    }
+    for (const good of ['mock', 'pushplus', 'qqmail']) {
+      const result = validateConfig({ pushAdapter: good })
+      assert.ok(result.value, `${good} 是合法值：${JSON.stringify(result.issues ?? [])}`)
+      assert.equal(result.value.pushAdapter, good)
+    }
+  })
+
+  await check('组合根：适配器名字查不到时抛 invalid-input，不再静默退回 mock', async () => {
+    const { pickAdapterFactory, EXECUTORS, PUSHES } = await import('../src/index.js')
+    assert.equal(pickAdapterFactory(EXECUTORS, 'agent', 'workExecutor', '执行器'), EXECUTORS.agent)
+    // 「没写」与「写错」语义不同：没写仍给 mock（离线自测与首次安装靠它跑通链路）。
+    for (const blank of [undefined, null, '', '   ']) {
+      assert.equal(pickAdapterFactory(EXECUTORS, blank, 'workExecutor', '执行器'), EXECUTORS.mock)
+    }
+    // 期望值直接由注册表推出来，不手抄一遍：文案里的可用值就是
+    // `Object.keys(table)?.join(' / ')`，抄一份等于把顺序钉死（`EXECUTORS`
+    // 里 mock 在 agent 前面，`PUSHES` 里顺序又不同），以后谁调一下注册顺序
+    // 这条断言就会红，而它想守的其实是「把能用的值都列出来」。
+    const listsEveryKey = (table) => (error) => {
+      assert.equal(error.kind, 'invalid-input')
+      for (const key of Object.keys(table)) {
+        assert.match(error.message, new RegExp(key), `文案里要列出可用的 ${key}`)
+      }
+      return true
+    }
+    assert.throws(
+      () => pickAdapterFactory(EXECUTORS, 'Agent', 'workExecutor', '执行器'),
+      listsEveryKey(EXECUTORS),
+    )
+    assert.throws(
+      () => pickAdapterFactory(PUSHES, 'qqmail2', 'pushAdapter', '通知适配器'),
+      listsEveryKey(PUSHES),
+    )
+  })
 }

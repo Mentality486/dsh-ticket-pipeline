@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `0b9dcff`）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `dbfa21f` + 本轮未提交的上线加固）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -391,7 +391,8 @@ export type ExecResult = {
 
 **`sessionId` 是可选但推荐返回的**：`run()` 的三个出口（done / skipped / failed）都带它，
 `executor-agent` 用 `buildSessionId(ticket, ctx)` 生成同一个人能认出来的名字，落到票据的 `sessionId`。
-有了它，`pipeline_status` 才会打出「处理会话：…（可在会话列表里点进去继续问）」，通知正文里也会带上。
+有了它，`pipeline_status` 才会打出「处理会话：…（可在会话列表里点进去继续问）」，回填进表格「处理结果」列的那段话里也有一行 `处理会话：`。
+**注意通知正文里没有这一行** —— `renderNotifyBody()` 只写 `本地提交：` / `draft MR：` / `改动文件：` / `验证：` 那几段。
 
 **`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然做本地提交，但**必须把原因写进提交说明**，不能默默略过 —— 人 `git show` 才知道「这个改动没被真跑过」。
 
@@ -909,7 +910,7 @@ export const Config = {
   pollIntervalMinutes: number,   // 默认 3，1..60
   safePageRun: number,           // 默认 20，5..100
   goneAfterScans: number,        // 默认 3，1..20
-  concurrency: number,           // 默认 1（当前只支持 1）
+  concurrency: number,           // 默认 1（当前只支持 1）。**死配置：全仓零消费点，改了不生效**（见 §9 末尾与 feature-checklist §9.2 第 14 条）
 
   // ── 租约与重试 ──────────────────────────────────────
   leaseTtlMinutes: number,       // 默认 10，1..60
@@ -917,7 +918,8 @@ export const Config = {
   maxAttempts: number,           // 默认 2，1..5
 
   // ── 执行 ────────────────────────────────────────────
-  workExecutor: 'mock' | 'agent', // 默认 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 在工作区检出里做本地提交）
+  workExecutor: 'mock' | 'agent', // 默认 mock。**enum 强校验**：写错（含大小写、尾空格）激活期直接抛 invalid-input 并列可选值，
+                                  // 只有 undefined/null/空串才回落到 mock；以前静默退回 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 在工作区检出里做本地提交）
   ticketTimeoutMinutes: number,  // 默认 40，5..180
   isolateWorktree: boolean,      // 默认 false：直接在项目工作区的检出里改代码（检出脏也能跑，只提交 agent 改过的）；
                                  // true 才每票 `git worktree add -b <branch> .agents/worktrees/<branch>` 开隔离检出
@@ -939,7 +941,7 @@ export const Config = {
   agentPreset: string,           // 默认 'ptc'；空串 = 不挂 preset（agent 会一个工具都没有）
 
   // ── 通知 ────────────────────────────────────────────
-  pushAdapter: 'mock' | 'pushplus' | 'qqmail', // 默认 pushplus
+  pushAdapter: 'mock' | 'pushplus' | 'qqmail', // 默认 pushplus。同样 enum 强校验：写错即抛 invalid-input 并列可选值（以前静默退回 mock，真通知一封都发不出去）
   pushplus: { token, channel, template, callbackUrl },
   qqmail: {                      // QQ 邮箱 SMTP 直发；授权码走 credentials 的 QQMAIL_AUTH_CODE
     host: string,                // 默认 'smtp.qq.com'
@@ -952,7 +954,7 @@ export const Config = {
 
   // ── 杂项 ────────────────────────────────────────────
   enabled: boolean,              // 默认 false
-  logLevel: string,              // 默认 'info'
+  logLevel: string,              // 默认 'info'。**死配置：全仓零消费点，改了不生效**（见 §9 末尾与 feature-checklist §9.2 第 14 条）
 }
 ```
 
@@ -974,6 +976,35 @@ export const Config = {
 「为什么这么改」），而 **agent 实例无论如何都会在 `finally` 里释放** —— 保留的是会话记录，不是模型占用。
 设成 `false` 才调宿主的 `sessions` 服务把会话一起收掉（`close` / `dispose` / `closeSession` 三选一，取到哪个用哪个）。
 
+**`concurrency` 与 `logLevel` 是死配置**：两个键在 `CONFIG_FIELDS` 里有定义、有分组标签、在设置页能改，
+但**全仓没有任何消费点**（`core/config.js` 之外 grep 不到读它们的地方）。改了不生效 ——
+`concurrency` 恒等于「一轮一票」，`logLevel` 恒等于实际写日志的行为。这条缺陷在
+`feature-checklist.md` §9.2 第 14 条记着，别把这两个键当成能调节的旋钮。
+
+**`workExecutor` / `pushAdapter` 是 enum 强校验，写错就停**：两个键在 `CONFIG_FIELDS` 里带
+`enum: Object.freeze([...])`（`config.js` 的 `workExecutor` / `pushAdapter`），激活期由
+`src/index.js` 的 `pickAdapterFactory(table, requested, fieldName, label)` 取工厂。语义刻意区分：
+
+- `undefined` / `null` / 空串（含纯空白）→ 用 `mock`（首次安装与离线自测靠它跑通链路）；
+- 写了任何别的值 → 必须是注册表里的键，否则抛 `invalid-input` 并列出可选值。
+
+为什么不再用 `EXECUTORS[config.workExecutor] ?? EXECUTORS.mock`：写错一个字母（`Agent`、`agents`、带尾空格）
+会让插件**悄悄用 mock 跑完整条链路** —— 不改一行代码，却给票打 `testOutcome: 'passed'`、写个假 commit sha、
+回填表格写「已按工单改完并提交」，还能照常发通知。这类「看起来成功」的假执行是上线后最难发现的事故，
+所以宁可激活期直接停。
+
+**验证命令的超时与取消**：`src/index.js` 的 `VERIFY_TIMEOUT_MS = 30 * 60 * 1000`、
+`VERIFY_TIMEOUT_EXIT_CODE = 124`；`makeCommandRunner(ctx)` 生成的 runner 收
+`{ argv, cwd, signal, timeoutMs }`，把 `timeoutMs` 与 `signal` 一起交给宿主 `shell.resolve`，
+外面再套一层 `Promise.race` 兜底（宿主版本忽略这两个字段时也要能走开并 `handle.kill()`）。
+超时**返回 124 而不是抛**（沿 coreutils `timeout` 约定：124 = 命令没跑完，和「检查没通过」区分开）；
+`signal` 已 aborted 时不启进程、直接抛 `PipelineError('aborted', ...)`。
+宿主 `bash-local` 还会按它自己的 `maxTimeoutMs`（缺省 10 分钟）夹一次（`clampTimeout` 取 min），
+所以真实上限是两者里小的那个 —— 要真的跑到 30 分钟得改 profile 的 bash-local 配置。
+这一层不是「锦上添花」：没有它，一条卡住的 `npm test` 会让 `runOne` 永远停在 `await` 上，
+`finally` 走不到、单飞标记 `running` 恒为 `true`，之后每次 tick 都直接返回 `already-running` ——
+**整条流水线静默停摆，而且 `pipeline_cancel` 也取消不了**（票面超时只 abort 了 signal，子进程照跑）。
+
 ---
 
 ## 10. 可替换点（文件级）
@@ -990,6 +1021,7 @@ src/
 │   ├── plugin-version.js          ← 安装副本 vs 源码的文件级比对（判断「跑的是不是最新代码」）
 │   ├── domain.js                  ← 平台无关的小工具（ID 归一、时间等）
 │   ├── branch-name.js             ← 分支名 sanitize
+│   ├── branches.js                ← 分支候选：parseBranchRefs / mergeBranchChoices / listBranches（给 baseBranch / targetBranch 当候选，绝不抛）
 │   ├── prompt.js                  ← 给 agent 的 task 文案拼装（纯文本 + 图片块）
 │   └── prompts.js                 ← 插件自带的提示词片段（面板/工具文案）
 ├── contracts/                     ← 只有类型与错误类，不 import 任何东西
@@ -1011,7 +1043,7 @@ src/
 │   ├── source-webform/            ← 网页表单（内存 records，最小实现）
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
 │   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 在工作区检出里做本地提交（可选出口才开 draft MR）
-│   │   ├── index.js               ← 主流程（起 agent、preset、基线快照、collect、verify、commitLocally、keepSession、可选 openDraftMr）
+│   │   ├── index.js               ← 主流程（起 agent、preset、基线快照、受保护路径快照、collect、verify、篡改自检、commitLocally、keepSession、可选 openDraftMr）；含敏感名单 SENSITIVE_FILE_PATTERNS（8 大类 41 条）
 │   │   └── agent-failure.js       ← 从 session.log / agent/error 里读真实失败原因
 │   ├── executor-mock/             ← 不发真改动的执行器，自测用（返回假的 commit）
 │   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端（只在 repo.gitlab.enabled=true 时被调用）
@@ -1195,6 +1227,16 @@ T+0:35  onPhase('mr-opening', '在工作区检出里做本地提交')
         │       旧解析器会把引号写进提交路径 → git 找不到文件
         ├─ 敏感文件过滤后，若 agent 自己把它们 `git add` 过：
         │    `git restore --staged -- <敏感文件>` 退回未跟踪（白名单只放行 --staged）
+        ├─ ★ 提交前复拍受保护路径快照，与 T+0:02 前那份比：
+        │    `.git/` 的 10 个元数据文件（config / config.worktree / HEAD / commondir / shallow /
+        │    packed-refs / info/attributes / info/exclude / info/grafts / info/sparse-checkout）
+        │    + 28 个 git hook 名（githooks(5) 固定清单）+ 4 个插件 profile 文件
+        │    （cordis.patch.yml / .yaml / cordis.yml / .yaml）
+        │    —— 动过就把这些路径 `git restore --staged --` 撤回、判 failed + invalid-input（不可重试），
+        │    理由「agent 改动了受保护的元数据（…），按约定不提交；请人工核查这些文件后再决定是否重跑」
+        │    ⚠️ 这是「被发现」不是「被阻止」：git 看不见自己的元数据、profile 压根不在仓库里，
+        │       没有「diff 里冒出一行」这种免费信号，只能自己拍哈希比对。
+        │       拿不到 readFile 服务时跳过自检并记日志（安全降级：提交仍只含非敏感文件）
         ├─ git add -- <非敏感且非删除的文件>   ← 点名暂存（不用 add -A：全量暂存会让
         │    ⚠️ 敏感文件露在 index 里，人一提交就跟着走了；git 白名单也只放行 `add -- <文件>`）
         ├─ git commit -m <提交说明> -- <改动文件 ∪ 重命名前的旧路径>
@@ -1213,6 +1255,9 @@ T+0:35  onPhase('mr-opening', '在工作区检出里做本地提交')
              开完断言 draft === true
 
 T+0:36  onPhase('done') / onPhase('skipped')
+        ├─ 这一段落库时**同时**写 pendingEffects（见 §11.1）：
+        │    终态字段 + 「还没做完的事后动作」在同一次 setPhase 里落下，
+        │    这样进程在两者之间崩掉时，下次启动知道还有事没做完
         ├─ 存 commit.sha / commit.branch / commit.files、sessionId
         │    （有远程出口时一并存 mr.iid / mr.url）
         ├─ 释放 agent 实例（finally 里无条件 dispose）；keepSession !== false 时
@@ -1223,10 +1268,16 @@ T+0:36  onPhase('done') / onPhase('skipped')
         │    且终态是 done/skipped 时，调一次 writeResult(recordId,
         │    { status: writeBackStatus, result: renderWriteBackResult(...), handledAt })
         │    → 回执落到票据 writeBack = { written, fields, at, note? }
+        │    做完就 clearPendingEffect(key, 'writeBack')
         │    ⚠️ failed 不回填（表里留在「处理中」是刻意留的信号）；
         │       被取消就不写；回填失败只记日志，票态不回退、通知照发
-        ├─ push.send({ title, body, level:'info' })：正文首行是
+        ├─ push.send({ title, body, level:'info' })：正文第一段是 项目/工单序号/模块/优先级
+        │    + 描述前 3 行，**描述之后**才有一行
         │    「本地提交：<sha 前 12 位> @ <branch>（<worktreePath>）」；有 mr 时才多带 link
+        │    ⚠️ writeBack.written === false 时正文多一行
+        │       「回填表格：没写成 —— <原因>（表格里那一行可能还停在「处理中」，请手工改一下）」；
+        │       成功时不加（预期行为，多一行只是噪音）
+        │    发完就 clearPendingEffect(key, 'notify')
         ├─ 释放租约、清超时定时器
         └─ running = false
 
@@ -1237,6 +1288,49 @@ T+3:00  下一轮 tick()（队列空，只扫描 + 清理）
 **关键点**：整条链路里，内核只调了四个接口。它不知道飞书的 URL、不知道 GitLab 的 API、不知道该改哪个 `.vue` 文件。
 默认交付形态是**工作区检出里的本地提交**，GitLab 那一半（`commitLocally` 之后的 `openDraftMr`）只有项目显式
 打开 `repo.gitlab.enabled: true` 时才发生 —— 内核连「有没有远端」都不关心，它只认 `ExecResult.commit` 或 `mr`。
+
+### 11.1 事后动作补偿（`pendingEffects`）
+
+回填与通知都是**在终态之后**做的外部动作，都可能失败或被打断（进程崩了、网络断了、用户关了窗口）。
+如果只把它们当普通 `await`，中间崩一次就会永远丢掉：票据是 `done`，但表格停在「处理中」、人也收不到通知 ——
+而且没有任何地方记得「还欠两件事」。
+
+做法是把「还没做完的事后动作」和终态**同一次写入**落库：
+
+```js
+// scheduler.js，setPhase 到终态那一次
+const pendingEffects = {}
+pendingEffects.writeBack = { /* 待写的内容 */ }
+if (willNotify(finalPhase)) pendingEffects.notify = true
+await store.setPhase(key, finalPhase, {
+  ...终态字段,
+  pendingEffects: Object.keys(pendingEffects).length > 0 ? pendingEffects : undefined,
+})
+```
+
+- **清一项用 `clearPendingEffect(key, name)`，刻意不走 `setPhase`**：`setPhase` 会重写 `finishedAt`，
+  让「这票跑了多久」失真（见 `store.js` 的 `clearPendingEffect` 注释）。它只动 `pendingEffects` 一个字段，
+  两个子项都清空时把整个字段删掉（而不是留一个 `{}`）。
+- **启动时 `replayPendingEffects()` 补做**：只捞 `pendingEffects && TERMINAL.includes(row.phase)` 的票，
+  补发通知前先记日志。`src/index.js` 的 `apply` 里在启动阶段调它一次。
+- **`enqueue` / `revise` / `resetByHuman` 都不继承 `pendingEffects`**：那是「上一轮已经到终态、但事后动作还没补完」
+  的标记，带进新一轮会让启动补偿在新结果上再补发一次旧通知。
+- **`recover`/清理路径不写 `pendingEffects`**：否则每次启动都会捞到一批永远做不完的票。
+- `pipeline_status` 会打一行「待补：回填表格」/「待补：通知」，接口里也有 `pendingEffects` 字段 ——
+  否则表格停在「处理中」没人知道。
+
+### 11.2 租约是 best-effort，不是原子 CAS
+
+早先文档里把租约写成「CAS」（compare-and-swap）。实际宿主 `storageDomain` 的 table API 只有
+`get` / `entries` / `put` / `delete`，**没有 compare-and-swap 原语**，`read` 与 `put` 之间也没有互斥。
+
+所以真实保证是：
+
+- **同进程**靠调度器的单飞标记 `running`（一个 tick 只跑一票，`already-running` 直接返回）；
+- **跨进程**靠「put 之后再读一次确认」——被抢就记日志、让出这张票（写 `lastError`），不硬抢。
+
+这不是「保证不会双跑」，而是「正常路径下单飞 + 抢到了能发现」。多进程同表跑同一票仍有极小的双跑窗口
+（例如两边同时在 read 与 put 之间），代价是同一票可能被改两遍；`leaseTtlMinutes` 只影响「多久算过期」。
 
 ---
 
@@ -1601,6 +1695,43 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 `new TicketPipelineRemote({ doctorOptions })`（`src/index.js:974-1004`），所以对话里的
 `pipeline_doctor` 与设置页「立即体检」按钮的版本结论天然一致，不需要两处维护。
 
+### 12.12 执行器的安全兜底（三层，都不是硬隔离）
+
+agent 在本机跑，能执行任意命令。宿主给不出「只读自动批、写入弹卡」这一档
+（`APPROVAL_POLICIES = ['ask', 'never']`，见 `executor-agent/index.js` 文件头与实跑 warn 日志），
+所以 `approval/policy` 实跑是 `never` —— 无头场景下 `ask` 会 fail-closed，让每一步工具调用都失败。
+真正兜底只有三层：
+
+**一、git 白名单**（`assertAllowedGit`）：只放行插件自己需要的那几个形态 ——
+`add -- <具体文件>`、`commit`、`rev-parse HEAD`（与自检要用的 `--git-dir` / `--git-common-dir` 形态）、
+`restore --staged -- <文件>`、`stash create`、`hash-object -- <path>`。
+`add -A` / `add .` / `push` / `stash pop|apply|drop` 一律拒绝 —— 全量暂存会让敏感文件露在 index 里，
+人一提交就跟着走了。
+
+**二、敏感文件名单**（`SENSITIVE_FILE_PATTERNS`，**8 大类、41 条正则**，原 9 条）：`.env` 家族、
+Spring 配置（`application*` 与 `bootstrap*`）、包管理器 token、SSH·GPG 私钥、云与容器凭据、
+明文机器凭据、证书·密钥库·Terraform 状态、关键字兜底 `secret`。
+命中就**不进提交**，文件名进 `ExecResult.blockedFiles` 与「未提交」那一行。
+名单用「已知后缀白名单」而不是通配（`env\..+` 会把 `src/env.js` 也拦掉），
+所以 `src/env.js`、`docs/credentials.md`、`.environment.md` 这类代码/文档不会被误伤 —— 这条有专门断言守着。
+
+**三、提交前的元数据篡改自检**（**这是「被发现」不是「被阻止」**）：
+git 看不见自己的元数据（`.git/` 不在 `diff`/`status` 视野里），插件 profile 更不在仓库里，
+所以没有「diff 里冒出一行」这种免费信号。只能在 agent 动手前拍 sha256 快照、提交前复拍比对：
+
+| 保护对象 | 数量 | 为什么 |
+|---|---|---|
+| `PROTECTED_GIT_FILES` | 10 | `config`（能改 `core.hooksPath` 把 hook 指到别处）、`config.worktree`、`HEAD`、`commondir`、`shallow`、`packed-refs`、`info/attributes`、`info/exclude`、`info/grafts`、`info/sparse-checkout` —— 改这些等于劫持执行器自己的提交动作 |
+| `GIT_HOOK_NAMES` | 28 | `githooks(5)` 的固定清单；git 只会执行名字在这份清单里的 hook，agent 想留后门只能占其中一个文件名。按名字列全而不是「列出目录里有什么」，因为执行器没有目录列举能力 |
+| `PROTECTED_PROFILE_FILES` | 4 | `cordis.patch.yml` / `cordis.patch.yaml` / `cordis.yml` / `cordis.yaml` —— 插件的装配清单，改它等于改宿主行为 |
+
+动过就把这些路径 `git restore --staged --` 撤回、判 `failed` + `invalid-input`（不可重试，
+因为重试只会重复篡改），理由写「agent 改动了受保护的元数据（…），按约定不提交；请人工核查这些文件后再决定是否重跑」。
+快照用 `options.readFile` 而不是 `fs`（本文件坚持不 import 宿主包），存的是 sha256 而不是原文
+（`.git/config` 里可能有远程地址与凭据片段，没必要在工作区多留一份明文）。
+拿不到 `readFile`（老宿主/纯 mock）就跳过自检并记日志 —— **跳过是安全降级**：提交仍只含非敏感文件，
+只是少了「元数据被动过」这一层告警。
+
 ## 13. 事实来源
 
 本文所有「实测」结论都来自以下材料，改动前先回读原文：
@@ -1618,6 +1749,6 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | QQ 邮箱 SMTP 直发（真实发信已验） | `plugins/ticket-pipeline/src/adapters/push-qqmail/index.js`；自测 `scripts/push-qqmail-checks.mjs` |
 | 宿主 shell / 沙箱 / agent 装配链（asar 解包实读） | `.scratch/_asar/`（`dsh-agent-loop` / `dsh-headless` / `dsh-subagent` / `api-session-controller` 等） |
 | 真实飞书工单表结构与状态分布 | 表 `RZZQbY4SkaY6z0shZaBcVpQCnhh` / `tblWhRSGf0osJqrE`，79 条；「是否处理」分布 是:71 / 否:6 / 处理中:1 / 空:1 |
-| 真实跑通记录（本地提交） | 2026-11-06 在 `D:/WorkSpace/mgiot-pms` 的工作区检出里实跑：`fix(pms): [pms] ##1 rec-probe-1` → sha 落库、通知正文首行「本地提交：<sha12> @ <branch>」，敏感文件 `application.yml` 留在工作区并写进提交说明 |
+| 真实跑通记录（本地提交） | 2026-11-06 在 `D:/WorkSpace/mgiot-pms` 的工作区检出里实跑：`fix(pms): [pms] ##1 rec-probe-1` → sha 落库、通知正文里有「本地提交：<sha12> @ <branch>」一行（在描述之后），敏感文件 `application.yml` 留在工作区并写进提交说明 |
 | 真实跑通记录（沙盒票 → 真 MR，可选出口） | `sandbox\|rec-mock-001` → GitLab MR !1（draft，source `ticket-sandbox-rec-mock-001-r1` → `main`）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | 上游模型限流真因（不是插件缺陷） | agent 会话 `session.v4.jsonl.zstd` 里的 `turn/end` reason：HTTP 429 / `quota_exceeded` |

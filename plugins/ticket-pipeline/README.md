@@ -155,6 +155,40 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
   `hasAppToken` + `appTokenPreview`（前 4…后 4）。第 3 个 Remote 方法 `ticketPipeline.projects()` 提供扁平视图，
   第 4 个 `ticketPipeline.branches()` 给两个分支字段当候选；
   写入只发深层路径，绝不整数组替换。全局配置现在 **33 个键 / 7 个分组**（`projects` 子树另算）。
+- **适配器名写错就报错，不再静默退回 mock**：`workExecutor` 只能是 `agent` / `mock`，`pushAdapter` 只能是
+  `mock` / `pushplus` / `qqmail`（`src/core/config.js` 里带 `enum`）。写错一个字（含大小写、尾空格）激活期直接抛
+  `invalid-input` 并列出可选值；只有 `undefined` / `null` / 空串才回落到 `mock`。
+  以前 `EXECUTORS[config.workExecutor] ?? EXECUTORS.mock` 的写法会让 `Agent` 这类笔误静默跑完整条链路 ——
+  不改一行代码、给票打 `testOutcome: 'passed'`、写个假 commit sha、回填表格写「已按工单改完并提交」，
+  是最难发现的「看起来成功」的假执行（`src/index.js` `pickAdapterFactory()`）。
+- **验证命令必须有超时与取消**：缺省 `VERIFY_TIMEOUT_MS = 30 分钟`，超时退出码 **`VERIFY_TIMEOUT_EXIT_CODE = 124`**
+  （沿 coreutils `timeout` 约定，和「检查没通过」区分开）；`signal` 一起进宿主 `shell.resolve`，
+  用户取消会真的 kill 子进程。宿主 `bash-local` 的 `maxTimeoutMs` 缺省 10 分钟会把它夹下去（真实上限取小者）。
+  没有这一层时，一条卡住的 `npm test` 会让 `runOne` 永远停在 `await` 上 → 单飞标记 `running` 恒 `true` →
+  之后每次 tick 都直接返回 `already-running`，**整条流水线静默停摆且取消不了**。
+- **敏感文件名单 8 大类 / 41 条正则**（`SENSITIVE_FILE_PATTERNS`，原 9 条）：`.env` 家族、Spring 配置（含 `bootstrap*`）、
+  包管理器 token、SSH·GPG 私钥、云与容器凭据、明文机器凭据、证书·密钥库·Terraform 状态、关键字兜底。
+  被拦文件进 `ExecResult.blockedFiles`，`plan.summary` 写「另有 N 个敏感文件按约定未提交（疑似含真实凭据）：…」。
+  名单按「已知后缀白名单」写而不是通配，所以 `src/env.js`、`docs/credentials.md`、`.environment.md` 不会被误伤。
+- **`.git` 与插件 profile 的篡改自检**：git 看不见自己的元数据、profile 不在仓库里，所以只能自己在 agent 动手前
+  拍 sha256 快照、提交前复拍比对（10 个 git 元数据文件 + 28 个官方 hook 名 + 4 个 profile 文件）。
+  动过就 `git restore --staged` 撤回、判 `failed` + `invalid-input`（不可重试）并点名文件。
+  拿不到 `readFile` 服务时跳过自检并记日志（安全降级）。**这是「被发现」不是「被阻止」**。
+- **approval/policy 仍然是 `never`**：宿主只有 `ask` / `never` 两档，**没有**「只读自动批、写入弹卡」。
+  `ask` 在无头场景 fail-closed 会让每一步工具调用失败，所以实跑会用 `never` 并打 warn 日志。
+  兜底只有 git 白名单 + 提交前篡改自检，**不是硬隔离**。
+- **终态与事后动作同一次落库（`pendingEffects`）**：回填与通知都可能失败/被打断，所以 `setPhase` 到终态时
+  把「还没做完的事后动作」一起写进票据（`pendingEffects.writeBack` / `.notify`）；做完一项就
+  `clearPendingEffect()` 清一项（刻意不走 `setPhase`，否则会重写 `finishedAt` 让「跑了多久」失真）。
+  启动时 `replayPendingEffects()` 扫终态票把没做完的补做；`enqueue` / `revise` / `resetByHuman` **都不继承**
+  上一轮的 `pendingEffects`。`pipeline_status` 会打「待补：回填表格」。
+- **回填失败要进通知**：`writeBack.written === false` 时通知正文多一行
+  `回填表格：没写成 —— <原因>（表格里那一行可能还停在「处理中」，请手工改一下）`；成功时不加（避免噪音）。
+  注意这只影响通知，不改票态。
+- **就地模式的重跑起点**：`isolateWorktree: false` 时每轮重新取检出当前 HEAD 当起点。上一轮已经提交过、
+  重跑时 agent 若无新改动，会被判「没有产生任何文件改动」—— 这是预期行为，日志会写新旧两个 head 方便对账。
+- **租约是 best-effort，不是原子 CAS**：宿主 storageDomain 的 table API 只有 get/entries/put/delete，
+  没有 compare-and-swap 原语。同进程靠调度器的 `running` 单飞，跨进程靠 put 之后二次读确认（被抢就记日志让出）。
 
 ## 安装
 
@@ -210,7 +244,7 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**325 项断言，全绿 exit 0**，共 24 个小节（编号到 17，含 `2b` / `11.5` / `11.6` / `12b`–`12e` 这类补丁小节；第 16 节专测回填工单表与保留会话，第 17 节专测分支候选）。
+**363 项断言，全绿 exit 0**，共 25 个小节（编号到 17，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16b` 这类补丁小节；第 16 节专测回填工单表与保留会话，`16b` 专测事后动作补偿（`pendingEffects`）与租约诚实化，第 17 节专测分支候选）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，但宿主服务全部打桩），
 其余测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 
@@ -218,10 +252,10 @@ node scripts/dev-run.mjs
 |---|---|
 | 内核与契约 | 调度、租约心跳、退避重试、状态机、store 持久化、pipeline_* 四工具、组合根接线 |
 | `feishu-checks`（58 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、扫描全程无写操作；**回填**：`writeResult` 走 `PUT …/records/:id` 只写三列、字段缺失（1254040 / 1254045）返 `{written:false,note}` 不抛、写失败时按 91403 分类 |
-| `gitlab-checks`（78 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器在工作区检出里做本地提交（`commitLocally`：sha/分支/文件、敏感文件不进提交、`repo.gitlab.enabled` 未开时零 GitLab 请求、提交失败让票失败、空提交与缺 git 运行器被拒、git 白名单只放行 `add -- <文件>` / `commit` / `rev-parse HEAD` / `restore --staged -- <文件>` / `stash create` / `hash-object --`）；**基线**：`createBaseline` 拍的基线只读、人的未提交改动与已 `git add` 的改动都进不了本次提交、拍不下来降级不失败；**保留会话**：`sessionId` 三个出口都带回、agent 实例必释放、`keepSession: false` 才回收；`-z` 解析（`parseStatusZ` / `parseNameStatusZ`）：未跟踪新文件要算进改动、重命名的旧路径要进 commit pathspec、删除的路径不能进 `add`、中文名与空格名不被转义；会话 cwd = 项目工作区根、`workingDirectory` 仅在隔离 worktree 打开时钉到隔离子目录、`attachSession` 归属工作区 |
+| `gitlab-checks`（86 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器在工作区检出里做本地提交（`commitLocally`：sha/分支/文件、敏感文件不进提交、`repo.gitlab.enabled` 未开时零 GitLab 请求、提交失败让票失败、空提交与缺 git 运行器被拒、git 白名单只放行 `add -- <文件>` / `commit` / `rev-parse HEAD` / `restore --staged -- <文件>` / `stash create` / `hash-object --`）；**基线**：`createBaseline` 拍的基线只读、人的未提交改动与已 `git add` 的改动都进不了本次提交、拍不下来降级不失败；**保留会话**：`sessionId` 三个出口都带回、agent 实例必释放、`keepSession: false` 才回收；**敏感名单**：覆盖各家凭据落盘位置（私钥 / 云 / 证书 / 状态文件）且不误伤「名字像但其实是代码/文档」的文件、被拦文件在 `ExecResult.blockedFiles` 里看得见；**篡改自检**：agent 动了 `.git/hooks` 或插件 `cordis.patch.yml` 就整票失败（不提交也不开 MR）、没有 `readFile` 服务时跳过自检但票照常交付、受保护路径判定与快照比对边界（缺失 / 删除 / 无服务）；`-z` 解析（`parseStatusZ` / `parseNameStatusZ`）：未跟踪新文件要算进改动、重命名的旧路径要进 commit pathspec、删除的路径不能进 `add`、中文名与空格名不被转义；会话 cwd = 项目工作区根、`workingDirectory` 仅在隔离 worktree 打开时钉到隔离子目录、`attachSession` 归属工作区 |
 | `push-qqmail`（18 项） | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
-| `wps-checks`（25 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底 |
-| `workspace-checks`（11 项） | 项目工作区：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用同一工作区、attachSession 归属 |
+| `wps-checks`（34 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底；**下载通道**：超时中断报 `network`（可重试）、调用方取消算 `aborted` 且立刻断、`content-length` 谎报超大就当场拒绝、无 `content-length` 时边读边计数超限即断连、跳转最多跟 `MAX_SHEET_REDIRECTS` 跳、逐跳校验协议与主机（`file:` / 未放行主机都拒）；**取数通道**：`scan` 能把 signal 传下去、`wpsOptionsFromMatch` 译出的通道带超时与字节上限（不是裸 fetch） |
+| `workspace-checks`（19 项） | 项目工作区：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用同一工作区、attachSession 归属；**验证命令**：signal 已 aborted 时不起子进程、跑到一半被取消立刻返回并 kill、取消恰好发生在起进程那一瞬间也不漏、到点返回 **124** 不再无限等待、不传 `timeoutMs` 时用 30 分钟缺省；**适配器名**：`workExecutor` / `pushAdapter` 写错一个字要报错并列出可选值（以前静默换成 mock），组合根查不到时抛 `invalid-input` |
 
 另有**全链路接线冒烟**（独立于 dev-run，测「组件之间接没接对」而不是单模块行为）：
 

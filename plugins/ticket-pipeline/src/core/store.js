@@ -55,6 +55,9 @@ export const TABLES = Object.freeze({
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
  * @property {string} [sessionId] 这次执行用的会话 id（会话默认保留在项目工作区名下，可在 GUI 里点回去继续问）
  * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果
+ * @property {{ writeBack?: { phase: string, plan?: unknown, commit?: { sha: string, branch: string, files: string[] }, mr?: { iid: number, url: string, draft: boolean }, changedFiles?: string[], worktreePath?: string, sessionId?: string, verification?: { outcome?: string, detail?: string } }, notify?: boolean }} [pendingEffects]
+ *   终态票还没做完的「事后动作」。done/skipped 落库时先记上，回填/通知各自成功后再把子项清掉；
+ *   进程在两者之间崩掉时，下次启动由 `replayPendingEffects()` 补做（回填幂等，通知会补发）。
  * @property {number} attempt
  * @property {number} [startedAt]
  * @property {number} [finishedAt]
@@ -191,7 +194,11 @@ export class TicketStore {
     // 与这一轮无关。留着它，一次偶发失败会永远挂在票上 —— 人看队列时
     // 以为还没修好，而这一轮的真实原因又被旧值盖着看不见。
     // 新行本来就没有 lastError 字段，覆盖写入时旧值随之消失，不需要显式写 undefined。
-    
+    //
+    // 同理**不继承 `pendingEffects`**：那是「上一轮已经到终态、但事后动作还没补完」的标记。
+    // 重新入队意味着这票要重新跑一遍，跑完会重新登记自己该做的回填/通知；
+    // 把旧标记带过来会让启动补偿在一张 pending 票上做终态动作，写出「已完成」的通知。
+
 
     await this.repo.put(TABLES.tickets, key, row)
     return row
@@ -238,6 +245,11 @@ export class TicketStore {
     // needs-info 的票收到修订后回到队里；其它状态保持不动。
     const restarted = row.phase === 'needs-info'
     if (restarted) row.phase = 'pending'
+
+    // 和 `enqueue` 一样不继承上一轮的 `pendingEffects`：修订意味着这票要按新内容
+    // 再跑一遍，跑完会重新登记自己的待办。留着旧的，启动补偿会在新一轮的中间态上
+    // 做上一轮的终态动作 —— 补发一条说「已完成」的通知，而这次其实还没跑。
+    delete row.pendingEffects
 
     await this.repo.put(TABLES.tickets, key, row)
     return { row, restarted }
@@ -304,9 +316,40 @@ export class TicketStore {
   }
 
   /**
+   * 清掉终态票的一个「事后动作」标记（`pendingEffects.writeBack` / `.notify`）。
+   *
+   * 为什么不用 `setPhase`：`setPhase` 每次都把 `finishedAt` 重写成「现在」，
+   * 而补做回填/通知发生在票到终态**之后**，拿补做时刻当完成时刻会让「这票跑了多久」失真。
+   * 这里只动 `pendingEffects` 一个字段。
+   *
+   * 两个子项都清空时把整个 `pendingEffects` 删掉（而不是留一个 `{}`）：
+   * 队列里每张终态票都挂个空对象，是给未来的自己埋一个「这到底算不算待办」的疑问。
+   *
+   * @param {string} key 票据复合主键
+   * @param {'writeBack'|'notify'} name 子项名
+   * @returns {Promise<TicketRecordRow | undefined>} 更新后的行；票不存在时 undefined
+   */
+  async clearPendingEffect (key, name) {
+    const row = this.getTicket(key)
+    if (!row) return undefined
+    if (!row.pendingEffects) return row
+    /** @type {any} */
+    const next = { ...row, pendingEffects: { ...row.pendingEffects } }
+    delete next.pendingEffects[name]
+    if (Object.keys(next.pendingEffects).length === 0) delete next.pendingEffects
+    await this.repo.put(TABLES.tickets, key, next)
+    return next
+  }
+
+  /**
    * 人工重置：表格里「是否处理」从别的值拨回 `处理中`。
    *
    * 这是 `failed` 票**唯一**的重开路径（用户拍板：超时不自动重试）。
+   *
+   * 重置会 `delete` 掉 `pendingEffects`：那是上一轮终态还没来得及补做的事后动作
+   * （回填/通知）。让这张票重新进队意味着它会被重新跑一遍，重新跑完会给出新的
+   * `pendingEffects`；旧的那份如果留着，启动补偿会在新结果上再补发一次旧通知，
+   * 说出跟当前状态对不上的话。
    *
    * @param {string} key 票据复合主键
    * @returns {Promise<boolean>}
@@ -315,14 +358,17 @@ export class TicketStore {
     const row = this.getTicket(key)
     if (!row) return false
     if (row.phase !== 'failed' && row.phase !== 'needs-info' && row.phase !== 'gone') return false
-    await this.repo.put(TABLES.tickets, key, {
+    const next = {
       ...row,
       phase: 'pending',
       attempt: 0,
       lastError: undefined,
       finishedAt: undefined,
       enqueuedAt: this.now(),
-    })
+    }
+    // undefined 会被 repo 原样写进去，这里显式删字段（和 setPhase 的 undefined=删 语义一致）。
+    delete next.pendingEffects
+    await this.repo.put(TABLES.tickets, key, next)
     this.log('人工重置成功，重新入队', { key, projectId: row.projectId, recordId: row.recordId })
     return true
   }
@@ -349,10 +395,19 @@ export class TicketStore {
   // ── 租约 ────────────────────────────────────────────────
 
   /**
-   * 抢租约：写 → 回读校验 → 成功或退让。
+   * 抢租约：read → 判断 → put → 回读校验 → 成功或退让。
+   *
+   * **这不是原子 CAS**，别当它是：`read` 和 `put` 之间没有任何互斥，两个进程可以同时读到
+   * 「没人租」然后都 `put` 自己的 token，最后谁赢完全看回读那一刻谁的数据先落盘。
+   * 之所以可以接受：
+   * - 同进程内不会并发 —— `scheduler.js` 用 `running` 单飞，一个进程同时只跑一张票；
+   * - 跨进程时赢家之外的进程「回读」会看到别人的 token，当场退让，损失只是白跑一轮 `pickNext`；
+   * - 真出事（两个进程都在写同一张票）由票级的 `setPhase` 非法转移拒绝 + 工作区隔离兜底，
+   *   不会静默把两张票的改动搅在一起。
    *
    * 为什么不用文件锁：跨平台不可靠，且在沙箱里可能直接被拒。
-   * 存储 CAS 用的还是同一个后端，天然跟着「写后落盘」的语义走。
+   * 要真正的原子性只能换后端（存储层提供 compare-and-swap），那是另一个量级的改动，
+   * 当前单进程 + TTL + 回读的组合已经把风险压到可接受范围。
    *
    * @param {string} key 票据复合主键
    * @param {number} ttlMs
@@ -368,13 +423,27 @@ export class TicketStore {
     const lease = { key, ownerToken: this.ownerToken, leaseExpiresAt: now + ttlMs }
     await this.repo.put(TABLES.leases, key, lease)
 
-    // 回读校验：被别人同时覆盖了就让出去，本轮跳过这票。
+    // 二次读确认：read 和 put 之间可能有别的进程插队写了自己的 token，
+    // 只有回读到的仍是自己的 token 才算抢到；否则让出去，本轮跳过这票。
     const readBack = /** @type {LeaseRow | undefined} */ (this.repo.get(TABLES.leases, key))
-    return Boolean(readBack && readBack.ownerToken === this.ownerToken)
+    const won = Boolean(readBack && readBack.ownerToken === this.ownerToken)
+    if (!won) {
+      this.log('抢租约时被别人抢先写入（read→put 之间无互斥），本轮让出', {
+        key,
+        ownerToken: this.ownerToken,
+        holder: readBack?.ownerToken,
+      })
+    }
+    return won
   }
 
   /**
    * 续租。续租失败说明租约被别人抢走了 → 调用方必须让出这张票。
+   *
+   * 和 `acquireLease` 一样**不是原子操作**（read→判断→put→回读）。这里的 token 校验能挡住
+   * 「租约已经被别人接管」的绝大多数情况：别人的 token 一旦落到存储里，自己这轮的
+   * `current.ownerToken !== this.ownerToken` 立刻为 false，当场让出。
+   *
    * @param {string} key 票据复合主键
    * @param {number} ttlMs
    * @returns {Promise<boolean>}
