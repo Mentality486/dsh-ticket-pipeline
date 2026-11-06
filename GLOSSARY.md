@@ -18,3 +18,7 @@
 | 退役 | retire / disappeared | 工单行从表格消失或连续多轮不再「处理中」，终态标 `gone`，不再执行 |
 | needs-info | 需要补信息 | 中间态：截图取不到、信息不全或工单正文疑似提示注入时，停下等人补，发通知 |
 | dead-letter | 死信 | 重试耗尽（attempt 达到 maxAttempts）后的 failed 票。保留工作区与最后错误，等人工 `pipeline_reset` 或改表重跑 |
+| 表型 | table kind | 同一平台（飞书）下工单表的两种形态：**多维表格**（bitable）与**电子表格**（sheet）。由插件探测，不写进配置 —— 用户只管填表，表型不是配置项 |
+| 工作表 | sheet | 电子表格里的一个页签（`sheet_id` / `title`）。对应多维表格里的「数据表」（`table_id`） |
+| 表头行 | header row | 电子表格里写着列名的那一行（默认第 1 行，`match.sheetHeaderRow` 可改）。不自动往下扫 —— 行号身份下表头行一变身份就变 |
+| 行身份 | row identity | 电子表格没有 `record_id`，身份由插件自造：`sh-seq-<序号值>`（默认，取序号列）或 `sh-row-<物理行号>`（序号为空时的兜底）。插行会让行号身份整体漂移 |

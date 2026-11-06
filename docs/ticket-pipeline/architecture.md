@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
-> 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-05，基线 HEAD `26f0391`）
+> 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填
+> 日期：2026-11-03（最近一次按实现校准：2026-11-06，基线 HEAD `2488036` + 工作树未提交的「本地提交」与「改代码落点」两项改造）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -21,6 +21,7 @@
 10. [可替换点（文件级）](#10-可替换点文件级)
 11. [一次完整跑的时序](#11-一次完整跑的时序)
 12. [已知约束与未决](#12-已知约束与未决)
+    - [12.10 飞书电子表格支持（设计待实施）](#1210-飞书电子表格支持设计待实施)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -45,7 +46,8 @@
 | 工单表 | **只读**，绝不回写任何列 | 地图 Decisions（用户 2026-11-03） |
 | 收票信号 | 「是否处理」列取值命中 `match.statusValues`（**缺省 `['处理中']`**；真实表用的是「否」，见 §9）。下拉三值是 / 否 / 处理中 | 地图 Decisions + 实表核实 |
 | 代码仓库 | 项目清单维护在 `projects[]` 配置，每项目一个仓库 | 地图 Decisions |
-| MR | 只开 draft，绝不自动合并；基准/目标分支由项目 `repo.baseBranch`/`repo.targetBranch` 决定 | 票 `04` + 用户拍板 |
+| 交付物 | **默认是项目工作区检出里的一次本地提交**（`ExecResult.commit`）；远程 draft MR 是可选出口，只有项目显式 `repo.gitlab.enabled: true` 才开 | 2026-11-06 用户拍板（本阶段交付形态） |
+| MR（可选出口） | 开了也只开 draft，绝不自动合并；基准/目标分支由项目 `repo.baseBranch`/`repo.targetBranch` 决定 | 票 `04` + 用户拍板 |
 | 通知 | `PushAdapter` 可替换：PushPlus（`channel=clawbot` 中继微信）/ QQ 邮箱 SMTP 直发 / mock；默认 PushPlus | 票 `07` + 实现补充 |
 | 并发 | 串行，并发恒为 1 | 票 `08` |
 | 超时 | 超时只报给人，**不自动重试** | 票 `08` |
@@ -67,7 +69,7 @@
               └─────┬──────┘ └─────┬─────┘ └──┬─────┘ └┬──────────┘
                     │              │          │        │
           飞书 / WPS / webform   projects[]   agent    PushPlus
-              / mock             查表         + MR      / qqmail / mock
+              / mock             查表         + commit  / qqmail / mock
 ```
 
 内核**四个接口都要用，一个都不实现**。它不知道飞书长什么样、不知道 GitLab 的 URL 怎么拼、不知道该改哪个文件。它只知道：拿到票 → 建工作区 → 让执行器干活 → 把结果推出去 → 记住进度。
@@ -300,9 +302,9 @@ export interface RepoLocator {
 
 export type LocateResult = {
   repoPath: string          // 绝对路径（来自 project.repo.path）
-  remote?: string           // GitLab remote URL（来自 project.repo.remote）
-  baseBranch?: string       // 切 worktree 的基准分支（来自 project.repo.baseBranch）
-  targetBranch?: string     // draft MR 目标分支（来自 project.repo.targetBranch）
+  remote?: string           // GitLab remote URL（来自 project.repo.remote）；只有 repo.gitlab.enabled=true 才用于开 draft MR
+  baseBranch?: string       // 建隔离 worktree 的基准分支（来自 project.repo.baseBranch；只在 isolateWorktree: true 时用到）
+  targetBranch?: string     // draft MR 目标分支（来自 project.repo.targetBranch，可选出口才用）
   candidatePaths: string[]  // 恒为空：代码定位交给 executor-agent 现场读仓库
   ambiguous: boolean        // 恒 false：这里不猜代码路径
   notes?: string            // 项目 description，原样进 prompt
@@ -314,7 +316,7 @@ export type LocateResult = {
 「工单对应哪个仓库」是流水线的第一跳，放查表里比散在各处可靠。**「该改哪个文件」
 则不属于这一层**——那需要读代码、看工单描述，是 agent 现场定位的事。
 
-### 5.4 `WorkExecutor` — 怎么改代码、怎么验证、怎么开 MR
+### 5.4 `WorkExecutor` — 怎么改代码、怎么验证、怎么落交付物
 
 ```ts
 export interface WorkExecutor {
@@ -324,45 +326,67 @@ export interface WorkExecutor {
    * 执行一票。内部按阶段推进，每进入一个阶段调 onPhase 落库（崩溃恢复用）。
    *
    * 契约：
-   * - 必须尊重 signal：aborted 时停手、保留 worktree、抛 PipelineError('aborted')。
+   * - 必须尊重 signal：aborted 时停手、保留工作区、抛 PipelineError('aborted')。
    * - 每进入新阶段必须 await onPhase(...)，不能只在自己的内存里更新 —— 那是崩溃恢复的唯一依据。
-   * - 不改 worktree 之外的文件；不 push（沙箱封死，见 §12）。
-   * - 返回前必须已经开完 MR（或在 error 里说明为什么没开）。
+   * - 不改改代码落点之外的文件；不 push（沙箱封死，见 §12）。
+   * - 返回前必须已经把改动落成**可交付的东西**：默认本地提交（commit，写清工单溯源）；
+   *   配了 GitLab 的部署还会同时开 draft MR（mr）。两样都没有时必须在 error 里说明为什么。
    */
   run (ticket: Ticket, target: LocateResult, ctx: ExecCtx): Promise<ExecResult>
 }
 
 export type ExecCtx = {
   signal: AbortSignal
-  workspacePath?: string                   // 项目工作区根（= 宿主的 Workspace.path；缺省退化成 worktreePath）
+  workspacePath?: string                   // 项目工作区根（= 宿主的 Workspace.path）
   workspaceId?: string                     // 宿主 WorkspaceId，用来 attachSession 归属会话
-  worktreePath: string                     // 已建好的隔离工作区绝对路径
-  branch: string                           // 已创建的分支名
+  worktreePath: string                     // 改代码的落点绝对路径：缺省就是工作区根（isolateWorktree 关）；
+                                           // 打开 isolateWorktree 时才是隔离检出 <repoPath>/.agents/worktrees/<branch>
+  branch: string                           // 缺省 = 检出当前分支；isolateWorktree 打开时是新建的票分支
   onPhase (phase: Phase, detail?: string): Promise<void>
   log (msg: string): void                  // 写进插件日志，带 recordId 前缀
 }
 
 export type ExecResult = {
   phase: Phase                             // 终态：done / skipped / failed
-  plan?: Plan                              // 执行器产出的方案（进 MR 描述）
+  plan?: Plan                              // 执行器产出的方案（进提交说明 / MR 描述）
   changedFiles: string[]
   testOutcome: 'passed' | 'failed' | 'skipped'
   testDetail?: string                      // skipped 时必须写原因
-  mr?: { iid: number; url: string; draft: boolean }
+  commit?: { sha: string; branch: string; files: string[] }  // 在工作区检出里做出来的本地提交（本阶段交付形态）
+  mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
   error?: { kind: ErrorKind; message: string; retryable: boolean }
 }
 ```
 
-**`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然开 draft MR，但**必须把原因写进 MR 描述**，不能默默略过 —— 人看到 draft MR 才知道「这个改动没被真跑过」。
+**`phase = done/skipped` 时 `commit` 与 `mr` 至少给一个**（`makeExecResult` 会校验，两个都没有直接抛）。
+这是本轮改造的核心：原来契约要求「必须给 `mr`」，等于把「有远端的 GitLab」写进了内核契约；
+现在默认交付形态是**工作区检出里的一次本地提交**，远程 MR 降级成 `repo.gitlab.enabled: true` 才走的可选出口。
+
+**`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然做本地提交，但**必须把原因写进提交说明**，不能默默略过 —— 人 `git show` 才知道「这个改动没被真跑过」。
 
 **`workspacePath` 与 `worktreePath` 是两个不同的东西**：前者是**项目工作区** ——
 `projects[].repo.path` 那个目录在宿主的 `workspaceRegistry` 里的一条登记（一个项目一条，
-多张票共用）；后者是**这一票**的隔离检出（`<repoPath>/.agents/worktrees/<branch>`）。
+多张票共用）；后者只有在 `isolateWorktree: true` 时才有值，是**这一票**的隔离检出
+（`<repoPath>/.agents/worktrees/<branch>`）。
 为什么要两套：宿主 `Workspace.attachSession(sessionId)` 强制要求会话 header 的规范 cwd
-**等于**工作区路径，worktree 子目录挂不上；而 agent 又必须在 worktree 里改代码。
+**等于**工作区路径，隔离子目录挂不上；而 agent 又必须在一个具体的检出里改代码。
 所以会话 `meta.cwd` 用 `workspacePath`，再由 `workingDirectory.set` 把**这一轮的工作目录**
 换成 `worktreePath`（只追加事件、不改 header.cwd，两者可以共存）。缺 `workspacePath`
-（升级前入队的老票据）时退回「cwd = worktreePath」，即改造前的行为。
+（升级前入队的老票据）时退回「cwd = worktreePath」。
+
+**隔离层是可选的，缺省关**：`isolateWorktree` 默认 `false`，`prepareWorkspace` 走缺省分支 ——
+`inspectCheckout()` 读 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>` + `git rev-parse --abbrev-ref HEAD`，
+`assertCleanCheckout()` 发现有未提交改动就直接抛 `invalid-input` 拒绝跑这张票（报错点名文件，
+并提示「提交或 stash，或者打开 `isolateWorktree` 让每票用独立隔离 worktree」），
+干净则 `{ path: workspacePath, branch: 检出当前分支, baseCommit: 检出当前 HEAD }`
+—— **就在项目工作区的检出里改、就地提交**，不建 worktree、不另开票分支。
+只有 `isolateWorktree: true` 才 `git fetch` + `git worktree add -b <branch> .agents/worktrees/<branch>`。
+
+读检出状态这件事有三个容易踩的坑（都实测过，缺陷详情与修法见 `feature-checklist.md` §1.4）：`-uall` 不能省（否则未跟踪目录折叠成一个目录名，
+里面的文件路径全丢，`application.yml` 这类敏感文件就绕过了拦截）；`-z` 不能省（否则中文名输出八进制转义、
+含空格名一定加引号，旧解析器会把引号带进提交路径）；排除规则只排 `.agents/worktrees`，**不排整个 `.agents`**
+（排整个目录会把用户自己放在 `.agents/` 下的内容一起误排）。三处读状态的地方（`inspectCheckout`、
+`pipeline_doctor`、`collectChanges`）必须用同一组参数，否则「体检说干净、跑票说脏」这种问题最难查。
 
 **`onPhase` 的第二个参数是给人看的说明，不是落库补丁**：`scheduler` 只对对象形态的参数调
 `store.setPhase(phase, patch)`；字符串会被当成 detail 写进日志。踩过的坑：早先 `scheduler` 把字符串
@@ -391,7 +415,7 @@ export interface PushAdapter {
 export type NotifyMessage = {
   title: string                  // 短，能在一行里看完
   body: string                   // Markdown
-  link?: string                  // 通常是 MR URL
+  link?: string                  // 通常是 MR URL；本阶段交付形态是本地提交，没有 MR 时为空
   level: 'info' | 'warn' | 'error'
 }
 
@@ -471,7 +495,7 @@ export type ScreenshotRef =
 
 ### 6.4 `Plan`
 
-执行器在 `planning` 阶段产出，存进 `TicketStore`，最终进 MR 描述。
+执行器在 `planning` 阶段产出，存进 `TicketStore`，最终进提交说明 / MR 描述。
 
 ```ts
 export type Plan = {
@@ -482,7 +506,7 @@ export type Plan = {
 }
 ```
 
-`risks` 不是装饰。人审 draft MR 时最想知道的就是「AI 自己觉得哪里可能不对」。
+`risks` 不是装饰。人 review 那个本地提交（或 draft MR）时最想知道的就是「AI 自己觉得哪里可能不对」。
 
 ### 6.5 存储形状（`TicketStore`）
 
@@ -504,7 +528,8 @@ type TicketRecordRow = {
   plan?: Plan
   changedFiles?: string[]
   testOutcome?: 'passed' | 'failed' | 'skipped'
-  mr?: { iid: number; url: string; draft: boolean }
+  commit?: { sha: string; branch: string; files: string[] }  // 工作区检出里的本地提交（本阶段交付形态）
+  mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
   attempt: number                      // 失败重试计数
   startedAt?: number                   // epoch ms
   finishedAt?: number
@@ -549,10 +574,10 @@ export type Phase =
   | 'planning'        // agent 正在定位与规划
   | 'editing'         // agent 正在改代码
   | 'testing'         // agent 正在构建 / 单测 / 起后端验证
-  | 'mr-opening'      // 正在开 draft MR
+  | 'mr-opening'      // 正在本地提交（阶段名保留，语义已从「开 draft MR」改为「在工作区检出里做本地提交」）
   | 'needs-info'      // 等人补信息（截图取不到），补上后回 pending
   | 'done'            // 终态：成功
-  | 'skipped'         // 终态：MR 开了但测试没跑成
+  | 'skipped'         // 终态：改动已本地提交，但测试没跑成
   | 'failed'          // 终态：失败
   | 'gone'            // 终态：表格里这行消失了
 
@@ -576,7 +601,7 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 | 从 | 允许到 | 谁触发 | 副作用 |
 |---|---|---|---|
 | `pending` | `pending` · `worktree-ready` · `needs-info` · `gone` · `failed` | 修订打点 / 建工作区 / 截图取不到 / 行被删 / 早期失败 | 见下三行 |
-| `pending` | `worktree-ready` | `prepareWorkspace` 成功（未注入它时也会推进） | 回填并记 `worktreePath`/`branch`/`baseCommit` |
+| `pending` | `worktree-ready` | `prepareWorkspace` 成功（未注入它时也会推进） | 回填并记 `worktreePath`（缺省模式 === workspacePath）/`branch`/`baseCommit` |
 | `pending` | `needs-info` | `loadScreenshot` 抛错 | 通知人补图、释放租约、**不标 failed** |
 | `pending` | `gone` | 连续 `goneAfterScans` 轮没扫到 | 静默退役、释放租约 |
 | `needs-info` | `pending` · `gone` · `failed` | 人在表格里改了内容 / 行被删 / 人工重开后重跑失败 | 指纹变才回到队里，否则继续等人 |
@@ -584,7 +609,7 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 | `planning` | `planning` · `editing` · `worktree-ready` · `pending` · `failed` | agent 报「定位完成」/ 要重建工作区 / 可重试错误回队 / 失败 | 存 `Plan` |
 | `editing` | `editing` · `testing` · `planning` · `worktree-ready` · `pending` · `failed` | agent 报「改完了」/ 验证不通过退回重做 | 存 `changedFiles` |
 | `testing` | `testing` · `mr-opening` · `done` · `skipped` · `planning` · `worktree-ready` · `pending` · `failed` | 构建/测试有结论；或退回重做 | 存 `testOutcome`、`testDetail` |
-| `mr-opening` | `mr-opening` · `done` · `skipped` · `planning` · `worktree-ready` · `pending` · `failed` | MR 开成功 / 开之前发现问题退回 | 存 `mr`、发通知、释放租约、清超时定时器 |
+| `mr-opening` | `mr-opening` · `done` · `skipped` · `planning` · `worktree-ready` · `pending` · `failed` | 本地提交做成功（或开完可选 draft MR）/ 提交之前发现问题退回 | 存 `commit`（有远端时一并存 `mr`）、发通知、释放租约、清超时定时器 |
 | `done` | `done` | 幂等重打点 | 不改任何东西；**终态一旦落下就不再退回**（要重跑只能靠复活） |
 | `skipped` | `skipped` | 同上 | 同上 |
 | `failed` | `failed` · `pending` | 幂等重打点 / **人工重开** | 人工重开：`attempt = 0`、清 `lastError`、回队首 |
@@ -598,8 +623,8 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 
 **「任意非终态 → `failed`」在代码里并不是一条通配边**：`failed` 之所以能从每个中间态到达，是因为上表每个中间态那一行都列了 `failed`。
 超时 / 不可重试错误（`auth`/`not-found`/`invalid-input`）/ 可重试错误且 `attempt ≥ maxAttempts` 这三种情况都落到 `failed`，
-差别在副作用：**保留 worktree**、发通知、释放租约；超时还要先 `agent.cancel()`。
-而可重试错误且 `attempt < maxAttempts` 走的是**回 `pending`**（`attempt++`、回队首、同样保留 worktree）。
+差别在副作用：**保留改代码落点**（缺省就是项目工作区的检出，本来也不会删；开了 `isolateWorktree` 则是那个隔离目录）、发通知、释放租约；超时还要先 `agent.cancel()`。
+而可重试错误且 `attempt < maxAttempts` 走的是**回 `pending`**（`attempt++`、回队首、同样保留改代码落点）。
 
 **回退路径**（`recover.js`，§7.6）：`worktreePath` 不在时优先退到 `worktree-ready`；
 若当前 phase 不允许（实际不会发生，上表每个中间态都允许），再退一步回 `pending` 并清掉工作区坐标。
@@ -625,8 +650,8 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 1. `agent.cancel()` —— 让 agent 停手
 2. `onPhase('failed', '超时 N 分钟')`
-3. 通知（`level: 'warn'`，正文写明超时分钟数与 worktree 绝对路径）
-4. **保留 worktree**（排查线索）
+3. 通知（`level: 'warn'`，正文写明超时分钟数与工作区绝对路径）
+4. **保留改代码落点**（排查线索）
 5. **不自动重试**（用户拍板）
 
 同一 `recordId` 下一轮扫描见 `phase = failed` → **直接跳过**，不再入队。
@@ -640,7 +665,7 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 - 标 `phase = failed`，`lastError = 'cancelled by user'`
 - **不发通知**（人自己取消的，不需要再告诉他）
-- 保留 worktree
+- 保留改代码落点
 
 ### 7.6 进程重启恢复
 
@@ -649,9 +674,9 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 1. 读 `TicketRecordRow` 里 `phase ∉ TERMINAL` 的全部记录
 2. 对每条：
    - `worktreePath` 存在且 `git -C <path> rev-parse --is-inside-work-tree` 通过 → 从当前 phase 接着走
-   - `worktreePath` 不存在 → 重新 `git worktree add`（组合根的 `prepareWorkspace`），phase 回退到 `worktree-ready`（不可复用脏状态）
+   - `worktreePath` 不存在 → 重新走组合根的 `prepareWorkspace`：`isolateWorktree` 关（缺省）时它就地复用项目工作区检出（重新校验干净），打开时才 `git worktree add`；phase 回退到 `worktree-ready`（不可复用脏状态）
    - 分支已被删 / 已被改 → 重建，不重用
-3. **不从头重跑**：已经改过的文件不重改，已经开过的 MR 不重开（先查 `merge_requests?source_branch=X&state=opened`）
+3. **不从头重跑**：已经改过的文件不重改；已经做过的本地提交不重做（新工作区是新检出，旧 sha 不存在，恢复时 `commit` 会被清掉）；可选的 draft MR 也不重开（先查 `merge_requests?source_branch=X&state=opened`）
 
 ### 7.7 项目工作区（票 → 项目 → 宿主 Workspace）
 
@@ -676,14 +701,18 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 登记下来的 `workspacePath` / `workspaceId` 落进 `TicketRecordRow`，执行器据此：
 1. `agents.create({ meta: { cwd: workspacePath } })` —— 会话 header 的 cwd 是工作区根；
-2. `setup` 里 `workingDirectory.set(agent, worktreePath)` —— 把这一轮的工作目录钉到 worktree；
+2. `setup` 里 `workingDirectory.set(agent, worktreePath)` —— 把这一轮的工作目录钉到改代码的落点
+   （缺省模式 `worktreePath` 就是工作区根，这一步等于不换目录；打开 `isolateWorktree` 才是隔离检出）；
 3. `workspaceRegistry.get(workspaceId).attachSession(sessionId)` —— 会话归属到该工作区，
    在 GUI 的工作区分组下能看到，而不是散落的孤儿会话。
 
-**没有 `workingDirectory` 服务但有工作区坐标时，直接抛 `invalid-input`**：
-继续跑就是在项目主检出里改代码，宁可这张票失败也不能偷偷污染人工位上的工作区。
-反过来，**没有工作区坐标时不 pin、也不要求 `workingDirectory`** —— 那时 header.cwd
-本来就是 worktree，行为与改造前完全一致（离线自测、headless 链路都走这条）。
+**只有「会话 cwd 与改代码落点不是同一个目录」时才算需要钉，钉不了就抛 `invalid-input`**：
+判据是 `worktreePath.length > 0 && workspacePath.length > 0 && workspacePath !== worktreePath`。
+缺省模式（`isolateWorktree` 关）两者**相等**，`needsPin` 为 false，根本不需要 `workingDirectory` 服务
+—— agent 就在会话 cwd 里改，正合本意。打开 `isolateWorktree` 时两者不同、又缺 `workingDirectory`，
+才直接抛 `invalid-input`：继续跑就是在项目主检出里改代码，宁可这张票失败也不能偷偷污染人工位上的工作区。
+没有工作区坐标时（离线自测、headless 链路）同样不 pin、也不要求 `workingDirectory` ——
+那时 `meta.cwd` 本来就是改代码落点，行为与改造前一致。
 
 ---
 
@@ -708,25 +737,41 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 | 情况 | 处理 |
 |---|---|
 | 截图取不到 | `needs-info` + 通知人补图；票留在队列，不阻塞后面的票 |
-| 测试环境起不来 | `testOutcome = 'skipped'`，仍开 draft MR，原因写进 MR 描述 |
+| 测试环境起不来 | `testOutcome = 'skipped'`，仍做本地提交，原因写进提交说明 |
 | `RepoLocator` 标了 `ambiguous` | 照常跑，prompt 里列候选并要求定不了就问人 |
 | 目标仓库读不到 | `network` 处理，重试到上限 |
 | 单据内容为空（`description` 空） | 直接 `invalid-input` → `failed` + 通知（这票没法做） |
 
 ### 8.3 通知文案模板
 
+标题：`【{projectId}】{状态短语}｜{problemSummary}`（`{状态短语}` 见 §7.1 的中文名，
+`skipped` 在通知里叫「已提交但未验证」）。
+
+正文（`scheduler.renderNotifyBody`）：
+
 ```
-[工单流水线] {状态短语}：{problemSummary}
+项目：{projectId}
+工单序号：{seq}
+模块：{module}
+优先级：{priority}
 
-工单：{seq} · {department} · {module}
-状态：{phase 中文}
-{额外一行：MR 链接 / 超时分钟数 / 失败原因 / 需要你做什么}
+{描述前 3 行}
 
-分支：{branch}
-工作区：{worktreePath}
+本地提交：{sha 前 12 位}[ @ {branch}][（{worktreePath}）]
+draft MR：{url}                ← 只有开了远程出口（repo.gitlab.enabled: true）才有这一行
+改动文件：{N} 个
+- {file}
+…
+验证：通过 / 未跑成 —— {原因} / 未通过
+
+（改动已提交到工作区，但验证没跑通，请人工确认）   ← 仅 skipped 的尾注
 ```
 
-`level` 约定：`info` = done/skipped，`warn` = 超时 / needs-info / 需人介入，`error` = failed。
+失败分支是另一套：`失败原因：{lastError}` + `工作区保留在：{worktreePath}` + 一句「修好之后把表格里
+「是否处理」拨走再拨回「处理中」即可重跑」。needs-info 分支：`需要补充：{…}` + 怎么补。
+
+`level` 约定：`info` = done、`warn` = skipped / needs-info / 超时 / 需人介入、`error` = failed。
+`link` 只在开了远程出口、真有 `mr.url` 时才带；本阶段交付形态是本地提交，通常为空。
 
 ### 8.4 重试只认「抛出的错误」（实现约束，改代码前必读）
 
@@ -785,10 +830,11 @@ export const Config = {
     },
     repo: {
       path: string             // 本地 git 检出根目录（必填）
-      remote?: string          // GitLab remote URL（开 MR 用）
-      baseBranch?: string      // 切 worktree 的基准分支（不填则自动识别：origin/HEAD → 当前分支 → main）
-      targetBranch?: string    // draft MR 目标分支（默认同 baseBranch）
+      remote?: string          // GitLab remote URL（只有开了远程 MR 出口才用得上）
+      baseBranch?: string      // 建隔离 worktree 用的基准分支（不填则自动识别：origin/HEAD → 当前分支 → main；只在 isolateWorktree: true 时用到）
+      targetBranch?: string    // 可选出口的 draft MR 目标分支（默认同 baseBranch）
       gitlab?: {               // 自建站点坐标（不填则从 remote URL 里解析）
+        enabled?: boolean      // 远程 MR 出口总开关，缺省 false：不连远程、不要 GITLAB_TOKEN
         baseUrl?: string       // 例如 http://gitlab.example.com
         remote?: string        // 可覆盖 repo.remote
         projectId?: number | string // 数字优先，其次是 group/sub/repo 路径
@@ -812,11 +858,13 @@ export const Config = {
   maxAttempts: number,           // 默认 2，1..5
 
   // ── 执行 ────────────────────────────────────────────
-  workExecutor: 'mock' | 'agent', // 默认 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 开 draft MR）
+  workExecutor: 'mock' | 'agent', // 默认 mock（agent 执行器已接线：真实起 agent 改码 → 跑验证 → 在工作区检出里做本地提交）
   ticketTimeoutMinutes: number,  // 默认 40，5..180
-  fetchBeforeCreate: boolean,    // 默认 true
-  branchPrefix: string,          // 默认 'ticket-'，后接 <projectId>-<recordId>-r<修订号>
-  worktreeRetentionHours: number,// 默认 24，0..720
+  isolateWorktree: boolean,      // 默认 false：直接在项目工作区的检出里改代码（要求检出干净）；
+                                 // true 才每票 `git worktree add -b <branch> .agents/worktrees/<branch>` 开隔离检出
+  fetchBeforeCreate: boolean,    // 默认 true；只有 isolateWorktree: true 建隔离 worktree 时才用得上
+  branchPrefix: string,          // 默认 'ticket-'，后接 <projectId>-<recordId>-r<修订号>（只在 isolateWorktree: true 时用于票分支）
+  worktreeRetentionHours: number,// 默认 24，0..720（只有 isolateWorktree: true 才有 worktree 可清）
 
   // ── agent 与模型 ────────────────────────────────────
   provider: string,              // 默认 'workbuddy'
@@ -845,7 +893,11 @@ export const Config = {
 **凭据不进配置**：`pushplus.token`、GitLab PAT、飞书应用密钥全部走 `ctx.credentials`。
 配置里的 token 字段只是占位，读取顺序是 credentials → 配置（空则视为未配置）。
 
-**`enabled` 默认 `false` 的理由**：插件装上就自动开始扫表、建 worktree、开 MR 是很危险的默认值。必须由人显式打开。
+**`enabled` 默认 `false` 的理由**：插件装上就自动开始扫表、跑票、改工作区里的代码并做提交是很危险的默认值。必须由人显式打开。
+
+**`repo.gitlab.enabled` 也默认 `false`**：它是**远程 MR 出口的总开关**。缺省下执行器完全不需要 `GITLAB_TOKEN`、
+不发任何 GitLab 请求，交付物就是工作区检出里的一次本地提交；只有项目显式写 `true` 且配了 `repo.remote`，
+才走原来的 GitLab Commits API 开 draft MR。`config.js` 的 `validateProject` 只在严格 `=== true` 时把它透传下去。
 
 ---
 
@@ -859,6 +911,7 @@ src/
 │   ├── recover.js                 ← 启动恢复（扫未完成票）
 │   ├── config.js                  ← Config 校验（CONFIG_FIELDS + projects[]）
 │   ├── workspace.js               ← 项目工作区：repo.path ↔ 宿主 workspaceRegistry 的登记
+│   ├── worktree-path.js           ← isIsolatedWorktreePath（清理前的前缀校验，防误删主检出）
 │   ├── domain.js                  ← 平台无关的小工具（ID 归一、时间等）
 │   ├── branch-name.js             ← 分支名 sanitize
 │   ├── prompt.js                  ← 给 agent 的 task 文案拼装（纯文本 + 图片块）
@@ -870,6 +923,7 @@ src/
 │   ├── work-executor.js           ← WorkExecutor / ExecCtx / ExecResult / Plan
 │   ├── push-adapter.js            ← PushAdapter / NotifyMessage / PushReceipt
 │   ├── record-filter.js           ← recordIds 收窄开关（resolve/create）
+│   ├── git-status.js              ← `git -z` 状态/改名解析 + 插件自有目录排除规则
 │   └── types.js                   ← Ticket / ScreenshotRef / Phase / 状态机
 ├── adapters/                      ← 唯一允许按平台改的地方
 │   ├── source-mock/               ← 内存里造票，用于开发与自测
@@ -880,11 +934,11 @@ src/
 │   │   └── zip.js                 ← 零依赖 zip 解包
 │   ├── source-webform/            ← 网页表单（内存 records，最小实现）
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
-│   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 用 Commits API 开 draft MR
-│   │   ├── index.js               ← 主流程（起 agent、preset、collect、verify、MR）
+│   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 在工作区检出里做本地提交（可选出口才开 draft MR）
+│   │   ├── index.js               ← 主流程（起 agent、preset、collect、verify、commitLocally、可选 openDraftMr）
 │   │   └── agent-failure.js       ← 从 session.log / agent/error 里读真实失败原因
-│   ├── executor-mock/             ← 不发真改动的执行器，自测用
-│   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端
+│   ├── executor-mock/             ← 不发真改动的执行器，自测用（返回假的 commit）
+│   ├── gitlab-client/             ← Commits API + draft MR 的最小客户端（只在 repo.gitlab.enabled=true 时被调用）
 │   ├── push-pushplus/             ← PushPlus channel=clawbot
 │   ├── push-qqmail/               ← 零依赖手写 SMTP（QQ 邮箱直发）
 │   └── push-mock/                 ← 记录推送内容的假适配器
@@ -946,7 +1000,7 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 > 删掉 `src/adapters/source-feishu/` 整个目录 + `src/index.js` 里那个 import 和表里那一行，
 > 插件仍能构建、仍能用 `projects: [{ name:'demo', match:{ platform:'mock' }, repo:{ path:'...' } }]` 跑通整条链路。
 
-> 静态注册表背后的取舍写在 [ADR 0001：平台适配层可插拔](../adr/0001-平台适配层可插拔.md)；错误模型见 [ADR 0002：PipelineError 错误模型](../adr/0002-PipelineError错误模型.md)；工单正文不可信的边界见 [ADR 0003：工单正文不可信](../adr/0003-工单正文不可信.md)；插件为何要给 git/verify 显式申请完整文件权限见 [ADR 0004](../adr/0004-插件git需要完整文件权限.md)。术语表在仓库根 [GLOSSARY.md](../../GLOSSARY.md)。
+> 静态注册表背后的取舍写在 [ADR 0001：平台适配层可插拔](../adr/0001-平台适配层可插拔.md)；错误模型见 [ADR 0002：PipelineError 错误模型](../adr/0002-PipelineError错误模型.md)；工单正文不可信的边界见 [ADR 0003：工单正文不可信](../adr/0003-工单正文不可信.md)；插件为何要给 git/verify 显式申请完整文件权限见 [ADR 0004](../adr/0004-插件git需要完整文件权限.md)；飞书电子表格按表型分派的决策见 [ADR 0005](../adr/0005-飞书电子表格源按表型分派.md)。术语表在仓库根 [GLOSSARY.md](../../GLOSSARY.md)。
 
 做不到就说明边界漏了 —— 有内核代码直接引用了飞书的细节，或者适配器之间互相 import 了。
 
@@ -971,12 +1025,17 @@ T+0:01  drainOne() 取出票A（并发 1，一轮只跑一票）
         │                                    candidatePaths:[], ambiguous:false }
         ├─ 组合根的 prepareWorkspace 先确保**项目工作区**（`repo.path` 这个目录在宿主
         │    workspaceRegistry 里有登记：已登记就复用，没登记就补一条，见 §7.7）
-        ├─ 若 fetchBeforeCreate → git fetch <项目 baseBranch>
-        ├─ 再跑 git worktree add，落到 `<repoPath>/.agents/worktrees/<branch>`；
-        │    没有 subprocess 时只返回工作区坐标，阶段照走
-        │    （早先设想的 ctx.worktrees.create 路子在当前宿主上没有，已改用这条）
+        ├─ isolateWorktree !== true（**缺省**）：inspectCheckout → assertCleanCheckout，
+        │    读状态统一用 `git status --porcelain -z -uall -- . <排除 .agents/worktrees>`；
+        │    检出脏就直接抛 invalid-input 拒跑这张票（点名文件）；
+        │    干净则 path = 工作区根、branch = 检出当前分支、baseCommit = 检出当前 HEAD
+        │    —— 就在这份检出里改代码、就地提交，不建 worktree
+        ├─ isolateWorktree === true：若 fetchBeforeCreate → git fetch <项目 baseBranch>，
+        │    再跑 git worktree add -b <branch> `<repoPath>/.agents/worktrees/<branch>`
+        │    （隔离层是可选的；没有 subprocess 时只返回工作区坐标，阶段照走）
         └─ onPhase('worktree-ready') 记 workspacePath/workspaceId/worktreePath/branch/baseCommit
-             （先回填进 ws 再落库，执行器读 ws）
+             （先回填进 ws 再落库，执行器读 ws；缺省模式下 worktreePath === workspacePath，
+               branch 是检出当前分支，不是新造的票分支）
 
 T+0:02  onPhase('planning')，起超时定时器（40 min）
         ├─ 截图是**输入**不是阶段，在开工之前就取：
@@ -989,32 +1048,49 @@ T+0:02  onPhase('planning')，起超时定时器（40 min）
         └─ executor-agent 内部：agents.create({ sessionId, meta:{cwd: workspacePath},
               agentOptions: resolveAgentOptions(config), setup }) → agent.followup(msg)
               ← 必须 followup（inject 不唤醒 agent）
-              ← header.cwd 是**项目工作区根**，不是 worktree：宿主 attachSession
-                要求会话 cwd 正好等于工作区路径，worktree 子目录挂不上
-             setup 里做四件事：挂 preset、追加 sandbox/mode 与 approval/policy、
-             把工作目录钉到 worktree（workingDirectory.set）、attachSession 归属工作区
+              ← header.cwd 是**项目工作区根**：宿主 attachSession 要求会话 cwd 正好
+                等于工作区路径，隔离子目录挂不上
+             setup 里做三件事：挂 preset、追加 sandbox/mode 与 approval/policy、
+             attachSession 归属工作区；只有 worktreePath !== workspacePath
+             （即 isolateWorktree 打开）时才把工作目录钉到隔离检出（workingDirectory.set）
 
-T+0:03  … agent 在 wt.path 里读代码、定位、规划
+T+0:03  … agent 在改代码落点里读代码、定位、规划（缺省就是项目工作区的检出）
         └─ 报「定位完成」→ onPhase('editing')，存 Plan
 
 T+0:30  … agent 改完 → onPhase('testing')
         └─ 验证命令从项目配置 verify.build / verify.test 注入
-           （没配 verify 就跳过验证，直接开 draft MR）
+           （没配 verify 就跳过验证，验证结论记为「未跑成」，仍然做本地提交）
 
-T+0:35  onPhase('mr-opening')
-        ├─ git push 不可用（沙箱封死，见 §12）
-        ├─ 用 GitLab Commits API 把改动物化成远端 commit
-        │    POST /api/v4/projects/28/repository/commits
-        │      { branch, commit_message, actions:[{action:'update', file_path, content}] }
-        │    ⚠️ 过滤 application.yml 之类含真实凭据的文件
-        ├─ GET /repository/branches/:branch 确认分支存在（POST 分支不存在也返 201）
-        ├─ GET /merge_requests?source_branch=X&state=opened 去重
-        └─ POST /merge_requests { source_branch, target_branch:'<项目 targetBranch>',
-                                  title:'Draft: [工单#N] 摘要', description }
+T+0:35  onPhase('mr-opening', '在工作区检出里做本地提交')
+        ├─ 收集改动：`git diff --name-status -z <baseCommit> -- . <排除>` ∪
+        │    `git status --porcelain -z -uall -- . <排除>`
+        │    ⚠️ `git diff` 看不见未跟踪新文件，而「新建文件」是工单最常见产物；
+        │       漏了会连 committable.length === 0 一起判 failed
+        │    ⚠️ 一律走 `-z`：非 `-z` 下中文名是八进制转义、含空格名一定带引号，
+        │       旧解析器会把引号写进提交路径 → git 找不到文件
+        ├─ 敏感文件过滤后，若 agent 自己把它们 `git add` 过：
+        │    `git restore --staged -- <敏感文件>` 退回未跟踪（白名单只放行 --staged）
+        ├─ git add -- <非敏感且非删除的文件>   ← 点名暂存（不用 add -A：全量暂存会让
+        │    ⚠️ 敏感文件露在 index 里，人一提交就跟着走了；git 白名单也只放行 `add -- <文件>`）
+        ├─ git commit -m <提交说明> -- <改动文件 ∪ 重命名前的旧路径>
+        │    ⚠️ 删除路径不能进 add（会 fatal: pathspec did not match any files），
+        │       但必须进 commit pathspec；重命名的旧路径同理，否则历史里变「复制」
+        │    ⚠️ 过滤 application.yml 之类含真实凭据的文件：它们根本进不了 index，
+        │       留在工作区，文件名写进提交说明的「未提交（疑似含真实凭据，按约定留在工作区）：」一行
+        ├─ git rev-parse HEAD → sha
+        ├─ 得到 ExecResult.commit = { sha, branch, files }
+        └─ 只有 repo.gitlab.enabled === true 时才继续开远程 draft MR（可选出口）：
+             git push 不可用（沙箱封死，见 §12）→ 改走 GitLab Commits API 物化
+             POST /api/v4/projects/28/repository/commits
+             GET /repository/branches/:branch 确认分支存在（POST 分支不存在也返 201）
+             GET /merge_requests?source_branch=X&state=opened 去重
+             POST /merge_requests { source_branch, target_branch, title:'Draft: [工单#N] 摘要', description }
+             开完断言 draft === true
 
 T+0:36  onPhase('done') / onPhase('skipped')
-        ├─ 存 mr.iid / mr.url
-        ├─ push.send({ title, body, link: mr.url, level:'info' })
+        ├─ 存 commit.sha / commit.branch / commit.files（有远程出口时一并存 mr.iid / mr.url）
+        ├─ push.send({ title, body, level:'info' })：正文首行是
+        │    「本地提交：<sha 前 12 位> @ <branch>（<worktreePath>）」；有 mr 时才多带 link
         ├─ 释放租约、清超时定时器
         └─ running = false
 
@@ -1023,6 +1099,8 @@ T+3:00  下一轮 tick()（队列空，只扫描 + 清理）
 ```
 
 **关键点**：整条链路里，内核只调了四个接口。它不知道飞书的 URL、不知道 GitLab 的 API、不知道该改哪个 `.vue` 文件。
+默认交付形态是**工作区检出里的本地提交**，GitLab 那一半（`commitLocally` 之后的 `openDraftMr`）只有项目显式
+打开 `repo.gitlab.enabled: true` 时才发生 —— 内核连「有没有远端」都不关心，它只认 `ExecResult.commit` 或 `mr`。
 
 ---
 
@@ -1091,12 +1169,14 @@ fatal: unable to fork
 
 不是网络、不是权限配置，是子进程管道建不出来（连本地裸仓库都失败）。**所以不能用 `git push -o merge_request.create`**，只能：
 
-- 本地 commit 留在 worktree 里给人看
-- 远端用 **Commits API** 物化改动（`actions[]` 按文件内容表达）
+- 本地 commit 留在检出里给人看（**这就是本阶段的交付形态**，人 `git show <sha>` 就能 review）
+- 真需要远端时才用 **Commits API** 物化改动（`actions[]` 按文件内容表达）—— 只在 `repo.gitlab.enabled: true` 的可选出口里发生
 
 代价：远端那个 commit 和本地那个 SHA 不同、作者默认是 token 用户（可用 `author_name`/`author_email` 覆盖）。
 
-### 12.3 MR 必须走标题前缀
+### 12.3 MR 必须走标题前缀（只在远程出口打开时才相关）
+
+`repo.gitlab.enabled` 缺省 `false`，本节只在那条可选出口真的打开时才适用：
 
 - `draft=true` 参数被**静默忽略**（返回 201 但 `draft:false`）
 - `wip_event=draft` 直接 400（参数未声明）
@@ -1104,7 +1184,7 @@ fatal: unable to fork
 
 **开完必须断言返回体 `draft === true`**，不能只看 201。
 
-### 12.4 两个 GitLab 坑
+### 12.4 两个 GitLab 坑（同上，只在远程出口打开时适用）
 
 1. **`source_branch` 不存在也返回 201** → 开 MR 前必须先 `GET /repository/branches/:branch`
 2. **重复 MR 返回 409**（文案是中文）→ 只按状态码判断，不匹配文案
@@ -1126,7 +1206,7 @@ fatal: unable to fork
 ### 12.6 明确不做（`Out of scope`）
 
 - 个人微信 bot 框架（wechaty / itchat / wcferry）—— 违反微信 ToS，有封号风险
-- 自动合并 MR —— 人验收后自己合
+- 自动合并 MR —— 人验收后自己合（本阶段连 MR 都不开，交付物是本地提交）
 - `projects[]` 未配置的仓库
 - `pms-miniapp` 小程序的自动化测试
 - **工单表状态回写** —— 用户明确只要只读
@@ -1267,6 +1347,71 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 **能力声明**：`capabilities = ['watermark', 'scanTuning']` —— 金山这条路不需要密钥，也不读本地文件；
 水位必须落盘（否则重启后整张表当新票重收），扫描节流两个数来自全局配置。
 
+### 12.10 飞书电子表格支持（设计待实施）
+
+> **状态：设计已定、尚未实施。** 本节记录的是**已拍板的架构结论**，不是当前代码的行为 ——
+> 电子表格路径要等 `docs/ticket-pipeline/feishu-sheet-source.md` 排期里的阶段 A–E 落地后才存在。
+> 决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
+
+**现状：电子表格 100% 进不来，而且报错文案会把人引到错方向。**
+
+四条硬证据（都在**代码路径**上，与权限无关）：
+
+| 证据 | 位置 | 说明 |
+|---|---|---|
+| wiki 节点查询把表型写死 | `src/adapters/source-feishu/index.js:763-766` | `get_node` 的 query 里硬写 `obj_type: 'bitable'` |
+| `sheet` 被判成「不是多维表格」 | `src/adapters/source-feishu/index.js:770-775` | 抛 `invalid-input`，文案里写着「sheet=电子表格」不支持 |
+| 云文档搜索只认 bitable | `src/adapters/source-feishu/index.js:713` | `searchBitableDocs` 只收 `type === 'bitable'` |
+| 配置校验只认两种绑定 | `src/core/config.js:494-501` | `validateProject` 只给「`appToken`+`tableId`」或「`docNamePattern`」二选一，只给 `spreadsheetToken` 的配置**启动时就被拒** |
+
+**这是代码路径问题，不是权限问题** —— 错误文案（先说「不是多维表格」，再列一串 `docx` / `sheet` / `mindnote`）
+很容易把人引到「去申请权限」的错方向，而实际上**哪怕权限全开也扫不出来**。
+
+**两种表型的八维对照**（下面每一行都是电子表格分支要单独处理的差异）：
+
+| 维度 | 多维表格 | 电子表格 |
+| --- | --- | --- |
+| 绑定键 | `appToken` + `tableId` | `spreadsheetToken` + `sheetId` |
+| 读值接口 | `bitable/v1 .../records/search`（**有分页**：`has_more` / `page_token`） | `sheets/v2 .../values/:range`（**无分页**，响应里根本没有这两个字段；单次上限 10 MB） |
+| 行身份 | `record_id`（平台生成，稳定） | **没有** → 插件自造（`sh-seq-<序号值>` / `sh-row-<行号>`） |
+| 行级 mtime | 有（`pickMtime`，`index.js:894-906`） | **没有** → 变更判定完全依赖指纹 |
+| 元数据接口 | `bitable/v1 .../tables` | `sheets/v3 .../sheets/query`（**snake_case**，与 v2 读值接口的 camelCase 不是一套风格） |
+| 早停 | 连续 `safePageRun` 条已知未变就停翻页（`index.js:1004-1005`、`:1031-1034`） | **不做早停**（没有 mtime、没有分页可停） |
+| 截图 | attachment / path / url 三形态 | **只支持 path / url**（内嵌图片没有稳定可下载的 token 形态） |
+| 表型判定 | —— | wiki 节点看 `node.obj_type`（`bitable` / `sheet`）；裸 token 先试 bitable 表清单再试 sheet 工作表清单；`docNamePattern` 时 drive 搜索扩 `type ∈ {bitable, sheet}` |
+
+**不变契约的红利**：**不新增 `platform`**，仍用 `feishu` —— 表型是同一平台下的两种文档类型，不是新平台。
+于是 `src/contracts/*`（`TicketSource` 契约、`makeTicket`、`fingerprintOf`）、`src/core/scheduler.js`、
+`src/core/store.js`、`src/index.js` 的 `SOURCES` / `PLATFORMS` / `buildSourceOptions`
+**一个字都不用改**。这正是 ADR-0001「加平台 = 加目录 + `SOURCES` 一行 + `PLATFORMS` 一个字符串」那套成本
+**不用付**的原因。
+
+**身份策略与代价**：电子表格没有 `record_id`，身份只能自造。默认取**序号列**的值（`sh-seq-<值>`），
+序号为空时兜底物理行号（`sh-row-<行号>`，在 `raw.identitySource` 标 `fallback-row`），
+同一轮序号重复直接报 `invalid-input`（**不静默取第一个** —— 静默取第一个 = 一张票吞掉另一张，最难查）。
+已知代价：**在表上方插行会让所有后续行的行号身份整体漂移**（旧票退役 + 新票涌入）；序号被重填也会换身份。
+金山源已经踩过同一个坑（`src/adapters/source-wps/xlsx.js:611-613` 的注释明确写了这个取舍），
+电子表格分支**继承同一套水位与退役语义**，不另造机制。
+
+**探测的错误分流**：探测阶段 `auth` / `rate-limit` / `network` 类错误**直接抛**，不换接口重试 ——
+凭据、限流、网络问题与表型无关，换个接口再试只会把真因埋掉。只有 `not-found` / `invalid-input`
+才继续试另一种表型。两次都失败时，`invalid-input` 的文案要**列出每次尝试**
+（沿用现有多候选 app_token 的写法，`index.js:806-810`）。
+
+**探测结果缓存**：`tableCache`（`index.js:359-360`，现形状 `{appToken, tableId}`）升级为带 `kind` 的联合类型，
+一轮扫描只探测一次（`scan` 开头调 `resolveTable`，`index.js:917`）。
+
+**落地形态**：新增 `src/adapters/source-feishu/sheets.js`（探测的 sheet 分支 + 工作表定位 + 读值 +
+表头映射 + 身份计算），`index.js` 只做分派 —— 与金山源同构（`source-wps/index.js` + `source-wps/xlsx.js`）。
+
+**人工前置**（与多维表格**两套独立 scope**）：`sheets:spreadsheet:readonly` 或 `drive:drive:readonly`；
+电子表格所有者要手动「…」→「…更多」→「添加文档应用」把应用加为协作者
+（`POST /drive/v1/permissions/:token/members` 只对 `user_access_token` 有效，插件用的是
+`tenant_access_token`，**无法自举** —— 同 §12.8 记的多维表格那条）。
+
+完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`；
+决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
+
 ## 13. 事实来源
 
 本文所有「实测」结论都来自以下材料，改动前先回读原文：
@@ -1276,7 +1421,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | DSH 插件系统 / 服务 / slot / 发布 | `docs/research/dsh-capabilities.md`；抽取的原始文档在 `.scratch/_reference/dsh-plugin-docs/` |
 | 飞书多维表格 API、水位、附件 | 票 `.scratch/ticket-pipeline/issues/01-飞书多维表格的变更水位与去重.md` 的 Resolution |
 | 截图上模型的唯一合法通路 | `.scratch/ticket-pipeline/research/image-path.md`（723 行，每条带 `包名:行号`） |
-| GitLab draft MR / Commits API | `.scratch/ticket-pipeline/research/gitlab-mr.md`（558 行，每条标【实测】/【源码】/【不可知】） |
+| GitLab draft MR / Commits API（**现在只是 `repo.gitlab.enabled: true` 才走的可选出口**） | `.scratch/ticket-pipeline/research/gitlab-mr.md`（558 行，每条标【实测】/【源码】/【不可知】） |
 | 项目仓库目录结构与验证命令参考 | `.scratch/ticket-pipeline/research/repo-map.md`（405 行，11 节，作示例） |
 | 微信推送（WorkBuddy 排除 / PushPlus） | `.scratch/ticket-pipeline/research/wechat-push.md`（784 行） |
 | `worktrees` 服务契约 | `.scratch/_reference/worktree-README.md`（从 asar 抽出） |
@@ -1284,5 +1429,6 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | QQ 邮箱 SMTP 直发（真实发信已验） | `plugins/ticket-pipeline/src/adapters/push-qqmail/index.js`；自测 `scripts/push-qqmail-checks.mjs` |
 | 宿主 shell / 沙箱 / agent 装配链（asar 解包实读） | `.scratch/_asar/`（`dsh-agent-loop` / `dsh-headless` / `dsh-subagent` / `api-session-controller` 等） |
 | 真实飞书工单表结构与状态分布 | 表 `RZZQbY4SkaY6z0shZaBcVpQCnhh` / `tblWhRSGf0osJqrE`，79 条；「是否处理」分布 是:71 / 否:6 / 处理中:1 / 空:1 |
-| 真实跑通记录（沙盒票 → 真 MR） | `sandbox|rec-mock-001` → GitLab MR !1（draft，source `ticket-sandbox-rec-mock-001-r1` → `main`） |
+| 真实跑通记录（本地提交） | 2026-11-06 在 `D:/WorkSpace/mgiot-pms` 的工作区检出里实跑：`fix(pms): [pms] ##1 rec-probe-1` → sha 落库、通知正文首行「本地提交：<sha12> @ <branch>」，敏感文件 `application.yml` 留在工作区并写进提交说明 |
+| 真实跑通记录（沙盒票 → 真 MR，可选出口） | `sandbox\|rec-mock-001` → GitLab MR !1（draft，source `ticket-sandbox-rec-mock-001-r1` → `main`）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | 上游模型限流真因（不是插件缺陷） | agent 会话 `session.v4.jsonl.zstd` 里的 `turn/end` reason：HTTP 429 / `quota_exceeded` |

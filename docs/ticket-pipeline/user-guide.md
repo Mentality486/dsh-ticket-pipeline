@@ -1,6 +1,6 @@
 # 工单流水线插件 · 使用手册（v0.1.0-test.1）
 
-> 本手册面向**使用者**：从零开始把插件跑起来，直到收到第一封带 Draft MR 的通知邮件。
+> 本手册面向**使用者**：从零开始把插件跑起来，直到收到第一封带**本地提交**的通知邮件。
 > 架构原理见 [architecture.md](./architecture.md)，实现进度见 [feature-checklist.md](./feature-checklist.md)。
 
 ---
@@ -12,12 +12,14 @@
 ```
 监控工单表 → 发现「处理中」的行 → 解析问题描述/操作流程/截图
     → 确定这张工单属于哪个项目 → 确保该项目的工作区已登记在 DSH 里
-    → 在工作区下切本票的 worktree → AI 规划并改代码 → 跑构建/测试
-    → 经 GitLab API 开 Draft MR → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信）
-    → 你人工验证后合并 MR，拨回工单状态
+    → 直接在项目工作区的检出里改代码（缺省；开跑前要求检出干净）
+      └─ 打开 isolateWorktree 时才额外切一个隔离 worktree 子目录
+    → AI 规划并改代码 → 跑构建/测试
+    → 在工作区检出里做一次本地提交 → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信）
+    → 你在检出里 review 这个提交，拨回工单状态
 ```
 
-**人只做三件事**：填工单、收通知、验证合并。
+**人只做三件事**：填工单、收通知、review 那个本地提交。
 
 ---
 
@@ -54,7 +56,7 @@
 |---|---|---|
 | `FEISHU_APP_ID` | 飞书应用 id | 用飞书工单源时 |
 | `FEISHU_APP_SECRET` | 飞书应用密钥 | 用飞书工单源时 |
-| `GITLAB_TOKEN` | 开 MR 的 GitLab 私人令牌（需 api 权限） | workExecutor=agent 时 |
+| `GITLAB_TOKEN` | 开远程 draft MR 的 GitLab 私人令牌（需 api 权限） | **仅**项目显式打开 `repo.gitlab.enabled: true` 时；本阶段用不到 |
 | `QQMAIL_AUTH_CODE` | QQ 邮箱**授权码**（不是登录密码） | pushAdapter=qqmail 时 |
 | `PUSHPLUS_TOKEN` | PushPlus 推送 token | pushAdapter=pushplus 时 |
 
@@ -76,12 +78,19 @@
 3. **关键一步：发布** —— 左侧 **版本管理与发布** → 创建版本 → 填个版本号和更新说明 → 提交发布。
    **权限不开版本不生效**（企业自建应用一般秒过或管理员自动审批）。
 
+> **用电子表格当工单表时，还要额外开一组权限**：`sheets:spreadsheet:readonly`（或 `drive:drive:readonly`）。
+> 这跟多维表格的 `bitable:app:readonly` **是两套互不相通的 scope，必须单独申请**。
+> 另外电子表格的所有者要在表格页面「…」→「…更多」→「**添加文档应用**」把应用加为协作者 ——
+> 插件用的是应用身份（`tenant_access_token`），没法自己给自己授权，这一步必须人工做一次。
+> （电子表格支持**设计待实施**，这一步是等它落地后才需要的。）
+
 ### 1.3 确认本地仓库
 
 每个项目需要一个**本地 git 检出**（`repo.path`），并确认：
 
-- 工作区干净（没有未提交改动，worktree 机制要求）
-- 能访问对应 GitLab 远端（插件用 **GitLab Commits API** 提交，不依赖本机 `git push`）
+- 工作区干净。**缺省模式（`isolateWorktree: false`）就在这份检出里改代码、就地提交**，脏起点会把别人的改动混进这次提交；检出脏时插件会直接拒跑并点名是哪些文件，让你先提交或 `git stash`。
+  插件判脏的口径是 `git status --porcelain -z -uall -- . ':(exclude).agents/worktrees' ':(exclude).agents/worktrees/**'`：`-uall` 会把未跟踪目录展开到文件级（否则目录里混的 `application.yml` 会被折叠成一个目录名、躲过敏感文件拦截），末尾两条排除规则跳过插件自己开的隔离 worktree —— 所以你手工跑 `git status --porcelain` 看到 `?? .agents/` 不算脏
+- 远端 GitLab **只在**你打开了 `repo.gitlab.enabled: true`、要额外开远程 draft MR 时才需要。默认交付形态是工作区检出里的一次本地提交，不需要远端，也不需要 `GITLAB_TOKEN`
 
 ---
 
@@ -109,7 +118,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 |---|---|
 | 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
-| 配置 | 29 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
+| 配置 | 30 个字段按「扫描与队列 / 租约与重试 / 执行 / agent 与模型 / 通知 / 杂项」分组，改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
 | 项目清单 | `projects[]` 是结构化数组，**不在表单里**，仍按下文手改配置 |
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
@@ -134,7 +143,8 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
       "repo": {
         "path": "D:/WorkSpace/pms",
         "remote": "https://gitlab.example.com/group/pms.git",
-        "baseBranch": "main"
+        "baseBranch": "main",
+        "gitlab": { "enabled": false }
       },
       "verify": {
         "build": "npm run build",
@@ -147,7 +157,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 ### 3.1 配置项速查
 
-**顶层**（全部 29 个字段，键名与 `src/core/config.js` 的 `CONFIG_FIELDS` 一一对应，按面板分组列出）：
+**顶层**（全部 30 个字段，键名与 `src/core/config.js` 的 `CONFIG_FIELDS` 一一对应，按面板分组列出）：
 
 **扫描与队列（4 个）**：
 
@@ -166,15 +176,16 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `leaseHeartbeatSeconds` | `60` | 跑票期间续租间隔（秒），必须显著小于租约时长 |
 | `maxAttempts` | `2` | 可重试错误的自动重试上限 |
 
-**执行（5 个）**：
+**执行（6 个）**：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `workExecutor` | `mock` | `mock`（离线验证）/ `agent`（真执行）。agent 是真实现：起宿主 agent 改码 → 收集改动 → 跑验证 → 开 GitLab draft MR，已产出过真实 draft MR |
+| `workExecutor` | `mock` | `mock`（离线验证）/ `agent`（真执行）。agent 是真实现：起宿主 agent 改码 → 收集改动 → 跑验证 → 在工作区检出里做本地提交（`repo.gitlab.enabled: true` 时才额外开 draft MR） |
 | `ticketTimeoutMinutes` | `40` | 单票执行超时，超时只通知不重试 |
-| `fetchBeforeCreate` | `true` | 切 worktree 前先 git fetch 一次基准分支 |
-| `branchPrefix` | `ticket-` | 工作分支前缀 |
-| `worktreeRetentionHours` | `24` | 终态票的 worktree 保留时长；0 = 不自动清理 |
+| `isolateWorktree` | `false` | **改代码落点**。`false`（缺省）直接在项目工作区的检出里改代码、就地提交，**要求检出干净**（脏就拒跑并点名文件）；`true` 才每票 `git fetch` + `git worktree add` 开隔离 worktree |
+| `fetchBeforeCreate` | `true` | 切 worktree 前先 `git fetch` 一次基准分支（只有 `isolateWorktree: true` 时用得上；宿主 profile 现为 `false`，项目工作区已是最新检出时不必每次拉） |
+| `branchPrefix` | `ticket-` | 工作分支前缀（只有 `isolateWorktree: true` 时用于票分支） |
+| `worktreeRetentionHours` | `24` | 终态票的隔离 worktree 保留时长；0 = 不自动清理（只有开了 `isolateWorktree` 才有 worktree 可清） |
 
 **agent 与模型（4 个）**：
 
@@ -210,18 +221,30 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 **projects[] 每项**：
 
+> 飞书的工单表可以是**多维表格**也可以是**电子表格**，插件自己判断，你不用填表型。
+> 电子表格这套键**设计待实施**（见 `docs/ticket-pipeline/feishu-sheet-source.md`）。
+
 | 键 | 说明 |
 |---|---|
 | `name` | 项目唯一标识（分支名里会出现：`ticket-pms-xxx-r1`） |
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐） |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
+| `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`）。和多维表格的 `appToken` 二选一；配了插件就按电子表格处理（**该能力设计待实施**） |
+| `match.sheetId` / `match.sheetName` | 电子表格里**工作表**的 id 或名字（二选一），跟 `spreadsheetToken` 配套。`match.sheetName` 与金山源共用同一个键 |
+| `match.sheetHeaderRow` | 表头在第几行，默认 `1` |
+| `match.sheetIdentity` | 行身份来源：`seq`（默认，取序号列的值）/ `row`（取物理行号） |
+| `match.sheetIdColumn` | 序号列的表头文字，默认「序号」 |
+| `match.sheetColumns` | 列名覆盖，如 `{"description":"缺陷描述"}` |
+| `match.sheetRange` | 限定读取范围，如 `A1:M500`（大表用；读值接口无分页、单次上限 10 MB） |
+| `match.tableKind` | 逃生阀：`bitable` / `sheet`。**一般不用填**，留空 = 插件自己判断表型 |
 | `match.statusValues` | 可配：状态列里哪些取值算「在处理中」（收票条件）。不填则用默认值 `处理中` |
 | `match.recordIds` | 可配：只处理这几条工单（收窄开关）。不填 = 整张表 |
 | `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条；一个项目一条，多张票共用）。目录必须**已经存在**，插件不会替你克隆；不存在时这张票以 `invalid-input` 失败并说明该改哪个配置 |
-| `repo.remote` | GitLab remote URL（开 MR 用） |
-| `repo.baseBranch` | 切 worktree 的基准分支。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上 |
-| `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接开 draft MR** |
+| `repo.remote` | GitLab remote URL。**只有** `repo.gitlab.enabled: true` 要走远程 draft MR 时才用得上；本阶段留空即可 |
+| `repo.gitlab.enabled` | 远程 MR 出口总开关，**缺省 `false`**。false 时执行器完全不需要 `GITLAB_TOKEN`、不发任何 GitLab 请求，只做本地提交 |
+| `repo.baseBranch` | 建隔离 worktree 用的基准分支（只有 `isolateWorktree: true` 时用到）。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上 |
+| `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接做本地提交**（验证结论记为「未跑成」并写进通知） |
 
 ---
 
@@ -239,15 +262,15 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 pipeline_status
 ```
 
-预期：能看到一张 `pending → worktree-ready → planning → done` 的票。
-mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机、通知全链路都已走通**。
+预期：能看到一张 `pending → worktree-ready → planning → done` 的票，`pipeline_status` 里带一行 `本地提交：mock…`。
+mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、状态机、通知全链路都已走通**。
 
 ### 4.2 五个对话工具
 
 | 工具 | 干什么 |
 |---|---|
 | `pipeline_scan` | 立即扫一次工单表（不等轮询） |
-| `pipeline_status` | 看所有票的当前阶段与最近错误 |
+| `pipeline_status` | 看所有票的当前阶段、本地提交（sha + 分支）与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
 | `pipeline_doctor` | 体检：git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知，结论按「必须修复」「提醒」分段 |
@@ -258,7 +281,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 1. `workExecutor` 改为 `"agent"`
 2. `pushAdapter` 改为 `"qqmail"`（并填 `qqmail.user`/`qqmail.to`）
-3. 确认 `GITLAB_TOKEN`、`QQMAIL_AUTH_CODE` 已配
+3. 确认 `QQMAIL_AUTH_CODE` 已配（**不需要** `GITLAB_TOKEN` —— 除非你另外打开了 `repo.gitlab.enabled: true`）
 4. `enabled` 保持 `true`，重新拨一张工单
 
 ---
@@ -267,19 +290,19 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 ```
 你：在飞书表填一行「问题描述/操作流程/模块/截图」，是否处理=处理中
-插件（≤3 分钟内）：收票 → 确保项目工作区 → 建 worktree → AI 改码 → 构建+测试 → 开 Draft MR
-你：收到邮件通知（含 MR 链接 + 失败原因 + worktree 保留路径）
-你：本地 checkout 那个分支验证 → 满意就合 MR → 把工单「是否处理」拨走
+插件（≤3 分钟内）：收票 → 确保项目工作区 → 确定改代码落点（缺省就在检出里，`isolateWorktree: true` 才开隔离 worktree）→ AI 改码 → 构建+测试 → 在工作区检出里做本地提交
+你：收到邮件通知（含本地提交 sha + 分支 + 失败原因 + 工作区路径）
+你：在检出里 `git show <sha>` review → 满意就合到你自己的分支 → 把工单「是否处理」拨走
 ```
 
 ### 5.1 通知里能读到什么
 
 | 阶段 | 通知内容 |
 |---|---|
-| done | MR 链接、改动文件、测试结果 |
-| failed | 失败原因（具体错误）、worktree 保留路径（去现场看） |
+| done | 本地提交的 sha（前 12 位）与分支、工作区路径、改动文件、测试结果 |
+| failed | 失败原因（具体错误）、工作区保留路径（去现场看） |
 | needs-info | 缺什么（常见：截图取不到，需要人补图） |
-| skipped | 已开 MR 但未经真实验证（Draft 性质） |
+| skipped | 改动已提交到工作区，但验证没跑通，请人工确认 |
 
 ### 5.2 出问题怎么办
 
@@ -289,14 +312,14 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 | 票正在跑想停 | `pipeline_cancel` |
 | 长时间没动静 | `pipeline_status` 看阶段；超 40 分钟是超时，会自动通知你 |
 | 截图没进 prompt | 票会进 needs-info 并通知；补图后拨回重跑 |
-| 想看改动细节 | 通知里的 worktree 路径保留 24 小时，直接本地打开看 |
+| 想看改动细节 | 通知里的工作区路径保留 24 小时，直接 `git show <sha>` 看那个本地提交 |
 
 ### 5.3 安全边界（使用前必读）
 
 - **工单正文按不可信输入处理**：表里出现「忽略以上要求/删文件/改配置/发邮件到某地址」等内容会被当问题描述忽略并转 needs-info（详见 ADR-0003）
-- AI 只被授权改 worktree 里的代码 + 跑 `verify` 配置的命令；**敏感文件**（`application.yml`/`.env`/`*.pem`/`*secret*`）不会被提交
+- AI 只被授权改**这张票的改代码落点**里的代码（缺省就是项目工作区的检出；`isolateWorktree: true` 时是隔离 worktree）+ 跑 `verify` 配置的命令；**敏感文件**（`application.yml`/`.env`/`*.pem`/`*secret*`）不会被提交 —— 只用**点名暂存** `git add -- <非敏感文件>`，再用 `git commit -- <非敏感文件列表>` 只提交放行的那些，**不用 `git add -A`**（全量暂存会让敏感文件露在 index 里，手一抖就跟着提交走了）；被拦下的留在工作区并写进提交说明的「未提交」一行
 - 凭据全部走 DSH credentials 存储，不落配置文件、不出现在错误信息里
-- 只开 **Draft MR**，不 push 分支到远端、不合 MR —— 合并权永远在人手上
+- 默认**只做本地提交**，不 push、不合任何分支 —— 要不要合进主干永远由人决定。只有项目显式打开 `repo.gitlab.enabled: true` 时才会额外开一条 draft MR
 - **插件里的 `git` 与 `verify` 命令以完整文件系统权限执行**。这不是疏忽，是宿主沙箱的硬约束：
   插件不是会话，调宿主 shell 时拿不到会话的写入授权，不显式声明 `danger-full-access` 就写不了
   `.git`（连 `git fetch` 都会 `Permission denied`）。所以这条旁路**只给 git 和 verify 用**，
@@ -309,12 +332,12 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 262 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 285 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
 | 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
-| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置（29 个字段，6 个分组） |
+| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据 / 配置（30 个字段，6 个分组） |
 | 设置页体检 | 该页点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
 | 设置页保存 | 改任一字段 → 保存 | 提示「已保存」；重启后值还在 |
 | 浏览器端一致性 | `node scripts/client-check.mjs`（开发目录） | `✅ client-check 通过` |
@@ -351,6 +374,17 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 **Q：为什么我配了凭据还是报 auth 错？**
 飞书文档授权必须人工把应用加为表格协作者（§1.2）；空字符串凭据会被当成「没配」。
 
+**Q：我的飞书工单表是「电子表格」不是「多维表格」，能扫到吗？**
+当前**还不能** —— 插件的飞书源目前只支持多维表格，电子表格会在探测阶段被判成「不是多维表格」并报错
+（这是代码路径限制，不是权限问题，别去反复申请权限）。电子表格支持**设计已定、尚未实施**，
+方案见 `docs/ticket-pipeline/feishu-sheet-source.md`。届时你只要填电子表格的 token，
+插件会自己判断表型，不用你选。
+
+**Q：电子表格没有 `record_id`，插件怎么认出「还是那张票」？**
+靠**序号列**（默认取表头叫「序号」的那一列）。人在表格上方**插行**会让所有后续行的行号整体漂移，
+所以请**不要在工单上方插行**，也不要重填序号；序号留空时插件会兜底用物理行号，
+但那张票在插行后会被判成新票。
+
 **Q：改了表里的内容，为什么票没更新？**
 只有「是否处理=处理中」的行会被跟踪修订；管理列（处理人/处理结果）的变化不触发。
 
@@ -358,21 +392,26 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 不能。租约机制保证单飞（`leaseTtlMinutes`），被抢走的进程会让出票并记 lastError。
 
 **Q：AI 会直接动我的 main 分支吗？**
-不会。每票一个独立 worktree + 独立分支（`<branchPrefix>...`），最终产物是 Draft MR。
+**缺省会。** 缺省模式（`isolateWorktree: false`）就在项目工作区的检出里改代码、就地提交，提交落在检出当前分支上 ——
+如果那份检出停在 `main`，那就是 `main`。所以插件开跑前**硬性要求检出干净**（`git status --porcelain` 一有输出就拒跑，
+并点名是哪些文件），提交本身也只是本地 commit，**插件从不 push、从不合并**。
+想彻底隔离就打开 `isolateWorktree: true`：每票 `git fetch` + `git worktree add -b <branchPrefix>…` 开一个独立隔离目录。
+不管哪种模式，最终产物都是这个检出里的一次**本地提交**：要不要合进主干、怎么合，由你决定。
 
 **Q：同一个项目来两张工单，会在同一个目录里改代码吗？**
-不会。同一个项目共用一份**项目工作区**（`repo.path`，也是 DSH 里的一条 Workspace 登记），
-但每张票各自开独立 worktree 与独立分支；会话都归属到同一个工作区下，在 GUI 里能一起看到。
-调度仍是单飞，一轮只跑一票。
+缺省模式**会** —— 两张票都改在同一份项目工作区检出里（所以要求检出干净，并且调度单飞、一轮只跑一票）。
+打开 `isolateWorktree: true` 时才会各自开一个隔离 worktree 与独立分支。
+会话都归属到同一个工作区下，在 GUI 里能一起看到。
 
 **Q：报「项目工作区目录不存在：…」怎么办？**
 `projects[].repo.path` 指向的目录不存在。插件不会替你克隆仓库（宿主的 Workspace 登记也要求
 目录已存在），请先把仓库检出到那个位置，或把配置改成一个真实的检出目录。
 
 **Q：报「会话的 cwd 是项目工作区根，需要把工作目录钉到 worktree，但本机没有 workingDirectory 服务」怎么办？**
-说明宿主缺 `workingDirectory` 服务（桌面版自带，裁剪过的 profile 可能没有）。插件宁可让这张票
-失败也不会在项目主检出里改代码。装齐宿主服务，或把 `projects[].repo.path` 直接指向一个
-可以随便改的检出目录。
+只在 `isolateWorktree: true`（每票一个隔离 worktree）时才会撞到这个：那时插件要把 agent 的会话目录从
+工作区根钉到隔离子目录，宿主缺 `workingDirectory` 服务就做不到，插件宁可让这张票失败也不会在错的地方改代码。
+两条出路：装齐宿主服务（桌面版自带，裁剪过的 profile 可能没有）；或者关掉 `isolateWorktree`，
+缺省模式 `worktreePath` 就等于工作区根、两者一致，**根本不需要这个服务**。
 
 **Q：报 `git fetch 失败：couldn't find remote ref main` 怎么办？**
 你的仓库主分支不叫 `main`。插件会自动识别（`origin/HEAD` → 当前分支），但显式写上更稳：
@@ -400,6 +439,13 @@ descriptor 没挂上，或字段没标 `meta.volatile`。宿主对这种情况�
 凭据从不回写配置文件、也不回传明文，界面只显示「已配置」。真要核对，看「立即体检」的
 凭据段（`QQMAIL_AUTH_CODE` 不在体检清单里，体检只查 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` /
 `GITLAB_TOKEN`）；发信失败时看通知日志里的错误码。
+
+**Q：`GITLAB_TOKEN` 还要不要配？**
+本阶段**不用配**，交付形态是项目工作区检出里的一次本地提交。缺省下执行器完全不碰 `GITLAB_TOKEN`、
+不发任何 GitLab 请求；`pipeline_doctor` 没看到它也只说一句
+`ℹ️ 凭据 GITLAB_TOKEN：未配置（本阶段不需要）`，**不进 warnings**。
+只有项目显式写了 `repo.gitlab.enabled: true` 并配了 `repo.remote`，才会走原来的 GitLab Commits API
+开一条 draft MR —— 那时才需要这个 token。
 
 **Q：在设置页改了配置，为什么行为没立刻变？**
 本插件 `~standard.vendor` 不是 `schemastery`，loader 判定为「整对象换掉」而非按 volatile 字段热更，
