@@ -334,6 +334,8 @@ export interface WorkExecutor {
 
 export type ExecCtx = {
   signal: AbortSignal
+  workspacePath?: string                   // 项目工作区根（= 宿主的 Workspace.path；缺省退化成 worktreePath）
+  workspaceId?: string                     // 宿主 WorkspaceId，用来 attachSession 归属会话
   worktreePath: string                     // 已建好的隔离工作区绝对路径
   branch: string                           // 已创建的分支名
   onPhase (phase: Phase, detail?: string): Promise<void>
@@ -352,6 +354,15 @@ export type ExecResult = {
 ```
 
 **`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然开 draft MR，但**必须把原因写进 MR 描述**，不能默默略过 —— 人看到 draft MR 才知道「这个改动没被真跑过」。
+
+**`workspacePath` 与 `worktreePath` 是两个不同的东西**：前者是**项目工作区** ——
+`projects[].repo.path` 那个目录在宿主的 `workspaceRegistry` 里的一条登记（一个项目一条，
+多张票共用）；后者是**这一票**的隔离检出（`<repoPath>/.agents/worktrees/<branch>`）。
+为什么要两套：宿主 `Workspace.attachSession(sessionId)` 强制要求会话 header 的规范 cwd
+**等于**工作区路径，worktree 子目录挂不上；而 agent 又必须在 worktree 里改代码。
+所以会话 `meta.cwd` 用 `workspacePath`，再由 `workingDirectory.set` 把**这一轮的工作目录**
+换成 `worktreePath`（只追加事件、不改 header.cwd，两者可以共存）。缺 `workspacePath`
+（升级前入队的老票据）时退回「cwd = worktreePath」，即改造前的行为。
 
 **`onPhase` 的第二个参数是给人看的说明，不是落库补丁**：`scheduler` 只对对象形态的参数调
 `store.setPhase(phase, patch)`；字符串会被当成 detail 写进日志。踩过的坑：早先 `scheduler` 把字符串
@@ -485,6 +496,8 @@ type TicketRecordRow = {
   fingerprint: string
   revisionCount: number
   phase: Phase
+  workspacePath?: string               // 项目工作区目录（= 该项目 repo.path 的规范绝对路径）
+  workspaceId?: string                 // 宿主 workspaceRegistry 里的 WorkspaceId（无 registry 时为空）
   worktreePath?: string
   branch?: string
   baseCommit?: string
@@ -639,6 +652,38 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
    - `worktreePath` 不存在 → 重新 `git worktree add`（组合根的 `prepareWorkspace`），phase 回退到 `worktree-ready`（不可复用脏状态）
    - 分支已被删 / 已被改 → 重建，不重用
 3. **不从头重跑**：已经改过的文件不重改，已经开过的 MR 不重开（先查 `merge_requests?source_branch=X&state=opened`）
+
+### 7.7 项目工作区（票 → 项目 → 宿主 Workspace）
+
+工单表里**没有**「待修改项目」这一列（飞书那 13 列是固定的，加不了也不该加）。
+归属只能由 `projects[].match` 决定 —— 一张表就是一个项目。项目一旦确定，
+它的 `repo.path` 就是**这个项目的工作区目录**。
+
+每张票开跑前（`worktree-ready` 之前），组合根的 `prepareWorkspace` 先调
+`src/core/workspace.js` 的 `ensureProjectWorkspace({path: repoPath, title: projectId})`：
+
+| 情形 | 结果 |
+|---|---|
+| 目录不存在 | 抛 `invalid-input`（「项目工作区目录不存在：… 插件不会替你克隆或创建目录」）—— 不是 ENOENT 原文 |
+| 目录在、宿主里已登记 | 复用，**不写登记表**，返回 `{workspacePath, workspaceId, created:false}` |
+| 目录在、还没登记 | `workspaceRegistry.create(path, title)` 补一条，返回 `created:true` |
+| 本机没有 `workspaceRegistry`（headless / 老宿主） | 记日志降级，只返回路径、没有 id；票照跑 |
+| `create` 抛错 | 记日志降级继续跑票（GUI 里少一个工作区分组，不该让整张票死） |
+
+**为什么先 `resolveByPath` 再 `create`**：`create` 虽然对同一路径幂等，但会把新登记
+工作区**置顶**到持久顺序。每张票都 create 一次 = 每张票都把人工作区列表搅一遍。
+所以正常路径是「查到了就完事」，`create` 只在新项目第一次出现时跑一次。
+
+登记下来的 `workspacePath` / `workspaceId` 落进 `TicketRecordRow`，执行器据此：
+1. `agents.create({ meta: { cwd: workspacePath } })` —— 会话 header 的 cwd 是工作区根；
+2. `setup` 里 `workingDirectory.set(agent, worktreePath)` —— 把这一轮的工作目录钉到 worktree；
+3. `workspaceRegistry.get(workspaceId).attachSession(sessionId)` —— 会话归属到该工作区，
+   在 GUI 的工作区分组下能看到，而不是散落的孤儿会话。
+
+**没有 `workingDirectory` 服务但有工作区坐标时，直接抛 `invalid-input`**：
+继续跑就是在项目主检出里改代码，宁可这张票失败也不能偷偷污染人工位上的工作区。
+反过来，**没有工作区坐标时不 pin、也不要求 `workingDirectory`** —— 那时 header.cwd
+本来就是 worktree，行为与改造前完全一致（离线自测、headless 链路都走这条）。
 
 ---
 
@@ -813,6 +858,7 @@ src/
 │   ├── store.js                   ← storageDomain 封装、phase 转移、租约
 │   ├── recover.js                 ← 启动恢复（扫未完成票）
 │   ├── config.js                  ← Config 校验（CONFIG_FIELDS + projects[]）
+│   ├── workspace.js               ← 项目工作区：repo.path ↔ 宿主 workspaceRegistry 的登记
 │   ├── domain.js                  ← 平台无关的小工具（ID 归一、时间等）
 │   ├── branch-name.js             ← 分支名 sanitize
 │   ├── prompt.js                  ← 给 agent 的 task 文案拼装（纯文本 + 图片块）
@@ -923,11 +969,14 @@ T+0:01  drainOne() 取出票A（并发 1，一轮只跑一票）
         ├─ 抢租约（写 + 回读校验）
         ├─ locate = locator.locate(票A)  → { repoPath, baseBranch, targetBranch,
         │                                    candidatePaths:[], ambiguous:false }
+        ├─ 组合根的 prepareWorkspace 先确保**项目工作区**（`repo.path` 这个目录在宿主
+        │    workspaceRegistry 里有登记：已登记就复用，没登记就补一条，见 §7.7）
         ├─ 若 fetchBeforeCreate → git fetch <项目 baseBranch>
-        ├─ 组合根的 prepareWorkspace 跑 git fetch + git worktree add，
-        │    落到 `<repoPath>/.agents/worktrees/<branch>`；没有 subprocess 时返回 {}，阶段照走
+        ├─ 再跑 git worktree add，落到 `<repoPath>/.agents/worktrees/<branch>`；
+        │    没有 subprocess 时只返回工作区坐标，阶段照走
         │    （早先设想的 ctx.worktrees.create 路子在当前宿主上没有，已改用这条）
-        └─ onPhase('worktree-ready') 记 worktreePath/branch/baseCommit（先回填进 ws 再落库，执行器读 ws）
+        └─ onPhase('worktree-ready') 记 workspacePath/workspaceId/worktreePath/branch/baseCommit
+             （先回填进 ws 再落库，执行器读 ws）
 
 T+0:02  onPhase('planning')，起超时定时器（40 min）
         ├─ 截图是**输入**不是阶段，在开工之前就取：
@@ -937,10 +986,13 @@ T+0:02  onPhase('planning')，起超时定时器（40 min）
         ├─ 调 executor.run(ticket, located, ctx)
         │    ctx 里 prompt / content / images 三个都给：老适配器只读 prompt，
         │    新适配器按 content 才看得见图；falsy 的图在 content 里被跳过
-        └─ executor-agent 内部：agents.create({ sessionId, meta:{cwd: worktreePath},
+        └─ executor-agent 内部：agents.create({ sessionId, meta:{cwd: workspacePath},
               agentOptions: resolveAgentOptions(config), setup }) → agent.followup(msg)
               ← 必须 followup（inject 不唤醒 agent）
-             setup 里做三件事：挂 preset、追加 sandbox/mode 与 approval/policy、钉 workingDirectory
+              ← header.cwd 是**项目工作区根**，不是 worktree：宿主 attachSession
+                要求会话 cwd 正好等于工作区路径，worktree 子目录挂不上
+             setup 里做四件事：挂 preset、追加 sandbox/mode 与 approval/policy、
+             把工作目录钉到 worktree（workingDirectory.set）、attachSession 归属工作区
 
 T+0:03  … agent 在 wt.path 里读代码、定位、规划
         └─ 报「定位完成」→ onPhase('editing')，存 Plan

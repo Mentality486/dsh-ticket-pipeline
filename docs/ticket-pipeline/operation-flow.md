@@ -21,7 +21,7 @@ flowchart TD
     H --> I[locator.locate projectId<br/>→ repoPath / baseBranch / targetBranch]
     I --> J[detectBaseBranch<br/>显式配置→origin/HEAD→HEAD→main]
     J --> K[fetchBeforeCreate 先 git fetch]
-    K --> L[prepareWorkspace<br/>git worktree add]
+    K --> L[prepareWorkspace<br/>确保项目工作区 workspaceRegistry<br/>+ git worktree add]
     L --> M[取截图字节 → saveImage → ImageBlock<br/>三形态 attachment/path/url]
     M --> N[渲染任务书<br/>renderTicketPrompt 文本 + renderTicketContent 图文]
     N --> O[executor.run ticket,target,ctx<br/>agent 改码 / mock 只演]
@@ -79,11 +79,12 @@ flowchart TD
 ```mermaid
 flowchart TD
     E0([executor.run]) --> E1[agentOptionsFromConfig<br/>✅ 空 model 不下传,跟随会话默认]
-    E1 --> E2[agents.create sessionId<br/>meta.cwd = worktreePath]
-    E2 --> E3[setupAgent 三件事]
+    E1 --> E2[agents.create sessionId<br/>meta.cwd = workspacePath 项目工作区根<br/>✅ 宿主 attachSession 要求 cwd == 工作区路径]
+    E2 --> E3[setupAgent 四件事]
     E3 --> E3a[1. 挂 preset: agentPresets.mount<br/>✅ 挂不上硬失败 invalid-input]
     E3 --> E3b[2. appendDelegatedPolicyOverrides 写策略]
-    E3 --> E3c[3. 钉 cwd: workingDirectory.set]
+    E3 --> E3c[3. 钉目录: workingDirectory.set → worktreePath<br/>✅ 有工作区却没这个服务就硬失败,不在主检出改码]
+    E3 --> E3d[4. attachSession 归属项目工作区<br/>失败只记日志,不影响改码]
     E3a --> E4[agent.followup 推任务书<br/>⚠ inject 不唤醒,必须 followup]
     E4 --> E5[waitForAgentIdle<br/>seq 连续静 2 次才认结束]
     E5 --> E6[collectChanges: git diff --name-status]
@@ -175,7 +176,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线：HEAD `26f0391`（2026-11-05），自测 242/242 + 链路冒烟 11/11。
+状态基线：HEAD `7d2cd56`（2026-11-05）+ 本项目工作区改造（未提交），自测 262/262 + 链路冒烟 11/11。
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |

@@ -11,7 +11,8 @@
 
 ```
 监控工单表 → 发现「处理中」的行 → 解析问题描述/操作流程/截图
-    → 在对应本地仓库切 worktree → AI 规划并改代码 → 跑构建/测试
+    → 确定这张工单属于哪个项目 → 确保该项目的工作区已登记在 DSH 里
+    → 在工作区下切本票的 worktree → AI 规划并改代码 → 跑构建/测试
     → 经 GitLab API 开 Draft MR → 通知你（QQ 邮箱直发 SMTP / PushPlus 中继微信）
     → 你人工验证后合并 MR，拨回工单状态
 ```
@@ -217,7 +218,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
 | `match.statusValues` | 可配：状态列里哪些取值算「在处理中」（收票条件）。不填则用默认值 `处理中` |
 | `match.recordIds` | 可配：只处理这几条工单（收窄开关）。不填 = 整张表 |
-| `repo.path` | 本地 git 检出根目录（**必填**） |
+| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条；一个项目一条，多张票共用）。目录必须**已经存在**，插件不会替你克隆；不存在时这张票以 `invalid-input` 失败并说明该改哪个配置 |
 | `repo.remote` | GitLab remote URL（开 MR 用） |
 | `repo.baseBranch` | 切 worktree 的基准分支。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上 |
 | `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接开 draft MR** |
@@ -266,7 +267,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 ```
 你：在飞书表填一行「问题描述/操作流程/模块/截图」，是否处理=处理中
-插件（≤3 分钟内）：收票 → 建 worktree → AI 改码 → 构建+测试 → 开 Draft MR
+插件（≤3 分钟内）：收票 → 确保项目工作区 → 建 worktree → AI 改码 → 构建+测试 → 开 Draft MR
 你：收到邮件通知（含 MR 链接 + 失败原因 + worktree 保留路径）
 你：本地 checkout 那个分支验证 → 满意就合 MR → 把工单「是否处理」拨走
 ```
@@ -308,7 +309,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 242 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 262 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -358,6 +359,20 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 **Q：AI 会直接动我的 main 分支吗？**
 不会。每票一个独立 worktree + 独立分支（`<branchPrefix>...`），最终产物是 Draft MR。
+
+**Q：同一个项目来两张工单，会在同一个目录里改代码吗？**
+不会。同一个项目共用一份**项目工作区**（`repo.path`，也是 DSH 里的一条 Workspace 登记），
+但每张票各自开独立 worktree 与独立分支；会话都归属到同一个工作区下，在 GUI 里能一起看到。
+调度仍是单飞，一轮只跑一票。
+
+**Q：报「项目工作区目录不存在：…」怎么办？**
+`projects[].repo.path` 指向的目录不存在。插件不会替你克隆仓库（宿主的 Workspace 登记也要求
+目录已存在），请先把仓库检出到那个位置，或把配置改成一个真实的检出目录。
+
+**Q：报「会话的 cwd 是项目工作区根，需要把工作目录钉到 worktree，但本机没有 workingDirectory 服务」怎么办？**
+说明宿主缺 `workingDirectory` 服务（桌面版自带，裁剪过的 profile 可能没有）。插件宁可让这张票
+失败也不会在项目主检出里改代码。装齐宿主服务，或把 `projects[].repo.path` 直接指向一个
+可以随便改的检出目录。
 
 **Q：报 `git fetch 失败：couldn't find remote ref main` 怎么办？**
 你的仓库主分支不叫 `main`。插件会自动识别（`origin/HEAD` → 当前分支），但显式写上更稳：

@@ -2,7 +2,7 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`（git 53 次提交，HEAD `26f0391`），插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-05 晚，`26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配；连同 `5b94a17` 的 agent 侧四项，自测 242/242 全绿
+> 最近一次更新：2026-11-05 深夜，新增「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根），自测 262/262 全绿；此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -34,7 +34,7 @@
 | ① | AI 同时监控多个平台（金山共享 Excel、飞书）上的工单表，检测内容变化 | **✅ 可用** | 飞书源 1264 行，已接真实表（appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条记录实测）；金山源 1340 行（xlsx/zip 自解 OOXML）；webform/mock 演示源 | 金山缺开放平台取数通道，只能用注入的 `fetchSheet`；飞书「收票状态值」与真实表语义不一致，已做成可配（`statusValues`） |
 | ② | 可以在插件中配置对应工单的项目本地仓库地址 | **✅ 可用** | `projects[].repo.path` / `remote` / `baseBranch` / `targetBranch` / `gitlab`（baseUrl / projectId / remote），由 `locator-table`（187 行）把工单 projectId 映射到仓库；`repo.gitlab` 已能在配置校验层存活（`5b94a17`） | 无（这项已补齐） |
 | ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `FEISHU_COLUMNS`（描述/操作流程/截图/模块/优先级/发现日期等）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② ~~金山表该列的值被丢弃~~ → **已修（`26f0391`）**：金山表该列的值现在进 `ticket.targetProject` 并写进任务书（不顶 `projectId` —— 那是存储主键的一半，而这一列是人手填的自由文本）；③ ~~URL 形态截图默认全拒、无配置键~~ → **已修（`26f0391`）**：新增 `match.allowedImageHosts` 白名单配置键（缺省仍为空 = 一律拒绝，安全闸门只有人能打开） |
-| ④ | 自主规划并执行修复 | **⚠️ 部分** | `executor-agent` 真实现：`agents.create` + followup + 挂 preset + 钉 cwd + `git diff --name-status` 收集改动 + 敏感文件过滤；沙盒票 `sandbox\|rec-mock-001` 已由 agent 真改出 `src/pagination.js` 并开成 MR !1 | 真实业务票（pms）只在配额上卡过一次；两处宿主侧雷已修（`5b94a17`：`{{model}}` 补齐、preset 缺服务硬失败），但**尚未在真实 pms 票上完整跑绿一次**（上游 workbuddy 429 配额限制，非插件缺陷） |
+| ④ | 自主规划并执行修复 | **⚠️ 部分** | `executor-agent` 真实现：先确保**项目工作区**（`repo.path` 目录在宿主 `workspaceRegistry` 里登记，一个项目一条，多票共用）→ `agents.create({meta:{cwd: workspacePath}})` + 挂 preset + `workingDirectory.set(worktreePath)` + `attachSession` 归属工作区 + followup + `git diff --name-status` 收集改动 + 敏感文件过滤；沙盒票 `sandbox\|rec-mock-001` 已由 agent 真改出 `src/pagination.js` 并开成 MR !1 | 真实业务票（pms）只在配额上卡过一次；两处宿主侧雷已修（`5b94a17`：`{{model}}` 补齐、preset 缺服务硬失败），但**尚未在真实 pms 票上完整跑绿一次**（上游 workbuddy 429 配额限制，非插件缺陷） |
 | ⑤ | 完成后对问题功能进行测试，自动提交 PR | **✅ 基本可用** | 真跑出 GitLab draft MR `http://gitlab.example.com/mk/end/ticket-pipeline-sandbox/-/merge_requests/1`（sha `634777aa…`，changes_count=1，源分支 `ticket-sandbox-rec-mock-001-r1`）；验证命令从 `projects[].verify.build/test` 注入，`verify.test` 真跑出 exit 0 | 没配验证命令时 `phase` 仍是 `done`（契约里 `skipped` 是合法成功路径），现在把验证结论写在 `plan.summary` 最前面以免误读（`5b94a17`）；要彻底区分得新增 phase，属契约变更 |
 | ⑥ | 通过微信 Clawbot 推送或 QQ 邮箱推送（先实现）完成通知，收到后看 PR 详情，人工验证后手动合并 | **✅ QQ 邮箱可用；微信走中继** | QQ 邮箱零依赖 SMTP 适配器（574 行）已真实发信成功（traceId `<mw319ltk.47861f8c479221d3@qq.com>`）；PushPlus 适配器 171 行 | 插件**不直连微信**：微信消息经 PushPlus 的 `clawbot` 渠道中继，需配 `pushplus.token`；PushPlus 回执未消费 |
 
@@ -45,7 +45,7 @@
 | 环节 | 实际结果 |
 | --- | --- |
 | 扫描入队 | 水位对比识别为新票，进 `pending` |
-| 工作区 | `git worktree add` 建 `.agents/worktrees/ticket-sandbox-rec-mock-001-r1` |
+| 工作区 | 先确保 `repo.path` 这个目录在宿主 `workspaceRegistry` 里有一份登记（一个项目一条，多票共用），再 `git worktree add` 建本票的隔离检出 `.agents/worktrees/ticket-sandbox-rec-mock-001-r1`；会话 header 的 cwd 是工作区根，`workingDirectory` 钉到 worktree |
 | 改码 | agent 改 `src/pagination.js` |
 | 验证 | `verify.test` 退出码 0 → `passed` |
 | 提 MR | GitLab draft MR !1（opened, draft, 源分支→main） |
@@ -194,7 +194,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | `match.recordIds` | 只处理指定几张工单（收窄开关，**四个源（飞书 / 金山 / mock / webform）都接了**；名单外的行整行跳过，不收票也不进水位） |
 | `match.allowedImageHosts` | URL 形态截图的允许主机名（缺省为空 = 一律拒绝，见 9.1 第 6 条） |
 | `match.sheetUrl` / `sheetName` / `statusColumn` / `statusValue` / `mediaPrefix` | 金山表定位 |
-| `repo.path` | **本地仓库路径**（需求②） |
+| `repo.path` | **本地仓库路径**（需求②）；**同时就是这个项目的工作区目录** —— 插件的 `core/workspace.js` 会确保它在宿主 `workspaceRegistry` 里有登记（已登记则复用，没有则补一条）。目录必须真实存在，插件不会替你克隆 |
 | `repo.remote` / `baseBranch` / `targetBranch` | 基准分支与目标分支 |
 | `verify.build` / `verify.test` | 验证命令（从配置注入，执行器里不硬编码任何命令） |
 
@@ -217,7 +217,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
                       │                      │
                       │                      ├─ acquireLease（租约 + 心跳续期）
                       │                      ├─ locator.locate(projectId) → 仓库/分支
-                      │                      ├─ prepareWorkspace（git fetch + worktree add）
+                      │                      ├─ prepareWorkspace（确保项目工作区 → git fetch + worktree add）
                       │                      ├─ 取截图字节 → saveImage → ImageBlock
                       │                      ├─ executor.run(ticket, target, ctx)
                       │                      │     ├─ agent：改码 → collectChanges → verify → draft MR
@@ -305,10 +305,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **242** | 通过 242，失败 0（2026-11-05 实跑；早期那条受 `spawnSync git EPERM` 限制的用例已随 git 链路改走宿主 shell 而消失） |
+| `node scripts/dev-run.mjs` | **262** | 通过 262，失败 0（2026-11-05 实跑；早期那条受 `spawnSync git EPERM` 限制的用例已随 git 链路改走宿主 shell 而消失） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
-`dev-run.mjs` 分 16 个小节：
+`dev-run.mjs` 分 17 个小节：
 
 | # | 小节 | 覆盖 |
 | --- | --- | --- |
@@ -331,6 +331,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 12d | 工具输出必须是 lossless JSON | `undefined` 会让宿主判整次调用失败 |
 | 12e | 平台可插拔 | 状态值可配 + 金山文档接进组合根 |
 | 13 | 新适配器 | gitlab 客户端 43 项 / qqmail 推送 / wps 工单源 21 项 |
+| 14 | 项目工作区 | 11 项：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用、attachSession 归属 |
 
 ### 8.2 真实链路验证记录
 
@@ -415,7 +416,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 7 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | 242 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | 262 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -431,6 +432,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 阶段 | 内容 | 判据 |
 | --- | --- | --- |
 | 第一步（`5b94a17` + `26f0391`，**已完成**） | 9.1 的 P0 里除金山取数通道外全部关掉；9.2 的 5 条关掉；收窄开关推广到四个源 | ✅ 自测 242/242；沙盒 001 已真跑出 MR !1 |
+| 第一步补（**已完成**） | 项目工作区：票 → 项目 → 宿主 Workspace 登记（`core/workspace.js`），会话 cwd = 工作区根 + `workingDirectory` 钉 worktree + `attachSession` 归属 | ✅ 自测 262/262（新增 11 项工作区断言 + 7 项执行器会话断言） |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、点开是真 draft MR、`verify.test` 真跑过 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

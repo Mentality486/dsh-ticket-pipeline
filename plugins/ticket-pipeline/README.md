@@ -102,7 +102,14 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 - **并发恒 1**：一轮最多跑一票、最多清一个 worktree。
 - **只开 draft MR**：`git push` 在本机被沙箱封死，改动经 GitLab Commits API 物化，MR 标题必须 `Draft:` 前缀。
 - **`accepted` ≠ 送达**：PushPlus `code:200` 只代表受理，真送达看 `callbackUrl` 的 `sendStatus`。
-- **每票一个 worktree**，分支 `<branchPrefix><projectId>-<recordId>-r<修订号>`，切前先 `git fetch` 该项目配置的 baseBranch。
+- **项目工作区复用，每票再开一个 worktree**：`projects[].repo.path` 那个目录就是一个项目的**工作区** ——
+  插件会确保它在宿主 `workspaceRegistry` 里有一份登记（一个项目一条，多张票共用同一个；
+  已登记则复用，没登记则补一条）。目录必须真实存在，插件不会替你克隆。
+  每张票再在它下面开一个隔离 worktree（分支 `<branchPrefix><projectId>-<recordId>-r<修订号>`，
+  切前先 `git fetch` 该项目配置的 baseBranch）。
+  会话的 header cwd 用**工作区根**（宿主 `attachSession` 要求会话 cwd 正好等于工作区路径），
+  再用 `workingDirectory.set` 把这一轮的工作目录钉到 worktree，最后 `attachSession` 把会话
+  归属到该工作区，在 GUI 的工作区分组下能看到。
 - **超时只报给人，不自动重试**；唯一重开路径 = 人把「是否处理」拨走再拨回「处理中」。
 
 ## 安装
@@ -158,16 +165,17 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**153 项断言，全绿 exit 0**，共 13 段。它不 import `src/index.js`（那需要宿主服务），
+**262 项断言，全绿 exit 0**，共 14 段。它不 import `src/index.js`（那需要宿主服务），
 测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 
 | 段 | 覆盖 |
 |---|---|
 | 内核与契约 | 调度、租约心跳、退避重试、状态机、store 持久化、pipeline_* 四工具、组合根接线 |
-| `feishu-checks`（37 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、全程无写操作 |
-| `gitlab-checks`（25 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤 |
+| `feishu-checks`（52 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、全程无写操作 |
+| `gitlab-checks`（51 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器的会话 cwd = 项目工作区根、`workingDirectory` 钉到 worktree、`attachSession` 归属工作区、缺 `workingDirectory` 时拒绝在主检出改码 |
 | `push-qqmail`（18 项） | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
-| `wps-checks`（21 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底 |
+| `wps-checks`（25 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底 |
+| `workspace-checks`（11 项） | 项目工作区：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用同一工作区、attachSession 归属 |
 
 另有**全链路接线冒烟**（独立于 dev-run，测「组件之间接没接对」而不是单模块行为）：
 

@@ -11,7 +11,8 @@
 
 ```
 监控工单表 → 发现「处理中」的行 → 解析问题描述/操作流程/截图
-    → 在对应本地仓库切 worktree → AI 规划并改代码 → 跑构建/测试
+    → 确定这张工单属于哪个项目 → 确保该项目的工作区已在 DSH 里登记
+    → 在工作区下切本票的 worktree → AI 规划并改代码 → 跑构建/测试
     → 经 GitLab API 开 Draft MR → 邮箱/微信通知你
     → 你人工验证后合并 MR，拨回工单状态
 ```
@@ -145,7 +146,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐） |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
-| `repo.path` | 本地 git 检出根目录（**必填**） |
+| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条），目录必须真实存在，插件不会替你克隆 |
 | `repo.remote` | GitLab remote URL（开 MR 用） |
 | `repo.baseBranch` | 切 worktree 的基准分支（默认 `main`） |
 | `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接开 draft MR** |
@@ -169,7 +170,7 @@ pipeline_status
 预期：能看到一张 `pending → worktree-ready → planning → done` 的票。
 mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机、通知全链路都已走通**。
 
-### 4.2 四个对话工具
+### 4.2 五个对话工具
 
 | 工具 | 干什么 |
 |---|---|
@@ -177,6 +178,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 | `pipeline_status` | 看所有票的当前阶段与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
+| `pipeline_doctor` | 环境体检：git 链路、各项目仓库与 remote、凭据、执行器与通知适配器 |
 
 ### 4.3 切换真执行
 
@@ -193,7 +195,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 ```
 你：在飞书表填一行「问题描述/操作流程/模块/截图」，是否处理=处理中
-插件（≤3 分钟内）：收票 → 建 worktree → AI 改码 → 构建+测试 → 开 Draft MR
+插件（≤3 分钟内）：收票 → 确保项目工作区 → 建 worktree → AI 改码 → 构建+测试 → 开 Draft MR
 你：收到邮件通知（含 MR 链接 + 失败原因 + worktree 保留路径）
 你：本地 checkout 那个分支验证 → 满意就合 MR → 把工单「是否处理」拨走
 ```
@@ -230,7 +232,7 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 154 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 262 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -253,6 +255,16 @@ mock 执行器不碰真代码，但**扫描、定位、建 worktree、状态机�
 
 **Q：AI 会直接动我的 main 分支吗？**
 不会。每票一个独立 worktree + 独立分支（`<branchPrefix>...`），最终产物是 Draft MR。
+
+**Q：插件会自己克隆仓库吗？**
+不会。`projects[].repo.path` 必须是**已经存在**的 git 检出目录；目录不存在时这张票会以
+`invalid-input` 失败并告诉你该配哪里（不会给你留一个半克隆的空目录）。
+插件会把这个目录登记成 DSH 的 Workspace（一个项目一条，多张票共用同一个），
+每张票的会话都归属到它下面。
+
+**Q：同一个项目同时来两张工单会怎样？**
+共用同一个项目工作区，但各自开独立的 worktree 与分支；会话也会分别归属到同一个工作区下。
+调度仍是单飞 —— 一轮只跑一票，第二张票排队。
 
 ---
 
