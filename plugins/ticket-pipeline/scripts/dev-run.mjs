@@ -1293,7 +1293,7 @@ async function main () {
   await check('pipeline_doctor 全绿：git 可用 + 仓库正常 + 凭据齐', async () => {
     const tool = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
-      // status --porcelain 必须回空串：缺省模式下「检出干净」是能跑票的前提，
+      // status --porcelain 必须回空串：这条用例验的是「干净时说检出干净」。
       // 回 'true' 会被当成一堆未提交改动（这条断言就是被它绊过）。
       gitRunner: async (argv) => ({
         code: 0,
@@ -1365,7 +1365,7 @@ async function main () {
     assert.ok(out2.text.includes('只做本地提交'), `要说明只做本地提交：${out2.text}`)
   })
 
-  await check('pipeline_doctor 检出脏时要提醒（缺省模式每票都会被拒）', async () => {
+  await check('pipeline_doctor 检出脏时只提醒不拦：说清照跑、只提交 agent 改过的', async () => {
     const tool = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
       gitRunner: async (argv) => {
@@ -1377,6 +1377,14 @@ async function main () {
     })
     const out = await tool.execute({}, {})
     assert.ok(out.warnings.some((w) => w.includes('未提交改动')), `脏检出要提醒：${JSON.stringify(out.warnings)}`)
+    // 脏检出已经不是「能不能跑」的前提了：跑票前会拍只读基线。
+    // 文案必须说清「不影响跑票」，否则人会以为还得先去提交一遍。
+    assert.equal(out.ok, true, '脏检出不能算「必须修复」')
+    assert.equal(out.problems.length, 0, '脏检出不挡跑票')
+    const dirtyNote = out.warnings.find((w) => w.includes('未提交改动')) ?? ''
+    assert.ok(dirtyNote.includes('不影响跑票'), `要说明不影响跑票：${dirtyNote}`)
+    assert.ok(dirtyNote.includes('只提交 agent 真正改过的文件'), `要说明只提交 agent 改的：${dirtyNote}`)
+    assert.ok(out.text.includes('照跑'), `渲染要写清照跑：${out.text}`)
     // 打开隔离开关后就不该再拿「检出脏」说事：那时每票有自己的目录。
     const isolated = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
