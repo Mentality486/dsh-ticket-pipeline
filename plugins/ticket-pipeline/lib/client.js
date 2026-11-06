@@ -161,6 +161,10 @@ window.__ModuleLoader__.load({
      */
     function collectLeaves (schema, refs, path, out) {
       if (!schema || typeof schema !== 'object') return out
+      // `projects` 是「项目清单」——结构化数组，由 ProjectListCard 专门画成卡片。
+      // 绝不能当普通叶子收进来：那样会被 draftValueOf 拼成 "[object Object],
+      // [object Object]" 显示成一个只读文本框（真实 bug，见 feature-checklist §1.14）。
+      if (path.length === 1 && path[0] === 'projects') return out
       var dict = schema.dict
       if (dict && typeof dict === 'object') {
         var keys = Object.keys(dict)
@@ -365,6 +369,38 @@ window.__ModuleLoader__.load({
         out.push({ path: match[2].trim(), text: match[1].trim() })
       }
       return out
+    }
+
+    // ── 高级配置项 ──────────────────────────────────────────────
+    //
+    // 33 个配置项一屏放不下，但真正天天要动的就那几个。缺省只显示下面这些「日常」
+    // 键，其余收进每组自己的「高级设置」折叠区 —— **不是删掉**，点一下就露出来。
+    //
+    // 判断用**键名**而不是 meta 标记：schema 是宿主发下来的，宿主加字段时不会知道
+    // 本插件想把谁归成高级；而且键名表改起来一眼看得出范围。
+    var ADVANCED_CONFIG_KEYS = {
+      // 扫描与队列：翻页/退役/并发都是「出问题才调」的旋钮。
+      safePageRun: true,
+      goneAfterScans: true,
+      concurrency: true,
+      // 租约与重试：心跳、重试次数同上；租约存活留着 —— 抢票冲突时会想改它。
+      leaseHeartbeatSeconds: true,
+      maxAttempts: true,
+      // 执行：切 worktree 前 fetch、分支名前缀、worktree 保留时长、回填状态值。
+      fetchBeforeCreate: true,
+      branchPrefix: true,
+      worktreeRetentionHours: true,
+      writeBackStatus: true,
+      // 通知：QQ 邮箱的 SMTP 细节、PushPlus 渠道/模板/回执地址。
+      'qqmail.port': true,
+      'qqmail.secure': true,
+      'pushplus.channel': true,
+      'pushplus.template': true,
+      'pushplus.callbackUrl': true,
+    }
+
+    function isAdvancedConfigKey (key) {
+      return ADVANCED_CONFIG_KEYS[key] === true
     }
 
     // ── 项目清单 ────────────────────────────────────────────────
@@ -595,6 +631,17 @@ window.__ModuleLoader__.load({
     // 为什么不能复用上面那个 map：全局配置里有「仓库」「验证」这样的组名，项目卡
     // 里也有，同一条 key 会把两边带在一起 —— 收起项目里的仓库，配置那边的仓库
     // 也跟着收起来。
+    var ADV_OPEN_KEY = 'ticket-pipeline:open-advanced'
+    function readAdvMap () {
+      try {
+        var raw = localStorage.getItem(ADV_OPEN_KEY)
+        return raw ? JSON.parse(raw) : {}
+      } catch (error) { return {} }
+    }
+    function isAdvOpenOf (map, label) {
+      return map && map[label] === true
+    }
+
     var PROJ_OPEN_KEY = 'ticket-pipeline:open-projects'
 
     function readProjMap () {
@@ -818,88 +865,230 @@ window.__ModuleLoader__.load({
     // ── 样式 ────────────────────────────────────────────────────
     // 只用带 fallback 的 DSH 设计 token：宿主换主题时自动跟着变，宿主没定义也有兜底。
 
+    /**
+     * 面板样式。
+     *
+     * 视觉基线照抄宿主设计系统（`dsh-web-frontend` 的 `--dsw-*` token）：宿主的
+     * 宿主的 cordis-plugin-development/practices.md 禁止把 Harness 的客户端包当模块
+     * 加载（ui-primitives 那一类），只能自己写控件、把宿主的 markup 与
+     * CSS 抄过来、类名换成自己的前缀、只保留 `--dsw-alias-*` token 引用。所以这里
+     * 的颜色/圆角/阴影全部走 token，只有 token 覆盖不到的地方才给兜底值。
+     *
+     * 三条硬要求（用户提的）：
+     *   1. **Label 置顶**：字段名在上、输入框在中、说明在下 —— 视线自上而下一次过，
+     *      不用在「左边一长串字 / 右边一个框」之间来回横跳。
+     *   2. **卡片化**：浅灰大背景 + 纯白圆角卡片 + 轻阴影，分组层级一眼看得出。
+     *   3. **克制**：标题 16px/600 深灰（不纯黑）、字段名 14px/500、说明 12px 浅灰。
+     */
     var CSS = [
-      '.tp-panel{display:flex;flex-direction:column;gap:16px;padding:4px 0 24px}',
-      '.tp-head h2{margin:0 0 4px;font-size:15px}',
-      '.tp-head p{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);opacity:.85}',
-      '.tp-card{border:1px solid var(--dsw-alias-border-l3,#8883);border-radius:var(--dsw-radius-md,12px);padding:14px 16px}',
-      '.tp-card>h3{margin:0 0 10px;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:8px}',
-      '.tp-group{margin:14px 0 0}',
-      '.tp-group:first-of-type{margin-top:0}',
-      '.tp-group>h4{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit)}',
-      '.tp-field{display:grid;grid-template-columns:minmax(140px,220px) 1fr;gap:6px 12px;align-items:start;padding:6px 0;border-bottom:1px dashed var(--dsw-alias-border-l3,#8882)}',
+      '.tp-panel{display:flex;flex-direction:column;gap:20px;padding:2px 0 32px;',
+      '  font-family:var(--dsw-font-family,inherit);',
+      '  background:var(--dsw-alias-bg-layer-1,#f7f8fa);',
+      '  border-radius:var(--dsw-radius-lg,14px);padding:16px 16px 32px}',
+      '.tp-head{display:flex;flex-direction:column;gap:2px}',
+      '.tp-head h2{margin:0;font-size:16px;font-weight:600;',
+      '  color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-head p{margin:0;font-size:12px;font-weight:400;line-height:1.6;',
+      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+
+      // 顶部操作栏：白底 + 一条浅底边，sticky 在顶上，任何时候都够得着「保存」。
+      '.tp-bar{position:sticky;top:0;z-index:3;display:flex;gap:8px;align-items:center;',
+      '  flex-wrap:wrap;padding:12px 16px;margin:0 -16px;',
+      '  background:var(--dsw-alias-bg-base,#fff);',
+      '  border-bottom:1px solid var(--dsw-alias-border-l2,#eee);',
+      '  box-shadow:0 1px 0 rgba(0,0,0,.02)}',
+
+      // 卡片：纯白 + 圆角 + 极轻阴影 + 24px 内边距。
+      '.tp-card{background:var(--dsw-alias-bg-base,#fff);',
+      '  border:1px solid var(--dsw-alias-border-l2,#ececec);',
+      '  border-radius:var(--dsw-radius-panel,var(--dsw-radius-lg,14px));',
+      '  box-shadow:0 2px 8px rgba(0,0,0,.05);padding:24px}',
+      '.tp-card>h3{margin:0 0 4px;font-size:16px;font-weight:600;',
+      '  color:var(--dsw-alias-label-primary,inherit);',
+      '  display:flex;align-items:center;justify-content:space-between;gap:8px}',
+      '.tp-card>.tp-note{margin:0 0 8px}',
+      '.tp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:16px}',
+
+      // 分组标题（配置分组 / 项目卡内分区共用一个字号）。
+      '.tp-group{padding:4px 0}',
+      '.tp-group>h4{margin:0 0 8px;font-size:13px;font-weight:600;',
+      '  color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-toggle{font:inherit;display:flex;align-items:center;gap:6px;width:100%;',
+      '  padding:6px 0;cursor:pointer;background:transparent;border:0;text-align:left;',
+      '  font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-toggle .tp-caret{display:inline-block;width:10px;opacity:.6}',
+      '.tp-toggle[aria-expanded=false]{color:var(--dsw-alias-label-secondary,#555)}',
+      '.tp-adv{border-top:1px dashed var(--dsw-alias-border-l2,#eee);margin-top:8px}',
+
+      // 字段：**上下结构**（Label 置顶）。字段名一行、输入框一行、说明一行。
+      '.tp-fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));',
+      '  gap:4px 28px}',
+      '.tp-field{display:flex;flex-direction:column;gap:6px;padding:10px 0;',
+      '  border-bottom:1px solid var(--dsw-alias-border-l2,#f0f0f0)}',
       '.tp-field:last-child{border-bottom:0}',
-      '.tp-field label{font-size:12px;line-height:1.5;padding-top:6px}',
-      '.tp-field .tp-help{margin:2px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit);opacity:.8}',
-      '.tp-input,.tp-select{font:inherit;min-height:32px;padding:4px 8px;width:100%;box-sizing:border-box;color:var(--dsw-alias-label-primary,inherit);background:transparent;border:1px solid var(--dsw-alias-border-l3,#8886);border-radius:var(--dsw-radius-sm,8px)}',
-      '.tp-input:focus-visible,.tp-select:focus-visible{outline:2px solid var(--dsw-alias-button-primary-fill,#356be8);outline-offset:2px}',
-      '.tp-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding-top:6px}',
-      '.tp-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px dashed var(--dsw-alias-border-l3,#8882);flex-wrap:wrap}',
-      '.tp-row:last-child{border-bottom:0}',
-      '.tp-row .tp-row-main{flex:1 1 220px;min-width:180px}',
-      '.tp-row .tp-row-title{font-size:12px}',
-      '.tp-row .tp-row-hint{margin:2px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit);opacity:.8}',
-      '.tp-row .tp-row-input{flex:1 1 200px;min-width:160px}',
-      '.tp-badge{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--dsw-alias-border-l3,#8886);white-space:nowrap}',
-      '.tp-badge.tp-on{color:var(--dsw-alias-button-primary-fill,#356be8);border-color:var(--dsw-alias-button-primary-fill,#356be8)}',
-      '.tp-btn{font:inherit;min-height:32px;padding:4px 14px;cursor:pointer;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l3,#8886);background:transparent;color:var(--dsw-alias-label-primary,inherit)}',
-      '.tp-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,#8882)}',
+      '.tp-field>label,.tp-field .tp-field-label{font-size:14px;font-weight:500;line-height:1.4;',
+      '  color:var(--dsw-alias-label-primary,inherit);',
+      '  display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tp-help{margin:0;font-size:12px;font-weight:400;line-height:1.6;',
+      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+      '.tp-constraint{margin:0;font-size:12px;font-weight:400;',
+      '  color:var(--dsw-alias-label-dimmed,#9aa1b0)}',
+      '.tp-field-err{margin:0;font-size:12px;color:var(--dsw-alias-state-error-primary,#d33)}',
+      '.tp-soft{margin:0;font-size:12px;color:var(--dsw-alias-state-warn-primary,#b8860b)}',
+      '.tp-note{margin:0;font-size:12px;line-height:1.7;',
+      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+      '.tp-err{margin:0;font-size:12px;line-height:1.7;',
+      '  color:var(--dsw-alias-state-error-primary,#d33)}',
+      '.tp-ok{margin:0;font-size:12px;color:var(--dsw-alias-state-success-primary,#2c9)}',
+
+      // 输入控件：统一 36px 高、限宽 420px（不占满全屏），只留 --dsw-* 引用。
+      '.tp-input,.tp-select{box-sizing:border-box;font:inherit;font-size:13px;line-height:1.5;',
+      '  height:36px;padding:0 12px;width:100%;max-width:420px;',
+      '  border:1px solid var(--dsw-alias-border-l4,#d9d9d9);',
+      '  border-radius:var(--dsw-radius-md,8px);',
+      '  background:var(--dsw-alias-bg-layer-3,#fff);',
+      '  color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-input::placeholder{color:var(--dsw-alias-label-dimmed,#9aa1b0)}',
+      '.tp-input:focus-visible,.tp-select:focus-visible{outline:none;',
+      '  border-color:var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary,#356be8))}',
+      '.tp-input:disabled,.tp-select:disabled{color:var(--dsw-alias-label-tertiary,#8c92a4);',
+      '  cursor:default}',
+      '.tp-field.tp-invalid .tp-input,.tp-field.tp-invalid .tp-select{',
+      '  border-color:var(--dsw-alias-state-error-primary,#d33)}',
+      'textarea.tp-input{height:auto;min-height:72px;padding:8px 12px;resize:vertical}',
+
+      // Switch 开关（抄宿主 _switch，类名换成自己的前缀）。
+      '.tp-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:36px;height:20px;',
+      '  padding:2px;border:0;border-radius:999px;background:var(--dsw-alias-border-l3,#c8c8c8);',
+      '  cursor:pointer;transition:background .12s ease}',
+      '.tp-switch[aria-checked=true]{background:var(--dsw-alias-brand-primary,#356be8)}',
+      '.tp-switch:disabled{cursor:default;opacity:.5}',
+      '.tp-switch:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid',
+      '  var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#356be8));',
+      '  outline-offset:2px}',
+      '.tp-switch-thumb{display:block;width:16px;height:16px;border-radius:50%;',
+      '  background:var(--dsw-alias-label-primary-foreground,#fff);',
+      '  transition:transform .12s ease}',
+      '.tp-switch[aria-checked=false] .tp-switch-thumb{',
+      '  background:var(--dsw-alias-switch-thumb,#fff)}',
+      '.tp-switch[aria-checked=true] .tp-switch-thumb{transform:translate(16px)}',
+      '.tp-switch-row{display:flex;align-items:center;gap:10px}',
+      '.tp-switch-state{font-size:12px;color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+
+      // 标签：已配置 / 已改 / 项目数等，一律用 Tag 而不是生硬的文字框。
+      '.tp-badge{font-size:11px;font-weight:500;padding:1px 8px;border-radius:999px;',
+      '  border:1px solid var(--dsw-alias-border-l2,#ddd);white-space:nowrap;',
+      '  color:var(--dsw-alias-label-secondary,#555);',
+      '  background:var(--dsw-alias-bg-layer-2,#fafafa)}',
+      '.tp-badge.tp-on{color:var(--dsw-alias-brand-primary,#356be8);',
+      '  border-color:var(--dsw-alias-brand-primary,#356be8);background:transparent}',
+      '.tp-badge.tp-ok{color:var(--dsw-alias-state-success-primary,#2c9);',
+      '  border-color:var(--dsw-alias-state-success-primary,#2c9);background:transparent}',
+      '.tp-badge.tp-bad{color:var(--dsw-alias-state-error-primary,#d33);',
+      '  border-color:var(--dsw-alias-state-error-primary,#d33);background:transparent}',
+
+      // 按钮。
+      '.tp-btn{font:inherit;font-size:13px;height:32px;padding:0 14px;cursor:pointer;',
+      '  border-radius:var(--dsw-radius-sm,8px);',
+      '  border:1px solid var(--dsw-alias-border-l3,#d0d0d0);background:transparent;',
+      '  color:var(--dsw-alias-label-primary,inherit);',
+      '  display:inline-flex;align-items:center;gap:6px}',
+      '.tp-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,#8881)}',
       '.tp-btn:disabled{opacity:.5;cursor:default}',
-      '.tp-btn.tp-primary{color:var(--dsw-alias-label-primary-foreground,#fff);background:var(--dsw-alias-button-primary-fill,#356be8);border-color:transparent}',
-      '.tp-btn:focus-visible{outline:2px solid var(--dsw-alias-button-primary-fill,#356be8);outline-offset:2px}',
-      '.tp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}',
-      '.tp-note{font-size:11px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);opacity:.85;margin:0}',
-      '.tp-note code{font-size:11px;padding:0 3px}',
-      '.tp-pre{margin:8px 0 0;padding:10px 12px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-word;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-interactive-bg-hover,#8881);max-height:320px;overflow:auto}',
-      '.tp-err{margin:8px 0 0;font-size:12px;color:var(--dsw-alias-label-error,#d33)}',
-      '.tp-ok{margin-left:auto;font-size:11px;color:var(--dsw-alias-label-secondary,inherit)}',
+      '.tp-btn.tp-primary{color:var(--dsw-alias-label-primary-foreground,#fff);',
+      '  background:var(--dsw-alias-button-primary-fill,#356be8);border-color:transparent}',
+      '.tp-btn.tp-primary:hover:not(:disabled){',
+      '  background:var(--dsw-alias-button-primary-hover,#2a5bd0)}',
+      '.tp-btn.tp-danger{color:var(--dsw-alias-state-error-primary,#d33);',
+      '  border-color:var(--dsw-alias-border-l2,#eee)}',
+      '.tp-btn.tp-sm{height:26px;padding:0 10px;font-size:12px}',
 
-      // 顶部操作条：页面很长（33 个配置项 + N 个项目卡片），保存按钮必须一直够得着。
-      '.tp-bar{position:sticky;top:0;z-index:3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;background:var(--dsw-alias-bg-base,Canvas)}',
-      '.tp-bar .tp-spacer{margin-left:auto}',
-      '.tp-bar .tp-count{font-size:11px;color:var(--dsw-alias-label-secondary,inherit)}',
+      // 凭据行。
+      '.tp-cred{display:flex;flex-direction:column;gap:6px;padding:16px 0;',
+      '  border-bottom:1px solid var(--dsw-alias-border-l2,#f0f0f0)}',
+      '.tp-cred:last-child{border-bottom:0}',
+      '.tp-cred-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tp-cred-title{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,inherit)}',
 
-      // 可折叠分组：标题本身就是按钮，键盘也能操作。
-      '.tp-group>h4{margin:0}',
-      '.tp-toggle{font:inherit;display:flex;align-items:center;gap:6px;width:100%;padding:4px 0;cursor:pointer;background:transparent;border:0;color:var(--dsw-alias-label-secondary,inherit);text-align:left;font-size:12px;font-weight:600}',
-      '.tp-toggle:hover{color:var(--dsw-alias-label-primary,inherit)}',
-      '.tp-toggle .tp-caret{display:inline-block;width:10px;opacity:.7}',
-      '.tp-toggle .tp-badge{margin-left:auto;font-weight:400}',
+      // 环境变量名：浅底纹 code，不再裸飘在说明里。
+      'code{font-family:var(--dsw-font-family,ui-monospace,monospace);font-size:11px;',
+      '  padding:1px 5px;border-radius:4px;',
+      '  background:var(--dsw-alias-markdown-inline-code,#8881);',
+      '  color:var(--dsw-alias-label-secondary,#555);word-break:break-all}',
 
-      // 字段级校验
-      '.tp-field.tp-invalid .tp-input,.tp-field.tp-invalid .tp-select{border-color:var(--dsw-alias-label-error,#d33)}',
-      '.tp-field .tp-field-err{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-error,#d33)}',
-      '.tp-field .tp-constraint{margin:2px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit);opacity:.7}',
-      '.tp-field .tp-soft{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit)}',
-
-      // 项目卡片
-      '.tp-proj{border:1px solid var(--dsw-alias-border-l3,#8883);border-radius:var(--dsw-radius-sm,8px);padding:10px 12px;margin:10px 0 0}',
-      // 收起时只留一行头：padding 不许把空卡片撑出半屏。
-      '.tp-proj.tp-collapsed{padding:8px 12px}',
-      '.tp-proj.tp-collapsed .tp-proj-head{margin:0}',
-      '.tp-proj-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 4px}',
-      // 头里的按钮是折叠开关，不要它自己那套 12px/toggle 的宽度，跟徽标排一行。
-      '.tp-proj-head .tp-toggle{width:auto;flex:0 1 auto;padding:0;font-size:12px}',
-      '.tp-proj-head strong{font-size:12px}',
-      '.tp-proj-head .tp-spacer{margin-left:auto}',
+      // 项目卡片：外层折叠 + 卡内分区折叠（两级），都用 tp-toggle。
+      '.tp-proj{background:var(--dsw-alias-bg-base,#fff);',
+      '  border:1px solid var(--dsw-alias-border-l2,#ececec);',
+      '  border-radius:var(--dsw-radius-md,10px);padding:12px 16px;margin:12px 0 0;',
+      '  box-shadow:0 1px 4px rgba(0,0,0,.04)}',
+      '.tp-proj.tp-collapsed{padding:8px 16px}',
+      '.tp-proj-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tp-proj-head .tp-toggle{width:auto;flex:0 1 auto;padding:4px 0;font-size:13px}',
+      '.tp-proj-head .tp-toggle strong{font-size:13px;font-weight:600}',
       '.tp-proj-body{margin-top:4px}',
-      // 卡内的组标题：比顶层的分组小一号，别和「配置」那边抢视觉层级。
-      '.tp-proj-body .tp-group .tp-toggle{font-size:12px}',
-      '.tp-proj .tp-field{padding:4px 0}',
-      // 收起状态下标签用更淡的字，提示它可点。
-      '.tp-proj-head .tp-toggle[aria-expanded="false"]{color:var(--dsw-alias-label-secondary,inherit)}',
-      // 分支字段：输入框占满一行，候选提示跟在下面一行。
-      '.tp-branch{display:flex;flex-direction:column;gap:2px}',
+      '.tp-proj-body .tp-group>h4 .tp-toggle{font-size:12px}',
+      '.tp-spacer{margin-left:auto}',
+      '.tp-field-mark{display:inline-flex;gap:6px;align-items:center}',
+      '.tp-count{font-size:12px;color:var(--dsw-alias-state-warn-label,#b8860b)}',
+      '.tp-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;',
+      '  color:var(--dsw-alias-label-secondary,#555);cursor:pointer}',
+      '.tp-check input{width:14px;height:14px;accent-color:var(--dsw-alias-brand-primary,#356be8)}',
+      '.tp-branch{display:flex;flex-direction:column;gap:4px}',
       '.tp-branch .tp-help{padding-left:2px}',
-      // 有错的项目徽标：红底，收起时也看得见。
-      '.tp-badge.tp-bad{color:var(--dsw-alias-label-error,#d33);border-color:var(--dsw-alias-label-error,#d33)}',
-      '.tp-empty{margin:6px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit)}',
 
-      '@media(max-width:520px){.tp-field{grid-template-columns:1fr}.tp-field label{padding-top:0}}',
+      '.tp-empty{padding:20px 0;font-size:13px;color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+      '.tp-pre{max-height:220px;overflow:auto;font-size:11px;line-height:1.6;',
+      '  padding:12px;margin:8px 0 0;white-space:pre-wrap;word-break:break-word;',
+      '  background:var(--dsw-alias-markdown-code-block,#8881);',
+      '  border:1px solid var(--dsw-alias-border-l2,#eee);',
+      '  border-radius:var(--dsw-radius-sm,8px)}',
+
+      // 窄屏：网格塌成单列，输入框也不用限宽了。
+      '@media(max-width:560px){',
+      '  .tp-fields{grid-template-columns:1fr}',
+      '  .tp-input,.tp-select{max-width:none}',
+      '  .tp-bar{margin:0 -12px;padding:12px}',
+      '  .tp-card{padding:16px}',
+      '}',
     ].join('')
 
+
+    // ── 组件 
     // ── 组件 ────────────────────────────────────────────────────
 
+    /**
+     * Switch 开关。
+     *
+     * 宿主的 cordis-plugin-development/practices.md 明确禁止把 Harness 客户端包当
+     * 模块加载（ui-primitives 之类）；要求是
+     * **自己写控件、把宿主的 markup / CSS / 行为抄过来、类名换成自己的前缀**，
+     * 并且保留用户依赖的行为契约 —— 比如 `role="switch"` + `aria-checked`。
+     * 这里就是照那条要求写的：按钮语义 + ARIA 开关 + 宿主 `_switch` 的尺寸与动效。
+     */
+    function Switch (props) {
+      return h('button', {
+        type: 'button',
+        role: 'switch',
+        className: 'tp-switch',
+        'aria-checked': props.checked ? 'true' : 'false',
+        'aria-label': props.label,
+        title: props.title,
+        disabled: props.disabled,
+        onClick: function () { props.onChange(!props.checked) },
+      }, h('span', { className: 'tp-switch-thumb' }))
+    }
+
+    /**
+     * 单个配置字段。
+     *
+     * **Label 置顶的上下结构**（不是左 label 右输入框）：第一行加粗字段名，第二行
+     * 输入框，第三行浅灰说明（约束 + 错误）。理由是眼睛从上往下一次过，不用在
+     * 「左边一长串字」和「右边一个框」之间来回横跳；字段一多、说明一长时左右结构
+     * 会把输入框推到很远的位置，改一个数要点很远。
+     *
+     * 布尔字段用 Switch 而不是原生 checkbox：checkbox 只有「有/无」，Switch 还带
+     * 得动「这是个开关」的语义，和宿主设置页一致。
+     */
     function Field (props) {
       var leaf = props.leaf
       var draftValue = props.value
@@ -914,14 +1103,14 @@ window.__ModuleLoader__.load({
 
       var control
       if (isBoolean(leaf)) {
-        control = h('label', { className: 'tp-check' },
-          h('input', {
-            type: 'checkbox',
+        control = h('div', { className: 'tp-switch-row' },
+          h(Switch, {
             checked: Boolean(draftValue),
             disabled: disabled,
-            onChange: function (event) { props.onChange(event.target.checked) },
+            label: label,
+            onChange: props.onChange,
           }),
-          '启用')
+          h('span', { className: 'tp-switch-state' }, Boolean(draftValue) ? '已开启' : '已关闭'))
       } else if (Array.isArray(meta.enum) && meta.enum.length > 0) {
         var options = meta.enum.map(function (value) {
           return h('option', { key: value, value: value }, value)
@@ -940,28 +1129,32 @@ window.__ModuleLoader__.load({
           disabled: disabled,
           min: meta.min === undefined ? undefined : meta.min,
           max: meta.max === undefined ? undefined : meta.max,
-          placeholder: secret ? (props.secretSet ? '已配置（留空表示不改）' : '未配置') : undefined,
+          placeholder: secret ? (props.secretSet ? '已配置，留空即不修改' : '粘贴到这里') : undefined,
           autoComplete: secret ? 'new-password' : 'off',
           onChange: function (event) { props.onChange(event.target.value) },
         })
       }
 
-      // 字段右侧的「已改 / 撤销」：只标记真正改过的字段，撤销只回退这一个。
+      // 「已改 / 撤销」只标真正改过的字段，撤销只回退这一个。
       var changed = Boolean(props.changed)
       var mark = changed
-        ? h('span', { style: { marginLeft: '8px', display: 'inline-flex', gap: '6px', alignItems: 'center' } },
+        ? h('span', { className: 'tp-field-mark' },
           h('span', { className: 'tp-badge tp-on' }, '已改'),
           h('button', {
             type: 'button',
-            className: 'tp-btn',
-            style: { minHeight: '24px', padding: '0 8px', fontSize: '11px' },
+            className: 'tp-btn tp-sm',
             disabled: disabled,
             onClick: props.onRevert,
           }, '撤销'))
         : null
 
       var notes = []
+      if (help.length > 0) notes.push(h('p', { key: 'help', className: 'tp-help' }, help))
       if (constraint.length > 0) notes.push(h('p', { key: 'constraint', className: 'tp-constraint' }, constraint))
+      if (changed) {
+        notes.push(h('p', { key: 'base', className: 'tp-constraint' },
+          '来自 profile 的当前值：' + describeBase(props.base)))
+      }
       if (issue !== undefined && issue !== null) {
         notes.push(h('p', {
           key: 'issue',
@@ -970,12 +1163,9 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { className: 'tp-field' + (invalid ? ' tp-invalid' : '') },
-        h('div', null,
-          h('label', null, label, mark),
-          help.length > 0 ? h('p', { className: 'tp-help' }, help) : null),
-        h('div', null,
-          control,
-          notes.length > 0 ? notes : null))
+        h('div', { className: 'tp-field-label' }, label, mark),
+        control,
+        notes.length > 0 ? notes : null)
     }
 
     /**
@@ -1005,44 +1195,61 @@ window.__ModuleLoader__.load({
         open ? props.children : null)
     }
 
+    /**
+     * 一行凭据。
+     *
+     * **不再有每行的小「保存」按钮**：之前每行一个「保存」，页面上同时出现五六个
+     * 「保存」+ 顶部一个主「保存」，谁也说不清到底点哪个会把什么写下去。现在只有
+     * 顶部一个主「保存」，输入框里填的值会攒着、随「保存」一起提交（见
+     * `onSave` 里的凭据提交段）。
+     *
+     * 「已配置」状态用绿色 Tag 而不是一个写着「已配置（留空表示不改）」的死文本框；
+     * 输入框留空时 placeholder 提示「已配置，留空即不修改」—— 那句提示只在该出现
+     * 的地方出现，而不是当成值显示出来。
+     *
+     * 「清除」是**删掉宿主里的凭据**，属于破坏性动作，和「保存」不是一回事，所以
+     * 单独留一个按钮，并且要二次确认。
+     */
     function CredentialRow (props) {
       var item = props.item
       var state = props.state || {}
+      // 字段名跟宿主 `remote.credentials.describe()` 对齐：`configured`（配没配）、
+      // `writable`（这条能不能写，宿主可以锁住某条）。以前叫什么也不能凭印象写。
       var configured = Boolean(state.configured)
       var writable = state.writable !== false
-      var value = props.value || ''
-      var busy = props.busy
+      var busy = props.busy === item.ref
+      var value = props.value === undefined || props.value === null ? '' : String(props.value)
 
-      return h('div', { className: 'tp-row' },
-        h('div', { className: 'tp-row-main' },
-          h('div', { className: 'tp-row-title' }, item.label,
-            h('span', { className: 'tp-badge' + (configured ? ' tp-on' : ''), style: { marginLeft: '8px' } },
-              configured ? '已配置' : '未配置')),
-          h('p', { className: 'tp-row-hint' }, item.hint,
-            h('code', { style: { marginLeft: '6px' } }, item.ref))),
+      return h('div', { className: 'tp-cred' },
+        h('div', { className: 'tp-cred-head' },
+          h('span', { className: 'tp-cred-title' }, item.label),
+          h('span', { className: 'tp-badge ' + (configured ? 'tp-ok' : '') },
+            configured ? '✓ 已配置' : '未配置'),
+          h('span', { className: 'tp-spacer' }),
+          configured
+            ? h('button', {
+              type: 'button',
+              className: 'tp-btn tp-sm tp-danger',
+              disabled: props.disabled || !writable || busy,
+              title: '把宿主凭据库里这一条删掉（不可撤销）',
+              onClick: function () {
+                if (typeof window !== 'undefined' && window.confirm) {
+                  if (!window.confirm('确定要清除「' + item.label + '」？清掉后要重新粘贴才能用。')) return
+                }
+                props.onClear(item.ref)
+              },
+            }, busy ? '处理中…' : '清除')
+            : null),
+        h('p', { className: 'tp-help' }, item.hint, h('code', null, item.ref)),
         h('input', {
-          className: 'tp-input tp-row-input',
+          className: 'tp-input',
           type: 'password',
           value: value,
-          disabled: !writable || busy,
-          placeholder: configured ? '已配置（留空表示不改）' : '粘贴到这里',
+          disabled: props.disabled || !writable || busy,
+          placeholder: configured ? '已配置，留空即不修改' : '粘贴到这里',
           autoComplete: 'new-password',
-          onChange: function (event) { props.onChange(event.target.value) },
-        }),
-        h('button', {
-          type: 'button',
-          className: 'tp-btn',
-          disabled: !writable || busy || value.trim().length === 0,
-          onClick: props.onSave,
-        }, '保存'),
-        configured
-          ? h('button', {
-            type: 'button',
-            className: 'tp-btn',
-            disabled: !writable || busy,
-            onClick: props.onClear,
-          }, '清除')
-          : null)
+          onChange: function (event) { props.onEdit(item.ref, event.target.value) },
+        }))
     }
 
     function DoctorCard (props) {
@@ -1073,6 +1280,19 @@ window.__ModuleLoader__.load({
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
 
+    /**
+     * 「配置」卡片：把 33 个配置项按 meta.group 分组、每组可折叠。
+     *
+     * 两层降噪（用户要的「化繁为简」）：
+     *   1. **组级折叠** —— 「扫描与队列」「租约与重试」这些一整组收起来，只留最核心
+     *      的一组摊开（见 `isGroupOpen` 的缺省）。
+     *   2. **组内「高级设置」折叠区** —— 每组里不常动的旋钮（翻页条数、心跳秒数、
+     *      SMTP 端口……）再收一层，缺省不画。改过的或有错的字段永远露出来。
+     *
+     * 卡片里**不再有第二套「保存 / 放弃改动」按钮**：之前顶部操作条一套、卡片里
+     * 又一套，两套按钮长得几乎一样，点哪个会把什么写下去说不清。现在只有顶部那
+     * 一套，卡片里只留状态提示。
+     */
     function SettingsCard (props) {
       var view = props.view
       var leaves = props.leaves
@@ -1088,30 +1308,67 @@ window.__ModuleLoader__.load({
 
       var groups = groupLeaves(leaves)
       var sections = groups.map(function (group) {
+        // 必须用 map 而不是 for + var：`var key` 是函数作用域，放进 for 里所有
+        // 闭包（onRevert / onChange）会一起指向最后一项 —— 改第 1 个字段会写到
+        // 第 N 个字段上。map 每次调用都是一个新的作用域，天然没这个问题。
         var changedCount = 0
-        var fields = group.leaves.map(function (leaf) {
+        var all = group.leaves.map(function (leaf) {
           var key = keyOf(leaf)
           var changed = !sameDraft(draft[key], props.initialDraft[key])
           if (changed) changedCount += 1
-          return h(Field, {
+          return {
             key: key,
-            leaf: leaf,
-            value: draft[key],
-            disabled: disabled,
-            secretSet: Boolean(props.secrets && props.secrets[key]),
-            issue: props.issues ? props.issues[key] : undefined,
             changed: changed,
-            onRevert: function () { props.onRevert(key) },
-            onChange: function (next) { props.onEdit(key, next) },
-          })
+            node: h(Field, {
+              key: key,
+              leaf: leaf,
+              value: draft[key],
+              base: props.initialDraft[key],
+              disabled: disabled,
+              secretSet: Boolean(props.secrets && props.secrets[key]),
+              issue: props.issues ? props.issues[key] : undefined,
+              changed: changed,
+              onRevert: function () { props.onRevert(key) },
+              onChange: function (next) { props.onEdit(key, next) },
+            }),
+          }
         })
+        var core = []
+        var advanced = []
+        for (var i = 0; i < all.length; i += 1) {
+          // 改过的和有错的永远露出来，不跟着「高级」一起藏 —— 否则折叠就成了遮蔽。
+          if (isAdvancedConfigKey(all[i].key) && !all[i].changed && !(props.issues && props.issues[all[i].key])) {
+            advanced.push(all[i].node)
+          } else {
+            core.push(all[i].node)
+          }
+        }
+
+        var children = [h('div', { key: 'core', className: 'tp-fields' }, core)]
+        if (advanced.length > 0) {
+          var advOpen = props.isAdvOpen(group.label)
+          children.push(h('div', { key: 'adv', className: 'tp-adv' },
+            h('button', {
+              type: 'button',
+              // 类名刻意**不是** tp-group-toggle：自测按 tp-group-toggle 数「配置
+              // 分组」的折叠标题，多一种折叠混进去就数不清了。
+              className: 'tp-toggle tp-adv-toggle',
+              'aria-expanded': advOpen ? 'true' : 'false',
+              onClick: function () { props.onToggleAdv(group.label) },
+            },
+              h('span', { className: 'tp-caret' }, advOpen ? '▾' : '▸'),
+              '高级设置',
+              h('span', { className: 'tp-badge' }, advanced.length + ' 项')),
+            advOpen ? h('div', { className: 'tp-fields' }, advanced) : null))
+        }
+
         return h(GroupSection, {
           key: group.label,
           group: group,
           open: props.isOpen(group.label),
           changedCount: changedCount,
           onToggle: function () { props.onToggle(group.label) },
-        }, fields)
+        }, children)
       })
 
       return h('section', { className: 'tp-card' },
@@ -1120,24 +1377,13 @@ window.__ModuleLoader__.load({
             props.dirty
               ? h('span', { className: 'tp-ok' }, '有未保存的改动')
               : null)),
+        h('p', { className: 'tp-note' },
+          '点组名折叠整组；组里的「高级设置」再收一层不常动的旋钮。',
+          '改过的和有错的字段无论收起与否都会露出来。'),
         h('div', null, sections),
-        h('div', { className: 'tp-actions' },
-          h('button', {
-            type: 'button',
-            className: 'tp-btn tp-primary',
-            disabled: disabled || !props.dirty || props.saving || props.errorCount > 0,
-            onClick: props.onSave,
-          }, props.saving ? '保存中…' : '保存'),
-          h('button', {
-            type: 'button',
-            className: 'tp-btn',
-            disabled: disabled || props.saving,
-            onClick: props.onReset,
-          }, '放弃改动'),
-          props.errorCount > 0
-            ? h('span', { className: 'tp-err', style: { margin: 0 } }, props.errorCount + ' 项待修')
-            : null,
-          props.message.length > 0 ? h('span', { className: 'tp-ok' }, props.message) : null),
+        props.errorCount > 0
+          ? h('p', { className: 'tp-err' }, props.errorCount + ' 项待修 —— 修好才能保存')
+          : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
 
@@ -1187,7 +1433,23 @@ window.__ModuleLoader__.load({
         // 高级字段），把它们混称「高级设置」会让人以为是同一个开关能全放出来。
         hiddenCount > 0 && open ? h('span', { className: 'tp-badge' }, hiddenCount + ' 项未显示') : null,
         h('span', { className: 'tp-spacer' }),
-        record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null)
+        record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null,
+        // 删除是**结构性**动作（会 splice 掉数组里这一项，后面项目的下标跟着前移），
+        // 所以有未保存的字段改动时禁用 —— 否则改了一半的字段会跟着换到别的项目上。
+        h('button', {
+          type: 'button',
+          className: 'tp-btn tp-sm tp-danger',
+          disabled: disabled || changedCount > 0,
+          title: changedCount > 0
+            ? '这个项目还有未保存的改动；先保存或放弃，再删它。'
+            : '从项目清单里删掉这一项（不可撤销）',
+          onClick: function () {
+            if (typeof window !== 'undefined' && window.confirm) {
+              if (!window.confirm('确定要删除项目「' + title + '」？删掉后配置里就没了。')) return
+            }
+            props.onRemove(index)
+          },
+        }, '删除'))
 
       var sections = PROJECT_SECTIONS.filter(function (section) {
         return sectionVisible(section, record, draft, issues, index, props.showAdvanced)
@@ -1204,14 +1466,15 @@ window.__ModuleLoader__.load({
 
           var control
           if (field.kind === 'bool') {
-            control = h('label', { className: 'tp-check' },
-              h('input', {
-                type: 'checkbox',
+            // 和配置区一致：布尔用 Switch，不用原生 checkbox。
+            control = h('div', { className: 'tp-switch-row' },
+              h(Switch, {
                 checked: Boolean(value),
                 disabled: disabled,
-                onChange: function (event) { props.onEdit(key, event.target.checked) },
+                label: field.label,
+                onChange: function (next) { props.onEdit(key, next) },
               }),
-              '启用')
+              h('span', { className: 'tp-switch-state' }, Boolean(value) ? '已开启' : '已关闭'))
           } else if (field.kind === 'select') {
             var options = field.options.map(function (option) {
               return h('option', { key: option, value: option }, option)
@@ -1264,33 +1527,29 @@ window.__ModuleLoader__.load({
           // 没改的挂在 title 上（21 个字段全摊开会把卡片撑爆）。
           var profileHint = '来自 profile 的当前值：' + describeBase(base)
 
+          // Label 置顶的上下结构：字段名一行、输入框一行、说明一行。
           return h('div', {
             key: key,
             className: 'tp-field' + (invalid ? ' tp-invalid' : ''),
             title: profileHint,
           },
-            h('div', null,
-              h('label', null, field.label,
-                changed
-                  ? h('span', { style: { marginLeft: '8px', display: 'inline-flex', gap: '6px', alignItems: 'center' } },
-                    h('span', { className: 'tp-badge tp-on' }, '已改'),
-                    h('button', {
-                      type: 'button',
-                      className: 'tp-btn',
-                      style: { minHeight: '24px', padding: '0 8px', fontSize: '11px' },
-                      disabled: disabled,
-                      onClick: function () { props.onRevert(key, base) },
-                    }, '撤销'))
-                  : null),
+            h('div', { className: 'tp-field-label' }, field.label,
               changed
-                ? h('p', { className: 'tp-help' }, '来自 profile 的当前值：' + describeBase(base))
-                : null,
-              field.hint ? h('p', { className: 'tp-help' }, field.hint) : null),
-            h('div', null,
-              control,
-              issue !== undefined && issue !== null
-                ? h('p', { className: issue.level === 'error' ? 'tp-field-err' : 'tp-soft' }, issue.text)
-                : null))
+                ? h('span', { className: 'tp-field-mark' },
+                  h('span', { className: 'tp-badge tp-on' }, '已改'),
+                  h('button', {
+                    type: 'button',
+                    className: 'tp-btn tp-sm',
+                    disabled: disabled,
+                    onClick: function () { props.onRevert(key, base) },
+                  }, '撤销'))
+                : null),
+            control,
+            field.hint ? h('p', { className: 'tp-help' }, field.hint) : null,
+            changed ? h('p', { className: 'tp-constraint' }, '来自 profile 的当前值：' + describeBase(base)) : null,
+            issue !== undefined && issue !== null
+              ? h('p', { className: issue.level === 'error' ? 'tp-field-err' : 'tp-soft' }, issue.text)
+              : null)
         })
         // 组也能折：一个项目 5 组全摊开时，光一个项目就顶满一屏。
         // 组内必填项与平台专属组默认展开，其余（验证命令、高级）默认收起；
@@ -1311,7 +1570,7 @@ window.__ModuleLoader__.load({
               h('span', { className: 'tp-caret' }, sectionOpen ? '▾' : '▸'),
               section.label,
               sectionChanged > 0 ? h('span', { className: 'tp-badge tp-on' }, '已改 ' + sectionChanged + ' 项') : null)),
-          sectionOpen ? fields : null)
+          sectionOpen ? h('div', { className: 'tp-fields' }, fields) : null)
       })
 
       // appToken：宿主只下发 hasAppToken + 打码预览，明文永不出宿主。
@@ -1326,14 +1585,12 @@ window.__ModuleLoader__.load({
         : '未配置'
       var tokenRow = platformNow === 'feishu'
         ? h('div', { className: 'tp-field' },
-          h('div', null,
-            h('label', null, '飞书 appToken'),
-            h('p', { className: 'tp-help' },
-              '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
-              h('code', null, 'cordis.patch.yml'),
-              '。')),
-          h('div', null,
-            h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-on' : '') }, tokenText)))
+          h('div', { className: 'tp-field-label' }, '飞书 appToken',
+            h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-ok' : '') }, tokenText)),
+          h('p', { className: 'tp-help' },
+            '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
+            h('code', null, 'cordis.patch.yml'),
+            '。'))
         : null
 
       return h('div', { className: 'tp-proj' + (open ? '' : ' tp-collapsed') },
@@ -1405,6 +1662,7 @@ window.__ModuleLoader__.load({
             onToggle: props.onToggleProject,
             isSectionOpen: props.isSectionOpen,
             onToggleSection: props.onToggleSection,
+            onRemove: props.onRemove,
           })
         }))
       }
@@ -1423,6 +1681,18 @@ window.__ModuleLoader__.load({
                 onChange: function (event) { props.onToggleAdvanced(event.target.checked) },
               }),
               '显示全部字段'),
+            // 「添加项目」是结构性动作：追加到数组末尾。有未保存的字段改动时禁用，
+            // 否则追加会让下标对不上（新项目排在最后，但改到一半的字段还没落盘）。
+            // 不用 tp-primary：全页只留一颗主按钮（顶部「保存」），新增是次级动作。
+            h('button', {
+              type: 'button',
+              className: 'tp-btn',
+              disabled: props.disabled || props.busy || props.dirty,
+              title: props.dirty
+                ? '先保存或放弃当前改动，再添加项目。'
+                : '往项目清单末尾加一个新项目',
+              onClick: props.onAdd,
+            }, '+ 添加项目'),
             h('button', {
               type: 'button',
               className: 'tp-btn',
@@ -1430,8 +1700,8 @@ window.__ModuleLoader__.load({
               onClick: props.onReload,
             }, props.busy ? '读取中…' : '重新读取'))),
         h('p', { className: 'tp-note' },
-          '每个项目 = 一张工单表 + 一个仓库的绑定。点项目名可以收起它；',
-          '改哪项就只写哪项（深层路径），不会整块覆盖。'),
+          '每个项目 = 一张工单表 + 一个仓库的绑定。点项目名可以收起它，卡内每个分区',
+          '也能单独收起；改哪项就只写哪项（深层路径），不会整块覆盖。'),
         body,
         props.message.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, props.message) : null,
         props.saveError ? h('p', { className: 'tp-err' }, props.saveError) : null)
@@ -1495,6 +1765,9 @@ window.__ModuleLoader__.load({
       // 高级开关**不记** —— 它是「我现在要配细节」的一次性意图，下次进来
       // 还全摊开反而又变回一屏放不下。
       var [projMap, setProjMap] = useState(readProjMap)
+      // 「高级设置」折叠：缺省全收起（和分组折叠相反 —— 分组是「常看的摊开」，
+      // 高级是「不常看的收起」，所以缺省取值正好相反）。
+      var [advMap, setAdvMap] = useState(readAdvMap)
       var [showAdvanced, setShowAdvanced] = useState(false)
 
       var isPage = props.view !== 'summary'
@@ -1795,6 +2068,15 @@ window.__ModuleLoader__.load({
         setSaveError('')
       }
 
+      function onToggleAdv (label) {
+        setAdvMap(function (previous) {
+          var copy = Object.assign({}, previous)
+          copy[label] = !(copy[label] === true)
+          try { localStorage.setItem(ADV_OPEN_KEY, JSON.stringify(copy)) } catch (error) {}
+          return copy
+        })
+      }
+
       function onToggleGroup (label) {
         setOpenMap(function (previous) {
           var copy = Object.assign({}, previous)
@@ -1882,6 +2164,35 @@ window.__ModuleLoader__.load({
           setSaveMessage('没有需要保存的改动')
           return
         }
+        // 凭据先写：它和配置 mutate 是两个独立通道，不互相阻塞 —— 凭据失败只报
+        // 凭据那条，配置照样存；反过来也一样。这里刻意**不 await**，让 mutate 立刻
+        // 发出去（自测按「点保存 → 同一拍里 mutate 数 +1」断言）。
+        if (pendingCreds.length > 0) {
+          var credNs = getNamespace('credentials')
+          if (credNs) {
+            for (var pc = 0; pc < pendingCreds.length; pc += 1) {
+              (function (entry) {
+                credNs.set(entry.ref, entry.value).then(function (response) {
+                  if (!response || !response.ok) {
+                    setCredMessage('保存 ' + entry.ref + ' 失败：' +
+                      ((response && response.error && response.error.message) || '未知错误'))
+                    return
+                  }
+                  setCredMessage(entry.ref + ' 已保存')
+                  setCredDraft(function (previous) {
+                    var copy = Object.assign({}, previous)
+                    copy[entry.ref] = ''
+                    return copy
+                  })
+                  loadCredentials()
+                }, function (error) {
+                  setCredMessage('保存 ' + entry.ref + ' 失败：' +
+                    (error && error.message ? error.message : String(error)))
+                })
+              })(pendingCreds[pc])
+            }
+          }
+        }
         setSaving(true)
         setSaveError('')
         setSaveMessage('')
@@ -1922,6 +2233,82 @@ window.__ModuleLoader__.load({
           return copy
         })
         setCredMessage('')
+      }
+
+      /**
+       * 待提交的凭据改动（输入框里填了、还没存的）。
+       *
+       * 凭据不再有每行的「保存」按钮，改用顶部主「保存」一次提交 —— 所以「有没有
+       * 未保存的东西」要把它们一起算进去，否则只填了凭据时保存按钮是灰的，点不动。
+       */
+      var pendingCreds = []
+      for (var ci = 0; ci < CREDENTIAL_REFS.length; ci += 1) {
+        var cRef = CREDENTIAL_REFS[ci].ref
+        var cVal = String(credDraft[cRef] === undefined || credDraft[cRef] === null ? '' : credDraft[cRef]).trim()
+        if (cVal.length > 0) pendingCreds.push({ ref: cRef, value: cVal })
+      }
+      var credDirty = pendingCreds.length > 0
+
+      /**
+       * 往项目清单末尾追加一个项目。
+       *
+       * 走的是 `settings.mutate` 的 `['projects', '<len>']` 追加语义（宿主的
+       * applyPathOp 允许 index === length 时 set 一项），所以**不需要**新的 Remote
+       * 方法，也不会整块替换数组 —— 已有的项目一个字节都不动。
+       */
+      function onAddProject () {
+        var ns = getNamespace('settings')
+        var view = findNamespace(snapshot)
+        if (!ns || !view) return
+        var next = projList.length
+        setProjBusy(true)
+        setProjError('')
+        ns.mutate(NAMESPACE, [{
+          op: 'set',
+          path: ['projects', String(next)],
+          value: {
+            name: '新项目' + (next + 1),
+            description: '',
+            match: { platform: 'mock' },
+            repo: { path: '' },
+          },
+        }], view.revision).then(function (response) {
+          setProjBusy(false)
+          if (!response || !response.ok) {
+            setProjError('添加项目失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          loadProjects()
+        }, function (error) {
+          setProjBusy(false)
+          setProjError('添加项目失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }
+
+      /**
+       * 删掉一个项目。
+       *
+       * `['projects', '<i>']` + `unset` 在宿主侧是 `splice(i, 1)`：删掉后下标会
+       * 前移，所以按钮在「有未保存字段改动」时禁用（改了一半的字段会跟到别的项目上）。
+       */
+      function onRemoveProject (index) {
+        var ns = getNamespace('settings')
+        var view = findNamespace(snapshot)
+        if (!ns || !view) return
+        setProjBusy(true)
+        setProjError('')
+        ns.mutate(NAMESPACE, [{ op: 'unset', path: ['projects', String(index)] }], view.revision)
+          .then(function (response) {
+            setProjBusy(false)
+            if (!response || !response.ok) {
+              setProjError('删除项目失败：' + ((response && response.error && response.error.message) || '未知错误'))
+              return
+            }
+            loadProjects()
+          }, function (error) {
+            setProjBusy(false)
+            setProjError('删除项目失败：' + (error && error.message ? error.message : String(error)))
+          })
       }
 
       function onCredSave (ref) {
@@ -2009,9 +2396,9 @@ window.__ModuleLoader__.load({
           state: creds[item.ref],
           value: credDraft[item.ref] || '',
           busy: credBusy === item.ref,
-          onChange: function (next) { onCredEdit(item.ref, next) },
-          onSave: function () { onCredSave(item.ref) },
-          onClear: function () { onCredClear(item.ref) },
+          disabled: saving,
+          onEdit: function (ref, next) { onCredEdit(ref, next) },
+          onClear: function (ref) { onCredClear(ref) },
         })
       })
 
@@ -2021,17 +2408,13 @@ window.__ModuleLoader__.load({
           h('p', null, '从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。')),
 
         // 顶部操作条：33 个配置项 + N 张项目卡片，页面很长，保存按钮得一直够得着。
+        // 顺序照草图：次要在左（放弃改动 / 重新载入 / 体检），主按钮「保存」放最右 ——
+        // 主操作落在视线终点，也和宿主其它设置页一致。
         h('div', { className: 'tp-bar' },
           h('button', {
             type: 'button',
-            className: 'tp-btn tp-primary',
-            disabled: saving || issues.errorCount > 0 || changedCount === 0,
-            onClick: onSave,
-          }, saving ? '保存中…' : '保存'),
-          h('button', {
-            type: 'button',
             className: 'tp-btn',
-            disabled: saving || changedCount === 0,
+            disabled: saving || (changedCount === 0 && !credDirty),
             onClick: onReset,
           }, '放弃改动'),
           h('button', {
@@ -2054,9 +2437,16 @@ window.__ModuleLoader__.load({
           issues.errorCount > 0
             ? h('span', { className: 'tp-count' }, issues.errorCount + ' 项待修')
             : null,
-          changedCount > 0
-            ? h('span', { className: 'tp-count' }, '未保存 ' + changedCount + ' 项')
-            : null),
+          changedCount > 0 || credDirty
+            ? h('span', { className: 'tp-count' },
+              '未保存 ' + (changedCount + pendingCreds.length) + ' 项')
+            : null,
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-primary',
+            disabled: saving || issues.errorCount > 0 || (changedCount === 0 && !credDirty),
+            onClick: onSave,
+          }, saving ? '保存中…' : '保存')),
 
         // 保存失败（含服务端拒绝）贴着操作条显示：人点完保存眼睛还在这里。
         saveError.length > 0 ? h('p', { className: 'tp-err', style: { marginTop: '0', whiteSpace: 'pre-wrap' } }, saveError) : null,
@@ -2075,7 +2465,8 @@ window.__ModuleLoader__.load({
         h('section', { className: 'tp-card' },
           h('h3', null, '凭据'),
           h('p', { className: 'tp-note' },
-            '凭据存在宿主的凭据库里，不写进配置文件；这里只显示「配没配」，输入框是只写的。'),
+            '凭据存在宿主的凭据库里，不写进配置文件；这里只显示「配没配」，输入框是只写的。',
+            '填好之后点页面顶部的「保存」一起提交 —— 留空表示不改，「清除」才会删掉已存的。'),
           h('div', { style: { marginTop: '8px' } }, credRows),
           credMessage.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, credMessage) : null),
 
@@ -2094,10 +2485,10 @@ window.__ModuleLoader__.load({
           errorCount: issues.errorCount,
           isOpen: function (label) { return isGroupOpen(openMap, label) },
           onToggle: onToggleGroup,
+          isAdvOpen: function (label) { return isAdvOpenOf(advMap, label) },
+          onToggleAdv: onToggleAdv,
           onEdit: onEdit,
           onRevert: onRevert,
-          onSave: onSave,
-          onReset: onReset,
         }),
 
         h(ProjectListCard, {
@@ -2111,6 +2502,8 @@ window.__ModuleLoader__.load({
           saveError: '',
           dirty: projectDirty,
           onReload: loadProjects,
+          onAdd: onAddProject,
+          onRemove: onRemoveProject,
           onEdit: onProjectEdit,
           onRevert: onProjectRevert,
           branchList: branchList,

@@ -581,6 +581,13 @@ async function main () {
   check('凭据区显示已配置', textOf(tree).indexOf('已配置') >= 0)
   const secretInputs = findAll(tree, (node) => node.type === 'input' && node.props.type === 'password')
   check('凭据输入框是只写密码框', secretInputs.length >= 5, String(secretInputs.length))
+  // 凭据不再有每行的「保存」按钮（统一走顶部主保存）——全树只能剩一个「保存」，
+  // 多出来的就是漏删的行内按钮。
+  const saveButtons = findAll(tree, (node) => node.type === 'button' &&
+    (node.props.children === '保存' || textOf(node) === '保存'))
+  check('凭据每行不再有「保存」按钮', saveButtons.length === 1, String(saveButtons.length))
+  check('凭据行的「清除」带二次确认',
+    findAll(tree, (node) => node.type === 'button' && textOf(node) === '清除').length >= 1)
 
   // ⑤ 项目清单：读的是 remote.projects() 的只读投影，写的是深层路径 mutate。
   tree = await render(Panel, { view: 'page' })
@@ -592,9 +599,19 @@ async function main () {
     findAll(tree, (node) => node.type === 'input' &&
       typeof node.props.value === 'string' && node.props.value.indexOf('basc') >= 0).length === 0)
   check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
+  // projects 是结构化数组，必须由 ProjectListCard 画成卡片 —— 要是漏成普通字段，
+  // draftValueOf 会把对象数组 join 成 '[object Object], [object Object]'。
+  check('项目清单没有被渲染成字符串',
+    textOf(tree).indexOf('[object Object]') < 0, textOf(tree).slice(0, 60))
+  check('项目清单是卡片列表而不是文本框',
+    findAll(tree, (node) => node.type === 'input' &&
+      typeof node.props.value === 'string' &&
+      node.props.value.indexOf('[object Object]') >= 0).length === 0)
   // 21 个字段分 5 节，节标题得真的渲染出来，否则一屏全是输入框没法看。
   // 「验证命令」整组是高级项（`advanced: true`），缺省不画 —— 要看全得勾
   // 「显示全部字段」，所以这里连那条路径一起验。
+  check('项目清单有「添加项目」按钮', findButton(tree, '+ 添加项目') !== undefined)
+  check('项目卡片有「删除」按钮', findButton(tree, '删除') !== undefined)
   check('项目卡片分了「仓库」一节', textOf(tree).indexOf('仓库') >= 0)
   check('缺省不显示高级组「验证命令」', textOf(tree).indexOf('验证命令') < 0)
   const advLabel = findAll(tree, (node) => node.type === 'label' &&
@@ -608,6 +625,22 @@ async function main () {
     tree = await render(Panel, { view: 'page' })
     check('勾上后显示高级组「验证命令」', textOf(tree).indexOf('验证命令') >= 0)
   }
+
+  // 布尔字段统一换成 role="switch" 的开关（宿主 practices.md 要求保留 aria-checked 语义）。
+  const switches = findAll(tree, (node) => node.props && node.props.role === 'switch')
+  check('布尔字段渲染成 Switch 开关', switches.length >= 1, String(switches.length))
+  check('Switch 带 aria-checked 语义',
+    switches.every((node) => node.props['aria-checked'] === 'true' || node.props['aria-checked'] === 'false'))
+  // 页面上唯一剩下的原生 checkbox 只能是项目清单的「显示全部字段」筛选 —— 布尔
+  // 配置项一律走 Switch，不能有一条漏回原生勾选框。
+  const plainChecks = findAll(tree, (node) => node.type === 'input' && node.props.type === 'checkbox')
+  check('布尔配置项不落回原生 checkbox', plainChecks.length <= 1, String(plainChecks.length))
+  // 顶部只留一颗主按钮（「保存」）—— 卡片里那套「保存/放弃改动」必须删干净。
+  const primaryButtons = findAll(tree, (node) => node.type === 'button' &&
+    typeof node.props.className === 'string' && node.props.className.indexOf('tp-primary') >= 0)
+  check('全页只有一颗主按钮', primaryButtons.length === 1, String(primaryButtons.length))
+  check('主按钮在操作条最右（主操作落在视线终点）',
+    primaryButtons.length === 1 && textOf(primaryButtons[0]) === '保存')
 
   const repoInput = findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms')
   check('找到项目仓库路径输入框', repoInput !== undefined)
