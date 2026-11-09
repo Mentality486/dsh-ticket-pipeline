@@ -142,7 +142,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 | 入口 | 怎么改 | 什么时候生效 |
 |---|---|---|
-| **设置面板（常规，推荐）** | 侧栏 Plugins → 工单流水线 → 那一行的「配置」→ 改完点顶部「保存」 | 保存即写回 `cordis.patch.yml`，插件会重新加载一次 |
+| **设置面板（常规，推荐）** | 侧栏 Plugins → 工单流水线 → 那一行的「配置」→ 改完点顶部「保存」 | 保存即写回 `cordis.patch.yml`，一般不用重启；改完发现行为没变（少数设置是启动时固化的），再重启一次宿主 |
 | **手改配置文件** | 用编辑器直接改下面那段 YAML | **必须重启宿主**，插件启动时才读 |
 
 配置文件位置（Windows 桌面版缺省）：
