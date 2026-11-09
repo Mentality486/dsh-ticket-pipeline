@@ -130,7 +130,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
 | 配置 | **33 个字段 / 7 个分组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项），改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`keepSession`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `writeBack`、`writeBackStatus` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
-| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（基本 / 工单表 / 仓库 / 验证命令 / 平台专属），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的**只读预览**（面板不提供输入框，改它要手改配置文件，见 §3.0.1）；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是 `wps` 时出现。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
+| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（**基本 / 工单表 / 金山文档 / 仓库 / 验证命令**；金山那组只在平台是 `wps` 时出现），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的**只读预览**（面板不提供输入框，改它要手改配置文件，见 §3.0.1）；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
 > 确认插件活着，再看 §6 的排查。
@@ -225,6 +225,9 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 - **已有 `- id: ticket-pipeline` 段落就只改里面的键**，别整段重复贴一遍（YAML 里同 id 出现两次，行为取决于加载器，可能只有一个生效）。
 - `match.appToken` **可以直接写飞书多维表格的整条 URL**（`https://<域>/base/<appToken>?table=<tableId>&view=…`），插件会自己啃出 app_token 和 table_id；也可以老老实实只填 app_token + `tableId` 两个字段。**面板上这一格是只读的**：只显示「已配置 / 前 4…后 4」，明文不下发到浏览器，也不提供输入框 —— 要改只能手改配置文件（见 §3.0.1 末尾）。
 - **`enabled` 缺省是 `false`**，手改时别忘了自己那行是 `true` 还是 `false`；写完重启宿主，用 `pipeline_doctor` 确认插件加载到了。
+- **值里带 `?` `&` `:` 这类字符（比如把整条飞书表格 URL 写进 `appToken`）时给整串加引号**，
+  例如 `appToken: "https://<域>/base/xxx?table=tblYYY&view=vewZZZ"`；不加引号时 YAML 也常能读，
+  但一旦值里出现 `: `（冒号+空格）就会被当成嵌套键，报错信息很难懂。
 - 手写的键名必须与 §3.1 的表**一字不差**（拼错的键会被忽略，不会报错 —— 表现就是「我改了它怎么没反应」）。
 
 ### 3.0.1 这条 JSON 的每一格，在面板上对应哪里
