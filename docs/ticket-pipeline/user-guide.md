@@ -119,6 +119,10 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 ## 3. 配置插件
 
+> **配置到底填在哪、要不要手写 JSON**：见下方 **§3.0**。一句话答案 —— 两个入口
+> （设置面板 / 手改 `cordis.patch.yml`），**常规用面板点就行，不需要抄任何 JSON**。
+> 面板长这样：
+
 装好重启后，打开**侧栏 Plugins → 找到「工单流水线」→ 点那一行的「配置」**，是一整页：
 
 | 区块 | 干什么 |
@@ -126,12 +130,36 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
 | 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
 | 配置 | **33 个字段 / 7 个分组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项），改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`keepSession`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `writeBack`、`writeBackStatus` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
-| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（名称 / 匹配 / 仓库 / 远程 GitLab / 验证命令），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的预览，明文不会下发到浏览器；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。手改配置文件仍然有效。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是 `wps` 时出现。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
+| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（基本 / 工单表 / 仓库 / 验证命令 / 平台专属），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的**只读预览**（面板不提供输入框，改它要手改配置文件，见 §3.0.1）；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里；金山那 5 个字段只在平台是 `wps` 时出现。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
 > 确认插件活着，再看 §6 的排查。
 
-`projects[]` 与其余字段的等价 JSON 写法（想手改配置时用，可直接抄，改三个地方）：
+### 3.0 这些配置到底填在哪？（面板 还是 手改文件）
+
+**两个入口，改哪个都行，最终落在同一个文件**：profile 的 `cordis.patch.yml` 里
+`- id: ticket-pipeline` 那一段的 `config:` 下。
+
+| 入口 | 怎么改 | 什么时候生效 |
+|---|---|---|
+| **设置面板（常规，推荐）** | 侧栏 Plugins → 工单流水线 → 那一行的「配置」→ 改完点顶部「保存」 | 保存即写回 `cordis.patch.yml`，插件会重新加载一次 |
+| **手改配置文件** | 用编辑器直接改下面那段 YAML | **必须重启宿主**，插件启动时才读 |
+
+配置文件位置（Windows 桌面版缺省）：
+
+```
+C:\Users\<你的用户名>\.dsh\profiles\desktop\cordis.patch.yml
+```
+
+也就是 `%DSH_PROFILE_DIR%\cordis.patch.yml`（`DSH_PROFILE_DIR` 指向哪就改哪；换过
+profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别**动同一文件里别的插件段落。
+
+> **面板上不需要你抄 JSON**。下面这段 JSON 只是**结构示意** —— 讲清「字段长什么样、
+> 谁嵌套在谁里面」，方便你对照面板上的分组。真想手改，请照 JSON 后面那段 **YAML** 写：
+> 文件是 **YAML 不是 JSON**（列表用 `-`，缩进两个空格，键值之间是 `冒号+空格`），
+> 而且整段必须落在 `- id: ticket-pipeline` 的 `config:` 里面，否则插件读不到。
+
+结构示意（`projects[]` 与其余字段的嵌套关系）：
 
 ```json
 {
@@ -161,6 +189,86 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
   ]
 }
 ```
+
+手改时照抄这份 **YAML**（这才是文件里真实的样子，可直接粘到 `- id: ticket-pipeline` 的
+`config:` 下；把路径、token、分支换成你自己的）：
+
+```yaml
+- id: ticket-pipeline
+  name: '@local/ticket-pipeline'
+  config:
+    enabled: false
+    workExecutor: mock
+    pushAdapter: mock
+    pollIntervalMinutes: 3
+    projects:
+      - name: pms
+        description: 项目管理系统
+        match:
+          platform: feishu
+          appToken: <你的多维表格 app_token>
+          tableId: <你的数据表 id>
+        repo:
+          path: D:/WorkSpace/pms
+          remote: https://gitlab.example.com/group/pms.git
+          baseBranch: main
+          gitlab:
+            enabled: false
+        verify:
+          build: npm run build
+          test: npm test
+  disabled: false
+```
+
+几个容易踩的点：
+
+- **已有 `- id: ticket-pipeline` 段落就只改里面的键**，别整段重复贴一遍（YAML 里同 id 出现两次，行为取决于加载器，可能只有一个生效）。
+- `match.appToken` **可以直接写飞书多维表格的整条 URL**（`https://<域>/base/<appToken>?table=<tableId>&view=…`），插件会自己啃出 app_token 和 table_id；也可以老老实实只填 app_token + `tableId` 两个字段。**面板上这一格是只读的**：只显示「已配置 / 前 4…后 4」，明文不下发到浏览器，也不提供输入框 —— 要改只能手改配置文件（见 §3.0.1 末尾）。
+- **`enabled` 缺省是 `false`**，手改时别忘了自己那行是 `true` 还是 `false`；写完重启宿主，用 `pipeline_doctor` 确认插件加载到了。
+- 手写的键名必须与 §3.1 的表**一字不差**（拼错的键会被忽略，不会报错 —— 表现就是「我改了它怎么没反应」）。
+
+### 3.0.1 这条 JSON 的每一格，在面板上对应哪里
+
+如果你已经看过上面那段 JSON，可以直接按下表在设置页里找（**绝大多数格子在面板上点就能改**，
+只有 `match.appToken` 一格必须手改配置文件，原因见表格下面的说明）：
+
+| JSON 里的键 | 设置页位置 | 控件 |
+|---|---|---|
+| `enabled` | 「配置」→ 分组 **杂项** | 开关 —— **总开关**，配好一切前别开 |
+| `workExecutor` | 「配置」→ 分组 **执行** | 下拉（`mock` / `agent`），写错直接报错不会静默退回 mock |
+| `pushAdapter` | 「配置」→ 分组 **通知** | 下拉（`mock` / `pushplus` / `qqmail`） |
+| `pollIntervalMinutes` | 「配置」→ 分组 **扫描与队列** | 数字，轮询间隔（分钟） |
+| `projects`（整个数组） | 「项目清单」区块 | 卡片列表，右上角「+ 添加项目」，卡片头「删除」（带二次确认） |
+| `projects[].name` | 项目卡片 → **基本** | 文本（必填、唯一） |
+| `projects[].description` | 项目卡片 → **基本** | 文本（收在「显示全部字段」里） |
+| `projects[].match.platform` | 项目卡片 → **基本** | 下拉（`feishu` / `wps` / `mock` / `webform`） |
+| `projects[].match.appToken` | 项目卡片 → 底部一行 **只读状态** | **面板不提供输入框**，只显示「已配置（前 4…后 4）／未配置」—— 要改只能手改 `cordis.patch.yml` |
+| `projects[].match.tableId` | 项目卡片 → **工单表** | 文本 |
+| `projects[].repo.path` | 项目卡片 → **仓库** | 文本（**必填**，目录必须已存在） |
+| `projects[].repo.baseBranch` | 项目卡片 → **仓库** | 输入框 + **候选下拉**（列出该检出里真实分支，也可手打） |
+| `projects[].repo.targetBranch` | 项目卡片 → **仓库** | 同上 |
+| `projects[].repo.remote` | 项目卡片 → **仓库** | 文本，收在「显示全部字段」里。**语义是 GitLab 仓库地址**（`https://gitlab.x/group/repo.git` 或 `git@gitlab.x:group/repo.git`），插件从它推 `baseUrl` + `projectId`；**只有** `repo.gitlab.enabled: true` 走远程 draft MR 时才需要 |
+| `projects[].repo.gitlab.enabled` | 项目卡片 → **仓库** | 开关，收在「显示全部字段」里（关着 = 只做本地提交） |
+| `projects[].verify.build` / `.test` | 项目卡片 → **验证命令** | 文本（整组收在「显示全部字段」里；不填 = 跳过验证直接本地提交） |
+
+> 项目卡片缺省只显示 8 个常改字段，其余收在「显示全部字段」复选框里；
+> 平台是 `wps` 时才会多出金山那 5 个字段（另有一组「金山文档」分区）。
+> 改过的和有错的字段**无论收起与否都会露出来**。
+
+**为什么 `appToken` 在面板上只读**：它里面是明文密钥。宿主只把
+`hasAppToken`（布尔）和 `appTokenPreview`（前 4…后 4）下发给浏览器，
+**明文永不出宿主**，所以面板上没有编辑框 —— 硬画一个输入框只会让人以为
+改了就存进凭据库，其实没有地方存。改它的唯一合法途径就是编辑 profile 的
+`cordis.patch.yml`（§3.0 上面那段 YAML 里的 `match.appToken`），改完重启宿主。
+反过来，`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 这些**应用凭据**走的是「凭据」区块，
+那是真能填的（写进 DSH 的 credentials 存储，只写不读回）。两者别混：
+
+| 填什么 | 在哪填 | 存到哪 |
+|---|---|---|
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 设置页「凭据」区块 | DSH credentials（只写不读回） |
+| `QQMAIL_AUTH_CODE` / `PUSHPLUS_TOKEN` / `GITLAB_TOKEN` | 同上 | 同上 |
+| `projects[].match.appToken`（多维表格 app_token） | **只能手改 `cordis.patch.yml`** | profile 配置文件 |
+| 其余 33 个配置键 + 项目清单其它字段 | 设置页「配置」「项目清单」 | profile 配置文件 |
 
 ### 3.1 配置项速查
 
@@ -243,7 +351,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 |---|---|
 | `name` | 项目唯一标识（分支名里会出现：`ticket-pms-xxx-r1`） |
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
-| `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐） |
+| `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐）。`tableId` 可在面板里改；**`appToken` 只能手改 `cordis.patch.yml`**（面板上是只读状态行，因为它含明文密钥、宿主不下发给浏览器，见 §3.0.1）。`appToken` 也可以直接写整条飞书表格 URL，插件会自己拆 |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
 | `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`）。和多维表格的 `appToken` 二选一；配了插件就按电子表格处理（**该能力设计待实施**） |
 | `match.sheetId` / `match.sheetName` | 电子表格里**工作表**的 id 或名字（二选一），跟 `spreadsheetToken` 配套。`match.sheetName` 与金山源共用同一个键 |
@@ -484,6 +592,19 @@ descriptor 没挂上，或字段没标 `meta.volatile`。宿主对这种情况�
 凭据从不回写配置文件、也不回传明文，界面只显示「已配置」。真要核对，看「立即体检」的
 凭据段（`QQMAIL_AUTH_CODE` 不在体检清单里，体检只查 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` /
 `GITLAB_TOKEN`）；发信失败时看通知日志里的错误码。
+
+**Q：配置是手动填 JSON 吗？我没找到 `enabled` / `workExecutor` / `projects` 该写在哪。**
+不用填 JSON，也**不需要**手写配置文件 —— 常规做法是在设置面板里点着改（§3.0）。
+面板里的「配置」是 33 个字段 / 7 个分组，「项目清单」是每个项目 5 个分区 21 个字段，
+`enabled`、`workExecutor`、`pushAdapter`、`projects[].repo.*` 这些都有对应的输入控件，
+§3.0.1 有一张「JSON 键 → 面板哪一格」的对照表。
+
+**唯一的例外是 `projects[].match.appToken`**（飞书多维表格的 app_token）：它含明文密钥，
+宿主只下发「已配置 / 前 4…后 4」，面板上是**只读状态行、没有输入框** ——
+要改它只能手改 profile 的 `cordis.patch.yml`，改完重启宿主。
+
+手改配置文件也行，但注意那是 **YAML 不是 JSON**，且要落在 `- id: ticket-pipeline` 的
+`config:` 下面（§3.0 给了可直接抄的 YAML 片段）。手改完**必须重启宿主**才生效。
 
 **Q：处理完表格会自己回填吗？**
 会。票跑成 `done` / `skipped` 之后，插件会回填三列：「是否处理」（值由 `writeBackStatus` 决定，缺省 `是`）、

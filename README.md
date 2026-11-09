@@ -107,7 +107,14 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 
 ## 3. 配置插件
 
-装好重启后，在插件设置里填配置。完整示例（可直接抄，改三个地方）：
+配置**常规在设置面板里点着改**：侧栏 Plugins → 「工单流水线」→ 那一行的「配置」。
+保存会写进 profile 的 `cordis.patch.yml`（`%DSH_PROFILE_DIR%\cordis.patch.yml`），重启后仍在。
+手改那个文件同样有效，但它是 **YAML 不是 JSON**，改完**必须重启宿主**才读。
+两种入口、每格对应面板哪一处、`appToken` 为什么只读，见
+[`docs/ticket-pipeline/user-guide.md` 的 §3.0](docs/ticket-pipeline/user-guide.md)。
+
+下面是配置的**结构示意**（`projects[]` 与顶层键的嵌套关系，JSON 只是为了好读 ——
+不需要你手写这段，面板上有对应的输入控件）：
 
 ```json
 {
@@ -141,6 +148,9 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
   ]
 }
 ```
+
+> 唯一**不能**在面板上填的是 `projects[].match.appToken`（飞书多维表格的 app_token）：
+> 它含明文密钥，宿主只下发「已配置 / 前 4…后 4」，要改只能手改 `cordis.patch.yml` 再重启。
 
 ### 3.1 配置项速查
 
