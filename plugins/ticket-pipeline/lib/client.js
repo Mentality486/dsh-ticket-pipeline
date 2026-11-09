@@ -457,7 +457,7 @@ window.__ModuleLoader__.load({
           { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。' },
           { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
-          { path: ['repo', 'remote'], from: 'repoRemote', label: '远端名', kind: 'text', advanced: true, hint: '缺省 origin。' },
+          { path: ['repo', 'remote'], from: 'repoRemote', label: 'GitLab 仓库地址', kind: 'text', advanced: true, hint: '只有要开 draft MR 时才需要。填仓库地址（https://gitlab.x/group/repo.git 或 git@gitlab.x:group/repo.git），不是 git 远端名，别填 origin。' },
           { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', advanced: true, hint: '关掉只做本地提交，不需要 GITLAB_TOKEN。' },
         ],
       },
@@ -578,6 +578,94 @@ window.__ModuleLoader__.load({
         }
       }
       return out
+    }
+
+    /**
+     * 把「某个下标上的项目草稿」搬到「另一个下标」上。
+     *
+     * 删除一个还没保存的新增项目时，它后面的卡片全部前移一位 —— 草稿 key 里带着
+     * 绝对下标，所以必须跟着重排，否则人会看到第 3 张卡显示第 4 张卡的值。
+     *
+     * 只搬 `copy[to*]`，不改 `from`；`from` 上不存在的键直接跳过。
+     */
+    function addProjectDraftKeys (copy, source, from, to) {
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var fields = PROJECT_SECTIONS[s].fields
+        for (var f = 0; f < fields.length; f += 1) {
+          var oldKey = projectKey(from, fields[f].path)
+          if (!hasKey(source, oldKey)) continue
+          copy[projectKey(to, fields[f].path)] = source[oldKey]
+        }
+      }
+    }
+
+    /**
+     * 新建项目时的空白记录（形状与宿主 `describeProject()` 的扁平字段一致）。
+     *
+     * 平台给 `mock`：这是唯一不需要任何凭据就能跑通收票/跑票的平台，
+     * 新人加项目先看到一条能跑通的链路，比看到 `feishu` 然后被要求填 appToken 友好。
+     */
+    function blankProjectRecord (index) {
+      var out = {}
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var fields = PROJECT_SECTIONS[s].fields
+        for (var f = 0; f < fields.length; f += 1) {
+          var field = fields[f]
+          var isPlatform = field.path.length === 2 && field.path[0] === 'match' && field.path[1] === 'platform'
+          out[field.from] = isPlatform ? 'mock' : (field.kind === 'bool' ? false : '')
+        }
+      }
+      out.name = '新项目' + (index + 1)
+      // 标记「还没进宿主」：保存时它要发整对象、删除时只丢本地、徽标要写清。
+      out.__pending = true
+      return out
+    }
+
+    /**
+     * 草稿 → 一个**完整**的项目配置对象（给新增项目用）。
+     *
+     * 为什么新增要发整对象、而改已有项目只发单字段：已有项目在宿主那边已经存在，
+     * 按深层路径改一个叶子是最小改动；新增项目在宿主那边根本不存在，只能整对象
+     * `set` 进去。
+     *
+     * 空串 / 空数组 / false 一律不写：配置里塞一堆空值会让 `validateProject`
+     * 的「可选字段」分支误判（例如 `statusValues: []` 是配置错误，不是「没填」）。
+     */
+    function buildProjectValue (record, index, draft) {
+      var value = {}
+      function put (path, raw) {
+        var node = value
+        for (var i = 0; i < path.length - 1; i += 1) {
+          if (!hasKey(node, path[i])) node[path[i]] = {}
+          node = node[path[i]]
+        }
+        node[path[path.length - 1]] = raw
+      }
+      for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
+        var fields = PROJECT_SECTIONS[s].fields
+        for (var f = 0; f < fields.length; f += 1) {
+          var field = fields[f]
+          var key = projectKey(index, field.path)
+          var raw = hasKey(draft, key) ? draft[key] : projectDraftValue(record, field)
+          var normalized = projectRawValue(field, raw)
+          if (field.kind === 'bool') {
+            if (normalized === true) put(field.path, true)
+            continue
+          }
+          if (field.kind === 'list') {
+            if (normalized.length > 0) put(field.path, normalized)
+            continue
+          }
+          var text = String(normalized === undefined || normalized === null ? '' : normalized).trim()
+          if (text.length > 0) put(field.path, text)
+        }
+      }
+      // 平台与仓库路径是必填：即使人还没填，也要把键位留出来，
+      // 这样宿主报错时指向的是 `projects[n].repo.path` 而不是「缺字段」。
+      if (!hasKey(value, 'name')) value.name = ''
+      if (!hasKey(value, 'match')) value.match = { platform: 'mock' }
+      if (!hasKey(value.repo, 'path')) value.repo.path = ''
+      return value
     }
 
     /** 看起来像不像一个路径/命令（只用来给软提示，不拦保存）。 */
@@ -1497,6 +1585,7 @@ window.__ModuleLoader__.load({
       var changedCount = countProjectChanges(props)
 
       var title = record && record.name ? record.name : ('项目 #' + (index + 1))
+      var pending = props.pending === true
       var open = props.open !== false
       var hiddenCount = hiddenProjectFieldCount(record, draft, issues, index, props.showAdvanced)
 
@@ -1521,6 +1610,9 @@ window.__ModuleLoader__.load({
           h('span', { className: 'tp-caret' }, open ? '▾' : '▸'),
           h('strong', null, title)),
         h('span', { className: 'tp-badge' }, record && record.platform ? record.platform : '未配置平台'),
+        // 新增但还没保存的项目要显眼地说清楚：它现在只活在面板里，
+        // 点一次「保存」才会真正写进配置。
+        pending ? h('span', { className: 'tp-badge tp-on' }, '未保存（点顶部保存才写进配置）') : null,
         changedCount > 0 ? h('span', { className: 'tp-badge tp-on' }, '已改 ' + changedCount + ' 项') : null,
         errorCount > 0 ? h('span', { className: 'tp-badge tp-bad' }, errorCount + ' 项待修') : null,
         // 说「未显示」而不是「高级」：藏起来的原因不止一种（不给这个平台用的组、
@@ -1528,13 +1620,15 @@ window.__ModuleLoader__.load({
         hiddenCount > 0 && open ? h('span', { className: 'tp-badge' }, hiddenCount + ' 项未显示') : null,
         h('span', { className: 'tp-spacer' }),
         record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null,
-        // 删除是**结构性**动作（会 splice 掉数组里这一项，后面项目的下标跟着前移），
-        // 所以有未保存的字段改动时禁用 —— 否则改了一半的字段会跟着换到别的项目上。
+        // 删除已保存的项目是**结构性**动作（会 splice 掉数组里这一项，后面项目的
+        // 下标跟着前移），所以有未保存的字段改动时禁用 —— 否则改了一半的字段会跟着
+        // 换到别的项目上。删「还没保存的新增」不吃这层限制：它本来就不在宿主里，
+        // 删掉只是把这张卡从面板上撤掉，谁的下标都不动。
         h('button', {
           type: 'button',
           className: 'tp-btn tp-sm tp-danger',
-          disabled: disabled || changedCount > 0,
-          title: changedCount > 0
+          disabled: disabled || (!pending && changedCount > 0),
+          title: !pending && changedCount > 0
             ? '这个项目还有未保存的改动；先保存或放弃，再删它。'
             : '从项目清单里删掉这一项（不可撤销）',
           onClick: function () {
@@ -1543,7 +1637,7 @@ window.__ModuleLoader__.load({
             }
             props.onRemove(index)
           },
-        }, '删除'))
+        }, pending ? '撤掉' : '删除'))
 
       var sections = PROJECT_SECTIONS.filter(function (section) {
         return sectionVisible(section, record, draft, issues, index, props.showAdvanced)
@@ -1716,14 +1810,17 @@ window.__ModuleLoader__.load({
      * 写用的是设置通道，谁也不会把 appToken 明文带到浏览器里。
      */
     function ProjectListCard (props) {
+      // `list` 的元素是 `{ record, pending }`：pending=true 表示「面板上新增、
+      // 还没保存进宿主」。用同一个组件渲染两者，人看不出两套行为。
       var list = props.list
       var draft = props.draft
-
+      var pendingCount = 0
+      for (var pi = 0; pi < list.length; pi += 1) {
+        if (list[pi].pending === true) pendingCount += 1
+      }
       var body
       if (props.busy) {
         body = h('p', { className: 'tp-note' }, '正在读取项目清单…')
-      } else if (props.error.length > 0) {
-        body = h('p', { className: 'tp-err' }, props.error)
       } else if (list.length === 0) {
         body = h('div', { className: 'tp-empty' },
           h('p', null, '还没有配置任何项目。'),
@@ -1737,15 +1834,16 @@ window.__ModuleLoader__.load({
             h('code', null, 'config.projects'),
             '，改完重启 DSH 生效。'))
       } else {
-        body = h('div', null, list.map(function (record, index) {
+        body = h('div', null, list.map(function (item, index) {
           // 分支候选按 index 对（宿主的 `branches()` 与 `projects()` 用的是同一次
           // `config.projects` 遍历，index 一定对得上；按 repoPath 对会在两个项目
-          // 指向同一个检出时串味）。
-          var entry = props.branchList && props.branchList[index] ? props.branchList[index] : null
+          // 指向同一个检出时串味）。pending 的项目不在宿主清单里，取不到候选。
+          var entry = !item.pending && props.branchList && props.branchList[index] ? props.branchList[index] : null
           return h(ProjectCard, {
             key: 'p' + index,
             index: index,
-            record: record,
+            record: item.record,
+            pending: item.pending === true,
             draft: draft,
             issues: props.issues,
             disabled: props.disabled,
@@ -1768,7 +1866,8 @@ window.__ModuleLoader__.load({
       // 一行挤了半屏宽，右半边还折行 —— 这是「乱」的典型来源。
       return h('section', { className: 'tp-card' },
         h('h3', null, '项目清单',
-          list.length > 0 ? h('span', { className: 'tp-badge' }, list.length + ' 个项目') : null),
+          list.length > 0 ? h('span', { className: 'tp-badge' }, list.length + ' 个项目') : null,
+          pendingCount > 0 ? h('span', { className: 'tp-badge tp-on' }, pendingCount + ' 个未保存') : null),
         h('p', { className: 'tp-note' },
           '每个项目 = 一张工单表 + 一个仓库的绑定。点项目名可以收起它，卡内每个分区',
           '也能单独收起；改哪项就只写哪项（深层路径），不会整块覆盖。'),
@@ -1784,16 +1883,15 @@ window.__ModuleLoader__.load({
             }),
             '显示全部字段'),
           h('span', { className: 'tp-spacer' }),
-          // 「添加项目」是结构性动作：追加到数组末尾。有未保存的字段改动时禁用，
-          // 否则追加会让下标对不上（新项目排在最后，但改到一半的字段还没落盘）。
+          // 「添加项目」是纯本地动作：往面板上垫一张空卡片，点顶部「保存」才真正写进
+          // 配置。因此**不再因为 dirty 而禁用** —— 上一版禁用是怕「追加进数组」把下标
+          // 搞乱，现在追加根本不碰数组，垫几张都行。
           // 不用 tp-primary：全页只留一颗主按钮（顶部「保存」），新增是次级动作。
           h('button', {
             type: 'button',
             className: 'tp-btn',
-            disabled: props.disabled || props.busy || props.dirty,
-            title: props.dirty
-              ? '先保存或放弃当前改动，再添加项目。'
-              : '往项目清单末尾加一个新项目',
+            disabled: props.disabled || props.busy,
+            title: '在面板上加一个空项目（填完点顶部「保存」才写进配置）',
             onClick: props.onAdd,
           }, '+ 添加项目'),
           h('button', {
@@ -1803,6 +1901,9 @@ window.__ModuleLoader__.load({
             onClick: props.onReload,
           }, props.busy ? '读取中…' : '重新读取')),
         body,
+        // 错误单独一行放在清单下面，不替换 body：上一版一旦出错就把所有卡片
+        // 换成一行红字，人连自己刚填的东西都看不见了。
+        props.error && props.error.length > 0 ? h('p', { className: 'tp-err' }, props.error) : null,
         props.message.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, props.message) : null,
         props.saveError ? h('p', { className: 'tp-err' }, props.saveError) : null)
     }
@@ -1849,6 +1950,14 @@ window.__ModuleLoader__.load({
       var [projError, setProjError] = useState('')
       var [projDraft, setProjDraft] = useState({})
       var [projInitial, setProjInitial] = useState({})
+      // 「点添加项目」加出来的、还没进宿主配置的条目。
+      //
+      // 为什么不在点下去的那一刻就 mutate：宿主对整份配置做校验，一条
+      // `repo.path` 是空串就让整笔 mutate 回滚，于是「先加空壳、填完再存」
+      // 这条路直接走不通（旧版就是这样，报 `projects[2].repo.path 必须是
+      // 非空字符串`）。改成先进本地草稿、随「保存」一起提交：用户的动作
+      // 顺序不变，但不会在半成品状态下撞校验。
+      var [projPending, setProjPending] = useState([])
 
       // 分支候选：来自宿主 `ticketPipeline.branches()`（每个项目一份）。
       // 刻意与项目清单分开存 —— 分支取不到是常态（repo.path 还没填、路径不是
@@ -1950,6 +2059,16 @@ window.__ModuleLoader__.load({
 
       // 项目清单走 `ticketPipeline.projects()`：宿主的只读投影（appToken 已打码）。
       // 拿不到就当空数组 —— 界面照样做出来，只是提示「没有项目」，不挡配置编辑。
+      // 面板上真正渲染的清单 = 宿主已有的 + 本地还没保存的新增。
+      // 两者用一个 `pending` 标记区分：它决定保存时发「单字段深层路径」还是
+      // 「整对象」、删除时发 `unset` 还是只丢本地。
+      var renderedProjects = useMemo(function () {
+        var out = []
+        for (var i = 0; i < projList.length; i += 1) out.push({ record: projList[i], pending: false })
+        for (var j = 0; j < projPending.length; j += 1) out.push({ record: projPending[j], pending: true })
+        return out
+      }, [projList, projPending])
+
       var loadProjects = useCallback(function (target) {
         var ns = target !== undefined ? target : getNamespace('ticketPipeline')
         setProjError('')
@@ -2076,8 +2195,10 @@ window.__ModuleLoader__.load({
       }, [leaves, draft])
 
       var localProjectIssues = useMemo(function () {
-        return allProjectIssues(projList, projDraft)
-      }, [projList, projDraft])
+        // 校验要覆盖「还没保存的新增」：否则一张空的待保存卡片不会报错，
+        // 保存按钮也就不会拦，人点下去才收到宿主的整笔拒绝 —— 又回到原来的坑。
+        return allProjectIssues(renderedProjects.map(function (one) { return one.record }), projDraft)
+      }, [renderedProjects, projDraft])
 
       // 项目里 error 级的条数：只用来给「项目」页签挂个红点，不拦保存
       // （拦保存统一走 `issues.errorCount`）。
@@ -2111,7 +2232,12 @@ window.__ModuleLoader__.load({
           var key = keyOf(leaves[i])
           if (!sameDraft(draft[key], initialDraft[key])) count += 1
         }
-        for (var p = 0; p < projList.length; p += 1) {
+        // 逐个**渲染出来的**项目数改动：包括还没保存的新增项目
+        // （它们不在 projList 里，漏掉的话「未保存 N 项」不涨、保存按钮是灰的）。
+        // 新增项目整张卡都是新的，按「1 个项目」计数，而不是按 21 个字段计数 ——
+        // 否则刚点一下「+ 添加项目」就会显示「未保存 21 项」，看着像出错了。
+        for (var p = 0; p < renderedProjects.length; p += 1) {
+          if (renderedProjects[p].pending === true) { count += 1; continue }
           for (var s = 0; s < PROJECT_SECTIONS.length; s += 1) {
             var fields = PROJECT_SECTIONS[s].fields
             for (var f = 0; f < fields.length; f += 1) {
@@ -2121,7 +2247,7 @@ window.__ModuleLoader__.load({
           }
         }
         return count
-      }, [leaves, draft, initialDraft, projList, projDraft, projInitial])
+      }, [leaves, draft, initialDraft, renderedProjects, projDraft, projInitial])
 
       /**
        * 清掉服务端挂在某个字段上的旧抱怨。
@@ -2153,6 +2279,8 @@ window.__ModuleLoader__.load({
       function onReset () {
         setDraft(Object.assign({}, initialDraft))
         setProjDraft(Object.assign({}, projInitial))
+        // 「放弃改动」连「还没保存的新增」一起放弃：否则点完像是什么都没发生。
+        setProjPending([])
         setServerIssues({})
         setSaveMessage('')
         setSaveError('')
@@ -2274,6 +2402,17 @@ window.__ModuleLoader__.load({
             }
           }
         }
+        // 新增项目整对象追加在末尾（宿主 applyPathOp 允许 index === length 时 set 一项）。
+        // 整对象而不是逐字段：它在宿主那边还不存在，逐字段 set 会先造出一个
+        // 缺 `repo.path` 的半成品，那一笔就会被校验整笔拒掉 —— 正是旧版的老毛病。
+        for (var q = 0; q < projPending.length; q += 1) {
+          var index = projList.length + q
+          ops.push({
+            op: 'set',
+            path: ['projects', String(index)],
+            value: buildProjectValue(projPending[q], index, projDraft),
+          })
+        }
         return ops
       }
 
@@ -2343,6 +2482,9 @@ window.__ModuleLoader__.load({
           }
           setServerIssues({})
           setSaveMessage('已保存')
+          // 新增的项目已经落进宿主，本地那份「待保存」清单必须清掉，
+          // 否则 `loadProjects()` 回来的真项目会和它们叠成两份卡片。
+          setProjPending([])
           return loadSettings().then(function () { return loadProjects() })
         }, function (error) {
           setSaving(false)
@@ -2376,46 +2518,76 @@ window.__ModuleLoader__.load({
       /**
        * 往项目清单末尾追加一个项目。
        *
-       * 走的是 `settings.mutate` 的 `['projects', '<len>']` 追加语义（宿主的
-       * applyPathOp 允许 index === length 时 set 一项），所以**不需要**新的 Remote
-       * 方法，也不会整块替换数组 —— 已有的项目一个字节都不动。
+       * **只进本地草稿，不发 mutate**。
+       *
+       * 旧版在这里直接发 `{op:'set', path:['projects', len], value:{…repo:{path:''}}}`
+       * —— 宿主对整份配置做校验，`repo.path` 是空串就报
+       * `projects[2].repo.path 必须是非空字符串（本地 git 检出根目录）` 并整笔回滚，
+       * 于是「先加一个、再慢慢填」这条路根本走不通（用户就是这么撞上的）。
+       *
+       * 现在改成：点一下先在面板上多出一张空卡片，填完点顶部「保存」时，
+       * 新增项目跟其它改动一起作为**一笔** mutate 提交。好处是
+       * ①半成品不会去撞校验；②新增与其它改动同 revision、要么全成要么全不成。
        */
       function onAddProject () {
-        var ns = getNamespace('settings')
-        var view = findNamespace(snapshot)
-        if (!ns || !view) return
-        var next = projList.length
-        setProjBusy(true)
-        setProjError('')
-        ns.mutate(NAMESPACE, [{
-          op: 'set',
-          path: ['projects', String(next)],
-          value: {
-            name: '新项目' + (next + 1),
-            description: '',
-            match: { platform: 'mock' },
-            repo: { path: '' },
-          },
-        }], view.revision).then(function (response) {
-          setProjBusy(false)
-          if (!response || !response.ok) {
-            setProjError('添加项目失败：' + ((response && response.error && response.error.message) || '未知错误'))
-            return
-          }
-          loadProjects()
-        }, function (error) {
-          setProjBusy(false)
-          setProjError('添加项目失败：' + (error && error.message ? error.message : String(error)))
+        var index = projList.length + projPending.length
+        var record = blankProjectRecord(index)
+        setProjPending(function (previous) { return previous.concat([record]) })
+        // 新增项目的字段草稿挂到 projDraft 的对应下标上，和已有项目走同一套
+        // 编辑/撤销/校验路径（ProjectCard 只认绝对下标，不区分新旧）。
+        setProjDraft(function (previous) {
+          var copy = Object.assign({}, previous)
+          var seeded = projectDrafts(record, index)
+          var keys = Object.keys(seeded)
+          for (var i = 0; i < keys.length; i += 1) copy[keys[i]] = seeded[keys[i]]
+          return copy
         })
+        setProjError('')
+        setSaveMessage('')
+        setSaveError('')
       }
 
       /**
        * 删掉一个项目。
        *
-       * `['projects', '<i>']` + `unset` 在宿主侧是 `splice(i, 1)`：删掉后下标会
-       * 前移，所以按钮在「有未保存字段改动」时禁用（改了一半的字段会跟到别的项目上）。
+       * 两种情形分开处理：
+       * - 删**已保存**的项目（`index < projList.length`）：发 `unset`，宿主侧是
+       *   `splice(i, 1)`，删掉后下标会前移，所以按钮在「有未保存字段改动」时禁用
+       *   （改了一半的字段会跟到别的项目上）。
+       * - 删**还没保存的新增**（`index >= projList.length`）：它本来就不在宿主里，
+       *   只需要从 `projPending` 里摘掉、顺手清掉那一档的字段草稿，**不发 mutate**。
        */
       function onRemoveProject (index) {
+        if (index >= projList.length) {
+          var offset = index - projList.length
+          setProjPending(function (previous) {
+            if (offset < 0 || offset >= previous.length) return previous
+            var copy = previous.slice()
+            copy.splice(offset, 1)
+            return copy
+          })
+          // 草稿是按绝对下标存的，删掉这一张之后，后面 pending 卡片的下标会前移，
+          // 所以把它们整段重排一遍（已保存项目的键原样不动）。
+          setProjDraft(function (previous) {
+            var copy = {}
+            // ① 已保存的项目：键完全不变，原样搬过去。
+            for (var i = 0; i < projList.length; i += 1) {
+              addProjectDraftKeys(copy, previous, i, i)
+            }
+            // ② 剩下的 pending：旧下标 → 新下标，逐个字段搬。
+            var kept = projPending.slice()
+            kept.splice(offset >= 0 ? offset : 0, 1)
+            for (var q = 0; q < kept.length; q += 1) {
+              var from = projList.length + (q < offset ? q : q + 1)
+              addProjectDraftKeys(copy, previous, from, projList.length + q)
+            }
+            return copy
+          })
+          setProjError('')
+          setSaveMessage('')
+          setSaveError('')
+          return
+        }
         var ns = getNamespace('settings')
         var view = findNamespace(snapshot)
         if (!ns || !view) return
@@ -2606,7 +2778,7 @@ window.__ModuleLoader__.load({
       var panels = {
         projects: function () {
           return h(ProjectListCard, {
-            list: projList,
+            list: renderedProjects,
             draft: projDraft,
             issues: issues.byKey,
             busy: projBusy,

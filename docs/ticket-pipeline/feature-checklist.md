@@ -2,7 +2,12 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「appToken 贴整条表格链接」的代码与本文同一次提交，上一轮已提交代码为 `789f6b2`（`6fb9f08` 是配置页页签式改版、`789f6b2` 只改文档）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-09，**`appToken` 贴整条表格链接真的够了**（`parseBitableUrl` 挪进 `src/contracts/types.js`，
+> 最近一次更新：2026-11-09，**设置面板「添加项目」失败修好**（原来点「+ 添加项目」会立刻发一笔
+> `settings.mutate`，而新项目带空的 `repo.path`，宿主对整份配置一次性校验 ⇒ 必然被
+> `projects[n].repo.path 必须是非空字符串` 整笔拒掉，用户永远加不进去。现在改成「垫一张空卡片，
+> 填完点顶部保存才与其它改动一起作为一笔提交」，见 §1.18），`client-smoke` 113 → **123 条**；
+> 顺手把 `repo.remote` 的面板标签从「远端名」改成「GitLab 仓库地址」（它要的是仓库 URL 不是 git 远端名）；
+> 此前同日**`appToken` 贴整条表格链接真的够了**（`parseBitableUrl` 挪进 `src/contracts/types.js`，
 > 配置校验与飞书适配器共用：从 `?table=` 啃出 `table_id`、`?view=` 啃出 `view_id`，显式 `tableId` 仍优先；
 > 此前只有适配器认得这个写法，用户在配置里只贴一条链接会被 `validateConfig` 拦在启动前），
 > `dev-run` **378/378**、`feishu-checks` 58 → **59** 条；此前同日「配置页改成页签式、视觉对齐宿主设置页」
@@ -550,22 +555,72 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 ---
 
+### 1.18 「添加项目」失败：面板把半成品当成要立刻落库的写操作（2026-11-09）
+
+**要解决什么**：用户在设置页点「+ 添加项目」，红字报
+
+```
+添加项目失败: invalid config: - projects[2].repo.path 必须是非空字符串（本地 git 检出根目录）(at projects.2.repo.path)
+```
+
+**根因**（两个事实叠在一起）：
+
+1. `lib/client.js` 的 `onAddProject()` 以前**点下去就发 mutate**，新项目带 `repo: { path: '' }`
+   （空壳，等用户填）：
+   `value: { name: '新项目' + (next + 1), description: '', match: { platform: 'mock' }, repo: { path: '' } }`。
+2. 宿主 `src/core/config.js:526-527` 对**整份配置**做 `~standard.validate`，`repo.path` 空就
+   `fail('repo.path', '必须是非空字符串（本地 git 检出根目录）')`；**任一 issue 整笔回滚**。
+
+⇒ 「先加个空壳再慢慢填」这条路从来就走不通，用户只能在外部手改 `cordis.patch.yml`。
+`invalid config: - <path> <message> (at <path>)` 这个前缀是**宿主 loader** 拼的（插件里没有这个字面量）。
+
+**做法**（选「垫卡片 + 一次保存」，否决「给个占位路径」和「让宿主放宽校验」）：
+
+| 环 | 落点 |
+| --- | --- |
+| 加项目变纯本地 | `onAddProject()` 不再发 mutate：`blankProjectRecord(index)` 造一条缺省 `match.platform: 'mock'`（唯一免凭据平台）的记录塞进新状态 `projPending`，并把 `projectDrafts(record, index)` 的键铺进 `projDraft` —— 新卡片与真卡片共用同一套编辑/撤销/校验路径（绝对下标） |
+| 保存时一起提交 | `collectOps()` 末尾追加 pending 循环：`{ op:'set', path:['projects', String(projList.length + q)], value: buildProjectValue(...) }`，宿主 `applyPathOp` 允许 `index === length` 时 set 一项。**新增与其它改动同 revision，要么全成要么全不成** |
+| 组装完整对象 | `buildProjectValue(record, index, draft)` 按 `PROJECT_SECTIONS` 铺平；空串/空数组/false **一律不写**（写 `statusValues: []` 会被 `validateProject` 判错）；末尾兜底 `name` / `match.platform` / `repo.path` 三键 |
+| 未填完不许保存 | `localProjectIssues` 改吃 `renderedProjects`（真项目 + pending），空壳参与校验 ⇒ 顶部「保存」灰掉并提示「N 项待修」 |
+| 撤掉 vs 删除 | `onRemoveProject(index)` 双分支：`index >= projList.length` 只从 `projPending` splice（按钮文案「撤掉」，**不发 mutate**），并用 `addProjectDraftKeys` 把剩余 pending 的草稿键从旧下标搬到新下标；已保存的项目仍立即 `unset`（宿主 `splice`，按钮文案「删除」+ 确认框） |
+| 成功/放弃时清干净 | `onSave()` 成功后 `setProjPending([])`（否则 `loadProjects()` 回来的真项目会和 pending 叠成两份卡片）；`onReset()` 也清 |
+| 计数不炸 | `changedCount` 把 pending 项目**整张按 1 计** —— 否则刚点一下「+ 添加项目」就显示「未保存 21 项」 |
+
+**顺手修的两个体验坑**：
+
+- **出错不再吃掉整个清单**：`ProjectListCard` 原来 `error.length > 0` 时把 `body` 整个换成一行红字，
+  两张项目卡片凭空消失；现在红字单独一行留在清单下方。
+- **有未保存改动不再锁死「+ 添加项目」**：按钮 `disabled` 去掉了 `props.dirty`（垫卡片本身就会让
+  `projectDirty` 为真，留着等于只能加一个），标题改成「在面板上加一个空项目（填完点顶部「保存」才写进配置）」。
+- 顺带把 `repo.remote` 的面板标签从「远端名 / 缺省 origin」改成「**GitLab 仓库地址**」——
+  它真正要的是仓库 URL（`resolveGitlab` 用它 `parseGitRemote` 推 `baseUrl` + `projectId`），
+  `src/core/config.js` 的 descriptor 同步改；这两个标签此前一直误导用户去填 `origin`。
+
+**自测**：`client-smoke` 113 → **123 条**（新增「按钮不被 dirty 锁死 / 点了不写宿主 / 多出一张卡 /
+空壳时保存被拦住 / 填完保存后 mutate 里出现 `['projects','1']` 完整对象且 `repo.path` 非空 /
+保存后「未保存」徽标消失」）。
+调试时踩到两个选择器坑：卡片要用精确正则 `/^tp-proj( tp-collapsed)?$/`（`indexOf('tp-proj')` 会把
+`tp-proj-head`/`tp-proj-body`/`tp-proj-toggle` 一起捞进来）；找「仓库」分区不能用 `indexOf('仓库')`
+（「基本」分区的 hint 里也有「仓库」二字），改成认 `仓库仓库路径` 这一段。
+
+---
+
 ## 2. 代码清单
 
-`src/` 共 **43 个 .js / 16 240 行**；`scripts/` 共 9 个 .mjs / **10 349 行**（`dev-run.mjs` **3 276 行**）；`lib/client.js` **2 972 行**（浏览器端设置面板）。
+`src/` 共 **43 个 .js / 16 297 行**；`scripts/` 共 9 个 .mjs / **10 461 行**（`dev-run.mjs` **3 276 行**）；`lib/client.js` **3 144 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 279 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry`**）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 4 538 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`**）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 7 610 | 见下表 |
+| `src/contracts/` | 1 313 | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl`**）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 4 543 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`**）、`config.js`（配置校验 + 描述符 + `projects` 子树）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 7 628 | 见下表 |
 | `src/tools/` | 1 296 | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（关键节点时间线渲染 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
 | `src/remote/` | 269 | `descriptors.js`（4 个 Remote 方法 / 87 行）、`host.js`（宿主 Remote 通道 / 184 行） |
 | 根 | 1 248 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `source-feishu/` | 1 384 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单；**`writeResult` 回填三列**（`PUT /records/:record_id`，字段缺失返 `{written:false}` 不抛） |
+| `source-feishu/` | 1 402 | **真实可用** | 飞书多维表格 API；水位、状态值可配、recordIds 收窄、截图三形态、`allowedImageHosts` 白名单；**`appToken` 可写整条表格 URL**（`parseBitableUrl` 啃 `?table=` / `?view=`，显式 `tableId` 优先）；**`writeResult` 回填三列**（`PUT /records/:record_id`，字段缺失返 `{written:false}` 不抛） |
 | `source-wps/` | 1 660 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet`；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
 | `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
 | `source-mock/` | 329 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
@@ -866,10 +921,11 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
-| 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **113** 条断言全过（页签式布局见 §1.17） |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **123** 条断言全过（页签式布局见 §1.17，「添加项目」见 §1.18） |
 | 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 378/378）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
 | appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **59** 条、`dev-run` 加 2 条配置校验断言（**378/378**） |
+| 面板「添加项目」修好（新，2026-11-09） | ✅ 加项目改成「垫空卡片 + 一次保存提交」：不再拿空 `repo.path` 撞宿主整份校验（见 §1.18）；顺手修「出错吃掉整个清单」与「有未保存改动就锁死加项目」；`repo.remote` 面板标签改「GitLab 仓库地址」；`client-smoke` 113 → **123** 条断言全过 |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |
 | QQ 邮箱真实发信 | ✅ `accepted=true`，traceId `<mw319ltk.47861f8c479221d3@qq.com>` |

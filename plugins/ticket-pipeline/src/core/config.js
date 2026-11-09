@@ -974,7 +974,7 @@ function buildProjectsDescriptor () {
 
   const repoNode = projectObject({
     path: projectLeaf('string', '仓库路径', '本地 git 检出根目录，绝对路径或相对 DSH 工作目录'),
-    remote: projectLeaf('string', '远端名', '缺省 origin'),
+    remote: projectLeaf('string', 'GitLab 仓库地址', '仓库 URL，用于推导 baseUrl 与 projectId；不是 git 远端名'),
     baseBranch: projectLeaf('string', '基准分支', '从哪条分支切出工作分支'),
     targetBranch: projectLeaf('string', '目标分支', 'MR 的目标分支'),
     gitlab: gitlabNode,

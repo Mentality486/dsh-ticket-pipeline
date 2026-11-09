@@ -1151,9 +1151,20 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
   （破坏性，要二次确认）。
 - **布尔项一律 `role="switch"` 开关**，不落回原生 checkbox；宿主 `practices.md` **禁止**加载
   `dsh-client-ui-primitives` 之类客户端包当模块，所以控件是自写的、抄宿主 markup/CSS/行为。
-- **项目清单可增删**：「+ 添加项目」→ `['projects','<len>']` + `set` 追加；卡片头「删除」→
-  `['projects','<i>']` + `unset`（宿主 `applyPathOp` 对数组是 `splice(i,1)`）。复用现有
-  `settings.mutate` 通道，**不新增 Remote 方法**；有未保存字段改动时禁用，避免删完下标错位。
+- **项目清单可增删**：卡片头「删除」→ `['projects','<i>']` + `unset`（宿主 `applyPathOp` 对数组是
+  `splice(i,1)`），立即生效。「+ 添加项目」**不发 mutate** —— 只往本地状态 `projPending` 塞一条
+  `blankProjectRecord()`（缺省 `match.platform: 'mock'`，唯一免凭据平台），在面板上垫一张标「未保存」
+  的空卡片；点顶部「保存」时由 `collectOps()` 末尾的 pending 循环发
+  `{ op:'set', path:['projects', String(projList.length + q)], value: buildProjectValue(...) }`
+  （宿主 `applyPathOp` 允许 `index === length` 时 set 一项）。
+  理由：宿主对**整份配置**做 `~standard.validate`，任一 issue 整笔回滚；新项目的 `repo.path` 必然
+  先是空的，直接提交必被 `projects[n].repo.path 必须是非空字符串` 拒掉（见功能清单 §1.18）。
+  这样新增与其它改动同属一个 revision，要么全成要么全不成。复用现有 `settings.mutate` 通道，
+  **不新增 Remote 方法**；已保存项目的删除在有未保存字段改动时仍禁用，避免删完下标错位。
+  `buildProjectValue` 只写非空值（空串/空数组/false 一律不写，否则 `statusValues: []` 会被判配置错），
+  末尾兜底 `name` / `match.platform` / `repo.path` 三键。`renderedProjects` = `projList` + `projPending`
+  的统一视图，编辑/撤销/校验/计数全走它；`onRemoveProject` 对 pending 只 splice 并搬移草稿键
+  （`addProjectDraftKeys`），不发 mutate；保存成功与「放弃改动」都清 `projPending`。
 
 `projects` 子树不再进普通字段渲染：`collectLeaves` 直接跳过它（`path[0] === 'projects'`），
 否则它是 `type:'array'` 的结构化数组，会被 `draftValueOf` 拼成 `[object Object], [object Object]`。

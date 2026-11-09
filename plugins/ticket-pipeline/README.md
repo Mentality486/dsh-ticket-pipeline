@@ -80,8 +80,11 @@ lib/
   `--dsw-alias-settings-card-fill` / `-stroke` 且**不带阴影** —— 亮色主题下 `bg-layer-1/2/3` 全是 `#fff`，
   白叠白再叠阴影就是「一堆框糊在一起」。字段是「加粗字段名 / 输入框 / 浅灰说明」的上下三行
   （不是左边一长串文字 + 右边输入框）；布尔项是 `role="switch"` 开关；全页只一颗主按钮（顶部「保存」），
-  凭据值攒着随它一起提交，行内只剩「清除」（要二次确认）。项目清单右上角「+ 添加项目」、卡片头「删除」
-  都走 `settings.mutate` 的数组语义（追加 / `splice`），不新增 Remote 方法。
+  凭据值攒着随它一起提交，行内只剩「清除」（要二次确认）。项目清单右上角「+ 添加项目」
+  只在面板上垫一张空卡片（标「未保存」），填完点顶部「保存」才与其它改动**一起**作为一笔
+  `settings.mutate` 提交 —— 原因：宿主对整份配置一次性校验，带空 `repo.path` 的半成品
+  直接提交必然被 `projects[n].repo.path 必须是非空字符串` 整笔拒掉。没保存的卡片「撤掉」只从
+  面板拿掉；已保存的项目「删除」仍立即 `unset`（宿主 `splice`）。两种情况都不新增 Remote 方法。
   控件是自写的 —— 宿主 `practices.md` 禁止把 `dsh-client-ui-primitives` 之类客户端包当模块加载。
 
 表单不自带渲染器：`src/core/config.js` 在 `Config` 上挂了一棵手写的 schema descriptor
@@ -291,7 +294,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 （platform 写错宿主会静默跳过整个 bundle），以及 **`projects` 子树的 `meta.volatile`**：
 descriptor 叶子 **33 个 / 7 组**、schema 信封 **71 节点 / 33 叶子**、Remote **4 个方法**
 （`doctor` / `config` / `projects` / `branches`）、`projects` 可写 **25 字段**、面板项目字段 **21 项**与宿主对得上。
-（`client-smoke` 真跑一遍 bundle，实跑 **113 条**断言。）
+（`client-smoke` 真跑一遍 bundle，实跑 **123 条**断言。）
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

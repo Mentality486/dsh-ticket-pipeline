@@ -838,6 +838,69 @@ async function main () {
     findAll(tree, (node) => typeof node.props.className === 'string' &&
       node.props.className.indexOf('tp-invalid') >= 0).length >= 1)
 
+  // ⑦ 「+ 添加项目」必须是**纯本地**动作。
+  //
+  // 旧版在这里直接发 mutate，新项目带 `repo: { path: '' }`，宿主对整份配置做校验，
+  // 于是每一笔都被 `projects[2].repo.path 必须是非空字符串` 整笔回滚 —— 人根本没法
+  // 「先加一个、再慢慢填」。这条断言就是钉死那个回归：点下去不许碰宿主。
+  resetRender()
+  tree = await render(Panel, { view: 'page' })
+  const mutateBeforeAdd = ctx.calls.mutate.length
+  const addButton = findButton(tree, '+ 添加项目')
+  check('「+ 添加项目」按钮可点（不因为 dirty 被锁死）',
+    addButton !== undefined && addButton.props.disabled === false,
+    addButton === undefined ? '没找到' : String(addButton.props.disabled))
+  addButton.props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  check('点「+ 添加项目」不写宿主（本地垫一张卡）',
+    ctx.calls.mutate.length === mutateBeforeAdd, String(ctx.calls.mutate.length))
+  check('新增的项目标着「未保存」', textOf(tree).indexOf('未保存') >= 0, textOf(tree).slice(0, 240))
+  check('清单里多出一张卡片', findProjectToggles(tree).length === 2,
+    String(findProjectToggles(tree).length))
+  // 半成品不许发出去：repo.path 还空着时，本地校验就该把保存按住，
+  // 而不是让人点下去再看宿主把它整笔拒掉。
+  const saveWithBlank = findButton(tree, '保存', 'tp-primary')
+  check('新增项目还没填必填项时保存被拦住',
+    saveWithBlank !== undefined && saveWithBlank.props.disabled === true,
+    saveWithBlank === undefined ? '没找到' : String(saveWithBlank.props.disabled))
+
+  // 把新卡片的仓库路径填上，再保存 → 一整笔 set(['projects','1'], 完整对象)。
+  const cards = findAll(tree, (node) => node.type === 'div' &&
+    /^tp-proj( tp-collapsed)?$/.test(String(node.props.className || '')))
+  // 找新卡片「仓库」那一组：组的标题文字必须以「仓库」开头
+  // （不能用 indexOf ——「基本」组的提示里也出现「仓库」两个字，会选错组）。
+  const groupsOfCard = cards.length >= 2
+    ? findAll(cards[1], (node) => node.type === 'div' &&
+      typeof node.props.className === 'string' && node.props.className.indexOf('tp-group') >= 0)
+    : []
+  const newRepoSection = groupsOfCard.find((node) => textOf(node).indexOf('仓库仓库路径') >= 0)
+  const newRepoInput = newRepoSection === undefined
+    ? undefined
+    : findInput(newRepoSection, (node) => node.type === 'input' && node.props.value === '')
+  check('找到新增卡片的仓库路径输入框', newRepoInput !== undefined,
+    JSON.stringify(findAll(newRepoSection, (node) => node.type === 'input')
+      .map((node) => [node.props.type, node.props.value])))
+  if (newRepoInput !== undefined) {
+    newRepoInput.props.onChange({ target: { value: 'D:/WorkSpace/.repos/new-proj' } })
+    tree = await render(Panel, { view: 'page' })
+    findButton(tree, '保存', 'tp-primary').props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    const addCall = ctx.calls.mutate[ctx.calls.mutate.length - 1]
+    const addOp = addCall === undefined
+      ? undefined
+      : addCall.ops.find((item) => JSON.stringify(item.path) === JSON.stringify(['projects', '1']))
+    check('新增项目保存成一条整对象 op',
+      addOp !== undefined, JSON.stringify(addCall && addCall.ops))
+    check('新增项目发的是完整对象（不是逐字段半成品）',
+      addOp !== undefined && addOp.value !== null && typeof addOp.value === 'object' &&
+      addOp.value.repo !== undefined && addOp.value.repo.path === 'D:/WorkSpace/.repos/new-proj',
+      JSON.stringify(addOp && addOp.value))
+    check('新增项目带上了必填的 match.platform',
+      addOp !== undefined && addOp.value.match !== undefined && typeof addOp.value.match.platform === 'string',
+      JSON.stringify(addOp && addOp.value && addOp.value.match))
+    check('保存成功后「未保存」徽标消失', textOf(tree).indexOf('未保存') < 0, textOf(tree).slice(0, 240))
+  }
+
   // ⑥ summary 视图只给一句话，不渲染整页。
   resetRender()
   tree = await render(Panel, { view: 'summary' })
