@@ -1,12 +1,12 @@
-# 飞书工单源 · 多维表格 + 电子表格双支持（设计与排期）
+# 飞书工单源 · 多维表格 + 电子表格双支持（设计与实施记录）
 
-> 状态：**设计已定，待实施**（2026-11-06）
+> 状态：**已实施**（设计 2026-11-06，实施 2026-11-09）
 > 需求来源：用户 2026-11-06 指令「能否都支持 由插件判断用户使用的是多维表格还是电子表格选择特定的工单」
 > 已确认的两个前提（用户拍板）：
 > - **身份策略 = B（行号 / 序号）** —— 电子表格没有 `record_id`，只能自造行身份。
-> - **本轮范围 = 先出设计 + 排期**，不写实现代码。
+> - **本轮范围 = 先出设计 + 排期**（当时）；2026-11-09 已按本文档实施完毕，见 §12 实施结果。
 > 配套文档：`docs/ticket-pipeline/architecture.md`（四层契约）、`docs/ticket-pipeline/feature-checklist.md`（完成度与缺陷）、`docs/adr/0005-飞书电子表格源按表型分派.md`（决策）、`docs/ticket-pipeline/operation-flow.md`（操作流程图）。
-> 文中所有行号取自 2026-11-06 工作区源码（HEAD `678475f`）。
+> 文中行号取自 2026-11-06 工作区源码（HEAD `678475f`）；§12 的行号取实施当日源码。
 
 ---
 
@@ -469,8 +469,8 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 
 | 阶段 | 内容 | 判据 |
 | --- | --- | --- |
-| 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| **第二步半（新增）** | **飞书电子表格支持（本文档）** | 5 人日；`dev-run` 384 → 404；一张真表读出一张真票 |
+| 第二步 | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
+| **第二步半（已完成）** | **飞书电子表格支持（本文档）** | 代码与自测已完成（`dev-run` 384 → **404**、`feishu-checks` 60 → **80**）；真表读数据待 §8.2 人工前置完成后验证 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |
 
@@ -512,4 +512,40 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 | Q2 | `match.sheetRange` 的范围语法要不要支持多段（`A1:M100,N200:P300`） | 倾向**不支持**（只支持单段），多表就配多个 `projects[]` 条目 | 实施时 |
 | Q3 | 表头行要不要支持「往下扫 N 行找第一行有 ≥3 个已知列名的行」 | 倾向**不支持**（会与行号身份打架），坚持显式配 | 已定：显式配 |
 | Q4 | 电子表格分支要不要支持 `viewId` 视图 | 倾向不支持（视图是 bitable 概念） | 已定：不支持 |
-| Q5 | 探测失败时要不要自动回退到 `match.tableKind` | 要：`tableKind` 显式配置时**跳过探测**（省两次请求），没配置才探测 | 实施时 |
+| Q5 | 探测失败时要不要自动回退到 `match.tableKind` | 要：`tableKind` 显式配置时**跳过探测**（省两次请求），没配置才探测 | 已定：显式配则跳过 |
+
+---
+
+## 12. 实施结果（2026-11-09）
+
+### 12.1 代码落点（与 §6 计划的差异）
+
+| 文件 | 行数 | 内容 |
+| --- | --- | --- |
+| `plugins/ticket-pipeline/src/adapters/source-feishu/sheets.js` | 579（新建） | 列名别名、工作表定位、range 拼装、读值解析、行身份、日期/优先级归一 —— 全部**纯函数**，可单测 |
+| `plugins/ticket-pipeline/src/adapters/source-feishu/index.js` | 1452 → 1891 | `get_node` 不再硬写 `obj_type`；新增 `probeWikiNode` / `extractSheetToken` / `isWikiToken` / `extractWikiToken` / `resolveSheetTarget` / `shouldTrySheet` / `resolveBitableFromCandidates` / `resolveBitableTableByIdentity`；`resolveTable` 改成表型分派总闸；`scan` 拆 `scanBitable` / `scanSheet` |
+| `plugins/ticket-pipeline/src/core/config.js` | 1225 | `validateProject` 电子表格分支四选一；9 个键的校验与透传；`buildProjectsDescriptor()` 的 match 组新增 8 个叶子 |
+| `plugins/ticket-pipeline/src/remote/host.js` | 202 | `describeProject()` 摊平 8 个电子表格字段（`sheetColumns` 从对象摊成 `k=v, k=v` 一行文本） |
+| `plugins/ticket-pipeline/lib/client.js` | 3390 | `PROJECT_SECTIONS` 新增第 6 组「飞书电子表格」；`kind:'columns'` 与 `parseColumnsDraft()`；`sheetName` 只画一次（挪进 `match` 组） |
+| `plugins/ticket-pipeline/scripts/feishu-checks.mjs` | 1404 → 1995 | 60 → **80** 条断言（19 条电子表格 + 1 条回填只读回执） |
+| `plugins/ticket-pipeline/scripts/client-smoke.mjs` | → 1061 | 新增第 ⑦ 组断言（电子表格字段渲染 / 列名覆盖往返 / 选择目录） |
+| `plugins/ticket-pipeline/scripts/client-check.mjs` | —— | `kind` 白名单加 `columns`；`select` 必须有 `options`；`pick` 只认 `directory` |
+
+比 §6 少改一处的意外收获：`match.sheetName` 原本计划「复用金山源的键」，实测发现**面板里画两次**会导致两个输入框绑同一个草稿键（`client-check` 报「重复字段」），最终把 `sheetName` 从 wps 组挪到 `match` 组只画一次，两个平台共用。
+
+### 12.2 与设计不同的三处决定
+
+1. **`shouldTrySheet` 多了 `confirmedBitable` 闸**。设计里只说「auth / rate-limit / network / internal 不试 sheet」，实测发现还差一种：`resolveBitableTableByIdentity` 已经把「数据表清单」读回来了、只是名字匹配不上——这**证明**这个 token 就是多维表格，此时再拿它去试电子表格只会把真因埋掉。做法：在抛错对象上打 `confirmedBitable = true`，`shouldTrySheet` 见到就回 false。
+2. **`resolveTable` 的第四步（只有 `docNamePattern`）调 `resolveBitableTableByIdentity(token, signal, false)`** —— `usePattern` 显式传 false。原因：`docNamePattern` 已经用来挑云文档了，再拿它去过滤「数据表名」会 0 命中。这一条是自测红出来的，不是想出来的。
+3. **`probeWikiNode` 返回 `note` 而不是直接抛**。`obj_type` 为空时（老服务端）按 bitable 兜底并在日志里说明；`obj_type` 是 `docx` / `mindnote` 等第三种类型才抛 `invalid-input`，文案里点名「多维表格用 match.appToken，电子表格用 match.spreadsheetToken」。
+
+### 12.3 自测
+
+- `node plugins/ticket-pipeline/scripts/dev-run.mjs` → **通过 404 项，失败 0 项**（原基线 384；19 条电子表格断言 + 1 条「回填退化成只读回执」）。
+- `node plugins/ticket-pipeline/scripts/feishu-checks.mjs` → **80 条全过**，含**只读断言**（全程不出现对 sheets 的写请求）。
+- `node plugins/ticket-pipeline/scripts/client-check.mjs` → 通过；面板项目字段 **29** 项与宿主 descriptor 对得上（`sheetName` 去重后从 30 降下来）。
+- `node plugins/ticket-pipeline/scripts/client-smoke.mjs` → 通过（**143** 条 `check(`）。
+
+### 12.4 仍未验证（需要人工前置）
+
+§8.2 的四条前置一条都还没做，所以**真实电子表格还没读过一张**：`sheets:spreadsheet:readonly` scope 未开、文档级「添加文档应用」未做。当前状态是：代码路径全部走通（假服务端），真表一接就能验；接上之前不要向用户承诺「已经在真表上跑过」。

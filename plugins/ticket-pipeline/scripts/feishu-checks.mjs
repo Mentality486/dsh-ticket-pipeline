@@ -31,6 +31,21 @@ import {
 import { sanitizeBranchName } from '../src/core/branch-name.js'
 // mock 源放在这一节测：它要跟飞书适配器**同形状**，两个实现放一起对比才看得见偏差。
 import { createMockSource } from '../src/adapters/source-mock/index.js'
+// 电子表格那套纯函数（表型分派的另一半）：解析配置、认列名、造行身份都在里面。
+import {
+  buildRowIdentity,
+  buildValueRange,
+  columnIndex,
+  columnLetter,
+  locateSheetHeader,
+  normalizeSheetDate,
+  parseSheetRange,
+  parseSheetRows,
+  resolveSheetColumns,
+  resolveWorksheet,
+  sheetPriorityOf,
+  SHEET_COLUMN_ALIASES,
+} from '../src/adapters/source-feishu/sheets.js'
 
 const APP_TOKEN = 'app-token-1'
 const TABLE_ID = 'tbl-1'
@@ -118,6 +133,12 @@ function createFakeServer (options = {}) {
     files: options.files ? [...options.files] : [],
     /** 这些 app_token 调 tables 时报 1254003 WrongBaseToken（测 wiki 双探测回退用） */
     failAppTokens: options.failAppTokens ?? [],
+    /**
+     * 调 tables 接口时固定回这个错误码（测「不是多维表格就去试电子表格」用）。
+     * 不设则正常回 `state.tables`。
+     * @type {number | null}
+     */
+    tablesFailCode: options.tablesFailCode ?? null,
     /** @type {string | null} */
     failCode: options.failCode ?? null,
     /** @type {string} */
@@ -136,6 +157,27 @@ function createFakeServer (options = {}) {
     rejectAfterRequests: Number(options.rejectAfterRequests ?? 0),
     /** 认证接口被调了几次（single-flight / 重取的证据） */
     authCallsByReason: 0,
+    /**
+     * wiki 节点探测回什么 `obj_type`。多维表格用例用缺省 `'bitable'`；
+     * 电子表格用例把它设成 `'sheet'`（或 `''` 测「老服务端不返回类型」的兜底）。
+     * @type {string}
+     */
+    wikiNodeType: options.wikiNodeType ?? 'bitable',
+    /**
+     * wiki 节点探测回什么 `obj_token`。缺省沿用老行为 `btplNormal-<token>`；
+     * 电子表格用例要让它等于「那张表的 spreadsheetToken」，因为飞书对知识库里的
+     * 电子表格就是「obj_token 直接当 spreadsheetToken 用」。
+     * @type {((token: string) => string) | null}
+     */
+    wikiNodeToken: options.wikiNodeToken ?? null,
+    /** 云「电子表格」工作表清单（`sheets/v3/.../sheets/query` 回它） */
+    /** @type {any[]} */
+    sheets: options.sheets ? [...options.sheets] : [],
+    /**
+     * 电子表格读值回什么二维数组（`sheets/v2/.../values/{range}` 回它）。
+     * @type {any[][]}
+     */
+    sheetValues: options.sheetValues ? options.sheetValues.map((row) => [...row]) : [],
   }
 
   const fetchImpl = async (url, init = {}) => {
@@ -184,6 +226,9 @@ function createFakeServer (options = {}) {
     if (/\/tables$/.test(path)) {
       const m = path.match(/\/apps\/([^/]+)\/tables/)
       const reqToken = m ? decodeURIComponent(m[1]) : ''
+      if (state.tablesFailCode !== null) {
+        return jsonResponse({ code: state.tablesFailCode, msg: 'injected tables failure' })
+      }
       if (Array.isArray(state.failAppTokens) && state.failAppTokens.includes(reqToken)) {
         return jsonResponse({ code: 1254003, msg: 'WrongBaseToken' }, 400)
       }
@@ -192,9 +237,27 @@ function createFakeServer (options = {}) {
 
     if (path.includes('/wiki/v2/spaces/get_node')) {
       const token = new URL(url, 'http://x').searchParams.get('token') ?? ''
+      const objToken = state.wikiNodeToken ? state.wikiNodeToken(token) : `btplNormal-${token}`
       return jsonResponse({
         code: 0,
-        data: { node: { obj_type: 'bitable', obj_token: `btplNormal-${token}` } },
+        data: { node: { obj_type: state.wikiNodeType, obj_token: objToken } },
+      })
+    }
+
+    // —— 电子表格：工作表清单（v3、snake_case）——
+    // 注意请求里 path 是 `/sheets/v3/spreadsheets/{token}/sheets/query`，
+    // token 那一段可能被 encodeURIComponent 过，所以先解码再比。
+    if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(path)) {
+      return jsonResponse({ code: 0, data: { sheets: state.sheets } })
+    }
+
+    // —— 电子表格：读值（v2、camelCase）——
+    // path 形如 `/sheets/v2/spreadsheets/{token}/values/{sheetId}!A1:M500`，
+    // `!` 与 `:` 是**不编码**的（飞书要求原样），所以这里直接截 `values/` 之后那一段。
+    if (path.includes('/sheets/v2/spreadsheets/') && path.includes('/values/')) {
+      return jsonResponse({
+        code: 0,
+        data: { valueRange: { values: state.sheetValues } },
       })
     }
 
@@ -277,6 +340,17 @@ function makeSource (server, options = {}) {
     allowedImageHosts: 'allowedImageHosts' in options ? options.allowedImageHosts : ['example.com'],
     safePageRun: options.safePageRun,
     goneAfterScans: options.goneAfterScans,
+    // —— 飞书电子表格（表型分派）——
+    // 这些键原样透传，让用例能分别构造「电子表格」「显式表型」「表头行在第 2 行」等场景。
+    spreadsheetToken: options.spreadsheetToken,
+    sheetId: options.sheetId,
+    sheetName: options.sheetName,
+    sheetHeaderRow: options.sheetHeaderRow,
+    sheetIdentity: options.sheetIdentity,
+    sheetIdColumn: options.sheetIdColumn,
+    sheetColumns: options.sheetColumns,
+    sheetRange: options.sheetRange,
+    tableKind: options.tableKind,
     // —— task-9 新增：这些参数不透传，离线打桩就测不到超时 / 字节上限 / 日志 ——
     requestTimeoutMs: options.requestTimeoutMs,
     imageTimeoutMs: options.imageTimeoutMs,
@@ -1400,5 +1474,522 @@ export async function runFeishuChecks (check) {
     const onlyTable = parseBitableUrl('https://x.feishu.cn/base/abcdef?table=tblOnly')
     assert.deepEqual(onlyTable, { tableId: 'tblOnly', viewId: '' }, '只带 table 的链接要读出 table，view 回空串')
     assert.equal(feishuOptionsFromMatch({ appToken: 'RZZQbY4SkaY6z0shZaBcVpQCnhh' }).tableId, '', '纯 token 时 tableId 保持空，走 docNamePattern 兜底')
+  })
+
+  // ============================================================
+  // 飞书**电子表格**（ADR-0005 / feishu-sheet-source.md）
+  //
+  // 二十条放在一起，因为它们共享同一套桩（假服务端 + 假工作表 + 假二维值）。
+  // 这些用例是「电子表格到底能不能用」的唯一证据 —— 真机验证要飞书开放平台的
+  // sheets scope + 文档级授权，离线跑不了。
+  // ============================================================
+
+  /** 造一张电子表格的工作表清单。 */
+  const makeSheets = () => [
+    { sheet_id: 'sh1', title: '工单', index: 0, hidden: false },
+    { sheet_id: 'sh2', title: '归档', index: 1, hidden: true },
+  ]
+
+  /** 造一份二维值：表头 + 两行数据。 */
+  const makeSheetValues = () => [
+    ['序号', '发现部门', '问题描述', '是否处理', '优先级', '模块'],
+    ['A-1', '客服', '列表翻页丢数据', '处理中', '高', '订单'],
+    ['A-2', '运营', '导出少一行', '否', '中', '报表'],
+  ]
+
+  /** 造一个「表型是电子表格」的假服务端。 */
+  const makeSheetServer = (overrides = {}) => createFakeServer({
+    sheets: makeSheets(),
+    sheetValues: makeSheetValues(),
+    ...overrides,
+  })
+
+  await check('电子表格：wiki 节点 obj_type=sheet 时走电子表格分支，不再报「不是多维表格」', async () => {
+    // 这就是用户「贴电子表格链接进来直接报错」的那条路：以前 get_node 硬写了
+    // obj_type='bitable'，服务端只回答「是不是多维表格」，sheet 一律被拒。
+    const server = makeSheetServer({ wikiNodeType: 'sheet', wikiNodeToken: (token) => `shtcn-${token}` })
+    const { source } = makeSource(server, {
+      appToken: 'https://x.feishu.cn/wiki/SHEETWIKI1',
+      tableId: '',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '电子表格里「处理中」那行要变成新票')
+    assert.equal(result.created[0].recordId, 'sh-seq-A-1', '序号列优先做身份')
+    // 只读铁律：一条写请求都不许出现。
+    const writes = server.requests.filter((r) => r.method !== 'GET' && !r.url.includes('/auth/v3/'))
+    assert.deepEqual(writes, [], `扫描绝不允许写表格，实际发了 ${JSON.stringify(writes.map((r) => r.url))}`)
+  })
+
+  await check('电子表格：wiki 节点是 bitable 时不回归（照样走多维表格）', async () => {
+    const server = createFakeServer({
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://x.feishu.cn/wiki/WIKIBITABLE1',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '多维表格这条路不能被表型分派改坏')
+    assert.ok(
+      server.requests.some((r) => r.url.includes('/bitable/v1/apps/')),
+      '多维表格必须走 bitable 接口',
+    )
+    assert.ok(
+      !server.requests.some((r) => r.url.includes('/sheets/')),
+      '不能顺手去读电子表格接口',
+    )
+  })
+
+  await check('电子表格：get_node 不返回 obj_type 时按多维表格兜底（老服务端兼容）', async () => {
+    const server = createFakeServer({
+      wikiNodeType: '',
+      tables: [{ table_id: 'tbl-a', name: '工单表' }],
+      rows: [makeRow('rec-1')],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://x.feishu.cn/wiki/OLDNODETYPE1',
+      tableId: '',
+      docNamePattern: '工单表',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, 'obj_type 缺失时要当成多维表格继续跑，不能拒服务')
+  })
+
+  await check('电子表格：裸 token 探不出多维表格时报错文案要列出两种尝试', async () => {
+    // bitable 说「这 token 不认识」，sheet 也说「这表没有工作表」——人得同时看到两边，
+    // 否则只能猜是 token 错还是表错。
+    const server = createFakeServer({
+      // 1254005 = INVALID_INPUT_ERROR_CODES：代表「这 token 不是多维表格」这类
+      // 「类型不对」的错，才值得再试一次电子表格（凭据错/限流错另有用例）。
+      tablesFailCode: 1254005,
+      sheets: [],
+    })
+    const { source } = makeSource(server, {
+      appToken: 'UNKNOWNDOC1',
+      tableId: '',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input'
+        && error.message.includes('既当不了多维表格')
+        && error.message.includes('按多维表格读')
+        && error.message.includes('按电子表格读')
+        && error.message.includes('match.appToken')
+        && error.message.includes('match.spreadsheetToken'),
+      '两种表型都失败时必须把两次尝试都写出来',
+    )
+  })
+
+  await check('电子表格：探测时遇到凭据错（auth）不偷偷去试电子表格，真因不许被埋', async () => {
+    // 凭据错 / 限流 / 网络错都是真故障。若这时还去试 sheet，最后抛的会是
+    // 「既当不了多维表格也当不了电子表格」，人 forever 找不到「凭据没配」这个真因。
+    const server = createFakeServer({
+      wikiNodeType: 'bitable',
+      tablesFailCode: 99991663, // AUTH_ERROR_CODES 里的一员
+      sheets: makeSheets(),
+      sheetValues: makeSheetValues(),
+    })
+    const { source } = makeSource(server, {
+      appToken: 'https://x.feishu.cn/wiki/AUTHFAIL1',
+      tableId: '',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'auth',
+      '凭据错必须原样抛出，不能被「再试一次电子表格」盖掉',
+    )
+    assert.ok(
+      !server.requests.some((r) => r.url.includes('/sheets/v3/') || r.url.includes('/values/')),
+      '凭据错之后不该再打电子表格接口',
+    )
+  })
+
+  await check('电子表格：只给 spreadsheetToken + sheetId 时能定位并读值', async () => {
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    const valuesRequest = server.requests.find((r) => r.url.includes('/values/'))
+    assert.ok(valuesRequest, '必须真的去读值')
+    assert.ok(
+      valuesRequest.url.includes('shtcnABCDEF'),
+      `读值要打对 spreadsheetToken，实际 ${valuesRequest.url}`,
+    )
+    // range 在 path 里：`!` 与 `:` 必须原样保留（编码了飞书不认）。
+    assert.ok(
+      /\/values\/sh1!A1:[A-Z]+$/.test(valuesRequest.url),
+      `range 形状应是 {sheetId}!A1:<列>，实际 ${valuesRequest.url}`,
+    )
+  })
+
+  await check('电子表格：回填退化成只读回执，不去拼一个必然 404 的 bitable 地址', async () => {
+    // 电子表格分支上 `table` 里没有 appToken / tableId。若 writeResult 继续往下走，
+    // 拼出来的是 `/bitable/v1/apps/undefined/tables/undefined/records/sh-seq-1`
+    // —— 必然 404，还得被当成可重试故障。所以这里必须是「written:false + 说清原因」，
+    // 而且**一个写请求都不许发**。
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    await source.scan(new AbortController().signal)
+    const before = server.requests.length
+    const receipt = await source.writeResult('sh-seq-1', { result: '已修复' })
+    assert.equal(receipt.written, false, '电子表格不回填，必须回 written:false')
+    assert.ok(
+      String(receipt.note || '').includes('电子表格'),
+      `回执要说清是「电子表格不支持回填」，实际 ${JSON.stringify(receipt)}`,
+    )
+    const writes = server.requests.slice(before).filter((r) => r.method !== 'GET')
+    assert.equal(writes.length, 0, `不许发任何写请求，实际发了 ${writes.map((r) => r.url).join(' | ')}`)
+  })
+
+  await check('电子表格：sheetId 不在清单里就报错并列出所有工作表', async () => {
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'shNOPE',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input'
+        && error.message.includes('shNOPE')
+        && error.message.includes('工单')
+        && error.message.includes('归档'),
+      'sheetId 拼错时要让人看到现有工作表清单',
+    )
+  })
+
+  await check('电子表格：sheetName 命中 2 张同名时报错让人改用 sheetId', async () => {
+    const server = createFakeServer({
+      sheets: [
+        { sheet_id: 'sh1', title: '同名', index: 0, hidden: false },
+        { sheet_id: 'sh2', title: '同名', index: 1, hidden: false },
+      ],
+      sheetValues: makeSheetValues(),
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetName: '同名',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input' && error.message.includes('sheetId'),
+      '同名工作表不能瞎挑一张',
+    )
+  })
+
+  await check('电子表格：sheetHeaderRow=2 时在第 2 行的表头里认列名', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['PMS 工单导出（自动生成，勿手改）', '', '', '', '', ''],
+        ['序号', '发现部门', '问题描述', '是否处理', '优先级', '模块'],
+        ['B-1', '客服', '第二行才是表头时的票', '处理中', '低', '订单'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+      sheetHeaderRow: 2,
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.equal(result.created[0].recordId, 'sh-seq-B-1', '第 2 行做表头时数据从第 3 行开始')
+    assert.equal(result.created[0].description, '第二行才是表头时的票')
+  })
+
+  await check('电子表格：表头缺「问题描述」时报错并列出读到的列名', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '发现部门', '是否处理'],
+        ['C-1', '客服', '处理中'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input'
+        && error.message.includes('问题描述')
+        && error.message.includes('序号'),
+      '必需列缺失要把「你表里到底有什么列」告诉人',
+    )
+  })
+
+  await check('电子表格：数到别名「缺陷描述」也算问题描述列', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '缺陷描述', '是否处理'],
+        ['D-1', '别名表头也能认', '处理中'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.equal(result.created[0].description, '别名表头也能认')
+  })
+
+  await check('电子表格：序号为空时用行号兜底，并标 fallback-row', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '问题描述', '是否处理'],
+        ['', '序号没填的行也要收', '处理中'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.equal(result.created[0].recordId, 'sh-row-2', '序号空 → 用物理行号当身份')
+    assert.equal(result.created[0].raw.identitySource, 'fallback-row', '要标出来这是兜底身份，方便排查')
+  })
+
+  await check('电子表格：同一轮序号重复直接报错，不许来回刷票', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '问题描述', '是否处理'],
+        ['X-1', '第一张', '处理中'],
+        ['X-1', '第二张用了同一个序号', '处理中'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input'
+        && error.message.includes('X-1')
+        && error.message.includes('sheetIdentity'),
+      '序号重复必须报错并给出逃生阀（改用 row 身份）',
+    )
+  })
+
+  await check('电子表格：水位——连扫两轮不重复推、改描述算 updated、只改「是否处理」不算变更', async () => {
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+    })
+    const signal = new AbortController().signal
+
+    const first = await source.scan(signal)
+    assert.equal(first.created.length, 1, '首轮把「处理中」那行收进来')
+
+    const second = await source.scan(signal)
+    assert.equal(second.created.length, 0, '内容没变不能重复推新票')
+    assert.equal(second.updated.length, 0, '内容没变也不能算修订')
+
+    // 只改状态（处理中 → 否）不算内容变更，只是退役。
+    server.state.sheetValues[1] = ['A-1', '客服', '列表翻页丢数据', '否', '高', '订单']
+    const third = await source.scan(signal)
+    assert.deepEqual(third.disappeared, ['sh-seq-A-1'], '拨出「处理中」= 退役，不是修订')
+    assert.equal(third.updated.length, 0, '状态列不算内容变更')
+
+    // 拨回「处理中」= 手动重置，要重新收。
+    server.state.sheetValues[1] = ['A-1', '客服', '列表翻页丢数据', '处理中', '高', '订单']
+    const fourth = await source.scan(signal)
+    assert.equal(fourth.created.length, 1, '从「否」拨回「处理中」应重新入队')
+    assert.equal(fourth.created[0].recordId, 'sh-seq-A-1')
+
+    // 改描述 = 内容变更 = updated。
+    server.state.sheetValues[1] = ['A-1', '客服', '列表翻页丢数据（补充：只在第 2 页）', '处理中', '高', '订单']
+    const fifth = await source.scan(signal)
+    assert.equal(fifth.updated.length, 1, '描述变了要当修订推一遍')
+    assert.equal(fifth.created.length, 0)
+  })
+
+  await check('电子表格：被删的行要连续 goneAfterScans 轮不见才退役', async () => {
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+      goneAfterScans: 2,
+    })
+    const signal = new AbortController().signal
+    await source.scan(signal)
+
+    // 把「处理中」那行删掉（只剩表头 + 另一行）。
+    server.state.sheetValues = [
+      ['序号', '发现部门', '问题描述', '是否处理', '优先级', '模块'],
+      ['A-2', '运营', '导出少一行', '否', '中', '报表'],
+    ]
+    const second = await source.scan(signal)
+    assert.deepEqual(second.disappeared, [], '第一轮不见还不能退役（可能是临时取数不全）')
+    const third = await source.scan(signal)
+    assert.deepEqual(third.disappeared, ['sh-seq-A-1'], '连续两轮不见才退役')
+  })
+
+  await check('电子表格：截图 url 不在白名单一律拒绝（SSRF 防线不能因为换表型就松）', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '问题描述', '是否处理', '截图'],
+        ['E-1', '带外链截图的行', '处理中', 'https://evil.test/a.png'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+      allowedImageHosts: [],
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '截图取不到不该阻塞收票')
+    const shot = result.created[0].screenshots[0]
+    assert.equal(shot.kind, 'url')
+    await assert.rejects(
+      () => source.loadScreenshot(shot),
+      (error) => error.kind === 'invalid-input' && error.message.includes('evil.test'),
+      '不在白名单的主机必须拒绝',
+    )
+  })
+
+  await check('电子表格：截图 path 形态能读出本地字节', async () => {
+    const server = makeSheetServer({
+      sheetValues: [
+        ['序号', '问题描述', '是否处理', '截图'],
+        ['F-1', '带本地路径截图', '处理中', 'D:/shots/f1.png'],
+      ],
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+      readLocalFile: async (path) => {
+        assert.equal(path, 'D:/shots/f1.png')
+        // 宿主注入的读文件服务回的是 `{ data, mediaType, name }`（不是裸字节），
+        // 媒体类型要由它给，适配器只做「是不是图片」这道判断。
+        return { data: PNG_BYTES, mediaType: 'image/png', name: 'f1.png' }
+      },
+    })
+    const result = await source.scan(new AbortController().signal)
+    const shot = result.created[0].screenshots[0]
+    assert.equal(shot.kind, 'path')
+    const loaded = await source.loadScreenshot(shot)
+    assert.deepEqual(loaded.data, PNG_BYTES)
+    assert.equal(loaded.mediaType, 'image/png')
+  })
+
+  await check('电子表格：tableKind 显式写了就跳过探测（一次 tables 请求都不发）', async () => {
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: 'SOMEAPPTOKEN',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetId: 'sh1',
+      tableKind: 'sheet',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1)
+    assert.ok(
+      !server.requests.some((r) => r.url.includes('/bitable/')),
+      '显式指定表型后不该再去试多维表格接口',
+    )
+  })
+
+  await check('电子表格：纯函数——列字母、range、日期、优先级、列名覆盖', async () => {
+    // 这些是表型分派的算术地基，写错了上层全部歪，所以单独钉死。
+    assert.equal(columnLetter(0), 'A')
+    assert.equal(columnLetter(25), 'Z')
+    assert.equal(columnLetter(26), 'AA')
+    assert.equal(columnIndex('A'), 0)
+    assert.equal(columnIndex('AA'), 26)
+    assert.throws(() => columnLetter(-1), /列号不合法/)
+    assert.throws(() => columnIndex('A1'), /列字母不合法/)
+
+    assert.deepEqual(parseSheetRange('A1:M500'), { startColumn: 0, startRow: 1, endColumn: 12, endRow: 500 })
+    assert.deepEqual(parseSheetRange('B2:K'), { startColumn: 1, startRow: 2, endColumn: 10, endRow: undefined })
+    assert.equal(parseSheetRange(''), undefined)
+    assert.throws(() => parseSheetRange('M1:A5'), /结束列在起始列左边/)
+    assert.throws(() => parseSheetRange('A5:M1'), /结束行在起始行上边/)
+    assert.throws(() => parseSheetRange('A1:M500,N1:P600'), /只支持单段/)
+
+    assert.equal(
+      buildValueRange({ range: { startColumn: 0, startRow: 1 }, endColumn: 7 }),
+      'A1:H',
+      '不给 sheetRange 时读到表头宽度',
+    )
+    assert.equal(
+      buildValueRange({ range: { startColumn: 0, startRow: 2, endColumn: 12, endRow: 500 } }),
+      'A2:M500',
+    )
+
+    // 日期归一成 `YYYY-MM-DD` 字符串（不是时间戳）：下游 fingerprint 要稳定，
+    // 而时区无关的字符串最稳。中文日期 / 斜杠 / 点号写法都要认。
+    assert.equal(normalizeSheetDate('2026年11月9日'), '2026-11-09')
+    assert.equal(normalizeSheetDate('2026/11/9'), '2026-11-09')
+    assert.equal(normalizeSheetDate('2026.11.9'), '2026-11-09')
+    assert.equal(normalizeSheetDate(''), '')
+    // Excel 序列号换算：46000 天对应 20 世纪末的某天，只验证换算不抛且是合法日期。
+    assert.match(normalizeSheetDate(46000), /^\d{4}-\d{2}-\d{2}$/, 'Excel 序列号也要能换算成日期')
+    assert.equal(sheetPriorityOf('严重'), 'high', '金山表里的「严重」要并进来')
+    assert.equal(sheetPriorityOf('轻微'), 'low')
+    assert.equal(sheetPriorityOf('高'), 'high')
+    assert.equal(sheetPriorityOf('看不懂'), undefined)
+
+    // 列名覆盖：把「问题描述」改成自家叫法，覆盖后仍认得必需列。
+    const header = locateSheetHeader(
+      [['序号', '我的问题描述列', '是否处理'], ['G-1', '自家列名也能认', '处理中']],
+      { headerRow: 1, columns: resolveSheetColumns({ description: '我的问题描述列' }) },
+    )
+    assert.equal(header.columns.description, 1, 'sheetColumns 覆盖要生效')
+    assert.ok(SHEET_COLUMN_ALIASES.description.includes('问题描述'))
+
+    // 行身份三形态
+    assert.deepEqual(buildRowIdentity({ mode: 'seq', seqValue: '1.0', rowNumber: 5 }), { recordId: 'sh-seq-1', identitySource: 'seq' })
+    assert.deepEqual(buildRowIdentity({ mode: 'seq', seqValue: '', rowNumber: 5 }), { recordId: 'sh-row-5', identitySource: 'fallback-row' })
+    assert.deepEqual(buildRowIdentity({ mode: 'row', seqValue: 'X', rowNumber: 5 }), { recordId: 'sh-row-5', identitySource: 'row' })
+
+    // 整行空白 / 问题描述为空的行不产票
+    const parsed = parseSheetRows({
+      values: [
+        ['序号', '问题描述', '是否处理'],
+        ['', '', ''],
+        ['H-1', '真的有问题', '处理中'],
+      ],
+      header: { headerRow: 1, columns: { seq: 0, description: 1, status: 2 }, headers: [] },
+      identity: 'seq',
+      idColumn: '序号',
+      extractScreenshots: () => [],
+    })
+    assert.equal(parsed.length, 1, '空白行必须跳过')
+    assert.equal(parsed[0].recordId, 'sh-seq-H-1')
   })
 }

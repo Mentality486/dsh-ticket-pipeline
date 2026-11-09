@@ -58,6 +58,16 @@
 > 整件事由 `writeBack` 开关控制（缺省开），关掉就退回纯只读。
 > 细节见 [ADR-0006](./docs/adr/0006-处理完回填工单表.md)。
 
+**飞书「电子表格」也能当工单表（2026-11-09 起）**：插件在探测阶段读 `node.obj_type` 自己判断表型，
+不用你选。表头行、列名、行身份都可配（`match.sheetHeaderRow` / `match.sheetColumns` /
+`match.sheetIdentity` 等，见 [user-guide §3.1](./docs/ticket-pipeline/user-guide.md)）。
+两点注意：
+- **必须人工做两件事**：开放平台开 `sheets:spreadsheet:readonly`（与多维表格的 `bitable:app:readonly`
+  是两套独立 scope），以及表格「…→更多→添加文档应用」把应用加成协作者。
+- **首版只读不回填**：电子表格的票跑完不会写回「是否处理 / 处理结果 / 处理日期」，
+  `pipeline_status` 会写明「首版只支持从电子表格读票、不支持回填」。要回填请用多维表格。
+  设计与实施记录见 [feishu-sheet-source.md](./docs/ticket-pipeline/feishu-sheet-source.md)。
+
 ### 1.2 准备凭据
 
 在 DSH 的凭据存储（credentials）里配置以下键名（**一字不差**）：
@@ -187,7 +197,15 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐） |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
-| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条），目录必须真实存在，插件不会替你克隆 |
+| `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`，整条表格链接贴进来也行）。和多维表格的 `appToken` 二选一 |
+| `match.sheetId` / `match.sheetName` | 电子表格里工作表的 id 或名字（二选一）；都不填取第一张可见工作表 |
+| `match.sheetHeaderRow` | 表头在第几行，默认 `1`（插件**不会**自己往下找表头） |
+| `match.sheetIdentity` | 行身份来源：`seq`（默认，序号列的值）/ `row`（物理行号） |
+| `match.sheetIdColumn` | 序号列的表头文字，默认「序号」 |
+| `match.sheetColumns` | 列名覆盖，如 `{"description":"缺陷描述"}`；面板上写成一行 `description=我的列名, status=我的状态` |
+| `match.sheetRange` | 限定读取范围，如 `A1:M500`（读值接口无分页、单次上限 10 MB） |
+| `match.tableKind` | 逃生阀：`bitable` / `sheet`。一般不用填，留空 = 插件自己判断表型 |
+| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条），目录必须真实存在，插件不会替你克隆。设置页里这一格有「**选择目录**」按钮，接系统的目录选择器（只改草稿、不立即保存） |
 | `repo.remote` | GitLab remote URL。只在要额外开远程 draft MR 时才需要（配合 `repo.gitlab.enabled`） |
 | `repo.gitlab.enabled` | 远程 MR 出口总开关，**缺省 `false`**。缺省下只在工作区检出里做本地提交，不要 `GITLAB_TOKEN`、不发任何 GitLab 请求 |
 | `repo.baseBranch` | 基准分支（默认 `main`）；只有 `isolateWorktree: true` 建隔离 worktree 时才用到。设置页里带候选下拉（列出该检出真实存在的分支） |
@@ -311,7 +329,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 384 项全过，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | 404 项全过，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |

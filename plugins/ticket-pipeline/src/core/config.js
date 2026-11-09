@@ -526,17 +526,33 @@ function validateProject (raw, index) {
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''
   if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）')
 
-  // feishu 要么显式绑定（appToken+tableId），要么用文件名模糊匹配。
-  // appToken 允许直接贴整条表格链接 —— 那条链接本来就带着 `?table=tblXXX`，
-  // 所以「链接里带了 table」也算显式绑定（与适配器共用同一个解析，见 contracts/types.js）。
+  // feishu 能读两种表：多维表格（appToken+tableId）和电子表格（spreadsheetToken+sheetId/sheetName）。
+  // 四选一即可 —— 少给一格就在启动时拦住，别等到扫描时才发现定位不到表：
+  //   ① appToken + tableId（多维表格显式绑定）
+  //   ② appToken 是一条带 ?table= 的链接（同上，table_id 从链接里啃）
+  //   ③ spreadsheetToken +（sheetId 或 sheetName）（电子表格显式绑定）
+  //   ④ docNamePattern（按云文档名模糊匹配，两种表型都认）
+  // 另外 tableKind 是逃生阀：显式写 bitable / sheet 就跳过表型探测。
   if (platform === 'feishu') {
     const rawAppToken = typeof match.appToken === 'string' ? match.appToken : ''
     const fromUrl = parseBitableUrl(rawAppToken)
     const explicitTableId = typeof match.tableId === 'string' && match.tableId.length > 0 ? match.tableId : fromUrl.tableId
-    const hasExplicit = rawAppToken.length > 0 && explicitTableId.length > 0
+    const hasBitable = rawAppToken.trim().length > 0 && explicitTableId.length > 0
+    const rawSpreadsheetToken = typeof match.spreadsheetToken === 'string' ? match.spreadsheetToken.trim() : ''
+    const sheetTarget = typeof match.sheetId === 'string' ? match.sheetId.trim() : ''
+    const sheetTargetName = typeof match.sheetName === 'string' ? match.sheetName.trim() : ''
+    const hasSheet = rawSpreadsheetToken.length > 0 && (sheetTarget.length > 0 || sheetTargetName.length > 0)
     const hasPattern = typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0
-    if (!hasExplicit && !hasPattern) {
-      fail('match', 'feishu 项目必须给 appToken+tableId（显式绑定，tableId 也可以写在 appToken 那条链接的 ?table= 里）或 docNamePattern（文件名模糊匹配）二选一')
+    const tableKind = typeof match.tableKind === 'string' ? match.tableKind.trim() : ''
+
+    if (tableKind.length > 0 && tableKind !== 'bitable' && tableKind !== 'sheet') {
+      fail('match.tableKind', '只能写 bitable 或 sheet（留空表示让它自己探测）')
+    }
+    if (!hasBitable && !hasSheet && !hasPattern) {
+      fail('match', 'feishu 项目必须给①appToken+tableId（或多维表格链接里的 ?table=）②spreadsheetToken + sheetId/sheetName（电子表格）③docNamePattern（按文件名匹配）之一')
+    }
+    if (rawSpreadsheetToken.length > 0 && !hasSheet) {
+      fail('match.spreadsheetToken', '给了电子表格 token 就得同时给 sheetId（工作表 id）或 sheetName（工作表名），否则不知道该读哪一张')
     }
   }
 
@@ -602,6 +618,65 @@ function validateProject (raw, index) {
   for (const key of ['sheetUrl', 'sheetName', 'statusColumn', 'statusValue', 'mediaPrefix']) {
     const item = match[key]
     if (typeof item === 'string' && item.length > 0) value.match[key] = item
+  }
+
+  // 飞书电子表格的定位与切表参数（设计 §4.2）。只有电子表格分支会用到；
+  // 配在多维表格项目上不报错，只是没人读 —— 这样一个人把项目从多维表格换成
+  // 电子表格时不用先删干净旧键，换个 token 就行。
+  //
+  // `sheetName` 与金山源同名同义（都是「工作表名」），所以它在上面的循环里已经透传过了，
+  // 这里**不要**再写一遍 —— 两份定义迟早会漂移。`sheetIdColumn` 缺省「序号」,
+  // 只在 `sheetIdentity: 'seq'` 时有意义。
+  if (typeof match.spreadsheetToken === 'string' && match.spreadsheetToken.trim().length > 0) value.match.spreadsheetToken = match.spreadsheetToken.trim()
+  if (typeof match.sheetId === 'string' && match.sheetId.trim().length > 0) value.match.sheetId = match.sheetId.trim()
+  if (typeof match.sheetIdColumn === 'string' && match.sheetIdColumn.trim().length > 0) value.match.sheetIdColumn = match.sheetIdColumn.trim()
+  if (typeof match.sheetRange === 'string' && match.sheetRange.trim().length > 0) value.match.sheetRange = match.sheetRange.trim()
+  if (typeof match.tableKind === 'string' && match.tableKind.trim().length > 0) value.match.tableKind = match.tableKind.trim()
+
+  // 表头行：必须是 ≥1 的整数。写字符串 "2" 也认（面板上的数字输入框回来的是字符串），
+  // 但写 "0" / "-1" / "abc" 必须报错 —— 静默当 1 会让「表头在第 2 行」的表整表错位。
+  if (match.sheetHeaderRow !== undefined && match.sheetHeaderRow !== null && match.sheetHeaderRow !== '') {
+    const row = Number(match.sheetHeaderRow)
+    if (!Number.isInteger(row) || row < 1) {
+      fail('match.sheetHeaderRow', `必须是 ≥1 的整数（表头在第几行），实际是 ${JSON.stringify(match.sheetHeaderRow)}`)
+    } else {
+      value.match.sheetHeaderRow = row
+    }
+  }
+
+  // 行身份策略：默认按「序号」列，兜底按物理行号。
+  // 这两个值差一个字就会让整表身份全变（旧票全退役、新票全涌入），所以严格白名单。
+  if (typeof match.sheetIdentity === 'string' && match.sheetIdentity.trim().length > 0) {
+    const identity = match.sheetIdentity.trim()
+    if (identity !== 'seq' && identity !== 'row') {
+      fail('match.sheetIdentity', '只能写 seq（按序号列，缺省）或 row（按物理行号）')
+    } else {
+      value.match.sheetIdentity = identity
+    }
+  }
+
+  // 列名覆盖：`{ 语义字段: 表头里实际写的字 }`。字段名必须是适配器认识的那 13 个，
+  // 写错一个就等于「配了但没生效」，所以这里先按白名单校验一遍。
+  if (match.sheetColumns !== undefined && match.sheetColumns !== null) {
+    if (typeof match.sheetColumns !== 'object' || Array.isArray(match.sheetColumns)) {
+      fail('match.sheetColumns', '必须是对象，形如 { "description": "问题描述", "status": "是否处理" }')
+    } else {
+      /** @type {Record<string, string | string[]>} */
+      const columns = {}
+      for (const [field, actual] of Object.entries(match.sheetColumns)) {
+        const names = Array.isArray(actual) ? actual : [actual]
+        const cleaned = names
+          .filter((item) => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+        if (cleaned.length === 0) {
+          fail(`match.sheetColumns.${field}`, '必须是非空字符串或字符串数组（表头里实际写的列名）')
+          continue
+        }
+        columns[field] = Array.isArray(actual) ? cleaned : cleaned[0]
+      }
+      if (Object.keys(columns).length > 0) value.match.sheetColumns = columns
+    }
   }
 
   if (typeof repo.remote === 'string' && repo.remote.length > 0) value.repo.remote = repo.remote
@@ -959,10 +1034,20 @@ function buildProjectsDescriptor () {
     recordIds: projectLeaf('string-array', '只处理这些工单', '收窄到指定 record id；留空表示整张表'),
     allowedImageHosts: projectLeaf('string-array', '允许的截图主机', '截图链接来自工单表（外部输入），不在白名单里的一律拒绝'),
     sheetUrl: projectLeaf('string', '表格链接', '金山文档表格的分享链接（wps 平台）'),
-    sheetName: projectLeaf('string', '工作表名', '金山文档里的工作表名（wps 平台）'),
+    sheetName: projectLeaf('string', '工作表名', '金山文档里的工作表名（wps 平台）；飞书电子表格也用它指定工作表'),
     statusColumn: projectLeaf('string', '状态列名', '「是否处理」列名（wps 平台）'),
     statusValue: projectLeaf('string', '在处理中的取值', 'wps 平台单值形态；飞书用 statusValues'),
     mediaPrefix: projectLeaf('string', '附件前缀', '截图 fileToken 的前缀（wps 平台）'),
+    // —— 飞书电子表格（ADR-0005：不新增 platform，表型在适配器内部判定）——
+    // 这几个键只在「表是电子表格」时有意义；配了但表是多维表格会被忽略，不报错。
+    spreadsheetToken: projectLeaf('string', '飞书电子表格 token', '飞书电子表格的链接或 token（shtcn…）；面板不画凭据但画它，贴整条链接就行'),
+    sheetId: projectLeaf('string', '工作表 id', '电子表格里的工作表 id（sh…）；不知道就留空并填工作表名'),
+    sheetHeaderRow: projectLeaf('number', '表头在第几行', '缺省 1。表头上方还有标题行时改成实际行号（不会自动往下找）'),
+    sheetIdentity: projectLeaf('string', '行身份', '缺省 seq（按序号列，序号重复会报错）；row（按物理行号，插行会换身份）', { enum: ['seq', 'row'] }),
+    sheetIdColumn: projectLeaf('string', '序号列名', '缺省「序号」。取这一列的值当工单身份，空值退回行号'),
+    sheetRange: projectLeaf('string', '读取范围', '可选，如 A1:M500；不填则从表头读到 Z 列末尾'),
+    sheetColumns: projectLeaf('string', '列名覆盖', '可选，JSON 形态 {"description":"你的列名"}；表头叫法不一样时用它'),
+    tableKind: projectLeaf('string', '强制表型', '可选，bitable/sheet；不填则按 token 自动探测', { enum: ['', 'bitable', 'sheet'] }),
   })
 
   const gitlabNode = projectObject({

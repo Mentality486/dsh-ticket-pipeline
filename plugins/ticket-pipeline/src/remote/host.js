@@ -139,6 +139,26 @@ function describeProject (project, index) {
     statusColumn: String(match.statusColumn ?? ''),
     statusValue: String(match.statusValue ?? ''),
     mediaPrefix: String(match.mediaPrefix ?? ''),
+    // 飞书电子表格（ADR-0005：与多维表格同一个 platform，靠表型分派）
+    spreadsheetToken: String(match.spreadsheetToken ?? ''),
+    sheetId: String(match.sheetId ?? ''),
+    sheetHeaderRow: Number.isFinite(Number(match.sheetHeaderRow)) && Number(match.sheetHeaderRow) >= 1
+      ? Number(match.sheetHeaderRow)
+      : '',
+    sheetIdentity: String(match.sheetIdentity ?? ''),
+    sheetIdColumn: String(match.sheetIdColumn ?? ''),
+    sheetRange: String(match.sheetRange ?? ''),
+    // sheetColumns 是「语义 → 实际表头」的对象。面板只有一个文本框，
+    // 这里摊成 `description=问题描述, status=是否处理` 这种一行写法，
+    // 改回去时由面板解析成对象（见 lib/client.js 的 projectRawValue）。
+    sheetColumns: match.sheetColumns && typeof match.sheetColumns === 'object' && !Array.isArray(match.sheetColumns)
+      ? Object.keys(match.sheetColumns).map((key) => {
+        const value = match.sheetColumns[key]
+        const text = Array.isArray(value) ? value.map(String).join('|') : String(value ?? '')
+        return `${key}=${text}`
+      }).join(', ')
+      : '',
+    tableKind: String(match.tableKind ?? ''),
     // 通用收窄
     statusValues: Array.isArray(match.statusValues) ? match.statusValues.map(String) : [],
     recordIds: Array.isArray(match.recordIds) ? match.recordIds.map(String) : [],

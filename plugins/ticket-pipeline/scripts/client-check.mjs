@@ -539,8 +539,18 @@ async function checkProjectFields () {
     if (typeof field.from !== 'string' || field.from.length === 0) {
       fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 没有 from（宿主 describeProject 的扁平字段名）')
     }
-    if (['text', 'list', 'select', 'bool', 'branch'].indexOf(field.kind) < 0) {
+    // kind 是面板画控件时用的分支：text/list/select/bool/branch 之外，
+    // columns 是「列名覆盖」那种 a=b, c=d 的一行写法（见 parseColumnsDraft）。
+    if (['text', 'list', 'select', 'bool', 'branch', 'columns'].indexOf(field.kind) < 0) {
       fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 的 kind 不认识：' + JSON.stringify(field.kind))
+    }
+    // select 没有 options 会在界面上画出一个空下拉，点了也选不了 —— 必须当场拦住。
+    if (field.kind === 'select' && (!Array.isArray(field.options) || field.options.length === 0)) {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 是 select 但没有 options')
+    }
+    // 目录选择按钮只在 pick 标了 directory 的字段上出现；标了别的值没人消费，静默失效。
+    if (field.pick !== undefined && field.pick !== 'directory') {
+      fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 的 pick 不认识：' + JSON.stringify(field.pick))
     }
     if (typeof field.label !== 'string' || field.label.length === 0) {
       fail('lib/client.js 的 PROJECT_SECTIONS 里 ' + field.path.join('.') + ' 没有 label —— 界面上会显示裸键名')

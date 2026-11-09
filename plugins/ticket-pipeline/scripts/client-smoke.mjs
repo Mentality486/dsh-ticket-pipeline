@@ -148,6 +148,17 @@ function makeProjectRecord (index) {
     statusValues: ['否'],
     recordIds: ['rec1'],
     allowedImageHosts: ['cdn.example.com'],
+    // 飞书电子表格（ADR-0005：与多维表格同一个 platform，靠表型分派）。
+    // 形状与 src/remote/host.js 的 describeProject 一致 —— 那边已经把
+    // `sheetColumns` 从一个对象摊成 `a=b, c=d` 一行文本了。
+    spreadsheetToken: 'shtcnAbcd1234',
+    sheetId: '',
+    sheetHeaderRow: 1,
+    sheetIdentity: 'seq',
+    sheetIdColumn: '序号',
+    sheetRange: '',
+    sheetColumns: 'description=问题描述, status=是否处理',
+    tableKind: '',
     repoPath: 'D:/WorkSpace/.repos/mgiot-pms',
     repoRemote: 'origin',
     repoBaseBranch: 'v2.x',
@@ -207,11 +218,24 @@ function makeSettingsResponse () {
  * 属性式 `ctx.remote.settings` 反而要**取不到**（取到就说明插件又退回了坏写法）。
  */
 function makeHost () {
-  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0 }
+  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0, pickDirectory: [] }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
   // gateway 服务自己维护的命名空间表（namespace → { service }）。
   const namespaces = new Map()
+
+  // 宿主的 dsh-client-ui-workspace 服务：面板的「选择目录」按钮靠它。
+  // 真实宿主里它挂在全局服务 store 上（ctx.get('uiWorkspace')），不是命名空间服务。
+  // 缺省回一个固定路径；calls.pickDirectory 记下每次传进来的「当前值」，
+  // 断言据此验证「选择器拿到的是人已经填在格子里的路径」。
+  services.uiWorkspace = {
+    pickDirectory: async (current) => {
+      calls.pickDirectory.push({ current })
+      return 'D:/picked/from/dialog'
+    },
+    listDirectory: async () => ({ entries: [] }),
+    createDirectory: async (parent, name) => parent.replace(/[\\/]+$/, '') + '/' + name,
+  }
 
   const settingsNamespace = {
     describe: async () => makeSettingsResponse(),
@@ -900,6 +924,120 @@ async function main () {
       JSON.stringify(addOp && addOp.value && addOp.value.match))
     check('保存成功后「未保存」徽标消失', textOf(tree).indexOf('未保存') < 0, textOf(tree).slice(0, 240))
   }
+
+  // ⑦ 飞书电子表格（ADR-0005）与「选择目录」。
+  //
+  // 这一组断言钉的是两件很容易「看着有、其实没接上」的事：
+  // 1. 电子表格那组字段真的画出来了，而且三个特殊 kind 都画对了控件
+  //    （select 有选项、columns 显示成一行文本、保存时要变回对象）；
+  // 2. 「选择目录」按钮真的调到了宿主的 uiWorkspace.pickDirectory，
+  //    而且**只改草稿不写宿主** —— 否则「撤销」就撤销不回来了。
+  resetRender()
+  tree = await render(Panel, { view: 'page' })
+  // tableKind / sheetRange / sheetColumns 是高级项，缺省收起 —— 先勾「显示全部字段」。
+  const advForSheet = findAll(tree, (node) => node.type === 'label' &&
+    textOf(node).indexOf('显示全部字段') >= 0)[0]
+  if (advForSheet !== undefined) {
+    const advBox = findAll(advForSheet, (node) => node.type === 'input')[0]
+    if (advBox !== undefined) advBox.props.onChange({ target: { checked: true } })
+    tree = await render(Panel, { view: 'page' })
+  }
+  check('飞书项目渲染出「飞书电子表格」一组',
+    textOf(tree).indexOf('飞书电子表格') >= 0, textOf(tree).slice(0, 400))
+  check('电子表格 token 有输入框（且显示的是宿主下发的值）',
+    findInput(tree, (node) => node.props.value === 'shtcnAbcd1234') !== undefined)
+  check('表头行号渲染成输入框而不是下拉',
+    findInput(tree, (node) => node.props.value === '1') !== undefined)
+
+  // sheetIdentity / tableKind 是固定集合，必须是下拉；给成自由文本等于让人手打错值。
+  const sheetSelects = findAll(tree, (node) => node.type === 'select' &&
+    Array.isArray(node.props.children))
+  const identitySelect = sheetSelects.find((node) =>
+    node.props.children.some((option) => option.props && option.props.value === 'seq'))
+  check('「行身份怎么认」渲染成下拉', identitySelect !== undefined,
+    JSON.stringify(sheetSelects.map((node) => node.props.value)))
+  check('「行身份怎么认」的选项是 seq / row',
+    identitySelect !== undefined &&
+    identitySelect.props.children.map((option) => option.props.value).join(',') === ',seq,row',
+    identitySelect === undefined ? '没找到' :
+      identitySelect.props.children.map((option) => option.props.value).join(','))
+  check('「行身份怎么认」当前选中宿主下发的值',
+    identitySelect !== undefined && identitySelect.props.value === 'seq',
+    identitySelect === undefined ? '没找到' : String(identitySelect.props.value))
+  const kindSelect = sheetSelects.find((node) =>
+    node.props.children.some((option) => option.props && option.props.value === 'sheet'))
+  check('「强制表型」渲染成下拉（含 bitable/sheet）', kindSelect !== undefined,
+    JSON.stringify(sheetSelects.map((node) => node.props.value)))
+
+  // 列名覆盖：宿主把对象摊成 `a=b, c=d` 一行文本，面板原样显示。
+  const columnsInput = findInput(tree, (node) => node.props.value === 'description=问题描述, status=是否处理')
+  check('列名覆盖渲染成一行文本（不是 [object Object]）', columnsInput !== undefined,
+    JSON.stringify(findAll(tree, (node) => node.type === 'input')
+      .map((node) => node.props.value).filter((value) => typeof value === 'string' && value.indexOf('=') >= 0)))
+  if (columnsInput !== undefined) {
+    // 改一项再保存：发出去的必须是**对象**，不是那行文本 ——
+    // 宿主那边的 `match.sheetColumns` 是 `{语义: 实际表头}`。
+    columnsInput.props.onChange({ target: { value: 'description=我的问题描述, status=我的状态' } })
+    tree = await render(Panel, { view: 'page' })
+    findButton(tree, '保存', 'tp-primary').props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    const columnsCall = ctx.calls.mutate[ctx.calls.mutate.length - 1]
+    const columnsOp = columnsCall === undefined
+      ? undefined
+      : columnsCall.ops.find((item) => item.path.join('.') === 'projects.0.match.sheetColumns')
+    check('列名覆盖保存时发的是对象', columnsOp !== undefined && columnsOp.value !== null &&
+      typeof columnsOp.value === 'object' && !Array.isArray(columnsOp.value),
+      JSON.stringify(columnsOp))
+    check('列名覆盖按 `=` 解析成 {语义: 列名}',
+      columnsOp !== undefined && columnsOp.value.description === '我的问题描述' &&
+      columnsOp.value.status === '我的状态',
+      JSON.stringify(columnsOp && columnsOp.value))
+  }
+
+  // 「选择目录」：按钮必须在仓库路径那一格旁边，点了改草稿、不写宿主。
+  resetRender()
+  tree = await render(Panel, { view: 'page' })
+  const pickButton = findButton(tree, '选择目录')
+  check('仓库路径旁边有「选择目录」按钮', pickButton !== undefined)
+  check('「选择目录」按钮可用', pickButton !== undefined && pickButton.props.disabled === false,
+    pickButton === undefined ? '没找到' : String(pickButton.props.disabled))
+  if (pickButton !== undefined) {
+    const mutateBeforePick = ctx.calls.mutate.length
+    const projectsBeforePick = ctx.calls.projects
+    pickButton.props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    check('点了「选择目录」会调宿主的 uiWorkspace.pickDirectory',
+      ctx.calls.pickDirectory.length >= 1, String(ctx.calls.pickDirectory.length))
+    check('选择器拿到的是格子里已经填着的路径',
+      ctx.calls.pickDirectory.length >= 1 &&
+      ctx.calls.pickDirectory[ctx.calls.pickDirectory.length - 1].current === 'D:/WorkSpace/.repos/mgiot-pms',
+      JSON.stringify(ctx.calls.pickDirectory))
+    check('选完的路径落进了输入框',
+      findInput(tree, (node) => node.props.value === 'D:/picked/from/dialog') !== undefined,
+      JSON.stringify(findAll(tree, (node) => node.type === 'input')
+        .map((node) => node.props.value).filter((value) => typeof value === 'string' && value.indexOf('D:') >= 0)))
+    check('选完目录不写宿主（只改草稿，撤销还能用）',
+      ctx.calls.mutate.length === mutateBeforePick, String(ctx.calls.mutate.length))
+    check('选完目录不重新读项目清单（没必要刷整份）',
+      ctx.calls.projects === projectsBeforePick, String(ctx.calls.projects))
+    check('选完目录后该字段标成「已改」', textOf(tree).indexOf('已改') >= 0)
+  }
+
+  // 宿主没有 uiWorkspace（老版本 / 没装 dsh-client-ui-workspace）时：
+  // 按钮不出现，但输入框照常在 —— 手打路径这条退路不能断。
+  delete services.uiWorkspace
+  RENDER.hooks = []
+  RENDER.effects = []
+  RENDER.dirty = true
+  dispose.length = 0
+  registrations.length = 0
+  injects.length = 0
+  await exports.apply(ctx)
+  const PanelWithoutPicker = registrations.find((r) => r.options.name === 'plugins.row.config').component
+  tree = await render(PanelWithoutPicker, { view: 'page' })
+  check('宿主没提供 uiWorkspace 时不画「选择目录」按钮', findButton(tree, '选择目录') === undefined)
+  check('宿主没提供 uiWorkspace 时仓库路径输入框照常可填',
+    findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms') !== undefined)
 
   // ⑥ summary 视图只给一句话，不渲染整页。
   resetRender()

@@ -29,6 +29,18 @@ import { PipelineError } from '../../contracts/errors.js'
 import { createRecordFilter, resolveRecordIds } from '../../contracts/record-filter.js'
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
 import { IMAGE_MEDIA_TYPES, parseBitableUrl } from '../../contracts/types.js'
+import {
+  DEFAULT_SHEET_HEADER_ROW,
+  DEFAULT_SHEET_ID_COLUMN,
+  buildValueRange,
+  locateSheetHeader,
+  normalizeSheetDate,
+  parseSheetRange,
+  parseSheetRows,
+  resolveSheetColumns,
+  resolveWorksheet,
+  sheetPriorityOf,
+} from './sheets.js'
 
 const FEISHU_API_BASE = 'https://open.feishu.cn'
 const AUTH_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
@@ -340,6 +352,23 @@ export function createFeishuSource (options = {}) {
   const tableId = String(options.tableId ?? '')
   const viewId = String(options.viewId ?? '')
   const docNamePattern = String(options.docNamePattern ?? '')
+
+  // ── 电子表格（Sheets）分支的配置 ────────────────────────────────
+  //
+  // 这些键只对电子表格有意义。配了但实际探测出的是多维表格 → 全部忽略，不报错
+  // （设计 §4.2 最后一条：同一份配置可能在两种表型之间搬来搬去，不该因此启动失败）。
+  const spreadsheetToken = String(options.spreadsheetToken ?? '')
+  const sheetId = String(options.sheetId ?? '')
+  const sheetName = String(options.sheetName ?? '')
+  const sheetHeaderRow = Number(options.sheetHeaderRow ?? DEFAULT_SHEET_HEADER_ROW) || DEFAULT_SHEET_HEADER_ROW
+  const sheetIdentity = options.sheetIdentity === 'row' ? 'row' : 'seq'
+  const sheetIdColumn = String(options.sheetIdColumn ?? DEFAULT_SHEET_ID_COLUMN)
+  // 逃生阀：显式指定表型时**跳过探测**（省两次请求，也给人一条「我知道这是什么」的路）。
+  const tableKindOption = options.tableKind === 'bitable' || options.tableKind === 'sheet' ? options.tableKind : ''
+  // 解析期的配置错误必须**当场抛**（而不是等第一次扫描才发现）：这两个函数会校验
+  // 写法是否合法，写错了现在就该告诉人，而不是等到半夜轮询才报错。
+  const sheetRange = parseSheetRange(options.sheetRange)
+  const sheetColumns = resolveSheetColumns(options.sheetColumns)
   // 「这一行算不算待处理的工单」由状态列的取值决定，而这个取值**每张表不一样**：
   // 常见有「处理中」「否」「待处理」「未处理」……写死一个值，配置写得再对也一张票都收不到。
   // 这里接受一组值（命中任意一个即算「在处理中」），缺省仍是老的那一个，保持既有行为。
@@ -763,13 +792,18 @@ export function createFeishuSource (options = {}) {
   }
 
   /**
-   * 在云文档里按名字找多维表格。
+   * 在云文档里按名字找工单表。
+   *
+   * 以前这里只认 `type === 'bitable'`，于是电子表格永远搜不到。现在两种都收，
+   * 由调用方按表型决定怎么用（设计 §3.1 第 4 条：`docNamePattern` 要能命中
+   * 电子表格；两种合计恰好命中 1 张才用）。
+   *
    * @param {string} pattern
    * @param {AbortSignal} [signal] 调用方的取消信号（B5 透传：整轮扫描被取消时这里也得停）
-   * @returns {Promise<Array<{ token: string, name: string }>>}
+   * @returns {Promise<Array<{ token: string, name: string, type: string }>>}
    */
-  async function searchBitableDocs (pattern, signal) {
-    /** @type {Array<{ token: string, name: string }>} */
+  async function searchCloudDocs (pattern, signal) {
+    /** @type {Array<{ token: string, name: string, type: string }>} */
     const hits = []
     let pageToken = ''
     for (let guard = 0; guard < 20; guard += 1) {
@@ -781,15 +815,149 @@ export function createFeishuSource (options = {}) {
       const files = Array.isArray(data.files) ? data.files : []
       for (const file of files) {
         const type = String(file?.type ?? '')
+        // 只认工单表可能的那两种。docx / mindnote 之类一律不看。
+        if (type !== 'bitable' && type !== 'sheet') continue
         const name = String(file?.name ?? '')
-        if (type !== 'bitable') continue
         if (!matchesPattern(name, pattern)) continue
-        hits.push({ token: String(file?.token ?? ''), name })
+        hits.push({ token: String(file?.token ?? ''), name, type })
       }
       if (!data.has_more || !data.page_token) break
       pageToken = String(data.page_token)
     }
     return hits.filter((hit) => hit.token)
+  }
+
+  /**
+   * 从用户填的值里抠出 `spreadsheetToken`。
+   *
+   * 三种写法都要认：整条表格链接（`…/sheets/shtcnXXX?sheet=YYY`）、裸 token、wiki 换算出来的 obj_token。
+   * 电子表格的行身份、工作表定位都基于这个 token，抠错了整条链路都读不到东西。
+   *
+   * @param {unknown} raw
+   * @returns {string}
+   */
+  function extractSheetToken (raw) {
+    const text = String(raw ?? '').trim()
+    if (text.length === 0) return ''
+    const urlMatch = text.match(/\/sheets\/([A-Za-z0-9]+)/)
+    if (urlMatch) return urlMatch[1]
+    const bare = text.match(/^([A-Za-z0-9]+)$/)
+    if (bare) return bare[1]
+    return text
+  }
+
+  /**
+   * 这个 token 是不是 wiki 形态（wiki 链接或 `wiki` 开头的 token）。
+   * @param {string} raw
+   * @returns {boolean}
+   */
+  function isWikiToken (raw) {
+    const text = String(raw ?? '').trim()
+    if (/\/wiki\//.test(text)) return true
+    return /^wiki/i.test(text)
+  }
+
+  /**
+   * 从 wiki 链接 / wiki token 里抠出裸 token（去掉 URL 外壳）。
+   *
+   * 为什么单独一个函数：`probeWikiNode` 里也会做同样的剥离，但那里剥完就只用于
+   * `get_node` 请求。而 resolveTable 在「obj_token 试不通、回退 wiki token」时
+   * 需要的是**裸 token** 拼 bitable 接口 —— 把整条 URL 塞进 path 会拼出错误地址。
+   *
+   * @param {unknown} raw
+   * @returns {string}
+   */
+  function extractWikiToken (raw) {
+    const text = String(raw ?? '').trim()
+    if (text.length === 0) return ''
+    const urlMatch = text.match(/\/wiki\/([A-Za-z0-9]+)/)
+    if (urlMatch) return urlMatch[1]
+    const bare = text.match(/^([A-Za-z0-9]+)$/)
+    if (bare) return bare[1]
+    return text
+  }
+
+  /**
+   * 用 `get_node` 问出 wiki 节点到底是什么文档。
+   *
+   * **这里以前硬写了 `obj_type: 'bitable'`** —— 请求里指定类型，飞书就只回答「是不是
+   * 多维表格」，电子表格 100% 进不来（这是用户「电子表格用不了」的直接原因）。
+   * 现在不带 `obj_type`，让服务端回答真实类型，再自己判定。
+   *
+   * `obj_type` 为空时按多维表格兜底：老版本服务端可能不返回这个字段，
+   * 而多维表格是本插件最早支持的形态，兜底它最不容易把现有用户弄挂。
+   *
+   * @param {string} raw
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ kind: 'bitable'|'sheet', token: string, note?: string }>}
+   */
+  async function probeWikiNode (raw, signal) {
+    let token = String(raw ?? '').trim()
+    const wikiUrlMatch = token.match(/\/wiki\/([A-Za-z0-9]+)/)
+    if (wikiUrlMatch) token = wikiUrlMatch[1]
+    else {
+      const bare = token.match(/^([A-Za-z0-9]+)$/)
+      if (bare) token = bare[1]
+    }
+    const payload = await apiCall('/open-apis/wiki/v2/spaces/get_node', { query: { token }, signal })
+    const node = payload?.data?.node
+    const objType = String(node?.obj_type ?? '')
+    const objToken = String(node?.obj_token ?? '')
+    if (objType.length === 0) {
+      return { kind: 'bitable', token: objToken || token, note: `wiki 节点 ${token} 没返回 obj_type，按多维表格试` }
+    }
+    if (objType === 'bitable') return { kind: 'bitable', token: objToken || token }
+    if (objType === 'sheet') {
+      // 知识库里的电子表格，obj_token 本身就是 spreadsheetToken（设计 §3.2 已核实），
+      // 不需要再换算一次。
+      return { kind: 'sheet', token: objToken || token }
+    }
+    throw new PipelineError(
+      'invalid-input',
+      `wiki 节点 ${token} 既不是多维表格也不是电子表格，实际类型是 ${objType}（docx=文档、mindnote=思维笔记）。`
+        + '请在飞书里确认工单表是多维表格或电子表格，把那张表的链接填进 match.appToken（或 match.spreadsheetToken）。',
+    )
+  }
+
+  /**
+   * 定位一张电子表格里的工作表。
+   *
+   * @param {unknown} rawToken spreadsheetToken / 表格链接 / wiki 换算结果
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ kind: 'sheet', spreadsheetToken: string, sheetId: string, sheetTitle: string }>}
+   */
+  async function resolveSheetTarget (rawToken, signal) {
+    const token = extractSheetToken(rawToken)
+    if (token.length === 0) {
+      throw new PipelineError('invalid-input', '飞书电子表格需要 spreadsheetToken（shtcn… 或整条表格链接），当前是空的')
+    }
+    const payload = await apiCall(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(token)}/sheets/query`, { signal })
+    const sheets = Array.isArray(payload?.data?.sheets) ? payload.data.sheets : []
+    const sheet = resolveWorksheet(sheets, { sheetId, sheetName })
+    if (sheet.note && typeof options.log === 'function') {
+      // 没指定工作表时取第一张可见的 —— 这不算错，但必须留下一行日志说明「取了哪张」，
+      // 否则人看到扫出票却不知道是从哪个页签读的。
+      options.log('feishu 电子表格工作表定位', { sourceId, spreadsheetToken: token, sheetId: sheet.sheetId, title: sheet.title, note: sheet.note })
+    }
+    return { kind: 'sheet', spreadsheetToken: token, sheetId: sheet.sheetId, sheetTitle: sheet.title }
+  }
+
+  /**
+   * 这个错误值不值得再拿同一个 token 试电子表格。
+   *
+   * 设计 §3.3：`auth` / `rate-limit` / `network` / `internal` 是**真故障**，
+   * 直接抛出去别埋掉（否则人会看到一句「两个都不是」，而真因是凭据错了）；
+   * `not-found` / `invalid-input` 之类才说明「这个 token 不是多维表格，试试 sheet」。
+   *
+   * @param {unknown} error
+   * @returns {boolean}
+   */
+  function shouldTrySheet (error) {
+    if (!(error instanceof PipelineError)) return false
+    // 已经确认这个 token 是多维表格（能列出数据表）时不要再试电子表格：
+    // 后面那句「既当不了多维表格也当不了电子表格」会把真正的错（表名写错）埋掉。
+    if (/** @type {any} */ (error).confirmedBitable === true) return false
+    return !['auth', 'rate-limit', 'network', 'internal', 'aborted'].includes(error.kind)
   }
 
   /**
@@ -807,13 +975,17 @@ export function createFeishuSource (options = {}) {
    * @returns {Promise<{ appToken: string, tableId: string }>}
    */
   /**
-   * 把配置里的 appToken 归一成 bitable 的 app_token。
+   * 把配置里的 appToken 归一成 bitable 的 app_token 候选。
    *
    * 用户常把 wiki 链接（或 wiki token）直接贴进来 —— wiki 里的多维表格有两种形态：
    * 旧版要换成 get_node 的 obj_token，新版 bitable API 直接吃 wiki token 本身。
    * 所以这里不做单一换算，而是返回候选列表（obj_token 优先，wiki token 兜底），
-   * 由 resolveTable 逐个试，哪个能列出表就用哪个。
+   * 由调用方逐个试，哪个能列出表就用哪个。
    * 支持：完整 wiki/base URL、wiki token、原生 app_token（原样返回）。
+   *
+   * 注意：**这个函数只负责「看起来像多维表格」的归一**。wiki 节点到底是不是多维表格，
+   * 由 `resolveTable` 里的 `probeWikiNode` 统一问（那里不再硬写 `obj_type`，
+   * 所以电子表格的 wiki 链接也不会被它错误地否掉）。
    *
    * @returns {Promise<string[]>} 按优先级排的候选 app_token 列表
    */
@@ -832,105 +1004,220 @@ export function createFeishuSource (options = {}) {
     }
     const fromWiki = Boolean(wikiUrlMatch) || /^wiki/i.test(token)
     if (!fromWiki) return [token] // 原生 app_token（含 /base/ 抠出的），原样返回
-    const payload = await apiCall('/open-apis/wiki/v2/spaces/get_node', {
-      query: { token, obj_type: 'bitable' },
-      signal,
-    })
-    const node = payload?.data?.node
-    const objType = String(node?.obj_type ?? '')
-    const objToken = String(node?.obj_token ?? '')
-    if (objType && objType !== 'bitable') {
+    // wiki 形态：交给 probeWikiNode 问真实类型（它才决定这是不是多维表格）。
+    const node = await probeWikiNode(token, signal)
+    if (node.kind !== 'bitable') {
       throw new PipelineError(
         'invalid-input',
-        `wiki 节点 ${token} 不是多维表格，实际类型是 ${objType}（docx=文档、sheet=电子表格、mindnote=思维笔记）。请在飞书里确认工单表是一张「多维表格」，把那张表的链接填进 appToken。`,
+        `wiki 节点 ${token} 是电子表格，不是多维表格（多维表格用 match.appToken，电子表格用 match.spreadsheetToken）。`,
       )
     }
-    if (!objToken) {
+    if (!node.token) {
       throw new PipelineError(
         'invalid-input',
-        `wiki 节点 ${token} 换算不出多维表格（obj_token 为空）。请确认这个链接指向的是一张多维表格，且应用有该知识库的阅读权限。`,
+        `wiki 节点 ${token} 换算不出多维表格 token（obj_token 为空）。请确认这个链接指向的是一张多维表格，且应用有该知识库的阅读权限。`,
       )
     }
     // 新版 wiki base 直接用 wiki token；旧版用换算出的 obj_token。两个都试。
-    const candidates = [objToken]
-    if (token !== objToken) candidates.push(token)
+    const candidates = [node.token]
+    if (token !== node.token) candidates.push(token)
     return candidates
   }
 
+  /**
+   * 定位到底读哪张表 —— **表型分派的总闸**。
+   *
+   * 三条输入形态（设计 §3.1）：
+   * 1. 显式给了 `spreadsheetToken` → 一定是电子表格，不用探测。
+   * 2. 给了 `appToken` → 可能是多维表格，也可能是 electronic 表格的 wiki 链接。
+   *    wiki 形态走 `get_node` 问真实类型；原生 token 先当多维表格试，
+   *    失败且是「不是这个类型」那类错就再试一次电子表格（双试，见 §3.3）。
+   * 3. 只有 `docNamePattern` → 在云文档里按名字找，两种表型合计恰好 1 张才用。
+   *
+   * `match.tableKind` 显式配置时**跳过探测**（省请求，也给人一条确定性路径）。
+   *
+   * 探测结果缓存在 `tableCache` 里，整轮扫描复用；探测失败**不重试**
+   * （配置写错了，同一轮里再试一百次也是同样的错）。
+   *
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ kind: 'bitable', appToken: string, tableId: string } | { kind: 'sheet', spreadsheetToken: string, sheetId: string, sheetTitle: string }>}
+   */
   async function resolveTable (signal) {
     if (tableCache) return tableCache
 
+    // ① 显式指定表型 = 跳过探测。
+    if (tableKindOption === 'sheet') {
+      tableCache = await resolveSheetTarget(spreadsheetToken || appToken, signal)
+      return tableCache
+    }
+    if (tableKindOption === 'bitable') {
+      if (!appToken) {
+        throw new PipelineError('invalid-input', 'match.tableKind="bitable" 要求同时给 match.appToken（多维表格的 token 或链接）')
+      }
+      tableCache = await resolveBitableTarget(signal)
+      return tableCache
+    }
+
+    // ② 显式给了 spreadsheetToken → 电子表格，不探测。
+    if (spreadsheetToken) {
+      tableCache = await resolveSheetTarget(spreadsheetToken, signal)
+      return tableCache
+    }
+
+    // ③ 有 appToken：先看是不是 wiki 链接（能问出真实类型），再按类型分派。
     if (appToken && String(appToken).trim().length > 0) {
-      const candidates = await normalizeAppToken(signal)
-      // 逐个候选试列表层：第一个能列出表的胜出（旧版 wiki base 用 obj_token，新版直接吃 wiki token）。
-      let lastError = null
-      const attempts = []
-      for (const candidate of candidates) {
-        try {
-          const found = await resolveTableWithAppToken(candidate, signal)
-          tableCache = found
-          return tableCache
-        } catch (error) {
-          attempts.push(`${candidate.slice(0, 12)}…: ${error instanceof Error ? error.message : String(error)}`)
-          lastError = error
+      if (isWikiToken(appToken)) {
+        const node = await probeWikiNode(appToken, signal)
+        if (node.note && typeof options.log === 'function') {
+          options.log('feishu 表型探测', { sourceId, note: node.note })
         }
+        if (node.kind === 'sheet') {
+          tableCache = await resolveSheetTarget(node.token, signal)
+          return tableCache
+        }
+        // 多维表格：obj_token 与 wiki token 两个都试 —— 新版 wiki base 的 bitable API
+        // 直接吃 wiki token 本身，旧版要 obj_token，从形状上看不出是哪一种。
+        // 注意第二个候选要给**裸 token**（从 /wiki/<token> 里抠出来的），
+        // 整条 URL 塞进 path 是另一回事，拼出来的接口地址不对。
+        const wikiBare = extractWikiToken(appToken)
+        const candidates = [node.token]
+        if (wikiBare && wikiBare !== node.token) candidates.push(wikiBare)
+        tableCache = await resolveBitableFromCandidates(candidates, signal)
+        return tableCache
       }
-      if (attempts.length > 1) {
-        // 多候选都失败时把每次尝试列出来，别只报最后一个 —— 用户能看出两个 token 都试过。
-        throw new PipelineError(lastError?.kind ?? 'internal', `飞书读表失败，共试了 ${attempts.length} 个 app_token 候选。`
-          + attempts.map((a) => `\n- ${a}`).join(''))
+
+      // 原生 token：先按多维表格试。失败时**只有**「不是这个类型」那类错才值得再试电子表格
+      // —— 凭据错 / 限流 / 网络错都是真故障，改成试 sheet 只会把真因埋掉。
+      let bitableError = null
+      try {
+        tableCache = await resolveBitableTarget(signal)
+        return tableCache
+      } catch (error) {
+        bitableError = error
+        if (!shouldTrySheet(error)) throw error
       }
-      throw lastError ?? new PipelineError('invalid-input', `appToken ${String(appToken)} 无法定位多维表格`)
+      try {
+        tableCache = await resolveSheetTarget(appToken, signal)
+        return tableCache
+      } catch (sheetError) {
+        throw new PipelineError(
+          'invalid-input',
+          `这个 token 既当不了多维表格，也当不了电子表格。\n`
+            + `- 按多维表格读：${bitableError instanceof Error ? bitableError.message : String(bitableError)}\n`
+            + `- 按电子表格读：${sheetError instanceof Error ? sheetError.message : String(sheetError)}\n`
+            + '请在飞书里确认这张表的类型，并把链接填到对应的配置项（多维表格 → match.appToken，电子表格 → match.spreadsheetToken）。',
+        )
+      }
     }
 
+    // ④ 只有 docNamePattern：按名字在云文档里找，两种表型合计恰好 1 张。
     if (!docNamePattern) {
-      throw new PipelineError('invalid-input', '飞书项目既没给 appToken/tableId，也没给 docNamePattern，无法定位工单表')
+      throw new PipelineError(
+        'invalid-input',
+        '飞书项目没法定位工单表：至少要给 match.appToken（多维表格）、match.spreadsheetToken（电子表格）或 match.docNamePattern（按文件名匹配）之一',
+      )
     }
 
-    const docs = await searchBitableDocs(docNamePattern, signal)
+    const docs = await searchCloudDocs(docNamePattern, signal)
     if (docs.length !== 1) {
       throw new PipelineError(
         'invalid-input',
-        `按 "${docNamePattern}" 匹配到 ${docs.length} 张多维表格，需要恰好 1 张。`
-          + `候选：${docs.map((doc) => doc.name).join('、') || '（无）'}`,
+        `按 "${docNamePattern}" 匹配到 ${docs.length} 张工单表（多维表格 + 电子表格合计），需要恰好 1 张。`
+          + `候选：${docs.map((doc) => `${doc.name}（${doc.type}）`).join('、') || '（无）'}`,
       )
     }
     const doc = docs[0]
-    const payload = await apiCall(`/open-apis/bitable/v1/apps/${doc.token}/tables`, { query: { page_size: 100 }, signal })
-    const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
-    if (items.length !== 1) {
-      throw new PipelineError(
-        'invalid-input',
-        `多维表格「${doc.name}」里有 ${items.length} 张数据表，需要恰好 1 张。`
-          + `现有表：${items.map((item) => String(item?.name ?? '?')).join('、') || '（空）'}`,
-      )
+    if (doc.type === 'sheet') {
+      tableCache = await resolveSheetTarget(doc.token, signal)
+      return tableCache
     }
-    tableCache = { appToken: doc.token, tableId: String(items[0].table_id) }
+    // pattern 已经用来挑文档了，别再拿它过滤数据表名。
+    tableCache = await resolveBitableTableByIdentity(doc.token, signal, false)
     return tableCache
   }
 
   /**
-   * 用确定的 app_token 走原来的两条路：有 tableId 直接绑定，没 tableId 按 pattern 在表清单里挑唯一一张。
+   * 逐个候选 token 试「列出数据表」：第一个能列出来的胜出。
+   *
+   * 为什么要多候选：wiki 里的多维表格有两种形态 —— 旧版要换算成 `obj_token`，
+   * 新版 bitable API 直接吃 wiki token 本身。我们没法从 token 形状判断是哪一种，
+   * 所以两个都试（`normalizeAppToken` 负责排优先级）。
+   *
+   * @param {string[]} candidates
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ kind: 'bitable', appToken: string, tableId: string }>}
    */
-  async function resolveTableWithAppToken (resolvedAppToken, signal) {
-    if (tableId) {
-      return { appToken: resolvedAppToken, tableId }
+  async function resolveBitableFromCandidates (candidates, signal) {
+    let lastError = null
+    const attempts = []
+    for (const candidate of candidates) {
+      try {
+        return await resolveBitableTableByIdentity(candidate, signal)
+      } catch (error) {
+        attempts.push(`${candidate.slice(0, 12)}…: ${error instanceof Error ? error.message : String(error)}`)
+        lastError = error
+      }
     }
+    if (attempts.length > 1) {
+      // 多候选都失败时把每次尝试列出来，别只报最后一个 —— 用户能看出两个 token 都试过。
+      throw new PipelineError(lastError?.kind ?? 'internal', `飞书读表失败，共试了 ${attempts.length} 个 app_token 候选。`
+        + attempts.map((a) => `\n- ${a}`).join(''))
+    }
+    throw lastError ?? new PipelineError('invalid-input', `appToken ${String(appToken)} 无法定位多维表格`)
+  }
 
+  /**
+   * 走多维表格的定位路径（appToken 可能是 wiki 链接）。
+   *
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ kind: 'bitable', appToken: string, tableId: string }>}
+   */
+  async function resolveBitableTarget (signal) {
+    const candidates = await normalizeAppToken(signal)
+    return resolveBitableFromCandidates(candidates, signal)
+  }
+
+  /**
+   * 已知这是一个多维表格的确定 token：有 tableId 直接绑定，否则在多张数据表里挑唯一一张。
+   *
+   * `usePattern` 区分两种来源（这个区别是历史行为，别随手统一）：
+   * - 由 `appToken` 进来时（true）：`docNamePattern` 是拿来**过滤数据表名**的 ——
+   *   用户可能一张多维表格里放了好几张数据表，按表名挑。
+   * - 由 `docNamePattern` 搜云文档进来时（false）：那个 pattern 已经用来挑**文档**了，
+   *   再拿它过滤数据表名等于要求文档名和表名同时匹配，会挑不到（历史上就是这样）。
+   *
+   * @param {string} resolvedAppToken
+   * @param {AbortSignal} [signal]
+   * @param {boolean} [usePattern]
+   * @returns {Promise<{ kind: 'bitable', appToken: string, tableId: string }>}
+   */
+  async function resolveBitableTableByIdentity (resolvedAppToken, signal, usePattern = true) {
+    if (tableId) return { kind: 'bitable', appToken: resolvedAppToken, tableId }
     const payload = await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 100 }, signal })
     const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
-    const matched = docNamePattern
+    const matched = usePattern && docNamePattern
       ? items.filter((item) => matchesPattern(String(item?.name ?? ''), docNamePattern))
       : items
     if (matched.length !== 1) {
-      throw new PipelineError(
+      const error = /** @type {any} */ (new PipelineError(
         'invalid-input',
-        `多维表格 ${appToken} 里按 "${docNamePattern || '（未指定表名）'}" 匹配到 ${matched.length} 张表，需要恰好 1 张。`
+        `多维表格 ${resolvedAppToken} 里按 "${docNamePattern || '（未指定表名）'}" 匹配到 ${matched.length} 张表，需要恰好 1 张（或者在 match.tableId 里指定）。`
           + `现有表：${items.map((item) => String(item?.name ?? '?')).join('、') || '（空）'}`,
-      )
+      ))
+      // 关键：这里**已经成功列出数据表了**，说明这个 token 就是一个多维表格，
+      // 只是表名没对上。给错误打个标记，让 resolveTable 不要去试电子表格 ——
+      // 否则人写错表名时会收到「既当不了多维表格也当不了电子表格」这种把真因埋掉的文案。
+      //
+      // 注意赋值写成单独一行、且别用 `/** @type {any} */ (error).x = y` 那种写法：
+      // 那样这一行以 `(` 开头，会被 ASI 当成上一行表达式的延续
+      // （`new PipelineError(...)(error)`），于是 `error` 在 TDZ 里被读 → ReferenceError。
+      error.confirmedBitable = true
+      throw error
     }
-    return { appToken: resolvedAppToken, tableId: String(matched[0].table_id) }
+    return { kind: 'bitable', appToken: resolvedAppToken, tableId: String(matched[0].table_id) }
   }
+  // 保留旧名字给上面 resolveBitableTarget 用（同一实现，避免两处逻辑漂移）。
+  const resolveTableWithAppToken = resolveBitableTableByIdentity
 
   /**
    * 把一行记录组装成内部 Ticket。
@@ -980,6 +1267,10 @@ export function createFeishuSource (options = {}) {
   /**
    * 扫一轮飞书工单表。
    *
+   * 表型分派在这里收口：`resolveTable()` 告诉我们这是一张多维表格还是电子表格，
+   * 两种表型各自把「这一轮看到了哪些行、哪些是新的、哪些变了」填进同一个账本，
+   * 退役/水位这些跟表型无关的逻辑留在下面统一做 —— 免得两边各写一份再慢慢漂移。
+   *
    * @param {AbortSignal} [signal]
    * @returns {Promise<import('../../contracts/ticket-source.js').ScanResult>}
    */
@@ -1000,6 +1291,58 @@ export function createFeishuSource (options = {}) {
     /** @type {Set<string>} */
     const live = new Set()
 
+    /** @type {{ seen: typeof seen, live: typeof live, created: typeof created, updated: typeof updated, disappeared: typeof disappeared }} */
+    const book = { seen, live, created, updated, disappeared }
+
+    // 电子表格没有行级 mtime，也没有分页，一次读全表 —— 所以它不存在「早停」。
+    // stopped 只有多维表格那条路会置 true（连续 N 行没变化就停），下面据此决定要不要推进 missingScans。
+    let stopped = false
+    if (table.kind === 'sheet') {
+      await scanSheet(table, book, signal)
+    } else {
+      stopped = await scanBitable(table, book, signal)
+    }
+
+    // 没出现在这一轮里的行：连续 goneAfterScans 轮才算删了。
+    //
+    // 但只有**完整扫完**这一轮才允许推进 missingScans：多维表格的翻页循环会因连续 safePageRun 条
+    // 已知未变而早停（stopped），这时后面没请求过的页里的行根本没进 live。「早停时未访问 ≠ 不存在」，
+    // 若照样给它们累加 missingScans，静止的表扫几轮就会把后面那批行全当成已删除地误退役。
+    // 被早停打断的这一轮，对没见到的行一律不下判断（missingScans 保持原值，seen 里的记录都留着）。
+    //
+    // 代价要写在明处：表回到「前 safePageRun 条（默认 20）稳定不变、后面还有行」的形状时，
+    // 排在停点之后的行整轮都不会被访问，它们若真被删了，missingScans 永远不涨，
+    // 于是会一直挂在水位里（不会误退役，但也永不消失）。这是拿「漏删」换「不误杀」。
+    // 真遇到要靠人工核对：把它当已知代价，别指望晚到的重扫能自愈。
+    if (!stopped) {
+      for (const [recordId, state] of Object.entries(seen)) {
+        if (live.has(recordId)) continue
+        // 收窄名单外的行不参与退役判定：收窄期间它们只是「没被看」，
+        // 累加「连续没出现」会把它们误判成已删除（票被收尾）。
+        if (!recordFilter.allows(recordId)) continue
+        state.missingScans = (state.missingScans ?? 0) + 1
+        if (state.missingScans >= goneAfterScans) {
+          if (!disappeared.includes(recordId)) disappeared.push(recordId)
+          delete seen[recordId]
+        }
+      }
+    }
+
+    await saveWatermark?.(sourceId, { seen, lastScanAt: now() })
+
+    return { created, updated, disappeared }
+  }
+
+  /**
+   * 多维表格这条路：翻页 + 按 mtime 早停。
+   *
+   * @param {{ kind: 'bitable', appToken: string, tableId: string }} table
+   * @param {{ seen: any, live: Set<string>, created: any[], updated: any[] }} book
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<boolean>} 是否因为早停而中断（true = 后面还有页没看，别判定退役）
+   */
+  async function scanBitable (table, book, signal) {
+    const { seen, live, created, updated, disappeared } = book
     let safePageRun = 0
     let pageToken = ''
     let stopped = false
@@ -1111,34 +1454,107 @@ export function createFeishuSource (options = {}) {
       pageToken = String(data.page_token)
     }
 
-    // 没出现在这一轮里的行：连续 goneAfterScans 轮才算删了。
-    //
-    // 但只有**完整扫完**这一轮才允许推进 missingScans：翻页循环会因连续 safePageRun 条
-    // 已知未变而早停（stopped），这时后面没请求过的页里的行根本没进 live。「早停时未访问 ≠ 不存在」，
-    // 若照样给它们累加 missingScans，静止的表扫几轮就会把后面那批行全当成已删除地误退役。
-    // 被早停打断的这一轮，对没见到的行一律不下判断（missingScans 保持原值，seen 里的记录都留着）。
-    //
-    // 代价要写在明处：表回到「前 safePageRun 条（默认 20）稳定不变、后面还有行」的形状时，
-    // 排在停点之后的行整轮都不会被访问，它们若真被删了，missingScans 永远不涨，
-    // 于是会一直挂在水位里（不会误退役，但也永不消失）。这是拿「漏删」换「不误杀」。
-    // 真遇到要靠人工核对：把它当已知代价，别指望晚到的重扫能自愈。
-    if (!stopped) {
-      for (const [recordId, state] of Object.entries(seen)) {
-        if (live.has(recordId)) continue
-        // 收窄名单外的行不参与退役判定：收窄期间它们只是「没被看」，
-        // 累加「连续没出现」会把它们误判成已删除（票被收尾）。
-        if (!recordFilter.allows(recordId)) continue
-        state.missingScans = (state.missingScans ?? 0) + 1
-        if (state.missingScans >= goneAfterScans) {
-          if (!disappeared.includes(recordId)) disappeared.push(recordId)
-          delete seen[recordId]
-        }
-      }
+    return stopped
+  }
+
+  /**
+   * 电子表格这条路：一次读全表，逐行比对指纹。
+   *
+   * 与多维表格的三处关键差异（设计 §5.5）：
+   * 1. **没有行级 mtime** —— 水位里 mtime 恒 0，变更判定完全靠内容指纹。
+   * 2. **没有分页** —— 读值接口不给 has_more/page_token，一次拿回来就是全部。
+   * 3. **不早停** —— 既然本来就是整表读回来，早停省不到请求，反而会让「后面那批行」漏判。
+   *
+   * 已知代价（写进设计 §5.5）：变更判定只看指纹，所以「被人动过但内容没变」察觉不到。
+   *
+   * @param {{ kind: 'sheet', spreadsheetToken: string, sheetId: string, sheetTitle?: string }} table
+   * @param {{ seen: any, live: Set<string>, created: any[], updated: any[] }} book
+   * @param {AbortSignal} [signal]
+   */
+  async function scanSheet (table, book, signal) {
+    const { seen, live, created, updated, disappeared } = book
+
+    // 读值接口的 range 是 **URL path 的一段**，形状 `{sheetId}!A1:M500`。
+    // `!` 与 `:` 必须保持原样（整段编码了飞书不认），只有 sheetId 自身需要编码 ——
+    // sheetId 里绝不会出现 `!` 或 `:`，所以分开拼是安全的。
+    // 不给 sheetRange 时从表头行读到 Z 列末尾（开放式写法，行号省略 = 到表尾）。
+    const range = sheetRange ?? { startColumn: 0, startRow: sheetHeaderRow }
+    const valuesPath = `${encodeURIComponent(table.sheetId)}!${buildValueRange({ range, endColumn: 25 })}`
+    const payload = await apiCall(
+      `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(table.spreadsheetToken)}/values/${valuesPath}`,
+      { method: 'GET', signal },
+    )
+
+    const values = Array.isArray(payload?.data?.valueRange?.values) ? payload.data.valueRange.values : []
+    if (values.length === 0 && typeof options.log === 'function') {
+      options.log('feishu 电子表格读回空表', { sourceId, sheetId: table.sheetId })
     }
 
-    await saveWatermark?.(sourceId, { seen, lastScanAt: now() })
+    const header = locateSheetHeader(values, { headerRow: sheetHeaderRow, columns: sheetColumns })
+    const rows = parseSheetRows({
+      values,
+      header,
+      identity: sheetIdentity,
+      idColumn: sheetIdColumn,
+      extractScreenshots,
+    })
 
-    return { created, updated, disappeared }
+    for (const row of rows) {
+      const recordId = row.recordId
+      if (!recordId) continue
+      if (!recordFilter.allows(recordId)) continue
+      live.add(recordId)
+
+      const cells = row.cells
+      const status = normalizeCellText(cells.status)
+      const inProgress = statusValues.includes(status)
+      const ticket = makeTicket({
+        recordId,
+        projectId,
+        description: normalizeCellText(cells.description),
+        module: normalizeCellText(cells.module),
+        flow: normalizeCellText(cells.flow),
+        priority: sheetPriorityOf(cells.priority),
+        department: normalizeCellText(cells.department),
+        foundAt: normalizeSheetDate(cells.foundAt),
+        seq: normalizeCellText(cells.seq),
+        status,
+        screenshots: row.screenshots,
+        // mtime 恒 0：电子表格没有行级最后修改时间。写 0 而不是 now()，
+        // 免得每轮都像是「刚改过」，把水位里的时间戳变成噪音。
+        raw: { sheetId: table.sheetId, rowNumber: row.rowNumber, identitySource: row.identitySource, mtime: 0 },
+      })
+      const prev = seen[recordId]
+
+      if (!prev) {
+        seen[recordId] = { mtime: 0, fingerprint: ticket.fingerprint, missingScans: 0, tracked: inProgress }
+        if (inProgress) created.push(ticket)
+        continue
+      }
+
+      prev.missingScans = 0
+      const contentChanged = ticket.fingerprint !== prev.fingerprint
+
+      if (!inProgress) {
+        if (prev.tracked) {
+          prev.tracked = false
+          if (!disappeared.includes(recordId)) disappeared.push(recordId)
+        }
+        continue
+      }
+
+      if (!prev.tracked) {
+        // 手动重置：把「是否处理」从别的值拨回「处理中」，要重新处理。
+        prev.tracked = true
+        created.push(ticket)
+        continue
+      }
+
+      if (contentChanged) {
+        updated.push(ticket)
+        prev.fingerprint = ticket.fingerprint
+      }
+    }
   }
 
   /**
@@ -1349,6 +1765,20 @@ export function createFeishuSource (options = {}) {
     }
 
     const table = await resolveTable(signal)
+
+    // 电子表格分支不做回填（首版范围见 feishu-sheet-source.md §1.2、ADR-0005 决策）。
+    // 必须在这里显式挡住：`table.appToken` / `table.tableId` 在 sheet 分支上根本不存在，
+    // 继续往下拼会得到 `/bitable/v1/apps/undefined/tables/undefined/records/sh-seq-3`
+    // —— 一个必然 404 的请求，还会被当成可重试故障反复重试。
+    if (table.kind === 'sheet') {
+      return {
+        written: false,
+        note: '这张工单表是飞书「电子表格」，首版只支持从电子表格读票、不支持回填'
+          + '（多维表格才回填「是否处理 / 处理结果 / 处理日期」三列）。票本身已处理完；'
+          + '要回填就把工单表换成多维表格，或把 writeBack 关掉。',
+      }
+    }
+
     const fields = {
       [FEISHU_COLUMNS.status]: status,
       [FEISHU_COLUMNS.result]: result.result,
@@ -1448,5 +1878,28 @@ export function feishuOptionsFromMatch (match) {
       .filter((item) => item.length > 0)
     if (hosts.length > 0) options.allowedImageHosts = Array.from(new Set(hosts))
   }
+
+  // 电子表格那一套（设计 §4.2）：同样按「写了才透传」的规矩来。
+  // 一条原则：**配置层校验过的值，适配器层不再重复判**，这里只做形状归一。
+  const spreadsheetToken = String(m.spreadsheetToken ?? '').trim()
+  if (spreadsheetToken.length > 0) options.spreadsheetToken = spreadsheetToken
+  if (typeof m.sheetId === 'string' && m.sheetId.trim().length > 0) options.sheetId = m.sheetId.trim()
+  // sheetName 与金山源同名同义，配置层已经透传过一次；这里再显式取一遍，
+  // 是因为 `createFeishuSource` 的 options 与 `match` 是两套字段名，不能靠「恰好同名」蒙。
+  if (typeof m.sheetName === 'string' && m.sheetName.trim().length > 0) options.sheetName = m.sheetName.trim()
+  if (typeof m.sheetIdColumn === 'string' && m.sheetIdColumn.trim().length > 0) options.sheetIdColumn = m.sheetIdColumn.trim()
+  if (typeof m.sheetRange === 'string' && m.sheetRange.trim().length > 0) options.sheetRange = m.sheetRange.trim()
+  if (typeof m.tableKind === 'string' && m.tableKind.trim().length > 0) options.tableKind = m.tableKind.trim()
+  if (m.sheetHeaderRow !== undefined && m.sheetHeaderRow !== null && m.sheetHeaderRow !== '') {
+    const row = Number(m.sheetHeaderRow)
+    if (Number.isInteger(row) && row >= 1) options.sheetHeaderRow = row
+  }
+  if (typeof m.sheetIdentity === 'string' && (m.sheetIdentity === 'seq' || m.sheetIdentity === 'row')) {
+    options.sheetIdentity = m.sheetIdentity
+  }
+  if (m.sheetColumns && typeof m.sheetColumns === 'object' && !Array.isArray(m.sheetColumns)) {
+    options.sheetColumns = m.sheetColumns
+  }
+
   return /** @type {any} */ (options)
 }

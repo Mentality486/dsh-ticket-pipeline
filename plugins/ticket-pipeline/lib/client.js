@@ -432,6 +432,9 @@ window.__ModuleLoader__.load({
         fields: [
           { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '飞书多维表格的 table id；与 appToken 一起构成显式绑定。' },
           { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 tableId 时按文件名模糊匹配（例：PMS项目管理系统工单）。' },
+          // 工作表名两边都用：金山拿它挑工作表，飞书电子表格也一样（同一个键，
+          // 所以只在这里画一次 —— 画两次会变成两个输入框绑同一个草稿键）。
+          { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text', hint: '表格底部那个标签页的名字（如「工单」）。金山文档与飞书电子表格都用这一项；留空则用第一张可见工作表。' },
           { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
           { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true },
           { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', advanced: true, hint: '逗号分隔的 record id；留空表示整张表。' },
@@ -444,17 +447,84 @@ window.__ModuleLoader__.load({
         onlyFor: 'wps',
         fields: [
           { path: ['match', 'sheetUrl'], from: 'sheetUrl', label: '表格链接', kind: 'text' },
-          { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text' },
           { path: ['match', 'statusColumn'], from: 'statusColumn', label: '状态列名', kind: 'text' },
           { path: ['match', 'statusValue'], from: 'statusValue', label: '在处理中的取值', kind: 'text' },
           { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text', advanced: true },
         ],
       },
       {
+        key: 'sheet',
+        label: '飞书电子表格',
+        onlyFor: 'feishu',
+        fields: [
+          {
+            path: ['match', 'spreadsheetToken'],
+            from: 'spreadsheetToken',
+            label: '电子表格链接或 token',
+            kind: 'text',
+            hint: '工单表如果是「电子表格」（不是多维表格），把浏览器地址栏那条链接整条贴进来就行，插件会自己认出 spreadsheetToken。填了这个就不用填上面的 appToken/tableId。',
+          },
+          {
+            path: ['match', 'sheetId'],
+            from: 'sheetId',
+            label: '工作表 id',
+            kind: 'text',
+            hint: '可选。留空就按上面的「工作表名」找；两个都不填则取第一张可见工作表。表 id 形如 shXXXXXX，在表格里右键工作表标签能看到。',
+          },
+          {
+            path: ['match', 'sheetHeaderRow'],
+            from: 'sheetHeaderRow',
+            label: '表头在第几行',
+            kind: 'text',
+            hint: '缺省 1（第一行就是表头）。表头上方还有标题、说明行时填实际行号；插件不会自己往下找。',
+          },
+          {
+            path: ['match', 'sheetIdColumn'],
+            from: 'sheetIdColumn',
+            label: '序号列名',
+            kind: 'text',
+            hint: '缺省「序号」。插件拿这一列的值当工单身份（同一行被重复收票靠它去重）；留空的行退回用行号，插行后会当成新工单。',
+          },
+          {
+            path: ['match', 'sheetIdentity'],
+            from: 'sheetIdentity',
+            label: '行身份怎么认',
+            kind: 'select',
+            options: ['', 'seq', 'row'],
+            hint: 'seq（缺省）=按序号列，稳定但同序号重复会报错；row=按物理行号，插入/删除行会让旧工单串位。没特殊理由留空。',
+          },
+          {
+            path: ['match', 'sheetRange'],
+            from: 'sheetRange',
+            label: '读取范围',
+            kind: 'text',
+            advanced: true,
+            hint: '可选，如 A1:M500。留空则从表头行读到 Z 列、读到表尾。数据很多或想限定列时用。',
+          },
+          {
+            path: ['match', 'sheetColumns'],
+            from: 'sheetColumns',
+            label: '列名覆盖',
+            kind: 'columns',
+            advanced: true,
+            hint: '表头叫法跟插件不一样时用，写成 description=我的列名, status=我的状态列。左边只能是 description / status / seq / module / priority 等固定语义名。',
+          },
+          {
+            path: ['match', 'tableKind'],
+            from: 'tableKind',
+            label: '强制表型',
+            kind: 'select',
+            options: ['', 'bitable', 'sheet'],
+            advanced: true,
+            hint: '自动探测有时会多花一次请求。明确知道是哪种就选死，省掉探测；留空=自动。',
+          },
+        ],
+      },
+      {
         key: 'repo',
         label: '仓库',
         fields: [
-          { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。' },
+          { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, pick: 'directory', hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。点「选择目录」可以直接挑，也可以手打。' },
           { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'remote'], from: 'repoRemote', label: 'GitLab 仓库地址', kind: 'text', advanced: true, hint: '只有要开 draft MR 时才需要。填仓库地址（https://gitlab.x/group/repo.git 或 git@gitlab.x:group/repo.git），不是 git 远端名，别填 origin。' },
@@ -546,6 +616,20 @@ window.__ModuleLoader__.load({
     function projectDraftValue (record, field) {
       var raw = record === null || record === undefined ? undefined : record[field.from]
       if (field.kind === 'bool') return Boolean(raw)
+      if (field.kind === 'columns') {
+        // 宿主已经摊平成 `a=b, c=d` 了；但万一拿到的是对象（比如换了宿主版本），
+        // 这里也认，免得显示成 [object Object]。
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          var pieces = []
+          var keys = Object.keys(raw)
+          for (var k = 0; k < keys.length; k += 1) {
+            var value = raw[keys[k]]
+            pieces.push(keys[k] + '=' + (Array.isArray(value) ? value.join('|') : String(value)))
+          }
+          return pieces.join(', ')
+        }
+        return raw === undefined || raw === null ? '' : String(raw)
+      }
       if (field.kind === 'list') {
         if (Array.isArray(raw)) return raw.join(', ')
         return raw === undefined || raw === null ? '' : String(raw)
@@ -553,9 +637,48 @@ window.__ModuleLoader__.load({
       return raw === undefined || raw === null ? '' : String(raw)
     }
 
-    /** 草稿值 → 真正要写进去的值（列表拆逗号、布尔转 bool）。 */
+    /**
+     * `a=b, c=d` 这种一行写法 → `{a:'b', c:'d'}`。
+     *
+     * 为什么用一行文本而不是在面板里再长一个键值编辑器：`sheetColumns` 通常一个
+     * 项目也就改一两项，为它单开一套嵌套编辑器不划算；而宿主下发的已经是摊平
+     * 字符串（见 `src/remote/host.js` 的 `describeProject`），面板只做「原样显示、
+     * 保存时解析回对象」，两边口径一致。
+     *
+     * 值里带 `|` 表示多个候选列名（`seq=序号|编号`），解析成数组 —— 与宿主那边
+     * 用 `|` 连接数组的写法对称。
+     */
+    function parseColumnsDraft (text) {
+      var out = {}
+      var parts = String(text === undefined || text === null ? '' : text).split(',')
+      for (var i = 0; i < parts.length; i += 1) {
+        var part = parts[i].trim()
+        if (part.length === 0) continue
+        var eq = part.indexOf('=')
+        // 没有等号的条目直接跳过：与其猜，不如不写进去（校验侧也不会因此报错）。
+        if (eq <= 0) continue
+        var key = part.slice(0, eq).trim()
+        var value = part.slice(eq + 1).trim()
+        if (key.length === 0 || value.length === 0) continue
+        var candidates = value.split('|')
+        if (candidates.length > 1) {
+          var list = []
+          for (var c = 0; c < candidates.length; c += 1) {
+            var one = candidates[c].trim()
+            if (one.length > 0) list.push(one)
+          }
+          out[key] = list
+        } else {
+          out[key] = value
+        }
+      }
+      return out
+    }
+
+    /** 草稿值 → 真正要写进去的值（列表拆逗号、布尔转 bool、列名覆盖转对象）。 */
     function projectRawValue (field, draftValue) {
       if (field.kind === 'bool') return Boolean(draftValue)
+      if (field.kind === 'columns') return parseColumnsDraft(draftValue)
       if (field.kind === 'list') {
         var parts = String(draftValue === undefined || draftValue === null ? '' : draftValue).split(',')
         var out = []
@@ -1214,6 +1337,10 @@ window.__ModuleLoader__.load({
       '.tp-check input{width:13px;height:13px;margin:0;',
       '  accent-color:var(--dsw-alias-button-primary-fill,#0f1115)}',
       '.tp-branch{display:flex;flex-direction:column;gap:3px}',
+      // 路径 + 「选择目录」横排：按钮与输入框同高，窄屏折行但按钮不压缩。
+      '.tp-pick{display:flex;gap:6px;align-items:center}',
+      '.tp-pick .tp-input{flex:1 1 auto;min-width:0}',
+      '.tp-pick-btn{flex:0 0 auto;white-space:nowrap}',
 
       '.tp-empty{padding:16px 0;font-size:13px;line-height:1.6;',
       '  color:var(--dsw-alias-label-tertiary,#81858c)}',
@@ -1699,6 +1826,33 @@ window.__ModuleLoader__.load({
               choices.length > 0
                 ? h('span', { className: 'tp-help' }, '候选 ' + choices.length + ' 条（来自这个项目的检出）')
                 : h('span', { className: 'tp-help' }, props.branchNote || '没读到分支清单；不影响保存，手打即可。'))
+          } else if (field.pick === 'directory') {
+            // 文本 + 「选择目录」：路径这东西手打最容易错一个字符，然后整条流水线
+            // 起不来，而宿主本来就有原生目录选择器（uiWorkspace.pickDirectory）。
+            //
+            // 选择器拿不到时（没装 uiWorkspace / 老版本宿主）就只画输入框 ——
+            // 手打路径这条退路必须一直在，不能因为选择器缺席就填不了。
+            var canPick = typeof props.onPickDirectory === 'function'
+            control = h('div', { className: 'tp-pick' },
+              h('input', {
+                className: 'tp-input',
+                type: 'text',
+                value: String(value === undefined || value === null ? '' : value),
+                disabled: disabled,
+                autoComplete: 'off',
+                onChange: function (event) { props.onEdit(key, event.target.value) },
+              }),
+              canPick
+                ? h('button', {
+                  type: 'button',
+                  className: 'tp-btn tp-sm tp-pick-btn',
+                  disabled: disabled || props.picking === true,
+                  title: '打开系统的目录选择器',
+                  onClick: function () {
+                    props.onPickDirectory(key, String(value === undefined || value === null ? '' : value))
+                  },
+                }, '选择目录')
+                : null)
           } else {
             control = h('input', {
               className: 'tp-input',
@@ -1855,6 +2009,8 @@ window.__ModuleLoader__.load({
             onRevert: props.onRevert,
             branchChoices: entry && Array.isArray(entry.branches) ? entry.branches : [],
             branchNote: entry && entry.ok === false && entry.reason ? entry.reason : '',
+            onPickDirectory: props.onPickDirectory,
+            picking: props.picking === true,
             open: props.isProjectOpen(index),
             showAdvanced: props.showAdvanced,
             onToggle: props.onToggleProject,
@@ -1968,6 +2124,8 @@ window.__ModuleLoader__.load({
       // git 检出），不该让「项目清单」跟着报错。
       var [branchList, setBranchList] = useState([])
       var [branchBusy, setBranchBusy] = useState(false)
+      // 「选择目录」正在挑（原生选择器是模态的，挡住按钮防连点）。
+      var [picking, setPicking] = useState(false)
 
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
       // 当前页签：整页一次只摊开一块，其余收在页签标题里（见 TABS）。
@@ -2322,6 +2480,41 @@ window.__ModuleLoader__.load({
         clearServerIssue(key)
         setSaveMessage('')
         setSaveError('')
+      }
+
+      /**
+       * 「选择目录」：调宿主原生目录选择器，把结果写回这一格的草稿。
+       *
+       * 三条设计约束：
+       * 1. 只是**改草稿**，不立刻 mutate —— 与「项目字段统一走保存」的语义一致，
+       *    人还能反悔（撤销 / 放弃改动都照常有效）。
+       * 2. 用户取消（picker 回 null）时什么都不做，不把已填路径清空。
+       * 3. 选择器缺席 / 抛错，只往错误区写一句人话，绝不影响其它字段。
+       *
+       * 选择器本身由 apply() 通过 `props.pickDirectory` 注入 —— 面板组件不碰 ctx，
+       * 那边才知道 uiWorkspace 有没有挂上（见 workspaceOf）。
+       */
+      function onPickDirectory (key, current) {
+        if (typeof props.pickDirectory !== 'function') {
+          setSaveError('这台机器的宿主没提供目录选择器，只能手打路径。')
+          return
+        }
+        setPicking(true)
+        setSaveError('')
+        Promise.resolve()
+          .then(function () { return props.pickDirectory(current) })
+          .then(function (picked) {
+            setPicking(false)
+            if (picked === null || picked === undefined || String(picked).length === 0) return
+            onProjectEdit(key, String(picked))
+            // 换了路径，分支候选一定变了 —— 顺手重读一次。读失败无所谓
+            //（分支取不到是常态），所以不 await、也不报错。
+            try { setTimeout(function () { loadBranches() }, 0) } catch (error) {}
+          }, function (error) {
+            setPicking(false)
+            var message = error && error.message ? error.message : String(error)
+            setSaveError('打开目录选择器失败：' + message)
+          })
       }
 
       function onToggleAdv (label) {
@@ -2798,6 +2991,12 @@ window.__ModuleLoader__.load({
             onRevert: onProjectRevert,
             branchList: branchList,
             branchBusy: branchBusy,
+            // 目录选择器：宿主真提供了才传（拿不到时字段里不画按钮，见 ProjectCard 的
+            // pick 分支）。这里必须按「宿主有没有 picker」判断，不能无条件传：面板自己
+            // 那个 onPickDirectory 永远存在，无条件传等于按钮永远画出来、点下去才报错。
+            pickDirectory: props.pickDirectory,
+            picking: picking,
+            onPickDirectory: typeof props.pickDirectory === 'function' ? onPickDirectory : undefined,
             showAdvanced: showAdvanced,
             onToggleAdvanced: setShowAdvanced,
             isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },
@@ -2910,6 +3109,23 @@ window.__ModuleLoader__.load({
       }
       try {
         return ctx === undefined || ctx === null ? undefined : ctx.remote
+      } catch (error) {
+        return undefined
+      }
+    }
+
+    /**
+     * 惰性取 uiWorkspace：同上，不写进 inject。
+     *
+     * 它由 dsh-client-ui-workspace 提供，不是所有部署都装；写进 inject 会让我们的
+     * fiber 在没装它的部署里永远不激活，整个设置页静默消失。拿不到就是「选择目录」
+     * 按钮不出现，手打路径照样能存。
+     */
+    function workspaceOf (ctx) {
+      if (ctx === undefined || ctx === null || typeof ctx.get !== 'function') return undefined
+      try {
+        var found = ctx.get('uiWorkspace')
+        return found === undefined || found === null ? undefined : found
       } catch (error) {
         return undefined
       }
@@ -3057,6 +3273,30 @@ window.__ModuleLoader__.load({
       // typert + connection 就绪才 provide，常常晚于我们；抓一次就等于永远拿不到。
       var getRemote = function () { return remoteOf(ctx) }
 
+      /**
+       * 原生目录选择器。同样不写进 inject（见 workspaceOf 的注释）。
+       *
+       * 返回的是**取值函数**而不是服务本身：这个服务可能比我们更晚挂上，
+       * 在 apply 时读一次会把「本来有、只是晚到」变成永久没有。面板每次渲染
+       * 现取一次，拿到才画按钮。
+       */
+      var getDirectoryPicker = function () {
+        var workspace = workspaceOf(ctx)
+        return workspace && typeof workspace.pickDirectory === 'function' ? workspace : undefined
+      }
+
+      /**
+       * 真正打开选择器；调用时现取服务，晚挂上的情况也能用。
+       *
+       * `current`（格子里已经填着的路径）要透传下去：宿主的 selectDirectory 用它当
+       * 对话框的初始目录，人从「现在配的那个检出」开始挑，而不是从盘符根目录开始翻。
+       */
+      var pickDirectory = function (current) {
+        var workspace = getDirectoryPicker()
+        if (!workspace) return Promise.reject(new Error('宿主没提供 uiWorkspace.pickDirectory，只能手打路径'))
+        return Promise.resolve(workspace.pickDirectory(current))
+      }
+
       // 取命名空间服务。属性式（ctx.remote.settings）在兄弟 fiber 提供的场景下会抛
       // "cannot get property ... without inject"，必须走 ctx.get。
       var getNamespace = function (name) { return namespaceOf(ctx, name) }
@@ -3095,6 +3335,8 @@ window.__ModuleLoader__.load({
           getRemote: getRemote,
           getNamespace: getNamespace,
           ensureRemoteMounted: ensureRemoteMounted,
+          // 每次都现算：uiWorkspace 可能比我们晚挂上，也可能在重载后消失。
+          pickDirectory: getDirectoryPicker() === undefined ? undefined : pickDirectory,
         }))
       }
 

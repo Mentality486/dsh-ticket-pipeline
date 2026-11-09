@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-09；本轮「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）与本文同一次提交，上一轮已提交代码为 `6fb9f08`/`789f6b2`；时间线见 §11.3）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-09，**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数）、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.3）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -21,7 +21,7 @@
 10. [可替换点（文件级）](#10-可替换点文件级)
 11. [一次完整跑的时序](#11-一次完整跑的时序)
 12. [已知约束与未决](#12-已知约束与未决)
-    - [12.10 飞书电子表格支持（设计待实施）](#1210-飞书电子表格支持设计待实施)
+    - [12.10 飞书电子表格支持（已实施）](#1210-飞书电子表格支持已实施)
     - [12.11 插件改动为什么会静默不生效](#1211-插件改动为什么会静默不生效pipeline_doctor-第-5-节)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
@@ -1717,13 +1717,13 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 **能力声明**：`capabilities = ['watermark', 'scanTuning']` —— 金山这条路不需要密钥，也不读本地文件；
 水位必须落盘（否则重启后整张表当新票重收），扫描节流两个数来自全局配置。
 
-### 12.10 飞书电子表格支持（设计待实施）
+### 12.10 飞书电子表格支持（已实施）
 
-> **状态：设计已定、尚未实施。** 本节记录的是**已拍板的架构结论**，不是当前代码的行为 ——
-> 电子表格路径要等 `docs/ticket-pipeline/feishu-sheet-source.md` 排期里的阶段 A–E 落地后才存在。
+> **状态：已实施（2026-11-09）。** 本节先记「为什么必须做」（当时的四条硬证据，现在是四条**已修**的坑），
+> 再记实施后的实际形状。设计全过程见 `docs/ticket-pipeline/feishu-sheet-source.md`（§12 是实施结果），
 > 决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
 
-**现状：电子表格 100% 进不来，而且报错文案会把人引到错方向。**
+**实施前：电子表格 100% 进不来，而且报错文案会把人引到错方向。**
 
 四条硬证据（都在**代码路径**上，与权限无关）：
 
@@ -1736,6 +1736,10 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 
 **这是代码路径问题，不是权限问题** —— 错误文案（先说「不是多维表格」，再列一串 `docx` / `sheet` / `mindnote`）
 很容易把人引到「去申请权限」的错方向，而实际上**哪怕权限全开也扫不出来**。
+
+**实施后（同一位置现在的行为）**：`get_node` 的 query 只剩 `token`，表型读 `node.obj_type`；`sheet` 走
+电子表格分支；云文档搜索改名 `searchCloudDocs` 并认 `type ∈ {bitable, sheet}`；`validateProject` 改成
+四选一（`appToken`+`tableId` / `spreadsheetToken`+`sheetId` / `spreadsheetToken`+`sheetName` / `docNamePattern`）。
 
 **两种表型的八维对照**（下面每一行都是电子表格分支要单独处理的差异）：
 
@@ -1763,24 +1767,38 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 金山源已经踩过同一个坑（`src/adapters/source-wps/xlsx.js:611-613` 的注释明确写了这个取舍），
 电子表格分支**继承同一套水位与退役语义**，不另造机制。
 
-**探测的错误分流**：探测阶段 `auth` / `rate-limit` / `network` 类错误**直接抛**，不换接口重试 ——
+**探测的错误分流**：探测阶段 `auth` / `rate-limit` / `network` / `internal` 类错误**直接抛**，不换接口重试 ——
 凭据、限流、网络问题与表型无关，换个接口再试只会把真因埋掉。只有 `not-found` / `invalid-input`
 才继续试另一种表型。两次都失败时，`invalid-input` 的文案要**列出每次尝试**
 （沿用现有多候选 app_token 的写法，`index.js:806-810`）。
 
+实施时补了第二种「不该换接口」的情形：**已经证明是多维表格也别换**。`resolveBitableTableByIdentity`
+把数据表清单读回来了、只是 `docNamePattern` 匹配不上 —— 这说明 token 就是多维表格，换 sheet 接口
+重试只会把「表名写错了」这个真因埋掉。做法：抛错对象上打 `confirmedBitable = true`，
+`shouldTrySheet(error)` 见到它回 false。
+
 **探测结果缓存**：`tableCache`（`index.js:359-360`，现形状 `{appToken, tableId}`）升级为带 `kind` 的联合类型，
 一轮扫描只探测一次（`scan` 开头调 `resolveTable`，`index.js:917`）。
 
-**落地形态**：新增 `src/adapters/source-feishu/sheets.js`（探测的 sheet 分支 + 工作表定位 + 读值 +
-表头映射 + 身份计算），`index.js` 只做分派 —— 与金山源同构（`source-wps/index.js` + `source-wps/xlsx.js`）。
+**落地形态**：新增 `src/adapters/source-feishu/sheets.js`（579 行：列名别名、工作表定位、range 拼装、
+读值解析、行身份、日期/优先级归一 —— 全是纯函数），`index.js` 只做分派 —— 与金山源同构
+（`source-wps/index.js` + `source-wps/xlsx.js`）。`scan` 拆成 `scanBitable` / `scanSheet` 两条互不干扰的路径。
 
 **人工前置**（与多维表格**两套独立 scope**）：`sheets:spreadsheet:readonly` 或 `drive:drive:readonly`；
 电子表格所有者要手动「…」→「…更多」→「添加文档应用」把应用加为协作者
 （`POST /drive/v1/permissions/:token/members` 只对 `user_access_token` 有效，插件用的是
 `tenant_access_token`，**无法自举** —— 同 §12.8 记的多维表格那条）。
 
-完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`；
-决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
+**面板上的形状**（2026-11-09 起）：项目卡片里多一组「飞书电子表格」（`onlyFor: 'feishu'`），8 个字段
+按 `lib/client.js` 的 `PROJECT_SECTIONS` 画；`sheetName`（工作表名）挪到「工单表」组统一画一次 ——
+两个组各画一次会变成两个输入框绑同一个草稿键。`sheetColumns`（列名覆盖）用一行文本
+`description=我的列名, status=我的状态`，保存时由 `parseColumnsDraft()` 解析回对象。
+
+**自测**：`dev-run` 384 → **404**（19 条电子表格断言，含**只读断言**：全程不出现对 sheets 的写请求）；
+`feishu-checks` 60 → **80**；`client-smoke` **143** 条 `check(`。
+
+完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`（§12 是实施结果与三处
+与设计不同的决定）；决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
 
 ### 12.11 插件改动为什么会静默不生效（`pipeline_doctor` 第 5 节）
 

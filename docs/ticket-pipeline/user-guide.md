@@ -155,7 +155,7 @@
 > 这跟多维表格的 `bitable:app:readonly` **是两套互不相通的 scope，必须单独申请**。
 > 另外电子表格的所有者要在表格页面「…」→「…更多」→「**添加文档应用**」把应用加为协作者 ——
 > 插件用的是应用身份（`tenant_access_token`），没法自己给自己授权，这一步必须人工做一次。
-> （电子表格支持**设计待实施**，这一步是等它落地后才需要的。）
+> （电子表格支持**已于 2026-11-09 落地**，首版**只读不回填**；要用它就必须先做完上面两步，否则一定扫不出票。）
 
 ### 1.3 确认本地仓库
 
@@ -443,7 +443,10 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 **projects[] 每项**：
 
 > 飞书的工单表可以是**多维表格**也可以是**电子表格**，插件自己判断，你不用填表型。
-> 电子表格这套键**设计待实施**（见 `docs/ticket-pipeline/feishu-sheet-source.md`）。
+> 电子表格这套键**已实施（2026-11-09）**，但**首版只读不回填**（见 `docs/ticket-pipeline/feishu-sheet-source.md` §12）。
+> 用电子表格前有两件**只能人做**的事，否则一定扫不出票：①飞书开放平台给应用开
+> `sheets:spreadsheet:readonly`（与多维表格的 `bitable:app:readonly` 是**两套独立**权限）；
+> ②打开那张表 → 右上「…」→「添加文档应用」把应用加成协作者（应用自己没法给自己加）。
 
 | 键 | 说明 |
 |---|---|
@@ -451,8 +454,8 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
 | `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐）。`tableId` 可在面板里改；**`appToken` 只能手改 `cordis.patch.yml`**（面板上是只读状态行，因为它含明文密钥、宿主不下发给浏览器，见 §3.0.1）。`appToken` 也可以直接写整条飞书表格 URL：插件从 `/base/<token>` 取 app_token、从 `?table=` 取 table_id，于是**只贴一条链接就能定位到表**，不用再单独填 `tableId` |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
-| `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`）。和多维表格的 `appToken` 二选一；配了插件就按电子表格处理（**该能力设计待实施**） |
-| `match.sheetId` / `match.sheetName` | 电子表格里**工作表**的 id 或名字（二选一），跟 `spreadsheetToken` 配套。`match.sheetName` 与金山源共用同一个键 |
+| `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`）。和多维表格的 `appToken` 二选一；配了插件就按电子表格处理。**整条电子表格链接直接贴进来也行**（插件从 `/sheets/<token>` 取 token），不用自己截 |
+| `match.sheetId` / `match.sheetName` | 电子表格里**工作表**的 id 或名字（二选一），跟 `spreadsheetToken` 配套。`match.sheetName` 与金山源共用同一个键。**两个都不填**时取第一张可见工作表（多张可见时会让你显式指定，不瞎猜） |
 | `match.sheetHeaderRow` | 表头在第几行，默认 `1` |
 | `match.sheetIdentity` | 行身份来源：`seq`（默认，取序号列的值）/ `row`（取物理行号） |
 | `match.sheetIdColumn` | 序号列的表头文字，默认「序号」 |
@@ -461,7 +464,7 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 | `match.tableKind` | 逃生阀：`bitable` / `sheet`。**一般不用填**，留空 = 插件自己判断表型 |
 | `match.statusValues` | 可配：状态列里哪些取值算「在处理中」（收票条件）。不填则用默认值 `处理中` |
 | `match.recordIds` | 可配：只处理这几条工单（收窄开关）。不填 = 整张表 |
-| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条；一个项目一条，多张票共用）。目录必须**已经存在**，插件不会替你克隆；不存在时这张票以 `invalid-input` 失败并说明该改哪个配置 |
+| `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条；一个项目一条，多张票共用）。目录必须**已经存在**，插件不会替你克隆；不存在时这张票以 `invalid-input` 失败并说明该改哪个配置。设置页里这一格右边有「**选择目录**」按钮，点开就是系统的目录选择器（`uiWorkspace.pickDirectory()`），挑完只改草稿、不立即保存，「撤销」照常管用；宿主的桌面版都带这个服务，裁剪过的 profile 没装时按钮不出现，手打路径照常 |
 | `repo.remote` | **GitLab 仓库地址**（不是 git 远端名）。**只有** `repo.gitlab.enabled: true` 要走远程 draft MR 时才用得上；本阶段（只做本地提交）留空即可。设置页里这一格的标签以前错写成「远端名」，现在已改成「GitLab 仓库地址」，hint 也写明了别填 `origin` —— 插件拿它推 `baseUrl` + `projectId` |
 | `repo.gitlab.enabled` | 远程 MR 出口总开关，**缺省 `false`**。false 时执行器完全不需要 `GITLAB_TOKEN`、不发任何 GitLab 请求，只做本地提交 |
 | `repo.baseBranch` | 建隔离 worktree 用的基准分支（只有 `isolateWorktree: true` 时用到）。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上。设置页里这个框带**候选下拉**（列出该检出里真实存在的分支，顺序是当前分支 → 远端默认 → 本地 → 其余远端），写错分支名这类错从「运行时炸」变成「选项里根本没有」；分支列不出来（`repo.path` 还没填、不是 git 检出）时仍可直接手打 |
@@ -586,7 +589,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **384 项全过**，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **404 项全过**，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
@@ -629,10 +632,30 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 飞书文档授权必须人工把应用加为表格协作者（§1.2）；空字符串凭据会被当成「没配」。
 
 **Q：我的飞书工单表是「电子表格」不是「多维表格」，能扫到吗？**
-当前**还不能** —— 插件的飞书源目前只支持多维表格，电子表格会在探测阶段被判成「不是多维表格」并报错
-（这是代码路径限制，不是权限问题，别去反复申请权限）。电子表格支持**设计已定、尚未实施**，
-方案见 `docs/ticket-pipeline/feishu-sheet-source.md`。届时你只要填电子表格的 token，
-插件会自己判断表型，不用你选。
+**能（2026-11-09 起）**。插件会在探测阶段自己判断表型：`match.appToken` 指向哪张表不重要，
+它读 `node.obj_type` 决定走多维表格还是电子表格分支。你可以①把整条电子表格链接贴进
+`match.spreadsheetToken`，或②照旧贴进 `match.appToken`（插件会先当多维表格试一次，失败再当电子表格试）；
+`match.tableKind` 是逃生阀，明确知道表型时填上能省掉探测的两次请求。
+**但有两件只能人做的事，缺一样都扫不出票**：
+①飞书开放平台给应用开 `sheets:spreadsheet:readonly`（或 `drive:drive:readonly`）—— 它和
+多维表格的 `bitable:app:readonly` 是**两套独立** scope，开了多维表格不等于开了电子表格；
+②打开那张表 → 右上「…」→「添加文档应用」，把应用加成协作者（插件用 `tenant_access_token`，
+没法自己给自己加权限）。
+另外**首版只读不回填**：电子表格的票跑完不会把「是否处理 / 处理结果」写回表格，
+`pipeline_status` 里会显示一条「这张工单表是飞书「电子表格」，首版只支持从电子表格读票、不支持回填」——
+票本身已经处理完了，要回填就把工单表换成多维表格，或把 `writeBack` 关掉。
+反复扫不出票时先看 `pipeline_doctor` 与 `pipeline_status` 里的报错全文：`auth` 类错是 scope/协作者没配好，
+「两张工作表重名」「序号重复」这类是表内容问题。
+
+**Q：电子表格的列名跟插件默认的对不上怎么办？**
+先试别名（「问题描述」也认「缺陷描述」「问题」「Bug 描述」，「是否处理」也认「处理状态」「状态」，
+「优先级」也认「严重程度」「等级」）。别名都不沾边就用 `match.sheetColumns` **覆盖个别列**，
+面板上是「列名覆盖」一格，写成一行 `description=我自己的问题描述列, status=我的状态列`。
+必需的两列是 `description`（问题描述）与 `status`（是否处理），缺任一启动/首扫就报错并列出读到的列名。
+
+**Q：电子表格的表头不在第一行怎么办？**
+填 `match.sheetHeaderRow`（默认 `1`）。插件**不会自己往下找表头** —— 电子表格的行身份依赖
+「数据行从表头下一行开始」这个前提，往下扫会把上面的说明行当成数据。
 
 **Q：电子表格没有 `record_id`，插件怎么认出「还是那张票」？**
 靠**序号列**（默认取表头叫「序号」的那一列）。人在表格上方**插行**会让所有后续行的行号整体漂移，
