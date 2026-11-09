@@ -108,6 +108,7 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 ## 3. 配置插件
 
 配置**常规在设置面板里点着改**：侧栏 Plugins → 「工单流水线」→ 那一行的「配置」。
+面板顶部是**四个页签**——项目 / 参数 / 凭据 / 体检，一次只显示一页（缺省停在「项目」）。
 保存会写进 profile 的 `cordis.patch.yml`（`%DSH_PROFILE_DIR%\cordis.patch.yml`），重启后仍在。
 手改那个文件同样有效，但它是 **YAML 不是 JSON**，改完**必须重启宿主**才读。
 两种入口、每格对应面板哪一处、`appToken` 为什么只读，见

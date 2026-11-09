@@ -26,6 +26,69 @@
 
 ---
 
+## 0.5 从零上手：整条路只有 6 步
+
+先看这张路线图，心里有个数；每一步的细节在后面各自的小节里。
+
+| # | 做什么 | 在哪做 | 怎么算这步过了 | 详见 |
+|---|---|---|---|---|
+| 1 | 把插件装进 profile | 命令行 `dsh.cmd plugin --profile desktop add "file:<插件目录>"`，然后**重启宿主** | 对话里说 `pipeline_status` 有响应 | §2 |
+| 2 | 配凭据 | 设置页「凭据」区块（或 DSH 凭据存储） | 该页显示「已配置」；`pipeline_doctor` 里凭据那行是 ✅ | §1.2 |
+| 3 | 给飞书应用开权限并发布 | [飞书开放平台](https://open.feishu.cn) → 权限管理 → 版本管理与发布 | 能把应用加成多维表格协作者（**可编辑**） | §1.2.1 |
+| 4 | 准备一份本地 git 检出 | 自己 `git clone` 到 `repo.path`（插件不替你克隆） | 那个目录里 `git status` 能跑 | §1.3 |
+| 5 | 写配置 | 设置面板（常规）**或**手改 `cordis.patch.yml`（见下） | 面板能保存；手改则必须重启后 `pipeline_doctor` 认到项目 | §3.0 |
+| 6 | mock 首跑 → 切真执行 | 先在对话里 `pipeline_scan` 走半程，再改 `workExecutor`/`pushAdapter` | `pipeline_status` 里出现一张 `done` 的票 | §4.1 / §4.3 |
+
+### 0.5.1 如果你打算手改配置文件（和最初一样）
+
+**这条路一直有效，插件现在也照样认**。手改的唯一代价是：**改完必须重启宿主**，因为配置在插件启动时读入。步骤：
+
+1. 找到 `<DSH_PROFILE_DIR>\cordis.patch.yml`（Windows 桌面版缺省 `C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml`）。
+2. 在文件里找 `- id: ticket-pipeline` 那一段（**已经存在就只改里面的键，别整段重复贴**；不存在才整段追加）。
+3. 按下面这份最小配置改（**YAML 不是 JSON**：列表用 `-`、缩进两个空格、键值之间是「冒号+空格」）。
+4. 存盘，**完全重启宿主**（关掉再开，页面刷新不算）。
+5. 对话里说 `pipeline_doctor`：项目、仓库、分支、执行器、通知都被认到，就算配好了。
+
+```yaml
+- id: ticket-pipeline
+  name: '@local/ticket-pipeline'
+  config:
+    enabled: true                 # 总开关，缺省是 false —— 最容易忘的一格
+    workExecutor: mock            # 先 mock 走半程，验通再换 agent
+    pushAdapter: mock             # 先 mock，验通再换 qqmail
+    pollIntervalMinutes: 3        # 多久扫一次工单表
+    projects:
+      - name: pms
+        description: 项目管理系统
+        match:
+          platform: feishu
+          # 可以直接写飞书表格的整条 URL（插件会自己啃出 app_token + table_id）；
+          # 值里有 ? & : 这些字符时务必加引号，否则 YAML 会解析出错
+          appToken: "https://<你的域>.feishu.cn/base/<appToken>?table=<tableId>&view=<viewId>"
+          docNamePattern: 项目管理系统工单
+          statusValues:
+            - 处理中
+        repo:
+          path: D:/WorkSpace/pms          # 必须已存在（插件不替你 clone）
+          baseBranch: main
+          targetBranch: main
+        verify:
+          test: npm test                  # 不填 = 跳过验证，直接本地提交
+  disabled: false
+```
+
+> 只写你想改的键就行，**其余走缺省**（比如 `writeBack` / `keepSession` / `isolateWorktree` 不写就是
+> `true` / `true` / `false`）。但 `enabled` 缺省是 `false`，一定要自己写一行 `true`。
+>
+> 三个「写了却不生效」的典型原因：键名拼错（拼错的键被忽略、不报错）、段落没落在 `config:` 下面、
+> 改完没重启宿主。用一个 `pipeline_doctor` 就能把前两个排掉。
+
+**面板 vs 手改，选哪个？** 日常微调（改分支、改通知、开关总开关）用面板更省事，保存即生效、不用重启；
+只有 `projects[].match.appToken` 这一格面板上没有输入框（明文密钥不下发浏览器），必须手改文件。
+两者改的是**同一个文件、同一段落**，混着用也不会打架 —— 但**别同时开着两边改**，后保存的一方覆盖。
+
+---
+
 ## 1. 准备工作
 
 ### 1.1 准备工单表（以飞书为例）
@@ -123,14 +186,18 @@ dsh.cmd plugin --profile desktop add "file:D:/WorkSpace/dsh-ticket-pipeline/plug
 > （设置面板 / 手改 `cordis.patch.yml`），**常规用面板点就行，不需要抄任何 JSON**。
 > 面板长这样：
 
-装好重启后，打开**侧栏 Plugins → 找到「工单流水线」→ 点那一行的「配置」**，是一整页：
+装好重启后，打开**侧栏 Plugins → 找到「工单流水线」→ 点那一行的「配置」**，是一整页。顶部四个**页签**，
+一次只显示一页（缺省停在「项目」，因为那是主线；参数和凭据是一次性调好的配角）。
+页签上会挂小数字 —— 只在真有未保存的改动或待修的错时才出现，平时不占位：
 
-| 区块 | 干什么 |
+| 页签 | 干什么 |
 |---|---|
-| 环境体检 | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
-| 凭据 | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」 |
-| 配置 | **33 个字段 / 7 个分组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项），改完点「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`keepSession`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `writeBack`、`writeBackStatus` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
-| 项目清单 | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（**基本 / 工单表 / 金山文档 / 仓库 / 验证命令**；金山那组只在平台是 `wps` 时出现），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的**只读预览**（面板不提供输入框，改它要手改配置文件，见 §3.0.1）；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
+| **项目** | **可以在面板上直接改**：每个项目 5 个分区 21 个字段（**基本 / 工单表 / 金山文档 / 仓库 / 验证命令**；金山那组只在平台是 `wps` 时出现），改完点保存。`match.appToken` 只显示「已配置 / 前 4…后 4」的**只读预览**（面板不提供输入框，改它要手改配置文件，见 §3.0.1）；保存时只发改动过的深层路径，不会把整个数组覆盖掉。基准/目标分支两个字段还带**候选下拉**（列出该检出里真实存在的分支，可手打）。**缺省只显示 8 个常改字段**，其余收在「显示全部字段」复选框里。点项目名可以收起整个项目卡片，卡片内每个分区也能单独收起 —— 改过的和有错的字段无论收起与否都会露出来。**还能增删**：项目清单右上角「+ 添加项目」追加一个新项目，卡片头「删除」删掉整个项目（都带二次确认或禁用保护） |
+| **参数** | **33 个字段 / 7 个分组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项），不常动的收在组内「高级设置」里。改完点顶部「保存」，写进 profile 的 `cordis.patch.yml`，重启后仍在。字段键名：`pollIntervalMinutes`、`safePageRun`、`goneAfterScans`、`concurrency` / `leaseTtlMinutes`、`leaseHeartbeatSeconds`、`maxAttempts` / `workExecutor`、`ticketTimeoutMinutes`、`isolateWorktree`、`keepSession`、`fetchBeforeCreate`、`branchPrefix`、`worktreeRetentionHours` / `writeBack`、`writeBackStatus` / `provider`、`model`、`maxTokens`、`agentPreset` / `pushAdapter`、`pushplus.token`、`pushplus.channel`、`pushplus.template`、`qqmail.host`、`qqmail.port`、`qqmail.secure`、`qqmail.user`、`qqmail.to`、`pushplus.callbackUrl`、`notifyOn` / `enabled`、`logLevel` |
+| **凭据** | 飞书 App ID & App Secret、QQ 邮箱授权码、GitLab Token、PushPlus token。**只写不读回**，界面只告诉你「已配置 / 未配置」。填完跟顶部「保存」一起提交，每行不再各带一个小「保存」 |
+| **体检** | 点「立即体检」跑一遍和 `pipeline_doctor` 同一份检查（git 链路 / 仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**），结果按「必须修复」「提醒」分段 |
+
+> 保存出错时提示**不随页签切换消失** —— 保存针对整份配置，错在哪页都得让你看见。
 
 > 「配置」按钮只在插件被正常加载后出现；整页空白/没有按钮，先在对话里说 `pipeline_status`
 > 确认插件活着，再看 §6 的排查。
@@ -492,8 +559,8 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |
 | 启动日志 | 看 DSH 启动输出 | 无 `did not activate ticket-pipeline` 警告 |
-| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页：环境体检 / 凭据（填好点顶部「保存」一起提交）/ 配置（**33 个字段，7 个分组**，不常动的收在组内「高级设置」里）/ 项目清单（可增删、可编辑，21 个字段） |
-| 设置页体检 | 该页点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
+| 设置页 | Plugins → 工单流水线 → 该行的「配置」 | 打开是一整页，顶部四个页签：**项目 / 参数 / 凭据 / 体检**，一次只显示一页。项目页 = 项目清单（可增删、可编辑，21 个字段）；参数页 = **33 个字段 / 7 个分组**（不常动的收在组内「高级设置」里）；凭据页 = 5 个凭据（填好点顶部「保存」一起提交）；体检页 = 环境体检报告 |
+| 设置页体检 | 切到「体检」页签，点「立即体检」 | 出「【环境体检】…」报告，与对话里 `pipeline_doctor` 结论一致 |
 | 设置页保存 | 改任一字段 → 保存 | 提示「已保存」；重启后值还在 |
 | 浏览器端一致性 | `node scripts/client-check.mjs`（开发目录） | `✅ client-check 通过` |
 | 浏览器端冒烟 | `node scripts/client-smoke.mjs`（开发目录） | `✅ client-smoke 通过` |
