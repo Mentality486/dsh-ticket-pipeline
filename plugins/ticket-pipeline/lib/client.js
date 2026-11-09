@@ -422,7 +422,7 @@ window.__ModuleLoader__.load({
         label: '基本',
         fields: [
           { path: ['name'], from: 'name', label: '项目名', kind: 'text', required: true, hint: 'projectId，必须唯一；工单里的项目要靠它对上仓库。' },
-          { path: ['description'], from: 'description', label: '说明', kind: 'text', advanced: true },
+          { path: ['description'], from: 'description', label: '说明', kind: 'text', advanced: true, hint: '随便写给人看的备注，不参与任何判断；留空也行。' },
           { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true, hint: '决定用哪个 ticket-source 适配器收票。' },
         ],
       },
@@ -436,7 +436,7 @@ window.__ModuleLoader__.load({
           // 所以只在这里画一次 —— 画两次会变成两个输入框绑同一个草稿键）。
           { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text', hint: '表格底部那个标签页的名字（如「工单」）。金山文档与飞书电子表格都用这一项；留空则用第一张可见工作表。' },
           { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
-          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true },
+          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true, hint: '只扫某一个视图时填（多维表格地址里 ?view= 后面那段）；留空表示整张表。' },
           { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', advanced: true, hint: '逗号分隔的 record id；留空表示整张表。' },
           { path: ['match', 'allowedImageHosts'], from: 'allowedImageHosts', label: '允许的截图主机', kind: 'list', advanced: true, hint: '逗号分隔的主机名白名单；截图链接来自外部输入，不放行的一律拒绝。' },
         ],
@@ -446,10 +446,10 @@ window.__ModuleLoader__.load({
         label: '金山文档',
         onlyFor: 'wps',
         fields: [
-          { path: ['match', 'sheetUrl'], from: 'sheetUrl', label: '表格链接', kind: 'text' },
-          { path: ['match', 'statusColumn'], from: 'statusColumn', label: '状态列名', kind: 'text' },
-          { path: ['match', 'statusValue'], from: 'statusValue', label: '在处理中的取值', kind: 'text' },
-          { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text', advanced: true },
+          { path: ['match', 'sheetUrl'], from: 'sheetUrl', label: '表格链接', kind: 'text', hint: '金山文档的分享链接；插件按链接直接下载整本 xlsx，需要「任何人可查看」级别的分享。' },
+          { path: ['match', 'statusColumn'], from: 'statusColumn', label: '状态列名', kind: 'text', hint: '哪一列表示「处理到哪一步」，缺省「是否处理」。' },
+          { path: ['match', 'statusValue'], from: 'statusValue', label: '在处理中的取值', kind: 'text', hint: '状态列等于这个值时才算待办，缺省「处理中」。' },
+          { path: ['match', 'mediaPrefix'], from: 'mediaPrefix', label: '附件前缀', kind: 'text', advanced: true, hint: '截图落在工作区时用的文件名前缀，缺省 wps-media。' },
         ],
       },
       {
