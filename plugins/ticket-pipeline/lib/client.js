@@ -642,6 +642,44 @@ window.__ModuleLoader__.load({
       return map && map[label] === true
     }
 
+    // ── 页签 ────────────────────────────────────────────────────
+    // 整页有四个互不相干的大块（项目 / 参数 / 凭据 / 体检）。上一版把它们竖着
+    // 排成一列，一屏 1300 多字、四个卡片首尾相接，谁也说不清该从哪儿看起 ——
+    // 这就是「太复杂」。改成页签之后每次只摊开一块，其余收在标题里。
+    //
+    // 缺省停在「项目」：它是这张配置页真正的主线（一张工单表绑一个仓库），
+    // 参数与凭据是一次性调好的配角。
+    var TAB_KEY = 'ticket-pipeline:open-tab'
+
+    var TABS = [
+      { key: 'projects', label: '项目' },
+      { key: 'params', label: '参数' },
+      { key: 'creds', label: '凭据' },
+      { key: 'doctor', label: '体检' },
+    ]
+
+    function readTab () {
+      try {
+        if (typeof localStorage === 'undefined') return 'projects'
+        var raw = localStorage.getItem(TAB_KEY)
+        for (var i = 0; i < TABS.length; i += 1) {
+          if (TABS[i].key === raw) return raw
+        }
+        return 'projects'
+      } catch (error) {
+        return 'projects'
+      }
+    }
+
+    function writeTab (key) {
+      try {
+        if (typeof localStorage === 'undefined') return
+        localStorage.setItem(TAB_KEY, key)
+      } catch (error) {
+        // 存不下就算了，下次回到缺省页签不影响功能。
+      }
+    }
+
     var PROJ_OPEN_KEY = 'ticket-pipeline:open-projects'
 
     function readProjMap () {
@@ -881,174 +919,230 @@ window.__ModuleLoader__.load({
      *   3. **克制**：标题 16px/600 深灰（不纯黑）、字段名 14px/500、说明 12px 浅灰。
      */
     var CSS = [
-      '.tp-panel{display:flex;flex-direction:column;gap:20px;padding:2px 0 32px;',
-      '  font-family:var(--dsw-font-family,inherit);',
-      '  background:var(--dsw-alias-bg-layer-1,#f7f8fa);',
-      '  border-radius:var(--dsw-radius-lg,14px);padding:16px 16px 32px}',
-      '.tp-head{display:flex;flex-direction:column;gap:2px}',
-      '.tp-head h2{margin:0;font-size:16px;font-weight:600;',
-      '  color:var(--dsw-alias-label-primary,inherit)}',
-      '.tp-head p{margin:0;font-size:12px;font-weight:400;line-height:1.6;',
-      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+      // 这一段是照着宿主自己的设置页重写的，不是凭空调色。
+      //
+      // 上一版错在三处，三处叠起来就是「丑」：
+      //   1. **面板铺了一层灰底**（bg-module-platform #f9fafb），于是整个插件面板
+      //      在宿主的设置页里像一块贴上去的异色区域。宿主设置区自己是透明的，
+      //      靠外部容器的留白跟别的内容分开。
+      //   2. **三层盒子套娃**：灰面板 → 白卡 → 灰项目卡。每层都在描边、都在圆角，
+      //      眼睛找不到边界。宿主只有「内容区 → 卡片」一层。
+      //   3. **胶囊分段页签**。宿主设置页里的页签是下划线式的（border-bottom 细线
+      //      + 选中项 2px 底条），胶囊只在少数工具条里出现。照它自己的写法，
+      //      两边才像同一个产品。
+      //
+      // 参考：@deepseek-ai/dsh-client-ui-settings-plugins 的 PluginsSettingsSection
+      //   .section{max-width:760px;flex-direction:column;gap:12px}
+      //   .heading{font-size:18px;font-weight:600}
+      //   .intro{font-size:13px;color:label-tertiary}
+      //   .tabs{border-bottom:.5px solid border-l2;gap:22px}
+      //   .tab{padding:7px 1px 9px;font-size:13px;color:label-tertiary}
+      //   .tab[data-active=true]:after{height:2px;background:label-primary;bottom:-1px}
+      //   .cards{gap:10px}
 
-      // 顶部操作栏：白底 + 一条浅底边，sticky 在顶上，任何时候都够得着「保存」。
-      '.tp-bar{position:sticky;top:0;z-index:3;display:flex;gap:8px;align-items:center;',
-      '  flex-wrap:wrap;padding:12px 16px;margin:0 -16px;',
+      // 面板本身不铺底色、不画边框 —— 宿主设置页就是这么做的。
+      '.tp-panel{display:flex;flex-direction:column;gap:16px;box-sizing:border-box;',
+      '  max-width:880px;padding:2px 0 24px;font-family:var(--dsw-font-family,inherit)}',
+
+      // 标题区照宿主的 heading/intro 比例：18px 标题 + 13px 说明。
+      '.tp-head{display:flex;flex-direction:column;gap:3px}',
+      '.tp-head h2{margin:0;font-size:18px;font-weight:600;line-height:26px;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-head p{margin:0;font-size:13px;line-height:20px;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+
+      // 工具条：吸顶，但**只有一条底线**，不做成一张卡片。
+      // 做成卡片就得给圆角 + 描边 + 阴影，而它横跨内容区顶端，视觉上等于又加一层框。
+      '.tp-toolbar{position:sticky;top:0;z-index:5;display:flex;align-items:flex-end;',
+      '  gap:12px;flex-wrap:wrap;padding:2px 0 0;margin:0 0 -1px;',
       '  background:var(--dsw-alias-bg-base,#fff);',
-      '  border-bottom:1px solid var(--dsw-alias-border-l2,#eee);',
-      '  box-shadow:0 1px 0 rgba(0,0,0,.02)}',
+      '  border-bottom:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1))}',
 
-      // 卡片：纯白 + 圆角 + 极轻阴影 + 24px 内边距。
-      '.tp-card{background:var(--dsw-alias-bg-base,#fff);',
-      '  border:1px solid var(--dsw-alias-border-l2,#ececec);',
-      '  border-radius:var(--dsw-radius-panel,var(--dsw-radius-lg,14px));',
-      '  box-shadow:0 2px 8px rgba(0,0,0,.05);padding:24px}',
-      '.tp-card>h3{margin:0 0 4px;font-size:16px;font-weight:600;',
-      '  color:var(--dsw-alias-label-primary,inherit);',
-      '  display:flex;align-items:center;justify-content:space-between;gap:8px}',
-      '.tp-card>.tp-note{margin:0 0 8px}',
-      '.tp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:16px}',
+      // 页签：下划线式，抄宿主 .tab / .tab[data-active]:after。
+      // 用 ::after 画底条而不是 border-bottom，这样底条能盖住工具条那根细线。
+      '.tp-tabs{display:flex;align-items:flex-end;gap:20px;border:0;background:none;padding:0}',
+      '.tp-tab{position:relative;font:inherit;font-size:13px;line-height:20px;',
+      '  padding:7px 1px 9px;border:0;background:none;cursor:pointer;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c);',
+      '  display:inline-flex;align-items:center;gap:5px;white-space:nowrap;',
+      '  transition:color .15s ease}',
+      '.tp-tab:hover{color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-tab[aria-selected=true]{color:var(--dsw-alias-label-primary,#0f1115);font-weight:500}',
+      '.tp-tab[aria-selected=true]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;',
+      '  height:2px;border-radius:2px 2px 0 0;background:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-tab:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);',
+      '  outline-offset:2px;border-radius:3px}',
+      // 页签上的小数字：只在真有事时出现，平时不占位（页签本来就窄）。
+      '.tp-tab-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;',
+      '  font-size:11px;font-weight:600;line-height:16px;text-align:center;',
+      '  background:var(--dsw-alias-state-warn-primary,#f59e0b);color:#fff}',
+      '.tp-tab-badge.tp-badge-bad{background:var(--dsw-alias-state-error-primary,#ec1313)}',
 
-      // 分组标题（配置分组 / 项目卡内分区共用一个字号）。
-      '.tp-group{padding:4px 0}',
-      '.tp-group>h4{margin:0 0 8px;font-size:13px;font-weight:600;',
-      '  color:var(--dsw-alias-label-primary,inherit)}',
+      // 右侧动作贴底对齐，跟页签的基线齐平。
+      '.tp-bar-actions{display:flex;align-items:center;gap:8px;margin-left:auto;',
+      '  padding-bottom:6px;flex-wrap:wrap}',
+
+      // 卡片：用宿主自己的 settings-card 两个 token（fill / stroke），圆角走 radius-lg。
+      // **不加阴影** —— 白底 + 半像素描边已经是宿主卡片的标准做法，加阴影反而脏。
+      '.tp-card{background:var(--dsw-alias-settings-card-fill,var(--dsw-alias-bg-layer-2,#fff));',
+      '  border:.5px solid var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l2,rgba(0,0,0,.1)));',
+      '  border-radius:var(--dsw-radius-lg,16px);padding:16px 18px;box-sizing:border-box}',
+      '.tp-card>h3{margin:0;display:flex;align-items:center;gap:8px;justify-content:space-between;',
+      '  font-size:15px;font-weight:600;line-height:22px;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-card>.tp-note{margin:6px 0 0}',
+      '.tp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}',
+
+      // 分组：标题行就是折叠按钮，整行可点。组与组之间用一条极淡的分隔线，
+      // **不再给每组套一个框** —— 框套框正是上一版乱的主因。
+      '.tp-group+.tp-group{border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04))}',
+      '.tp-group>h4{margin:0}',
       '.tp-toggle{font:inherit;display:flex;align-items:center;gap:6px;width:100%;',
-      '  padding:6px 0;cursor:pointer;background:transparent;border:0;text-align:left;',
-      '  font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,inherit)}',
-      '.tp-toggle .tp-caret{display:inline-block;width:10px;opacity:.6}',
-      '.tp-toggle[aria-expanded=false]{color:var(--dsw-alias-label-secondary,#555)}',
-      '.tp-adv{border-top:1px dashed var(--dsw-alias-border-l2,#eee);margin-top:8px}',
+      '  padding:10px 0 6px;cursor:pointer;background:none;border:0;text-align:left;',
+      '  font-size:13px;font-weight:600;line-height:20px;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-toggle .tp-caret{display:inline-block;width:10px;font-size:10px;opacity:.4}',
+      '.tp-toggle[aria-expanded=false]{color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.tp-adv{border-top:.5px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.1));margin-top:6px}',
+      '.tp-adv .tp-toggle{padding-top:8px;font-weight:400;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
 
-      // 字段：**上下结构**（Label 置顶）。字段名一行、输入框一行、说明一行。
-      '.tp-fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));',
-      '  gap:4px 28px}',
-      '.tp-field{display:flex;flex-direction:column;gap:6px;padding:10px 0;',
-      '  border-bottom:1px solid var(--dsw-alias-border-l2,#f0f0f0)}',
-      '.tp-field:last-child{border-bottom:0}',
-      '.tp-field>label,.tp-field .tp-field-label{font-size:14px;font-weight:500;line-height:1.4;',
-      '  color:var(--dsw-alias-label-primary,inherit);',
-      '  display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-      '.tp-help{margin:0;font-size:12px;font-weight:400;line-height:1.6;',
-      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
-      '.tp-constraint{margin:0;font-size:12px;font-weight:400;',
-      '  color:var(--dsw-alias-label-dimmed,#9aa1b0)}',
-      '.tp-field-err{margin:0;font-size:12px;color:var(--dsw-alias-state-error-primary,#d33)}',
-      '.tp-soft{margin:0;font-size:12px;color:var(--dsw-alias-state-warn-primary,#b8860b)}',
-      '.tp-note{margin:0;font-size:12px;line-height:1.7;',
-      '  color:var(--dsw-alias-label-tertiary,#8c92a4)}',
-      '.tp-err{margin:0;font-size:12px;line-height:1.7;',
-      '  color:var(--dsw-alias-state-error-primary,#d33)}',
-      '.tp-ok{margin:0;font-size:12px;color:var(--dsw-alias-state-success-primary,#2c9)}',
+      // 字段：上下结构（Label 置顶）。**不给每个字段画横线** ——
+      // 双列网格里每格一条线会把整块画成表格，比不画线还乱。
+      '.tp-fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));',
+      '  gap:4px 24px;padding:2px 0 8px}',
+      '.tp-field{display:flex;flex-direction:column;gap:5px;padding:5px 0;min-width:0}',
+      '.tp-field-label{font-size:13px;font-weight:500;line-height:20px;',
+      '  color:var(--dsw-alias-label-secondary,#61666b);',
+      '  display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+      '.tp-help{margin:0;font-size:12px;line-height:1.5;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-constraint{margin:0;font-size:11px;line-height:1.5;',
+      '  color:var(--dsw-alias-label-caption,#adb2b8)}',
+      '.tp-field-err{margin:0;font-size:12px;color:var(--dsw-alias-state-error-primary,#ec1313)}',
+      '.tp-soft{margin:0;font-size:12px;color:var(--dsw-alias-state-warn-primary,#f59e0b)}',
+      '.tp-note{margin:0;font-size:12px;line-height:1.6;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-err{margin:0;font-size:12px;line-height:1.6;',
+      '  color:var(--dsw-alias-state-error-primary,#ec1313)}',
+      '.tp-ok{margin:0;font-size:12px;color:var(--dsw-alias-state-success-primary,#22c55e)}',
 
-      // 输入控件：统一 36px 高、限宽 420px（不占满全屏），只留 --dsw-* 引用。
+      // 输入控件：32px 高、8px 圆角、半像素描边 —— 和宿主表单一致。
       '.tp-input,.tp-select{box-sizing:border-box;font:inherit;font-size:13px;line-height:1.5;',
-      '  height:36px;padding:0 12px;width:100%;max-width:420px;',
-      '  border:1px solid var(--dsw-alias-border-l4,#d9d9d9);',
-      '  border-radius:var(--dsw-radius-md,8px);',
-      '  background:var(--dsw-alias-bg-layer-3,#fff);',
-      '  color:var(--dsw-alias-label-primary,inherit)}',
-      '.tp-input::placeholder{color:var(--dsw-alias-label-dimmed,#9aa1b0)}',
-      '.tp-input:focus-visible,.tp-select:focus-visible{outline:none;',
-      '  border-color:var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary,#356be8))}',
-      '.tp-input:disabled,.tp-select:disabled{color:var(--dsw-alias-label-tertiary,#8c92a4);',
-      '  cursor:default}',
-      '.tp-field.tp-invalid .tp-input,.tp-field.tp-invalid .tp-select{',
-      '  border-color:var(--dsw-alias-state-error-primary,#d33)}',
-      'textarea.tp-input{height:auto;min-height:72px;padding:8px 12px;resize:vertical}',
-
-      // Switch 开关（抄宿主 _switch，类名换成自己的前缀）。
-      '.tp-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:36px;height:20px;',
-      '  padding:2px;border:0;border-radius:999px;background:var(--dsw-alias-border-l3,#c8c8c8);',
-      '  cursor:pointer;transition:background .12s ease}',
-      '.tp-switch[aria-checked=true]{background:var(--dsw-alias-brand-primary,#356be8)}',
-      '.tp-switch:disabled{cursor:default;opacity:.5}',
-      '.tp-switch:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid',
-      '  var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#356be8));',
-      '  outline-offset:2px}',
-      '.tp-switch-thumb{display:block;width:16px;height:16px;border-radius:50%;',
-      '  background:var(--dsw-alias-label-primary-foreground,#fff);',
-      '  transition:transform .12s ease}',
-      '.tp-switch[aria-checked=false] .tp-switch-thumb{',
-      '  background:var(--dsw-alias-switch-thumb,#fff)}',
-      '.tp-switch[aria-checked=true] .tp-switch-thumb{transform:translate(16px)}',
-      '.tp-switch-row{display:flex;align-items:center;gap:10px}',
-      '.tp-switch-state{font-size:12px;color:var(--dsw-alias-label-tertiary,#8c92a4)}',
-
-      // 标签：已配置 / 已改 / 项目数等，一律用 Tag 而不是生硬的文字框。
-      '.tp-badge{font-size:11px;font-weight:500;padding:1px 8px;border-radius:999px;',
-      '  border:1px solid var(--dsw-alias-border-l2,#ddd);white-space:nowrap;',
-      '  color:var(--dsw-alias-label-secondary,#555);',
-      '  background:var(--dsw-alias-bg-layer-2,#fafafa)}',
-      '.tp-badge.tp-on{color:var(--dsw-alias-brand-primary,#356be8);',
-      '  border-color:var(--dsw-alias-brand-primary,#356be8);background:transparent}',
-      '.tp-badge.tp-ok{color:var(--dsw-alias-state-success-primary,#2c9);',
-      '  border-color:var(--dsw-alias-state-success-primary,#2c9);background:transparent}',
-      '.tp-badge.tp-bad{color:var(--dsw-alias-state-error-primary,#d33);',
-      '  border-color:var(--dsw-alias-state-error-primary,#d33);background:transparent}',
-
-      // 按钮。
-      '.tp-btn{font:inherit;font-size:13px;height:32px;padding:0 14px;cursor:pointer;',
+      '  height:32px;padding:0 10px;width:100%;max-width:420px;',
+      '  border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));',
       '  border-radius:var(--dsw-radius-sm,8px);',
-      '  border:1px solid var(--dsw-alias-border-l3,#d0d0d0);background:transparent;',
-      '  color:var(--dsw-alias-label-primary,inherit);',
-      '  display:inline-flex;align-items:center;gap:6px}',
-      '.tp-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,#8881)}',
-      '.tp-btn:disabled{opacity:.5;cursor:default}',
-      '.tp-btn.tp-primary{color:var(--dsw-alias-label-primary-foreground,#fff);',
-      '  background:var(--dsw-alias-button-primary-fill,#356be8);border-color:transparent}',
-      '.tp-btn.tp-primary:hover:not(:disabled){',
-      '  background:var(--dsw-alias-button-primary-hover,#2a5bd0)}',
-      '.tp-btn.tp-danger{color:var(--dsw-alias-state-error-primary,#d33);',
-      '  border-color:var(--dsw-alias-border-l2,#eee)}',
-      '.tp-btn.tp-sm{height:26px;padding:0 10px;font-size:12px}',
+      '  background:var(--dsw-alias-bg-layer-1,#fff);',
+      '  color:var(--dsw-alias-label-primary,#0f1115);transition:border-color .12s ease}',
+      '.tp-input::placeholder{color:var(--dsw-alias-label-caption,#adb2b8)}',
+      '.tp-input:hover:not(:disabled),.tp-select:hover:not(:disabled){',
+      '  border-color:var(--dsw-alias-border-l4,rgba(0,0,0,.16))}',
+      '.tp-input:focus-visible,.tp-select:focus-visible{outline:none;',
+      '  border-color:var(--dsw-alias-state-business-primary,#4176e6);',
+      '  box-shadow:0 0 0 3px color-mix(in srgb, var(--dsw-alias-state-business-primary,#4176e6) 15%, transparent)}',
+      '.tp-input:disabled,.tp-select:disabled{color:var(--dsw-alias-label-tertiary,#81858c);',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);cursor:default}',
+      '.tp-field.tp-invalid .tp-input,.tp-field.tp-invalid .tp-select{',
+      '  border-color:var(--dsw-alias-state-error-primary,#ec1313)}',
+      'textarea.tp-input{height:auto;min-height:64px;padding:7px 10px;resize:vertical}',
 
-      // 凭据行。
-      '.tp-cred{display:flex;flex-direction:column;gap:6px;padding:16px 0;',
-      '  border-bottom:1px solid var(--dsw-alias-border-l2,#f0f0f0)}',
-      '.tp-cred:last-child{border-bottom:0}',
+      // Switch：照宿主开关的比例与品牌色。
+      '.tp-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:34px;height:18px;',
+      '  padding:2px;border:0;border-radius:999px;cursor:pointer;',
+      '  background:var(--dsw-alias-border-l3,rgba(0,0,0,.2));',
+      '  transition:background .14s ease}',
+      '.tp-switch[aria-checked=true]{background:var(--dsw-alias-button-primary-fill,#0f1115)}',
+      '.tp-switch:disabled{cursor:default;opacity:.45}',
+      '.tp-switch:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);',
+      '  outline-offset:2px}',
+      '.tp-switch-thumb{display:block;width:14px;height:14px;border-radius:50%;background:#fff;',
+      '  box-shadow:0 1px 2px rgba(15,17,21,.2);transition:transform .14s ease}',
+      '.tp-switch[aria-checked=true] .tp-switch-thumb{transform:translate(16px)}',
+      '.tp-switch-row{display:flex;align-items:center;gap:8px}',
+      '.tp-switch-state{font-size:12px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+
+      // 徽标：比上一版更淡。之前每个徽标都有描边 + 底色，一排看下来像按钮。
+      '.tp-badge{font-size:11px;font-weight:500;line-height:16px;padding:0 6px;',
+      '  border-radius:var(--dsw-radius-xs,4px);white-space:nowrap;',
+      '  border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));',
+      '  color:var(--dsw-alias-label-tertiary,#81858c);',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb)}',
+      '.tp-badge.tp-on{color:var(--dsw-alias-state-business-primary,#4176e6);',
+      '  border-color:color-mix(in srgb, var(--dsw-alias-state-business-primary,#4176e6) 26%, transparent);',
+      '  background:color-mix(in srgb, var(--dsw-alias-state-business-primary,#4176e6) 8%, transparent)}',
+      '.tp-badge.tp-ok{color:#12864a;border-color:rgba(34,197,94,.28);background:rgba(34,197,94,.09)}',
+      '.tp-badge.tp-bad{color:var(--dsw-alias-state-error-primary,#ec1313);',
+      '  border-color:rgba(236,19,19,.26);background:rgba(236,19,19,.07)}',
+
+      // 按钮：30px 高、8px 圆角；主按钮用宿主近黑品牌色，不是蓝。
+      '.tp-btn{font:inherit;font-size:13px;height:30px;padding:0 12px;cursor:pointer;',
+      '  border-radius:var(--dsw-radius-sm,8px);white-space:nowrap;',
+      '  border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:transparent;',
+      '  color:var(--dsw-alias-label-primary,#0f1115);',
+      '  display:inline-flex;align-items:center;gap:5px;transition:background .12s ease}',
+      '.tp-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(38,49,72,.06))}',
+      '.tp-btn:disabled{opacity:.4;cursor:default}',
+      '.tp-btn.tp-primary{color:#fff;background:var(--dsw-alias-button-primary-fill,#0f1115);',
+      '  border-color:transparent;font-weight:500}',
+      '.tp-btn.tp-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,#43454a)}',
+      '.tp-btn.tp-danger{color:var(--dsw-alias-state-error-primary,#ec1313);',
+      '  border-color:transparent;background:rgba(236,19,19,.06)}',
+      '.tp-btn.tp-danger:hover:not(:disabled){background:rgba(236,19,19,.12)}',
+      '.tp-btn.tp-sm{height:24px;padding:0 8px;font-size:12px}',
+
+      // 凭据行：靠分隔线分组，不给每行套框。
+      '.tp-cred{display:flex;flex-direction:column;gap:6px;padding:12px 0;',
+      '  border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04))}',
+      '.tp-cred:first-child{border-top:0;padding-top:4px}',
+      '.tp-cred:last-child{padding-bottom:0}',
       '.tp-cred-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-      '.tp-cred-title{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,inherit)}',
+      '.tp-cred-title{font-size:13px;font-weight:500;line-height:20px;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
 
-      // 环境变量名：浅底纹 code，不再裸飘在说明里。
+      // 行内代码：极淡底纹，不抢视线。
       'code{font-family:var(--dsw-font-family,ui-monospace,monospace);font-size:11px;',
-      '  padding:1px 5px;border-radius:4px;',
-      '  background:var(--dsw-alias-markdown-inline-code,#8881);',
-      '  color:var(--dsw-alias-label-secondary,#555);word-break:break-all}',
+      '  padding:1px 5px;border-radius:var(--dsw-radius-xs,4px);',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);',
+      '  border:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04));',
+      '  color:var(--dsw-alias-label-secondary,#61666b);word-break:break-all}',
 
-      // 项目卡片：外层折叠 + 卡内分区折叠（两级），都用 tp-toggle。
-      '.tp-proj{background:var(--dsw-alias-bg-base,#fff);',
-      '  border:1px solid var(--dsw-alias-border-l2,#ececec);',
-      '  border-radius:var(--dsw-radius-md,10px);padding:12px 16px;margin:12px 0 0;',
-      '  box-shadow:0 1px 4px rgba(0,0,0,.04)}',
-      '.tp-proj.tp-collapsed{padding:8px 16px}',
-      '.tp-proj-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-      '.tp-proj-head .tp-toggle{width:auto;flex:0 1 auto;padding:4px 0;font-size:13px}',
-      '.tp-proj-head .tp-toggle strong{font-size:13px;font-weight:600}',
-      '.tp-proj-body{margin-top:4px}',
-      '.tp-proj-body .tp-group>h4 .tp-toggle{font-size:12px}',
+      // 项目卡：**去掉它自己那层灰底盒子**。上一版是 灰面板 → 白卡 → 灰项目卡，
+      // 三层套娃是「乱」的最大来源。现在它只是白卡里的一段，靠分隔线分开。
+      '.tp-proj{border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));',
+      '  padding:10px 0 0;margin:10px 0 0}',
+      '.tp-proj:first-child{border-top:0;padding-top:0;margin-top:8px}',
+      '.tp-proj-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap}',
+      '.tp-proj-head .tp-toggle{width:auto;flex:0 1 auto;padding:3px 0;font-size:13px}',
+      '.tp-proj-head .tp-toggle strong{font-size:14px;font-weight:600}',
+      '.tp-proj-body{margin-top:2px}',
       '.tp-spacer{margin-left:auto}',
-      '.tp-field-mark{display:inline-flex;gap:6px;align-items:center}',
-      '.tp-count{font-size:12px;color:var(--dsw-alias-state-warn-label,#b8860b)}',
-      '.tp-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;',
-      '  color:var(--dsw-alias-label-secondary,#555);cursor:pointer}',
-      '.tp-check input{width:14px;height:14px;accent-color:var(--dsw-alias-brand-primary,#356be8)}',
-      '.tp-branch{display:flex;flex-direction:column;gap:4px}',
-      '.tp-branch .tp-help{padding-left:2px}',
+      // 卡片内的操作行：靠左是筛选开关，靠右是结构性动作。
+      '.tp-list-bar{display:flex;align-items:center;gap:8px;margin-top:12px;',
+      '  padding-top:12px;border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04));flex-wrap:wrap}',
+      '.tp-field-mark{display:inline-flex;gap:5px;align-items:center}',
+      '.tp-count{font-size:12px;color:var(--dsw-alias-state-warn-primary,#f59e0b);white-space:nowrap}',
+      '.tp-check{display:inline-flex;align-items:center;gap:5px;font-size:12px;',
+      '  color:var(--dsw-alias-label-secondary,#61666b);cursor:pointer}',
+      '.tp-check input{width:13px;height:13px;margin:0;',
+      '  accent-color:var(--dsw-alias-button-primary-fill,#0f1115)}',
+      '.tp-branch{display:flex;flex-direction:column;gap:3px}',
 
-      '.tp-empty{padding:20px 0;font-size:13px;color:var(--dsw-alias-label-tertiary,#8c92a4)}',
+      '.tp-empty{padding:16px 0;font-size:13px;line-height:1.6;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-empty p{margin:0 0 4px}',
       '.tp-pre{max-height:220px;overflow:auto;font-size:11px;line-height:1.6;',
-      '  padding:12px;margin:8px 0 0;white-space:pre-wrap;word-break:break-word;',
-      '  background:var(--dsw-alias-markdown-code-block,#8881);',
-      '  border:1px solid var(--dsw-alias-border-l2,#eee);',
+      '  padding:10px 12px;margin:10px 0 0;white-space:pre-wrap;word-break:break-word;',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);',
+      '  border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));',
       '  border-radius:var(--dsw-radius-sm,8px)}',
 
-      // 窄屏：网格塌成单列，输入框也不用限宽了。
+      // 窄屏：网格塌单列，页签允许横向滚。
       '@media(max-width:560px){',
       '  .tp-fields{grid-template-columns:1fr}',
       '  .tp-input,.tp-select{max-width:none}',
-      '  .tp-bar{margin:0 -12px;padding:12px}',
-      '  .tp-card{padding:16px}',
+      '  .tp-tabs{overflow-x:auto}',
+      '  .tp-bar-actions{margin-left:0;width:100%;padding-bottom:8px}',
+      '  .tp-card{padding:12px}',
       '}',
     ].join('')
 
@@ -1563,7 +1657,9 @@ window.__ModuleLoader__.load({
           h('h4', null,
             h('button', {
               type: 'button',
-              className: 'tp-toggle',
+              // 卡内分组用 tp-sec-toggle 标出来：配置分组是 tp-group-toggle，
+              // 两者在改版后不同页签里，但自测要能分别数清。
+              className: 'tp-toggle tp-sec-toggle',
               'aria-expanded': sectionOpen ? 'true' : 'false',
               onClick: function () { props.onToggleSection(index, section.key) },
             },
@@ -1667,41 +1763,45 @@ window.__ModuleLoader__.load({
         }))
       }
 
+      // 标题行只放「是什么」和「有几个」；操作放到下面单独一行。
+      // 上一版把这 5 个控件（计数 / 显示全部字段 / 添加 / 重新读取）全塞进 h3，
+      // 一行挤了半屏宽，右半边还折行 —— 这是「乱」的典型来源。
       return h('section', { className: 'tp-card' },
         h('h3', null, '项目清单',
-          h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } },
-            list.length > 0 ? h('span', { className: 'tp-ok' }, list.length + ' 个项目') : null,
-            // 高级字段开关：缺省视图只画日常要动的那些，想看全的点一下。
-            // 这是一次性的「我现在要配细节」，所以不记进 localStorage。
-            h('label', { className: 'tp-check', title: '勾上就显示「开 draft MR」「验证命令」「允许的截图主机」等不常改的字段' },
-              h('input', {
-                type: 'checkbox',
-                checked: props.showAdvanced === true,
-                disabled: props.disabled,
-                onChange: function (event) { props.onToggleAdvanced(event.target.checked) },
-              }),
-              '显示全部字段'),
-            // 「添加项目」是结构性动作：追加到数组末尾。有未保存的字段改动时禁用，
-            // 否则追加会让下标对不上（新项目排在最后，但改到一半的字段还没落盘）。
-            // 不用 tp-primary：全页只留一颗主按钮（顶部「保存」），新增是次级动作。
-            h('button', {
-              type: 'button',
-              className: 'tp-btn',
-              disabled: props.disabled || props.busy || props.dirty,
-              title: props.dirty
-                ? '先保存或放弃当前改动，再添加项目。'
-                : '往项目清单末尾加一个新项目',
-              onClick: props.onAdd,
-            }, '+ 添加项目'),
-            h('button', {
-              type: 'button',
-              className: 'tp-btn',
-              disabled: props.disabled || props.busy,
-              onClick: props.onReload,
-            }, props.busy ? '读取中…' : '重新读取'))),
+          list.length > 0 ? h('span', { className: 'tp-badge' }, list.length + ' 个项目') : null),
         h('p', { className: 'tp-note' },
           '每个项目 = 一张工单表 + 一个仓库的绑定。点项目名可以收起它，卡内每个分区',
           '也能单独收起；改哪项就只写哪项（深层路径），不会整块覆盖。'),
+        h('div', { className: 'tp-list-bar' },
+          // 高级字段开关：缺省视图只画日常要动的那些，想看全的点一下。
+          // 这是一次性的「我现在要配细节」，所以不记进 localStorage。
+          h('label', { className: 'tp-check', title: '勾上就显示「开 draft MR」「验证命令」「允许的截图主机」等不常改的字段' },
+            h('input', {
+              type: 'checkbox',
+              checked: props.showAdvanced === true,
+              disabled: props.disabled,
+              onChange: function (event) { props.onToggleAdvanced(event.target.checked) },
+            }),
+            '显示全部字段'),
+          h('span', { className: 'tp-spacer' }),
+          // 「添加项目」是结构性动作：追加到数组末尾。有未保存的字段改动时禁用，
+          // 否则追加会让下标对不上（新项目排在最后，但改到一半的字段还没落盘）。
+          // 不用 tp-primary：全页只留一颗主按钮（顶部「保存」），新增是次级动作。
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            disabled: props.disabled || props.busy || props.dirty,
+            title: props.dirty
+              ? '先保存或放弃当前改动，再添加项目。'
+              : '往项目清单末尾加一个新项目',
+            onClick: props.onAdd,
+          }, '+ 添加项目'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn',
+            disabled: props.disabled || props.busy,
+            onClick: props.onReload,
+          }, props.busy ? '读取中…' : '重新读取')),
         body,
         props.message.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, props.message) : null,
         props.saveError ? h('p', { className: 'tp-err' }, props.saveError) : null)
@@ -1757,6 +1857,8 @@ window.__ModuleLoader__.load({
       var [branchBusy, setBranchBusy] = useState(false)
 
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
+      // 当前页签：整页一次只摊开一块，其余收在页签标题里（见 TABS）。
+      var [activeTab, setActiveTab] = useState(readTab)
       var [openMap, setOpenMap] = useState(readOpenMap)
       var [serverIssues, setServerIssues] = useState({})
 
@@ -1948,6 +2050,17 @@ window.__ModuleLoader__.load({
 
       var dirty = !sameDraft(draft, initialDraft)
 
+      // 配置项自己的改动数（不含项目字段）。`changedCount` 是两边的总和，
+      // 页签徽标要分开显示，所以从总数里减出项目那部分。
+      var configChangedCount = useMemo(function () {
+        var count = 0
+        for (var i = 0; i < leaves.length; i += 1) {
+          var key = keyOf(leaves[i])
+          if (!sameDraft(draft[key], initialDraft[key])) count += 1
+        }
+        return count
+      }, [leaves, draft, initialDraft])
+
       // 项目清单和配置是两条通道、两套 key，脏标记也必须分开算 —— 否则改了个项目
       // 却让「配置」卡片显示未保存，人会以为改错了地方。
       var projectDirty = !sameDraft(projDraft, projInitial)
@@ -1965,6 +2078,17 @@ window.__ModuleLoader__.load({
       var localProjectIssues = useMemo(function () {
         return allProjectIssues(projList, projDraft)
       }, [projList, projDraft])
+
+      // 项目里 error 级的条数：只用来给「项目」页签挂个红点，不拦保存
+      // （拦保存统一走 `issues.errorCount`）。
+      var projectIssueCount = useMemo(function () {
+        var keys = Object.keys(localProjectIssues.byKey)
+        var count = 0
+        for (var i = 0; i < keys.length; i += 1) {
+          if (localProjectIssues.byKey[keys[i]].level === 'error') count += 1
+        }
+        return count
+      }, [localProjectIssues])
 
       // 本地即时校验 + 上次保存被服务端拒绝的字段，合成一张表；error 级别会拦保存。
       var issues = useMemo(function () {
@@ -2402,15 +2526,59 @@ window.__ModuleLoader__.load({
         })
       })
 
-      return h('div', { className: 'tp-panel' },
-        h('header', { className: 'tp-head' },
-          h('h2', null, '工单流水线'),
-          h('p', null, '从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。')),
+      function showTab (key) {
+        setActiveTab(key)
+        writeTab(key)
+      }
 
-        // 顶部操作条：33 个配置项 + N 张项目卡片，页面很长，保存按钮得一直够得着。
-        // 顺序照草图：次要在左（放弃改动 / 重新载入 / 体检），主按钮「保存」放最右 ——
-        // 主操作落在视线终点，也和宿主其它设置页一致。
-        h('div', { className: 'tp-bar' },
+      // 页签上的小数字：只有这一块真的「有事」时才出现（未保存 / 待修），
+      // 平时不占位 —— 页签本来就压得紧，不该再挂一排常驻徽标。
+      function tabBadge (key) {
+        var count = 0
+        var bad = false
+        if (key === 'params') {
+          count = configChangedCount
+          if (issues.errorCount > 0) { count = issues.errorCount; bad = true }
+        } else if (key === 'creds') {
+          count = pendingCreds.length
+        } else if (key === 'projects') {
+          count = changedCount - configChangedCount
+          if (changedCount === 0 && projectDirty) count = -1
+          var projectBad = projectIssueCount
+          if (projectBad > 0) { count = projectBad; bad = true }
+        } else if (key === 'doctor') {
+          count = doctorReport && doctorReport.ok === false ? doctorReport.problems.length : 0
+          bad = count > 0
+        }
+        if (count === 0) return null
+        return h('span', { className: 'tp-tab-badge' + (bad ? ' tp-badge-bad' : '') },
+          count > 0 ? String(count) : '·')
+      }
+
+      var tabs = h('div', { className: 'tp-tabs', role: 'tablist' },
+        TABS.map(function (tab) {
+          return h('button', {
+            key: tab.key,
+            type: 'button',
+            role: 'tab',
+            className: 'tp-tab',
+            'aria-selected': activeTab === tab.key ? 'true' : 'false',
+            onClick: function () { showTab(tab.key) },
+          }, tab.label, tabBadge(tab.key))
+        }))
+
+      // 顶部工具条：左页签、右动作。整页只有这一条，滚到哪儿都够得着「保存」。
+      // 刻意**不再**放「体检」按钮 —— 体检已是页签，那颗按钮在这儿是重复入口。
+      var toolbar = h('div', { className: 'tp-toolbar' },
+        tabs,
+        h('div', { className: 'tp-bar-actions' },
+          issues.errorCount > 0
+            ? h('span', { className: 'tp-count' }, issues.errorCount + ' 项待修')
+            : null,
+          changedCount + pendingCreds.length > 0
+            ? h('span', { className: 'tp-count' },
+              '未保存 ' + (changedCount + pendingCreds.length) + ' 项')
+            : null,
           h('button', {
             type: 'button',
             className: 'tp-btn',
@@ -2425,96 +2593,106 @@ window.__ModuleLoader__.load({
               loadSettings()
               loadProjects()
               loadCredentials()
+              loadBranches()
             },
           }, '重新载入'),
-          h('button', {
-            type: 'button',
-            className: 'tp-btn',
-            disabled: doctorBusy || !mounted,
-            onClick: onDoctor,
-          }, doctorBusy ? '体检中…' : '体检'),
-          h('span', { className: 'tp-spacer' }),
-          issues.errorCount > 0
-            ? h('span', { className: 'tp-count' }, issues.errorCount + ' 项待修')
-            : null,
-          changedCount > 0 || credDirty
-            ? h('span', { className: 'tp-count' },
-              '未保存 ' + (changedCount + pendingCreds.length) + ' 项')
-            : null,
           h('button', {
             type: 'button',
             className: 'tp-btn tp-primary',
             disabled: saving || issues.errorCount > 0 || (changedCount === 0 && !credDirty),
             onClick: onSave,
-          }, saving ? '保存中…' : '保存')),
+          }, saving ? '保存中…' : '保存')))
 
-        // 保存失败（含服务端拒绝）贴着操作条显示：人点完保存眼睛还在这里。
-        saveError.length > 0 ? h('p', { className: 'tp-err', style: { marginTop: '0', whiteSpace: 'pre-wrap' } }, saveError) : null,
+      var panels = {
+        projects: function () {
+          return h(ProjectListCard, {
+            list: projList,
+            draft: projDraft,
+            issues: issues.byKey,
+            busy: projBusy,
+            error: projError,
+            disabled: saving,
+            message: '',
+            saveError: '',
+            dirty: projectDirty,
+            onReload: loadProjects,
+            onAdd: onAddProject,
+            onRemove: onRemoveProject,
+            onEdit: onProjectEdit,
+            onRevert: onProjectRevert,
+            branchList: branchList,
+            branchBusy: branchBusy,
+            showAdvanced: showAdvanced,
+            onToggleAdvanced: setShowAdvanced,
+            isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },
+            onToggleProject: onToggleProject,
+            isSectionOpen: function (index, sectionKey) { return isProjectSectionOpen(projMap, index, sectionKey) },
+            onToggleSection: onToggleProjectSection,
+          })
+        },
+        params: function () {
+          return h(SettingsCard, {
+            view: findNamespace(snapshot),
+            leaves: leaves,
+            draft: draft,
+            initialDraft: initialDraft,
+            secrets: secretMap,
+            disabled: saving,
+            dirty: dirty,
+            saving: saving,
+            error: '',
+            message: '',
+            issues: issues.byKey,
+            errorCount: issues.errorCount,
+            isOpen: function (label) { return isGroupOpen(openMap, label) },
+            onToggle: onToggleGroup,
+            isAdvOpen: function (label) { return isAdvOpenOf(advMap, label) },
+            onToggleAdv: onToggleAdv,
+            onEdit: onEdit,
+            onRevert: onRevert,
+          })
+        },
+        creds: function () {
+          return h('section', { className: 'tp-card' },
+            h('h3', null, '凭据'),
+            h('p', { className: 'tp-note' },
+              '凭据存在宿主的凭据库里，不写进配置文件；这里只显示「配没配」，输入框是只写的。',
+              '填好之后点右上角「保存」一起提交 —— 留空表示不改，「清除」才会删掉已存的。'),
+            h('div', { style: { marginTop: '8px' } }, credRows),
+            credMessage.length > 0
+              ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, credMessage)
+              : null)
+        },
+        doctor: function () {
+          return h(DoctorCard, {
+            report: doctorReport,
+            busy: doctorBusy,
+            error: doctorError,
+            available: mounted,
+            message: '',
+            onRun: onDoctor,
+          })
+        },
+      }
+
+      var current = panels[activeTab] || panels.projects
+
+      return h('div', { className: 'tp-panel' },
+        h('header', { className: 'tp-head' },
+          h('h2', null, '工单流水线'),
+          h('p', null, '从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。')),
+
+        toolbar,
+
+        // 保存的结果（含服务端整笔拒绝）贴着工具条：人点完保存眼睛还在这里。
+        // 它**不随页签切换消失** —— 保存是针对整份配置的，错在哪一页都得看见。
+        saveError.length > 0
+          ? h('p', { className: 'tp-err', style: { whiteSpace: 'pre-wrap' } }, saveError)
+          : null,
         saveMessage.length > 0 ? h('p', { className: 'tp-note' }, saveMessage) : null,
-        loadError.length > 0 ? h('p', { className: 'tp-err', style: { marginTop: '0' } }, loadError) : null,
+        loadError.length > 0 ? h('p', { className: 'tp-err' }, loadError) : null,
 
-        h(DoctorCard, {
-          report: doctorReport,
-          busy: doctorBusy,
-          error: doctorError,
-          available: mounted,
-          message: '',
-          onRun: onDoctor,
-        }),
-
-        h('section', { className: 'tp-card' },
-          h('h3', null, '凭据'),
-          h('p', { className: 'tp-note' },
-            '凭据存在宿主的凭据库里，不写进配置文件；这里只显示「配没配」，输入框是只写的。',
-            '填好之后点页面顶部的「保存」一起提交 —— 留空表示不改，「清除」才会删掉已存的。'),
-          h('div', { style: { marginTop: '8px' } }, credRows),
-          credMessage.length > 0 ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, credMessage) : null),
-
-        h(SettingsCard, {
-          view: findNamespace(snapshot),
-          leaves: leaves,
-          draft: draft,
-          initialDraft: initialDraft,
-          secrets: secretMap,
-          disabled: saving,
-          dirty: dirty,
-          saving: saving,
-          error: '',
-          message: '',
-          issues: issues.byKey,
-          errorCount: issues.errorCount,
-          isOpen: function (label) { return isGroupOpen(openMap, label) },
-          onToggle: onToggleGroup,
-          isAdvOpen: function (label) { return isAdvOpenOf(advMap, label) },
-          onToggleAdv: onToggleAdv,
-          onEdit: onEdit,
-          onRevert: onRevert,
-        }),
-
-        h(ProjectListCard, {
-          list: projList,
-          draft: projDraft,
-          issues: issues.byKey,
-          busy: projBusy,
-          error: projError,
-          disabled: saving,
-          message: '',
-          saveError: '',
-          dirty: projectDirty,
-          onReload: loadProjects,
-          onAdd: onAddProject,
-          onRemove: onRemoveProject,
-          onEdit: onProjectEdit,
-          onRevert: onProjectRevert,
-          branchList: branchList,
-          branchBusy: branchBusy,
-          showAdvanced: showAdvanced,
-          onToggleAdvanced: setShowAdvanced,
-          isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },
-          onToggleProject: onToggleProject,
-          isSectionOpen: function (index, sectionKey) { return isProjectSectionOpen(projMap, index, sectionKey) },
-          onToggleSection: onToggleProjectSection,
-        }))
+        current())
     }
 
     // 硬依赖只有 slots —— 它由 dsh-client-ui-renderer 启动时就 provide，不存在「等不到」。

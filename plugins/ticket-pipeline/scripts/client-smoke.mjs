@@ -437,6 +437,27 @@ async function openAllGroups (Panel, tree) {
   return current
 }
 
+/** 顶部的分段页签（`.tp-tab`）。 */
+function findTabs (tree) {
+  return findAll(tree, (node) => node.type === 'button' &&
+    String(node.props.className || '').indexOf('tp-tab') >= 0)
+}
+
+/**
+ * 切到某个页签并重新渲染。
+ *
+ * 整页拆成四个页签之后，**只有当前页签的区块在树上** —— 断言「凭据区显示已配置」
+ * 之前必须先切到「凭据」，否则找到的是一张项目卡片。这个 helper 就是为了让
+ * 每条断言都明确说出「我在看哪一页」，而不是靠缺省页签碰运气。
+ */
+async function switchTab (Panel, label) {
+  const current = await render(Panel, { view: 'page' })
+  const tab = findTabs(current).find((node) => textOf(node).indexOf(label) >= 0)
+  if (tab === undefined) throw new Error('找不到页签「' + label + '」：' + findTabs(current).map(textOf).join(' | '))
+  tab.props.onClick()
+  return render(Panel, { view: 'page' })
+}
+
 // ── 断言 ──────────────────────────────────────────────────────
 
 async function main () {
@@ -495,13 +516,30 @@ async function main () {
 
   const Panel = registrations.find((r) => r.options.name === 'plugins.row.config').component
 
-  // ① 整页渲染：能读到配置、能列出叶子、分组正确。
+  // ① 整页渲染：先看外壳（页签 + 工具条），再逐页看内容。
   resetRender()
   let tree = await render(Panel, { view: 'page' })
-  check('渲染了体检按钮', findButton(tree, '立即体检') !== undefined)
-  check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
 
-  // 33 个配置项一屏放不下，默认只展开「扫描与队列」，其余收着。
+  // 整页拆成四个页签 —— 这是「太复杂」的解法：一次只摊开一块，其余收在标题里。
+  const tabs = findTabs(tree)
+  check('顶部有四个页签', tabs.length === 4, tabs.map(textOf).join(' | '))
+  check('页签是 项目 / 参数 / 凭据 / 体检',
+    tabs.map(textOf).join('|') === '项目|参数|凭据|体检', tabs.map(textOf).join('|'))
+  check('页签带 tablist 语义',
+    findAll(tree, (node) => node.props && node.props.role === 'tablist').length === 1)
+  check('缺省停在「项目」页签',
+    tabs[0].props['aria-selected'] === 'true' && tabs.filter((node) => node.props['aria-selected'] === 'true').length === 1,
+    tabs.map((node) => node.props['aria-selected']).join(','))
+
+  // 一次只渲染一块：停在「项目」时参数区的字段不该在树上。
+  check('非当前页签的内容不渲染', textOf(tree).indexOf('日志级别') < 0, textOf(tree).slice(0, 120))
+
+  check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
+  check('工具条上的「放弃改动」在', findButton(tree, '放弃改动') !== undefined)
+  check('工具条上的「重新载入」在', findButton(tree, '重新载入') !== undefined)
+
+  // ② 参数页：33 个配置项一屏放不下，默认只展开「扫描与队列」，其余收着。
+  tree = await switchTab(Panel, '参数')
   const toggles = findToggles(tree)
   check('每个分组都有折叠标题', toggles.length === 3, String(toggles.length))
   const toggleOf = (label) => toggles.find((node) => textOf(node).indexOf(label) >= 0)
@@ -515,7 +553,9 @@ async function main () {
 
   tree = await openAllGroups(Panel, tree)
   const inputs = findAll(tree, (node) => node.type === 'input' || node.type === 'select')
-  check('展开后渲染出输入控件', inputs.length >= 7, '只有 ' + inputs.length + ' 个')
+  // 「参数」页签只有配置项，凭据的 5 个密码框不再混进来 —— 拆页签之前这条断言
+  // 之所以能过，是因为凭据区也画在同一页上（≥7 里有一半是密码框）。
+  check('展开后渲染出输入控件', inputs.length >= 6, '只有 ' + inputs.length + ' 个')
   const bodyText = textOf(tree)
   check('显示分组标题「通知」', bodyText.indexOf('通知') >= 0)
   check('显示布尔字段', bodyText.indexOf('总开关') >= 0)
@@ -525,6 +565,11 @@ async function main () {
   // 折叠状态记进 localStorage，下次打开还是上次的样子。
   const openRaw = STORAGE.getItem('ticket-pipeline:open-groups')
   check('折叠状态写进了 localStorage', typeof openRaw === 'string' && openRaw.indexOf('通知') >= 0, String(openRaw))
+
+  // 页签选择也记下来 —— 下次进来还停在刚才那一页。
+  check('页签选择写进了 localStorage',
+    STORAGE.getItem('ticket-pipeline:open-tab') === 'params',
+    String(STORAGE.getItem('ticket-pipeline:open-tab')))
 
   // ② 改一个数字字段再保存 → 生成一条 path 是数组的 set op。
   const interval = findInput(tree, (node) => node.props.type === 'number')
@@ -564,20 +609,22 @@ async function main () {
     }
   }
 
-  // ③ 点「立即体检」→ 调自建 Remote。
+  // ③ 点「立即体检」→ 调自建 Remote。体检已经是一个页签，按钮在页签里。
   // apply 里就该把命名空间挂好（面板一打开按钮就能点），不该靠组件 effect 兜底。
   check('apply 里挂载了 ticketPipeline 命名空间（只挂一次）', ctx.calls.mounted === 1, String(ctx.calls.mounted))
   check('apply 之后命名空间已就绪', services['remote.ticketPipeline'] !== undefined)
-  tree = await render(Panel, { view: 'page' })
+  tree = await switchTab(Panel, '体检')
   const doctor = findButton(tree, '立即体检')
-  check('体检按钮可用', doctor.props.disabled === false, String(doctor.props.disabled))
+  check('体检页签里有「立即体检」按钮', doctor !== undefined)
+  check('体检按钮可用', doctor !== undefined && doctor.props.disabled === false,
+    doctor === undefined ? '没找到' : String(doctor.props.disabled))
   doctor.props.onClick()
   tree = await render(Panel, { view: 'page' })
   check('调用了 ticketPipeline.doctor', ctx.calls.doctor === 1, String(ctx.calls.doctor))
   check('渲染出体检报告', textOf(tree).indexOf('【环境体检】') >= 0)
 
   // ④ 凭据区：已配置项显示「已配置」，写一个值再保存 → credentials.set。
-  tree = await render(Panel, { view: 'page' })
+  tree = await switchTab(Panel, '凭据')
   check('凭据区显示已配置', textOf(tree).indexOf('已配置') >= 0)
   const secretInputs = findAll(tree, (node) => node.type === 'input' && node.props.type === 'password')
   check('凭据输入框是只写密码框', secretInputs.length >= 5, String(secretInputs.length))
@@ -590,7 +637,7 @@ async function main () {
     findAll(tree, (node) => node.type === 'button' && textOf(node) === '清除').length >= 1)
 
   // ⑤ 项目清单：读的是 remote.projects() 的只读投影，写的是深层路径 mutate。
-  tree = await render(Panel, { view: 'page' })
+  tree = await switchTab(Panel, '项目')
   check('渲染出「项目清单」', textOf(tree).indexOf('项目清单') >= 0)
   check('项目卡片显示项目名', textOf(tree).indexOf('pms') >= 0)
   check('项目卡片标注了 MR 开关', textOf(tree).indexOf('开 MR') >= 0)
@@ -772,8 +819,10 @@ async function main () {
   }
 
   // 卡内分组也能收：默认「验证命令」是收着的（高级组），必填组是展开的。
-  const sectionToggles = findToggles(tree).filter((node) =>
-    String(node.props.className || '').indexOf('tp-group-toggle') >= 0)
+  // 项目卡的卡内分组用 `.tp-sec-toggle` 标（配置分组是 `.tp-group-toggle`，
+  // 两者现在分属不同页签，但类名必须能分开数）。
+  const sectionToggles = findAll(tree, (node) => node.type === 'button' &&
+    String(node.props.className || '').indexOf('tp-sec-toggle') >= 0)
   check('项目卡内有可折叠的分组', sectionToggles.length >= 1, String(sectionToggles.length))
 
   // 必填项清空 → 即时校验标红 + 禁用保存 + 顶部「N 项待修」。
