@@ -28,7 +28,7 @@
 import { PipelineError } from '../../contracts/errors.js'
 import { createRecordFilter, resolveRecordIds } from '../../contracts/record-filter.js'
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
-import { IMAGE_MEDIA_TYPES } from '../../contracts/types.js'
+import { IMAGE_MEDIA_TYPES, parseBitableUrl } from '../../contracts/types.js'
 
 const FEISHU_API_BASE = 'https://open.feishu.cn'
 const AUTH_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
@@ -1348,17 +1348,35 @@ export function createFeishuSource (options = {}) {
 }
 
 /**
+ * 从一条飞书多维表格 URL 里啃出 `table` / `view` 两个问号参数。
+ *
+ * 实现在 `contracts/types.js` —— 配置校验（`validateConfig`）和本适配器必须用
+ * 同一套判断，否则用户在配置里只贴一条链接会被校验器拦下，而文档却写着「贴链接就够」。
+ * 这里重新导出，是为了让「啃 URL」这件事在适配器侧读起来是本地能力。
+ *
+ * @param {unknown} raw 用户填的 `match.appToken` 原值
+ * @returns {{ tableId: string, viewId: string }}
+ */
+export { parseBitableUrl }
+
+/**
  * 从项目条目的 `match` 里摘出本适配器用得到的值。
  * @param {any} match 项目条目的 `match` 字段
  * @returns {{ appToken: string, tableId: string, viewId: string, docNamePattern: string, statusValues?: string[], recordIds?: string[] }}
  */
 export function feishuOptionsFromMatch (match) {
   const m = match ?? {}
+  const rawAppToken = String(m.appToken ?? '')
+  // appToken 写成整条表格 URL 时，把 URL 里的 table / view 也一并啃出来。
+  // 用户从浏览器地址栏直接复制粘贴是最自然的动作，而那条 URL 里本来就带着
+  // `?table=tblXXX&view=vewYYY` —— 只要这两个问号参数，就能省掉「再去哪儿找 table_id」
+  // 这一步。显式写了 tableId / viewId 的，以显式值为准（别让 URL 覆盖人的明确意图）。
+  const fromUrl = parseBitableUrl(rawAppToken)
   /** @type {Record<string, unknown>} */
   const options = {
-    appToken: String(m.appToken ?? ''),
-    tableId: String(m.tableId ?? ''),
-    viewId: String(m.viewId ?? ''),
+    appToken: rawAppToken,
+    tableId: String(m.tableId ?? '') || fromUrl.tableId,
+    viewId: String(m.viewId ?? '') || fromUrl.viewId,
     docNamePattern: String(m.docNamePattern ?? ''),
   }
   // 只在配置里真的写了状态值时才透传：没写就用适配器自己的缺省值，

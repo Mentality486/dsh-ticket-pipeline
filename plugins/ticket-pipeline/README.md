@@ -255,14 +255,14 @@ descriptor 的 `toJSON()` 必须返回 schemastery 的**信封** `{ uid, refs }`
 node scripts/dev-run.mjs
 ```
 
-**376 项断言，全绿 exit 0**，共 26 个小节（编号到 17，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16b` / `16c` 这类补丁小节；第 16 节专测回填工单表与保留会话，`16b` 专测事后动作补偿（`pendingEffects`）与租约诚实化，`16c` 专测**关键节点流程日志（时间线）**，第 17 节专测分支候选）。
+**378 项断言，全绿 exit 0**，共 26 个小节（编号到 17，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16b` / `16c` 这类补丁小节；第 16 节专测回填工单表与保留会话，`16b` 专测事后动作补偿（`pendingEffects`）与租约诚实化，`16c` 专测**关键节点流程日志（时间线）**，第 17 节专测分支候选）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，但宿主服务全部打桩），
 其余测的是 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调四个适配器 checks：
 
 | 段 | 覆盖 |
 |---|---|
 | 内核与契约 | 调度、租约心跳、退避重试、状态机、store 持久化、pipeline_* 四工具、组合根接线；**时间线**：17 节点表、9 主站逐站打点、`✓/✗` 成败、连续同节点合并与 80 条封顶、重新入队/人工重置继承历史、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、返回体带 `timeline`/`station`/`stalledForMs` |
-| `feishu-checks`（58 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、扫描全程无写操作；**回填**：`writeResult` 走 `PUT …/records/:id` 只写三列、字段缺失（1254040 / 1254045）返 `{written:false,note}` 不抛、写失败时按 91403 分类 |
+| `feishu-checks`（59 项） | 假飞书服务端打桩：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、字节上限、错误码分类、扫描全程无写操作；**回填**：`writeResult` 走 `PUT …/records/:id` 只写三列、字段缺失（1254040 / 1254045）返 `{written:false,note}` 不抛、写失败时按 91403 分类；**链接解析**：`parseBitableUrl` 从整条表格 URL 里啃出 `?table=` / `?view=`（纯 token 回空串、显式 `tableId` 优先） |
 | `gitlab-checks`（86 项） | 假 GitLab 服务端：ensureBranch、Commits API 提交、Draft MR、错误分类（401/404/409/429）、敏感文件过滤；执行器在工作区检出里做本地提交（`commitLocally`：sha/分支/文件、敏感文件不进提交、`repo.gitlab.enabled` 未开时零 GitLab 请求、提交失败让票失败、空提交与缺 git 运行器被拒、git 白名单只放行 `add -- <文件>` / `commit` / `rev-parse HEAD` / `restore --staged -- <文件>` / `stash create` / `hash-object --`）；**基线**：`createBaseline` 拍的基线只读、人的未提交改动与已 `git add` 的改动都进不了本次提交、拍不下来降级不失败；**保留会话**：`sessionId` 三个出口都带回、agent 实例必释放、`keepSession: false` 才回收；**敏感名单**：覆盖各家凭据落盘位置（私钥 / 云 / 证书 / 状态文件）且不误伤「名字像但其实是代码/文档」的文件、被拦文件在 `ExecResult.blockedFiles` 里看得见；**篡改自检**：agent 动了 `.git/hooks` 或插件 `cordis.patch.yml` 就整票失败（不提交也不开 MR）、没有 `readFile` 服务时跳过自检但票照常交付、受保护路径判定与快照比对边界（缺失 / 删除 / 无服务）；`-z` 解析（`parseStatusZ` / `parseNameStatusZ`）：未跟踪新文件要算进改动、重命名的旧路径要进 commit pathspec、删除的路径不能进 `add`、中文名与空格名不被转义；会话 cwd = 项目工作区根、`workingDirectory` 仅在隔离 worktree 打开时钉到隔离子目录、`attachSession` 归属工作区 |
 | `push-qqmail`（18 项） | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
 | `wps-checks`（34 项） | 现场构造最小 xlsx（deflate + stored）：zip 解析、截图挂行、「掉出处理中」宽限期、水位兜底；**下载通道**：超时中断报 `network`（可重试）、调用方取消算 `aborted` 且立刻断、`content-length` 谎报超大就当场拒绝、无 `content-length` 时边读边计数超限即断连、跳转最多跟 `MAX_SHEET_REDIRECTS` 跳、逐跳校验协议与主机（`file:` / 未放行主机都拒）；**取数通道**：`scan` 能把 signal 传下去、`wpsOptionsFromMatch` 译出的通道带超时与字节上限（不是裸 fetch） |

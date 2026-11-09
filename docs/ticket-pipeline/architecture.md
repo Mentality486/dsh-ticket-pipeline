@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-06；本轮「关键节点流程日志（时间线）」的代码与本文同一次提交，上一轮已提交代码为 `8d93478`，`b5940ce` 仅改文档；见 §11.3）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-09；本轮「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）与本文同一次提交，上一轮已提交代码为 `6fb9f08`/`789f6b2`；时间线见 §11.3）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -871,10 +871,10 @@ export const Config = {
     match: {                   // 工单表怎么定位（表级绑定）；各平台专有键见下
       platform: 'feishu' | 'wps' | 'mock' | 'webform'
       // ── 飞书 ──
-      appToken?: string        // 飞书多维表格 app_token（显式绑定）
-      tableId?: string         // 飞书数据表 id（与 appToken 一起用）
-      viewId?: string          // 可选：只扫某个视图
-      docNamePattern?: string  // 文件名模糊匹配（无显式绑定时的兜底）
+      appToken?: string        // 飞书多维表格 app_token；也可以直接写整条表格 URL（从 ?table= / ?view= 解析出下面两格）
+      tableId?: string         // 飞书数据表 id（显式优先；不写则由 appToken 链接里的 ?table= 补上）
+      viewId?: string          // 可选：只扫某个视图（不写则由 ?view= 补上）
+      docNamePattern?: string  // 文件名模糊匹配（无显式绑定、链接里也没 ?table= 时的兜底）
       // ── 收票语义（飞书 / WPS 共用）──
       statusValues?: string[]  // 「在处理中」的状态取值集合，默认 ['处理中']
                                // 真实表下拉是 是/否/处理中，试点时配 ['否']
@@ -1573,9 +1573,16 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 
 | 给了什么 | 怎么找表 |
 |---|---|
-| `appToken` + `tableId` | 直接用 |
-| `appToken`（无 `tableId`） | `GET /open-apis/bitable/v1/apps/:appToken/tables`，按 `docNamePattern` 过滤，必须恰好 1 张 |
+| `appToken` + `tableId` | 直接用（显式 `tableId` 优先） |
+| `appToken` 是整条表格 URL（带 `?table=`） | `parseBitableUrl`（`src/contracts/types.js`）从 `?table=` 取 `table_id`、`?view=` 取 `view_id` 当 `viewId`；等价于"URL + tableId"，不用再另填 `tableId` |
+| `appToken`（无 `tableId`、链接里也没 `?table=`） | `GET /open-apis/bitable/v1/apps/:appToken/tables`，按 `docNamePattern` 过滤，必须恰好 1 张 |
 | 只有 `docNamePattern` | 先 `GET /open-apis/drive/v1/files` 找 `type==='bitable'` 且名字匹配的文档（必须恰好 1 张），再取它唯一的表 |
+
+> **为什么 `parseBitableUrl` 住在 `contracts/` 而不是适配器里**：`validateConfig` 也得认这个写法。
+> 只让适配器认得，用户在配置里只贴一条链接就会被「必须给 appToken+tableId 或 docNamePattern」
+> 拦在启动前 —— 文档写的「贴一条链接就够」就成了空话。两边共用同一个纯函数，
+> 解析规则只有一处，不会漂移。`feishuOptionsFromMatch` 里显式 `tableId` / `viewId` **优先**于
+> 链接里的问号参数（别让 URL 覆盖人的明确意图）。
 
 `docNamePattern` 先当正则用（`new RegExp(pattern,'i')`），正则不合法就退回「包含」。
 
@@ -1702,7 +1709,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 | wiki 节点查询把表型写死 | `src/adapters/source-feishu/index.js:763-766` | `get_node` 的 query 里硬写 `obj_type: 'bitable'` |
 | `sheet` 被判成「不是多维表格」 | `src/adapters/source-feishu/index.js:770-775` | 抛 `invalid-input`，文案里写着「sheet=电子表格」不支持 |
 | 云文档搜索只认 bitable | `src/adapters/source-feishu/index.js:713` | `searchBitableDocs` 只收 `type === 'bitable'` |
-| 配置校验只认两种绑定 | `src/core/config.js:494-501` | `validateProject` 只给「`appToken`+`tableId`」或「`docNamePattern`」二选一，只给 `spreadsheetToken` 的配置**启动时就被拒** |
+| 配置校验只认两种绑定 | `src/core/config.js:529-540` | `validateProject` 只给「`appToken`+`tableId`（`tableId` 也可以写在 `appToken` 那条链接的 `?table=` 里，`parseBitableUrl` 解析）」或「`docNamePattern`」二选一，只给 `spreadsheetToken` 的配置**启动时就被拒** |
 
 **这是代码路径问题，不是权限问题** —— 错误文案（先说「不是多维表格」，再列一串 `docx` / `sheet` / `mindnote`）
 很容易把人引到「去申请权限」的错方向，而实际上**哪怕权限全开也扫不出来**。

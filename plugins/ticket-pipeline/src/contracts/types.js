@@ -182,6 +182,40 @@ export function normalizeScreenshotRef (ref) {
 }
 
 /**
+ * 从一条飞书多维表格 URL 里啃出 `table` / `view` 两个问号参数。
+ *
+ * 为什么住在 contracts 而不是飞书适配器里：**配置校验也要用同一套判断**。
+ * `match.appToken` 允许直接写整条表格链接（从浏览器地址栏复制粘贴最自然），
+ * 而那条链接本来就长这样
+ * `https://<域>.feishu.cn/base/<appToken>?table=tblXXX&view=vewYYY`。
+ * 如果只有适配器认得这个写法、`validateConfig` 不认，用户在配置里只贴一条链接
+ * 就会被「feishu 项目必须给 appToken+tableId 或 docNamePattern」拦下 ——
+ * 文档说的「贴一条链接就够」也就成了空话。所以两边共用这一个解析。
+ *
+ * 只认 `table=` 和 `view=` 两个参数；不是 URL（纯 app_token）或解析失败时返回空串，
+ * 由调用方回退到原有的「显式 tableId / docNamePattern」路径 —— 这条兜底路径不能坏。
+ *
+ * @param {unknown} raw 用户填的 `match.appToken` 原值
+ * @returns {{ tableId: string, viewId: string }}
+ */
+export function parseBitableUrl (raw) {
+  const empty = { tableId: '', viewId: '' }
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  // 先挡掉纯 token：没有协议和斜杠就不必进 URL 解析器（也避免 `new URL('Abc123')` 抛错）
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return empty
+  let parsed
+  try {
+    parsed = new URL(text)
+  } catch {
+    return empty
+  }
+  return {
+    tableId: (parsed.searchParams.get('table') ?? '').trim(),
+    viewId: (parsed.searchParams.get('view') ?? '').trim(),
+  }
+}
+
+/**
  * 路径归一：统一 `/`、盘符大写、折叠重复分隔符、去掉尾随分隔符。
  * @param {string} p
  * @returns {string}

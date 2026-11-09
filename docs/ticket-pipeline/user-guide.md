@@ -62,9 +62,12 @@
         description: 项目管理系统
         match:
           platform: feishu
-          # 可以直接写飞书表格的整条 URL（插件会自己啃出 app_token + table_id）；
-          # 值里有 ? & : 这些字符时务必加引号，否则 YAML 会解析出错
+          # 可以直接写飞书表格的整条 URL：插件会从 /base/<token> 里啃出 app_token，
+          # 从 ?table=<tableId> 里啃出 table_id（这一条以前只啃前者，现在两个都认）。
+          # 值里有 ? & : 这些字符时务必加引号，否则 YAML 会解析出错。
           appToken: "https://<你的域>.feishu.cn/base/<appToken>?table=<tableId>&view=<viewId>"
+          # docNamePattern 是老写法（按文件名在多维表格里挑唯一一张表），
+          # URL 里已经带 ?table= 时可以不写；只写 appToken 不带 table 时才需要它兜底。
           docNamePattern: 项目管理系统工单
           statusValues:
             - 处理中
@@ -290,7 +293,7 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 几个容易踩的点：
 
 - **已有 `- id: ticket-pipeline` 段落就只改里面的键**，别整段重复贴一遍（YAML 里同 id 出现两次，行为取决于加载器，可能只有一个生效）。
-- `match.appToken` **可以直接写飞书多维表格的整条 URL**（`https://<域>/base/<appToken>?table=<tableId>&view=…`），插件会自己啃出 app_token 和 table_id；也可以老老实实只填 app_token + `tableId` 两个字段。**面板上这一格是只读的**：只显示「已配置 / 前 4…后 4」，明文不下发到浏览器，也不提供输入框 —— 要改只能手改配置文件（见 §3.0.1 末尾）。
+- `match.appToken` **可以直接写飞书多维表格的整条 URL**（`https://<域>/base/<appToken>?table=<tableId>&view=…`），插件会自己啃出 app_token **和 table_id**（app_token 来自 `/base/<token>`，table_id 来自 `?table=`；`?view=` 也会一并当成 `viewId`）—— 也就是说**贴一条链接就够，不必再另外去找 table_id**。也可以老老实实只填 app_token + `tableId` 两个字段（显式 `tableId` 优先于链接里的 `?table=`）。若链接里没带 `?table=`，则仍需 `tableId` 或 `docNamePattern` 兜底，否则启动校验会拒绝。**面板上这一格是只读的**：只显示「已配置 / 前 4…后 4」，明文不下发到浏览器，也不提供输入框 —— 要改只能手改配置文件（见 §3.0.1 末尾）。
 - **`enabled` 缺省是 `false`**，手改时别忘了自己那行是 `true` 还是 `false`；写完重启宿主，用 `pipeline_doctor` 确认插件加载到了。
 - **值里带 `?` `&` `:` 这类字符（比如把整条飞书表格 URL 写进 `appToken`）时给整串加引号**，
   例如 `appToken: "https://<域>/base/xxx?table=tblYYY&view=vewZZZ"`；不加引号时 YAML 也常能读，
@@ -421,7 +424,7 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 |---|---|
 | `name` | 项目唯一标识（分支名里会出现：`ticket-pms-xxx-r1`） |
 | `match.platform` | `feishu` / `wps` / `mock` / `webform` |
-| `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐）。`tableId` 可在面板里改；**`appToken` 只能手改 `cordis.patch.yml`**（面板上是只读状态行，因为它含明文密钥、宿主不下发给浏览器，见 §3.0.1）。`appToken` 也可以直接写整条飞书表格 URL，插件会自己拆 |
+| `match.appToken` + `match.tableId` | 飞书表显式绑定（推荐）。`tableId` 可在面板里改；**`appToken` 只能手改 `cordis.patch.yml`**（面板上是只读状态行，因为它含明文密钥、宿主不下发给浏览器，见 §3.0.1）。`appToken` 也可以直接写整条飞书表格 URL：插件从 `/base/<token>` 取 app_token、从 `?table=` 取 table_id，于是**只贴一条链接就能定位到表**，不用再单独填 `tableId` |
 | `match.docNamePattern` | 兜底：按文件名模糊搜（飞书） |
 | `match.spreadsheetToken` | 飞书**电子表格** token（`shtcn…`）。和多维表格的 `appToken` 二选一；配了插件就按电子表格处理（**该能力设计待实施**） |
 | `match.sheetId` / `match.sheetName` | 电子表格里**工作表**的 id 或名字（二选一），跟 `spreadsheetToken` 配套。`match.sheetName` 与金山源共用同一个键 |
@@ -554,7 +557,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **376 项全过**，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **378 项全过**，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |

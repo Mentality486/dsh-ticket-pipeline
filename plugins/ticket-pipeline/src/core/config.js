@@ -30,6 +30,7 @@
  */
 
 import { resolveRecordIds } from '../contracts/record-filter.js'
+import { parseBitableUrl } from '../contracts/types.js'
 
 /**
  * 一项配置的声明。
@@ -525,13 +526,17 @@ function validateProject (raw, index) {
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''
   if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）')
 
-  // feishu 要么显式绑定（appToken+tableId），要么用文件名模糊匹配
+  // feishu 要么显式绑定（appToken+tableId），要么用文件名模糊匹配。
+  // appToken 允许直接贴整条表格链接 —— 那条链接本来就带着 `?table=tblXXX`，
+  // 所以「链接里带了 table」也算显式绑定（与适配器共用同一个解析，见 contracts/types.js）。
   if (platform === 'feishu') {
-    const hasExplicit = typeof match.appToken === 'string' && match.appToken.length > 0 &&
-      typeof match.tableId === 'string' && match.tableId.length > 0
+    const rawAppToken = typeof match.appToken === 'string' ? match.appToken : ''
+    const fromUrl = parseBitableUrl(rawAppToken)
+    const explicitTableId = typeof match.tableId === 'string' && match.tableId.length > 0 ? match.tableId : fromUrl.tableId
+    const hasExplicit = rawAppToken.length > 0 && explicitTableId.length > 0
     const hasPattern = typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0
     if (!hasExplicit && !hasPattern) {
-      fail('match', 'feishu 项目必须给 appToken+tableId（显式绑定）或 docNamePattern（文件名模糊匹配）二选一')
+      fail('match', 'feishu 项目必须给 appToken+tableId（显式绑定，tableId 也可以写在 appToken 那条链接的 ?table= 里）或 docNamePattern（文件名模糊匹配）二选一')
     }
   }
 

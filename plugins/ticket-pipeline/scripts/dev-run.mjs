@@ -2090,6 +2090,25 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(result.value.projects[0].match.recordIds, undefined)
   })
 
+  await check('appToken 只贴一条表格链接也能通过校验：table 从 ?table= 里补上（文档说「贴链接就够」必须真成立）', async () => {
+    // 为什么这条重要：文档到处写着「appToken 可以直接写整条 URL，插件会自己啃出
+    // app_token + table_id」。但要真成立，**配置校验器**也得认这个写法 ——
+    // 只让适配器认得，用户贴一条链接进来会被「必须给 appToken+tableId 或 docNamePattern」拦在启动前。
+    const url = 'https://vcn6ijgss3oy.feishu.cn/base/RZZQbY4SkaY6z0shZaBcVpQCnhh?table=tblWhRSGf0osJqrE&view=vewsyZldQC'
+    const result = validateConfig({
+      projects: [{ name: 'pms', match: { platform: 'feishu', appToken: url }, repo: { path: 'D:/repo' } }],
+    })
+    assert.ok(result.value, `贴整条链接应当通过校验，实际 issues：${JSON.stringify(result.issues ?? [])}`)
+    assert.equal(result.value.projects[0].match.appToken, url, 'appToken 原值要留着，适配器还要从里面啃 app_token')
+
+    // 只有 /base/<token> 没有 ?table=、又没给 docNamePattern → 仍然必须拦下（不能假装能定位）。
+    const noTable = validateConfig({
+      projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'https://x.feishu.cn/base/abcdef' }, repo: { path: 'D:/repo' } }],
+    })
+    assert.ok(noTable.issues, '链接里没有 table、也没有 docNamePattern 时该报错，而不是放行到运行时才炸')
+    assert.match(JSON.stringify(noTable.issues), /docNamePattern/, '报错要说清还能怎么补（docNamePattern 兜底）')
+  })
+
   await check('buildSourceOptions：飞书项目的 recordIds 一路透到适配器', async () => {
     const { SOURCES, buildSourceOptions } = await import('../src/index.js')
     const opts = buildSourceOptions(SOURCES.feishu, {

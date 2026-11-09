@@ -20,6 +20,8 @@ import assert from 'node:assert/strict'
 
 import {
   createFeishuSource,
+  feishuOptionsFromMatch,
+  parseBitableUrl,
   FEISHU_COLUMNS,
   IN_PROGRESS_VALUE,
 } from '../src/adapters/source-feishu/index.js'
@@ -1334,5 +1336,33 @@ export async function runFeishuChecks (check) {
       'setFailWrite 打开的开关必须真的让回填失败（用来验证「回填失败不回退票态」）',
     )
     assert.equal(source.writes.length, 1, '失败的这次不该记进 writes')
+  })
+
+  await check('配置：appToken 贴整条表格 URL 时，table / view 要从链接里啃出来', async () => {
+    // 为什么测这个：文档一直写着「appToken 可以直接贴整条链接」，但代码先前只从
+    // `/base/<token>` 里抠 app_token，`?table=tblXXX` 被白白扔掉 —— 用户还得另外
+    // 去找 table_id 填进 match.tableId。这条用例把「贴一条链接就够」钉死。
+    const url = 'https://vcn6ijgss3oy.feishu.cn/base/RZZQbY4SkaY6z0shZaBcVpQCnhh?table=tblWhRSGf0osJqrE&view=vewsyZldQC'
+    const parsed = parseBitableUrl(url)
+    assert.deepEqual(parsed, { tableId: 'tblWhRSGf0osJqrE', viewId: 'vewsyZldQC' }, `URL 里的 table / view 要能读出来，实际 ${JSON.stringify(parsed)}`)
+
+    const options = feishuOptionsFromMatch({ appToken: url })
+    assert.equal(options.tableId, 'tblWhRSGf0osJqrE', 'tableId 没从链接里透传出来，用户就还得手工找 table_id')
+    assert.equal(options.viewId, 'vewsyZldQC', 'viewId 同理')
+    assert.equal(options.appToken, url, 'appToken 原值要原样保留 —— 适配器自己还要从里面啃 app_token')
+
+    // 显式写了 tableId 的，以显式值为准：别让 URL 覆盖人的明确意图。
+    const explicit = feishuOptionsFromMatch({ appToken: url, tableId: 'tblExplicit', viewId: 'vewExplicit' })
+    assert.equal(explicit.tableId, 'tblExplicit', '显式 tableId 优先级必须高于链接里的')
+    assert.equal(explicit.viewId, 'vewExplicit', '显式 viewId 同理')
+
+    // 纯 token（不是 URL）什么都啃不出来，必须回空串，把兜底让给 docNamePattern。
+    for (const plain of ['RZZQbY4SkaY6z0shZaBcVpQCnhh', '  ', 'not a url', '', undefined, null]) {
+      assert.deepEqual(parseBitableUrl(plain), { tableId: '', viewId: '' }, `纯 token / 空值不该啃出东西：${JSON.stringify(plain)}`)
+    }
+    // 只有 table 没有 view 的链接也得能读出一半。
+    const onlyTable = parseBitableUrl('https://x.feishu.cn/base/abcdef?table=tblOnly')
+    assert.deepEqual(onlyTable, { tableId: 'tblOnly', viewId: '' }, '只带 table 的链接要读出 table，view 回空串')
+    assert.equal(feishuOptionsFromMatch({ appToken: 'RZZQbY4SkaY6z0shZaBcVpQCnhh' }).tableId, '', '纯 token 时 tableId 保持空，走 docNamePattern 兜底')
   })
 }
