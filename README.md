@@ -1,6 +1,9 @@
 # 工单流水线插件 · 使用手册（v0.1.0-test.1）
 
 > 本手册面向**使用者**：从零开始把插件跑起来，直到收到第一封带**本地提交**的通知邮件。
+> 想知道「一共要几步、每步怎么算过了」，直接看
+> [`docs/ticket-pipeline/user-guide.md` §0.5 从零上手：整条路只有 6 步](docs/ticket-pipeline/user-guide.md)；
+> 想手改配置文件（和最初一样），看同一份的 [§0.5.1](docs/ticket-pipeline/user-guide.md)。
 > 架构原理见 [architecture.md](./architecture.md)，实现进度见 [feature-checklist.md](./feature-checklist.md)。
 
 ---
