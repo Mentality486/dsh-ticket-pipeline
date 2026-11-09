@@ -115,6 +115,44 @@ export function ticketKey (projectId, recordId) {
 }
 
 /**
+ * 判断一个字段名是不是「字符串被 `Object.entries` 展开」留下的数字键。
+ *
+ * 票据行里没有任何字段是以数字命名的，所以 `"0".."17"` 这种键只可能是脏数据。
+ */
+function isNumericKey (name) {
+  return /^\d+$/.test(name)
+}
+
+/**
+ * 把一行票据里「数字键」脏字段剔掉。
+ *
+ * 这些键来自一个已经修掉的老 bug：`onPhase('editing', '说明文字')` 的字符串说明
+ * 被当成字段补丁交给 `setPhase`，`Object.entries('agent 已接到任务书')` 于是把它
+ * 拆成 `{0:'a',1:'g',…}` 写进票据行。`setPhase` 现在有闸（patch 必须是对象），
+ * 新数据不会再脏；但**已经落库的行不会自己好**，而 `{ ...row }` 会把它们一路带下去
+ * （`setPhase`/`appendTimeline`/`clearPendingEffect` 全是展开后整体写回）。
+ *
+ * 所以在读的出口剔一次：下次任何一次写入都会顺手把存储里的脏键清掉，
+ * 而且不改变任何正常字段的语义。之所以按「数字键」而不是按白名单剔：
+ * 白名单要跟着 `TicketRecordRow` 一直维护，漏一个字段就会把它悄悄删掉。
+ *
+ * @param {TicketRecordRow} row
+ * @returns {TicketRecordRow}
+ */
+function sanitizeRow (row) {
+  let dirty = null
+  for (const name of Object.keys(row)) {
+    if (!isNumericKey(name)) continue
+    ;(dirty ?? (dirty = [])).push(name)
+  }
+  if (!dirty) return row
+  /** @type {any} */
+  const clean = { ...row }
+  for (const name of dirty) delete clean[name]
+  return clean
+}
+
+/**
  * 票据存储。
  */
 export class TicketStore {
@@ -138,7 +176,8 @@ export class TicketStore {
    * @returns {TicketRecordRow | undefined}
    */
   getTicket (key) {
-    return /** @type {TicketRecordRow | undefined} */ (this.repo.get(TABLES.tickets, key))
+    const row = /** @type {TicketRecordRow | undefined} */ (this.repo.get(TABLES.tickets, key))
+    return row && typeof row === 'object' ? sanitizeRow(row) : row
   }
 
   /** @returns {TicketRecordRow[]} */
@@ -146,7 +185,7 @@ export class TicketStore {
     /** @type {TicketRecordRow[]} */
     const rows = []
     for (const [, row] of this.repo.entries(TABLES.tickets)) {
-      if (row && typeof row === 'object') rows.push(/** @type {TicketRecordRow} */ (row))
+      if (row && typeof row === 'object') rows.push(sanitizeRow(/** @type {TicketRecordRow} */ (row)))
     }
     return rows
   }

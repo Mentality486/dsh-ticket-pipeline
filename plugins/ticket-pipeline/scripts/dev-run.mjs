@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 
-import { TicketStore, makeDomainRepo, makeMemoryRepo, ticketKey } from '../src/core/store.js'
+import { TicketStore, TABLES, makeDomainRepo, makeMemoryRepo, ticketKey } from '../src/core/store.js'
 import { createScheduler } from '../src/core/scheduler.js'
 import { recoverPending } from '../src/core/recover.js'
 import { createMockSource } from '../src/adapters/source-mock/index.js'
@@ -3311,6 +3311,33 @@ function makeFakeCtx ({ domain, registered }) {
     walk(out, '')
     assert.deepEqual(offenders, [], `新字段不能漏 undefined：${offenders.join(', ')}`)
     assert.deepEqual(out.tickets[0].timeline, [], '没时间线就是空数组')
+  })
+
+  await check('票据行里的数字键脏字段会被剔掉，且下一次写入把它从存储里清走', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const key = ticketKey(DEMO, 'r-dirty')
+    await store.enqueue({
+      projectId: DEMO, recordId: 'r-dirty', fingerprint: 'f', revisionCount: 1,
+      description: '说明', screenshots: [],
+    })
+    // 模拟老 bug 留下的形状：字符串被 Object.entries 展开成数字键。
+    const dirty = { ...repo.get(TABLES.tickets, key) }
+    ;['a', 'g', 'e', 'n', 't'].forEach((ch, i) => { dirty[String(i)] = ch })
+    await repo.put(TABLES.tickets, key, dirty)
+    assert.equal(Object.keys(repo.get(TABLES.tickets, key)).filter((n) => /^\d+$/.test(n)).length, 5, '前置：存储里确实脏了')
+
+    const read = store.getTicket(key)
+    assert.equal(Object.keys(read).filter((n) => /^\d+$/.test(n)).length, 0, 'getTicket 读出来要干净')
+    assert.equal(read.description, '说明', '正常字段不受影响')
+    assert.deepEqual(
+      Object.keys(store.listTickets()[0]).filter((n) => /^\d+$/.test(n)), [], 'listTickets 也要干净')
+
+    // 任何一次写入都会把存储里的脏键带走（展开的是已经洗过的行）。
+    await store.appendTimeline(key, 'editing', '改代码')
+    assert.equal(
+      Object.keys(repo.get(TABLES.tickets, key)).filter((n) => /^\d+$/.test(n)).length, 0,
+      '写回存储时脏键必须消失，不能一路带下去')
   })
 
   section('17. 选择分支：把检出里的分支列成下拉候选')
