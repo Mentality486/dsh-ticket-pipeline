@@ -250,7 +250,7 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 | `projects[].repo.path` | 项目卡片 → **仓库** | 文本（**必填**，目录必须已存在） |
 | `projects[].repo.baseBranch` | 项目卡片 → **仓库** | 输入框 + **候选下拉**（列出该检出里真实分支，也可手打） |
 | `projects[].repo.targetBranch` | 项目卡片 → **仓库** | 同上 |
-| `projects[].repo.remote` | 项目卡片 → **仓库** | 文本，收在「显示全部字段」里。**语义是 GitLab 仓库地址**（`https://gitlab.x/group/repo.git` 或 `git@gitlab.x:group/repo.git`），插件从它推 `baseUrl` + `projectId`；**只有** `repo.gitlab.enabled: true` 走远程 draft MR 时才需要 |
+| `projects[].repo.remote` | 项目卡片 → **仓库**（面板上标作「远端名」，名字有误导） | 文本，收在「显示全部字段」里。**实际要填的是 GitLab 仓库地址**（`https://gitlab.x/group/repo.git` 或 `git@gitlab.x:group/repo.git`），插件从它推 `baseUrl` + `projectId` —— **不要**填 `origin`；**只有** `repo.gitlab.enabled: true` 走远程 draft MR 时才需要 |
 | `projects[].repo.gitlab.enabled` | 项目卡片 → **仓库** | 开关，收在「显示全部字段」里（关着 = 只做本地提交） |
 | `projects[].verify.build` / `.test` | 项目卡片 → **验证命令** | 文本（整组收在「显示全部字段」里；不填 = 跳过验证直接本地提交） |
 
@@ -367,7 +367,7 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 | `match.statusValues` | 可配：状态列里哪些取值算「在处理中」（收票条件）。不填则用默认值 `处理中` |
 | `match.recordIds` | 可配：只处理这几条工单（收窄开关）。不填 = 整张表 |
 | `repo.path` | 本地 git 检出根目录（**必填**）；**同时就是这个项目的工作区目录** —— 插件会确保它在 DSH 的 Workspace 列表里有一份登记（已登记则复用，没有则补一条；一个项目一条，多张票共用）。目录必须**已经存在**，插件不会替你克隆；不存在时这张票以 `invalid-input` 失败并说明该改哪个配置 |
-| `repo.remote` | GitLab remote URL。**只有** `repo.gitlab.enabled: true` 要走远程 draft MR 时才用得上；本阶段留空即可 |
+| `repo.remote` | **GitLab 仓库地址**（不是 git 远端名）。**只有** `repo.gitlab.enabled: true` 要走远程 draft MR 时才用得上；本阶段（只做本地提交）留空即可。设置页里这一格的标签写的是「远端名」，**别被名字带偏去填 `origin`** —— 插件拿它推 `baseUrl` + `projectId` |
 | `repo.gitlab.enabled` | 远程 MR 出口总开关，**缺省 `false`**。false 时执行器完全不需要 `GITLAB_TOKEN`、不发任何 GitLab 请求，只做本地提交 |
 | `repo.baseBranch` | 建隔离 worktree 用的基准分支（只有 `isolateWorktree: true` 时用到）。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上。设置页里这个框带**候选下拉**（列出该检出里真实存在的分支，顺序是当前分支 → 远端默认 → 本地 → 其余远端），写错分支名这类错从「运行时炸」变成「选项里根本没有」；分支列不出来（`repo.path` 还没填、不是 git 检出）时仍可直接手打 |
 | `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接做本地提交**（验证结论记为「未跑成」并写进通知） |
