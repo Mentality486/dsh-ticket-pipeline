@@ -1823,16 +1823,20 @@ window.__ModuleLoader__.load({
         body = h('p', { className: 'tp-note' }, '正在读取项目清单…')
       } else if (list.length === 0) {
         body = h('div', { className: 'tp-empty' },
-          h('p', null, '还没有配置任何项目。'),
+          h('p', null, '还没有配置任何项目。点上面的「+ 添加项目」加一个：先在面板上垫一张空卡片，填完右边这些必填项，再点顶部「保存」。'),
           h('p', null,
-            '项目（工单表 → 仓库的绑定）是结构化数组。上面已经可以编辑了；',
-            '如果当前宿主还不支持通过设置通道写 ',
-            h('code', null, 'projects'),
-            '，保存时会把宿主原话显示出来 —— 那就改 profile 的 ',
+            '一个项目 = 一张工单表 + 一个本地 git 检出。最少要填 ',
+            h('code', null, 'name'),
+            '（项目名，唯一）、',
+            h('code', null, 'match.platform'),
+            '（工单来源）、',
+            h('code', null, 'repo.path'),
+            '（本地检出根目录）。',
+            '飞书来源还要在 ',
             h('code', null, 'cordis.patch.yml'),
-            ' 里本行的 ',
-            h('code', null, 'config.projects'),
-            '，改完重启 DSH 生效。'))
+            ' 里手填 ',
+            h('code', null, 'match.appToken'),
+            '（面板不显示明文密钥，详见文档 §3.0.1）。'))
       } else {
         body = h('div', null, list.map(function (item, index) {
           // 分支候选按 index 对（宿主的 `branches()` 与 `projects()` 用的是同一次

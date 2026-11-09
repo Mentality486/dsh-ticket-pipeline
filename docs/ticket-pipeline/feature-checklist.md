@@ -10,14 +10,14 @@
 > 此前同日**`appToken` 贴整条表格链接真的够了**（`parseBitableUrl` 挪进 `src/contracts/types.js`，
 > 配置校验与飞书适配器共用：从 `?table=` 啃出 `table_id`、`?view=` 啃出 `view_id`，显式 `tableId` 仍优先；
 > 此前只有适配器认得这个写法，用户在配置里只贴一条链接会被 `validateConfig` 拦在启动前），
-> `dev-run` **378/378**、`feishu-checks` 58 → **59** 条；此前同日「配置页改成页签式、视觉对齐宿主设置页」
+> `dev-run` **383/383**、`feishu-checks` 58 → **60** 条；此前同日「配置页改成页签式、视觉对齐宿主设置页」
 > （项目 / 参数 / 凭据 / 体检四个页签、一次只画一页、下划线式页签、卡片改用宿主 `settings-card-*` token 并去掉阴影、拆掉三层套娃、
 > 面板不再铺灰底，见 §1.17），`client-smoke` 105 → **113 条**，`dev-run` **376/376** 全绿；
 > 此前 2026-11-06 新增**关键节点流程日志（时间线）**（票据 `timeline` 17 节点表、9 主站 ①–⑨、
 > `pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」，见 §1.16），自测 **376/376** 全绿；
 > 此前同日新增**配置页 UI/UX 大改造**（Label 置顶、高级参数折叠、凭据统一走顶部保存、
 > 项目清单可增删、卡片化 + Switch 开关，顺手修掉 `[object Object]` 渲染 bug，见 §1.15），
-> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），该轮自测 **363/363** 全绿（后补时间线，现为 378/378）；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
+> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），该轮自测 **363/363** 全绿（后补时间线，现为 383/383）；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**设计已定、尚未实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`，5 人日）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -391,7 +391,7 @@ skipped 的首句要说「验证没跑通」。`feishu-checks.mjs` 52 → **58**
 `branches()` 与 `projects()` 用的是同一次 `config.projects` 遍历，index 一定对得上。
 
 **验收**：`dev-run` 新增 6 条断言（解析 / 排序去重 / 真跑通 / 四种失败不抛 / 游离 HEAD / 宿主 remote 按项目隔离），
-自测 **325/325** 全绿（当轮；上线加固 + 时间线后现为 **378/378**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
+自测 **325/325** 全绿（当轮；上线加固 + 时间线后现为 **383/383**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
 真机验证 `listBranches` 在 `D:/WorkSpace/mgiot-pms`（当前 `v2.x`，候选 `v2.x`/`master`/`workbuddy/v2-x-8ef29a33`/`main`）、
 本仓库（`v0.0.1`/`main`）、`.repos/tp-sandbox`（`main` + 3 个 worktree 分支）上都返回正确清单，
 不存在的路径返回 `fatal: cannot change to ...`。
@@ -418,7 +418,7 @@ skipped 的首句要说「验证没跑通」。`feishu-checks.mjs` 52 → **58**
 `.tp-toggle` 一把捞、断言「配置分组有 3 个折叠标题」；项目卡片与卡内分组加进来后变成 7 条，
 断言就红了，而且红得看不出是哪儿错。各认自己的类名，断言才能稳定表达「配置分组有 3 个」。
 
-**验收**：`dev-run` 363/363（当轮；时间线后现为 378/378）、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
+**验收**：`dev-run` 363/363（当轮；时间线后现为 383/383）、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
 `client-smoke` **85 → 94 条**（新增「卡片有折叠开关 / 默认展开 / 收起后不再渲染字段 / 收起后仍显示项目名 /
 aria-expanded 变 false / 再点一次展开回来 / 卡内有可折叠分组」7 条）。
 
@@ -449,7 +449,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 `ask` 在无头场景 fail-closed，会让 agent 的每一步工具调用都失败。所以只能退回 `never` 并打一条 warn
 （`executor-agent/index.js:1152`）。兜底只有 git 白名单 + 提交前篡改自检，**不是硬隔离**。
 
-**新增断言**：`dev-run` 325 → **363/363**（当轮；第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条；时间线后现为 378/378）；
+**新增断言**：`dev-run` 325 → **363/363**（当轮；第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条；时间线后现为 383/383）；
 `gitlab-checks` 78 → **86**（敏感名单覆盖与不误伤、`.git/hooks` 与 `cordis.patch.yml` 篡改判失败、无 `readFile` 跳过、
 白名单放行自检要用的 `rev-parse` 形态、`blockedFiles` 可见、受保护路径边界）；
 `wps-checks` 25 → **34**（下载通道超时/取消/字节上限/逐跳重定向校验、`scan` 传 signal）；
@@ -478,7 +478,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 **自测**：`client-smoke` 94 → **105 条**（新增：凭据每行不再有「保存」按钮、清单无 `[object Object]`、
 「+ 添加项目」/「删除」按钮、`role="switch"` 语义、布尔不落回原生 checkbox、全页只一颗主按钮）；
-`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**（当轮；时间线后现为 378）、`chain-smoke` **11** 全绿。
+`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**（当轮；时间线后现为 383）、`chain-smoke` **11** 全绿。
 
 ---
 
@@ -508,7 +508,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 **验收**：`dev-run` 第 **16c** 节 13 条断言全绿（主站顺序 / `at`/`ok`/`label` 合法性 / 相邻 `at` 单调 /
 `onFlow` 报的 ④ 进时间线 / 失败站记 ✗ / 连续合并 / 80 条封顶 / 重新入队继承 / 人工重置不清空 /
 `pipeline_status` 渲染「已 1 分 35 秒没动」/ 终态与 needs-info 文案 / 返回体四字段 / 老票无 undefined）；
-累计 **376/376**（当轮；补 appToken 链接解析 2 条后现为 **378/378**），26 小节。真实链路探针跑一轮 mock tick 得 11 条时间线（④ 因 mock 不上报而缺席，合法），
+累计 **376/376**（当轮；补 appToken 链接解析 2 条后现为 **383/383**），26 小节。真实链路探针跑一轮 mock tick 得 11 条时间线（④ 因 mock 不上报而缺席，合法），
 渲染探针给出「现在停在第 ⑥ 站」与 `station/stalledForMs` 返回值。详见 `README.md` §5.2.1、
 `user-guide.md` §5.2.1、`architecture.md` §11.3、`operation-flow.md` §1/§7。
 
@@ -551,7 +551,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 非当前页签不渲染内容；原有依赖「四块同屏」的断言按页签重校准 —— 参数页输入控件门槛 7 → 6，
 因为凭据的 5 个密码框不再同屏；「项目卡内可折叠分组」改用 `tp-sec-toggle` 计数）。
 `client-check` ✅（descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 方法、面板 21 项对得上）、
-`dev-run` **378**、`chain-smoke` **11** 全绿。
+`dev-run` **383**、`chain-smoke` **11** 全绿。
 
 ---
 
@@ -602,6 +602,28 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 调试时踩到两个选择器坑：卡片要用精确正则 `/^tp-proj( tp-collapsed)?$/`（`indexOf('tp-proj')` 会把
 `tp-proj-head`/`tp-proj-body`/`tp-proj-toggle` 一起捞进来）；找「仓库」分区不能用 `indexOf('仓库')`
 （「基本」分区的 hint 里也有「仓库」二字），改成认 `仓库仓库路径` 这一段。
+
+---
+
+### 1.19 「从 0 到 1」审计：新用户视角下修掉的 4 件事（2026-11-09）
+
+拿「一台干净机器上的新用户」当标准，把安装 → 凭据 → 飞书权限 → 检出 → 配置 → 首跑 → 日常使用整条路走了一遍，
+再逐个核对 33 个配置键与 25 个项目字段。四项必修：
+
+| # | 症状（新用户会遇到什么） | 根因 | 落点与改法 |
+| --- | --- | --- | --- |
+| 1 | 体检长期挂 `⚠️ 凭据服务不可用（ctx.credentials 缺席）`，看起来像装坏了；但飞书其实能正常读 `app_secret` | `makeCredentialsDescriber(ctx)` 在 `apply()` 时取一次 `ctx.get('credentials')` 并缓存成 `null`，之后再也不重取；而凭据服务由宿主 base composition 提供，挂载时刻晚于插件 `apply()`。真正读 secret 的 `makeSecretReader` 是每次重取，所以能工作 | `src/index.js`：`makeCredentialsDescriber` 改成惰性 `current()`（每次调用重取）+ 暴露 `available()`；`src/tools/pipeline-doctor.js` §3 三分支：服务可用→逐个 `describe`；服务没挂上→**进 `problems`** 并说明是宿主组合问题（确认 profile 挂了该服务 / 重装后完全重启）；连描述器都没有→`ℹ️ 内部接线问题，不影响跑票` |
+| 2 | 按文档配完一切，票永远不动，而体检报「环境体检通过」 | `enabled` 缺省 `false`（安全默认），`pipeline_status` 会说「总开关是关的」，但 `pipeline_doctor` **一个字都不提** | `src/tools/pipeline-doctor.js` §2 开头加 `✅ 总开关：已开启，会按 pollIntervalMinutes 自动扫表` / `⏸️ 总开关：关着（enabled=false）——不会自动扫表，也不会跑任何票。去设置页「参数」页签把 enabled 打开，或者直接调一次 pipeline_scan 手动跑一轮。`。**关着只进 `warnings` 不进 `problems`**——这不是装坏了，进 problems 会让人以为环境有故障 |
+| 3 | 票处理完了，表格里那一格却写不进去，票据上挂一句像插件坏了的 `internal:`，还会被当成可重试错误反复重试 | 用的是飞书**同步表**（数据由连接器同步进来），飞书不允许直接改行：`800074911 ConnectorSyncTableActionForbidden` / `[status_code: 800004105 msg: syncTable can not apply action:action=data.setRecord …]` | `src/adapters/source-feishu/index.js`：新增 `SYNC_TABLE_FORBIDDEN_ERROR_CODES = new Set([800074911, 800004105])` + `isSyncTableForbiddenError(error)`（先 `/(?:报错|错误码)\s*(\d+)/` 取码比对，再 `ConnectorSyncTableActionForbidden`、`syncTable … can not/cannot`、裸码兜底）；`writeResult` 的 catch 在 `isFieldMissingError` 之后加分支，退化成 `{written:false, note:'这张多维表格是「同步表」…要么在原系统里看结果，要么把 writeBack 关掉…要么换成自己建的非同步表…飞书原话：…'}`。**重试一万次也一样，所以不能算网络类可重试错误** |
+| 4 | 进程被杀在「改到一半」，重启后票**永久卡死**：恢复日志说 `resumed: 1`，票一步不动；`pipeline_reset` 又只认 failed/needs-info/gone，救不回来 | `recoverPending()` 把票恢复成原中间态（`planning`/`testing`）寓意「停在本步重做」，但 `store.pickNext()` **只挑 `pending`**，而 `tick()` 的唯一入口就是 `pickNext()` —— 恢复完之后没有任何代码路径会再把它交给执行器 | `src/core/recover.js`：恢复终态统一成 `pending`。工作区坐标有效就**留着**（`runOne` 会先问 `isStaleWorkspaceCoords`，坐标仍然有效就直接复用那个检出，不重新 clone）；失效则清掉 `worktreePath`/`branch`/`baseCommit`/`commit`/`mr` 再回 `pending` 重建。「上次停在哪一步」写进 `lastError` 给人看。真机事故现场：三张 sandbox 票停在 `testing`/`planning` 就这样躺了三天 |
+
+**配置页核对结论（全新用户视角）**：
+
+- `CONFIG_FIELDS` **33 个叶子 / 7 组**（扫描与队列 / 租约与重试 / 执行 / 回填工单表 / agent 与模型 / 通知 / 杂项）；`getConfigDescriptor()` 与面板三方一致（`client-check` 守）。
+- 项目字段 descriptor 里 **25 个**，面板只画 **21 个**。缺的 4 个：`match.appToken`（含明文密钥，宿主不下发，面板只显示「已配置（前 4…后 4）」）、`repo.gitlab.baseUrl` / `repo.gitlab.remote` / `repo.gitlab.projectId`（只能改配置文件）。**这是设计而非缺陷，但新用户不知道**，已在 `docs/ticket-pipeline/user-guide.md` §3.0.1 写明。
+- 空清单文案原来写「如果当前宿主还不支持通过设置通道写 `projects`，保存时会把宿主原话显示出来 —— 那就改 profile 的 `cordis.patch.yml`」，**对现在的面板已经过时**，改成「点上面的「+ 添加项目」加一个：先在面板上垫一张空卡片，填完右边这些必填项，再点顶部「保存」。」+「一个项目 = 一张工单表 + 一个本地 git 检出。最少要填 `name`（唯一）、`match.platform`、`repo.path`；飞书来源还要手填 `match.appToken`」。
+
+**自测**：`dev-run` 378 → **382**（+4：凭据描述器「服务晚于 apply() 挂上也能用」、doctor 区分「服务没挂上 / 这个 ref 没配」、doctor 必须说出总开关、「恢复完必须能被 pickNext 捡起来」并反向断言「工作区有效时不得清坐标」）；`feishu-checks` 59 → **60**（同步表回执）。
 
 ---
 
@@ -879,7 +901,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **378** | 通过 378，失败 0（2026-11-09 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → **378**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），最后 2 条是「appToken 贴整条链接」的配置校验） |
+| `node scripts/dev-run.mjs` | **383** | 通过 383，失败 0（2026-11-09 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → **383**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（凭据描述器惰性重取 2 条、总开关必须被体检说出来 1 条、启动恢复终态必须是 pending 1 条，见 §1.19），最后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」 |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
 `dev-run.mjs` 分 26 个小节：
@@ -922,9 +944,9 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
 | 设置面板（新） | ✅ `client-check.mjs`：descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 个方法、`projects` 可写 25 字段；`client-smoke.mjs` **123** 条断言全过（页签式布局见 §1.17，「添加项目」见 §1.18） |
-| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 378/378）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
+| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 383/383）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
-| appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **59** 条、`dev-run` 加 2 条配置校验断言（**378/378**） |
+| appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **60** 条、`dev-run` 加 2 条配置校验断言（**383/383**） |
 | 面板「添加项目」修好（新，2026-11-09） | ✅ 加项目改成「垫空卡片 + 一次保存提交」：不再拿空 `repo.path` 撞宿主整份校验（见 §1.18）；顺手修「出错吃掉整个清单」与「有未保存改动就锁死加项目」；`repo.remote` 面板标签改「GitLab 仓库地址」；`client-smoke` 113 → **123** 条断言全过 |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |
@@ -1013,7 +1035,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **378** 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **383** 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -1039,7 +1061,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「插件版本自检」（**已完成**，2026-11-06） | 宿主加载的是 profile 下的目录副本（跨盘 `file:` 落成复制），HMR `root: []` 不监听源码 ⇒ 改完不同步就静默跑旧代码；新增 `src/core/plugin-version.js`，`pipeline_doctor` 比对安装副本与源码的**文件内容**，落后时给出同步命令，只进「提醒」 | ✅ 自测 288 → 293（新增 5 组断言）；见 §1.6 与 `architecture.md` §12.11 |
 | 「`setPhase` 清不掉字段」缺陷修复（**已完成**，2026-11-06） | `setPhase` 把补丁里所有 `undefined` 一概过滤，于是调用方写的每一种「清掉」都静默失效：成功票上挂着上一轮 `lastError`（真实事故：`pms\|reczz28VWNWVbpgL` 跑成 done 却显示 `provider "workbuddy" has no configured model`），启动恢复以为清了死坐标其实没清。改为「键不存在 = 不动 / 键在值为 undefined = 删掉」 | ✅ 自测 293 → 294（新增 1 条走真实重试路径 —— 旧的那条是 `resetByHuman` 兜的假绿）；见 §1.7 |
 | 「回填 / 保留会话 / 基线 / 面板」四项改造（**已完成**，2026-11-06） | ①处理完回填工单表（`TicketSource.writeResult` 唯一写入口 + `writeBack`/`writeBackStatus`，见 §1.8）②处理完保留会话（`ExecResult.sessionId` + `keepSession`，见 §1.9）③脏工作区只提交 agent 改过的文件（`createBaseline` + `describeDirtyCheckout`，`assertCleanCheckout` 删除，见 §1.10）④设置面板补齐（`projects` 子树可编辑 + 第 3 个 Remote 方法，配置 33 键 / 7 组，见 §1.11） | ✅ 自测 319/319（新增 25 条，`dev-run.mjs` 第 16 节 + 第 15 节改写）；`feishu-checks` 52 → 58、`gitlab-checks` 68 → 78；`client-check` / `client-smoke` 全绿 |
-| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固 + 时间线后现为 378/378）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
+| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固 + 时间线后现为 383/383）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
 | **上线加固**（**已完成**，2026-11-06） | 5 条阻断项 + 4 条重要项：适配器名强校验（`workExecutor` / `pushAdapter` 的 `enum`，写错抛 `invalid-input` 不静默退 mock）、验证命令超时与取消（30 分钟缺省、退出码 124、取消真 kill）、敏感名单 9 → **8 大类 41 条正则**、`.git`/profile 篡改自检（28 + 10 + 4）、终态与事后动作同一次落库（`pendingEffects` + `replayPendingEffects`）、回填失败进通知、就地重跑起点、租约诚实化（best-effort，不是原子 CAS），见 §1.14 | ✅ 自测 325 → **363/363**（当轮；新增 38 条，`dev-run.mjs` 第 16b 节 14 条 + 各 checks）；`gitlab-checks` 78 → 86、`wps-checks` 25 → 34、`workspace-checks` 11 → 19 |
 | **关键节点流程日志（时间线）**（**已完成**，2026-11-06） | 票据 `timeline` 17 节点表（9 主站 ①–⑨ + 8 补充站）、`markNode` / `markExtra` / `onFlow` 全链路打点、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、历史不清空 + 80 条封顶，见 §1.16 | ✅ 自测 363 → **376/376**（新增 13 条，`dev-run.mjs` 第 16c 节）；26 小节；真实链路探针 11 条时间线、渲染探针给出 `station`/`stalledForMs` |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |

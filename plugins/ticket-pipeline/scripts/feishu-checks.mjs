@@ -21,6 +21,7 @@ import assert from 'node:assert/strict'
 import {
   createFeishuSource,
   feishuOptionsFromMatch,
+  isSyncTableForbiddenError,
   parseBitableUrl,
   FEISHU_COLUMNS,
   IN_PROGRESS_VALUE,
@@ -1252,6 +1253,41 @@ export async function runFeishuChecks (check) {
     const { source: byMsg } = makeSource(server, { fetch: msgFetch })
     const byMessage = await byMsg.writeResult('rec-1', { result: '已修复' })
     assert.equal(byMessage.written, false, 'msg 里明说字段不存在时也要退化成只读回执')
+  })
+
+  await check('回填：同步表拒绝写入要退化成只读回执，不能当成故障反复重试', async () => {
+    // 真发现（2026-11-09，pms 真链路）：回填发出 data.setRecord 之后飞书回
+    //   800074911：ConnectorSyncTableActionForbidden,
+    //   [status_code: 800004105 msg: syncTable can not apply action:action=data.setRecord...]
+    // 这是「表是同步表、行不归你改」，属于配置问题：票已经处理完了，
+    // 重试一万次也一样。以前归成 internal，票据上挂着看起来像插件坏了的话，
+    // 还会被当成可重试错误。
+    const realMessage = '飞书接口报错 800074911：ConnectorSyncTableActionForbidden, '
+      + '[status_code: 800004105 msg: syncTable can not apply action:action=data.setRecord, '
+      + 'tabID=tblWhRSGf0osJqrE, fldID=fldfZLT0D6]'
+    assert.equal(isSyncTableForbiddenError(new Error(realMessage)), true, '真实报错文本必须认出来')
+    // 内层 status_code 单独出现也要认（不同接口版本包装方式不一样）。
+    assert.equal(isSyncTableForbiddenError(new Error('syncTable can not apply action:action=data.setRecord')), true)
+    assert.equal(isSyncTableForbiddenError(new Error('[status_code: 800004105]')), true)
+    // 反例：真正的故障不能被误判成「同步表」。
+    assert.equal(isSyncTableForbiddenError(new Error('飞书接口报错 1254045：FieldNameNotFound')), false)
+    assert.equal(isSyncTableForbiddenError(new Error('调用飞书接口失败：socket hang up')), false)
+    assert.equal(isSyncTableForbiddenError(null), false)
+    assert.equal(isSyncTableForbiddenError(undefined), false)
+
+    // 端到端：写回时拿到这个码，要回 written:false + 说清怎么办，而不是抛。
+    const server = createFakeServer({ rows: [] })
+    const syncFetch = async (url, init = {}) => (
+      String(init.method ?? 'GET').toUpperCase() === 'PUT'
+        ? jsonResponse({ code: 800074911, msg: 'ConnectorSyncTableActionForbidden' })
+        : server.fetchImpl(url, init)
+    )
+    const { source } = makeSource(server, { fetch: syncFetch })
+    const receipt = await source.writeResult('rec-1', { result: '已修复' })
+    assert.equal(receipt.written, false, '同步表写不进去要如实回 written:false')
+    assert.ok(/同步表/.test(receipt.note ?? ''), `note 要说清是同步表：${receipt.note}`)
+    assert.ok(/writeBack/.test(receipt.note ?? ''), `note 要给出关掉回填这条退路：${receipt.note}`)
+    assert.ok(/ConnectorSyncTableActionForbidden/.test(receipt.note ?? ''), '要把飞书原话带上，便于排查')
   })
 
   await check('回填：真故障（鉴权 / 网络）必须抛出来，不能吞掉假装写成功', async () => {

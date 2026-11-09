@@ -328,6 +328,20 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 > 平台是 `wps` 时才会多出金山那 5 个字段（另有一组「金山文档」分区）。
 > 改过的和有错的字段**无论收起与否都会露出来**。
 
+#### 面板上改不了的 4 个字段
+
+项目字段一共 25 个，面板只画 21 个。剩下这 4 个**没有输入框**，要改只能手改 `cordis.patch.yml`（改完必须完全重启 DSH）：
+
+| 字段 | 为什么面板不画 |
+|---|---|
+| `projects[].match.appToken` | 里面是明文密钥，宿主不会把它下发到浏览器。面板只画一行只读状态：「已配置（前 4…后 4）」或「未配置」 |
+| `projects[].repo.gitlab.baseUrl` | GitLab 服务地址。一般由 `repo.remote` 自动推导出来，只有推导不对时（自建 GitLab、路径不规则）才需要显式覆盖 |
+| `projects[].repo.gitlab.remote` | 推 MR 时用哪个 git 远端名（缺省 `origin`）。只在你的检出里远端不叫 `origin` 时才要填 |
+| `projects[].repo.gitlab.projectId` | GitLab 的 `group/project` 形式 ID。同样一般能从 `repo.remote` 啃出来，路径带多层子组、或被重命名过时才需要显式写 |
+
+> 这 4 个都是「高级/敏感」项，正常配置用不到。**如果你需要动它们，说明前面的 `repo.remote` 没填对** ——
+> 先把 `repo.remote` 换成完整的仓库地址（`https://gitlab.x/group/repo.git`），多数情况就自动对上了。
+
 **加项目 / 删项目怎么算数**：点「**+ 添加项目**」只是在面板上垫一张空卡片
 （标题「未保存」，**这一刻什么都没写进配置文件**），把名字、平台、仓库路径这些
 必填项填完，再点顶部的「**保存**」，新增的项目才和其它改动一起落库。
@@ -453,6 +467,10 @@ profile 名字就把 `desktop` 换掉）。用记事本、VS Code 都行，**别
 | `repo.baseBranch` | 建隔离 worktree 用的基准分支（只有 `isolateWorktree: true` 时用到）。**建议显式填**；不填则自动识别（`origin/HEAD` → 当前分支 → 最后才猜 `main`）。仓库主分支不叫 main 时（如 `v2.x`）不填也能跑，但 `pipeline_doctor` 会提醒你补上。设置页里这个框带**候选下拉**（列出该检出里真实存在的分支，顺序是当前分支 → 远端默认 → 本地 → 其余远端），写错分支名这类错从「运行时炸」变成「选项里根本没有」；分支列不出来（`repo.path` 还没填、不是 git 检出）时仍可直接手打 |
 | `verify.build` / `verify.test` | 验证命令；**不填则跳过验证直接做本地提交**（验证结论记为「未跑成」并写进通知） |
 
+> 上表之外还有 4 个键**面板上没有输入框**、只能手改 `cordis.patch.yml`：
+> `match.appToken`（明文密钥，宿主不下发）、`repo.gitlab.baseUrl` / `repo.gitlab.remote` / `repo.gitlab.projectId`
+> （都能从 `repo.remote` 自动推导，只在推导不对时才需要显式覆盖）。详见 §3.0.1 末尾「面板上改不了的 4 个字段」。
+
 ---
 
 ## 4. 首次运行（强烈建议先走这一步）
@@ -480,7 +498,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 | `pipeline_status` | 看所有票的当前阶段、本地提交（sha + 分支）、处理会话、回填结果与最近错误 |
 | `pipeline_cancel` | 取消正在跑的那张票 |
 | `pipeline_reset` | 把一张终态票（failed/gone 等）重置回 pending 重跑 |
-| `pipeline_doctor` | 体检：git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**，结论按「必须修复」「提醒」分段 |
+| `pipeline_doctor` | 体检：**总开关状态** / git 链路 / 各项目仓库路径与 remote / 凭据 / 执行器与通知 / **插件是不是最新**，结论按「必须修复」「提醒」分段。**新装完第一件事就跑它** —— 总开关是关的、凭据服务没挂上、插件版本落后，都只在这里看得见 |
 
 ### 4.3 切换真执行
 
@@ -568,7 +586,7 @@ mock 执行器不碰真代码，但**扫描、定位、确定改代码落点、�
 
 | 检查 | 命令/动作 | 预期 |
 |---|---|---|
-| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **378 项全过**，exit 0 |
+| 离线自测 | `node scripts/dev-run.mjs`（开发目录） | **383 项全过**，exit 0 |
 | 接线冒烟 | `node scripts/chain-smoke.mjs` | 11 项全过 |
 | 插件加载 | 重启 DSH 后对话里说 `pipeline_status` | 工具能响应（enabled=false 时也会答） |
 | 真扫表 | 配好凭据后说 `pipeline_scan` | 返回 created/updated/disappeared 计数 |

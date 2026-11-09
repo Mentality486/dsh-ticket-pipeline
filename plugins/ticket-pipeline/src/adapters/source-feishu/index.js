@@ -120,6 +120,44 @@ const RATE_LIMIT_ERROR_CODES = new Set([99991400, 99991403])
 const FIELD_MISSING_ERROR_CODES = new Set([1254040, 1254045])
 
 /**
+ * 「这是一张同步表（sync table），不接受直接写记录」的业务码。
+ *
+ * 真发现（2026-11-09，pms 项目真链路）：回填发出 `data.setRecord` 之后飞书回
+ * `800074911：ConnectorSyncTableActionForbidden, [status_code: 800004105 msg: syncTable
+ * can not apply action:action=data.setRecord, tabID=tbl…, fldID=fld…]`。
+ *
+ * 和「字段不存在」是同一类事——**配置/权限问题，不是故障**：飞书的多维表格
+ * 如果是从一个「同步表」接出来的（数据由连接器同步进来），行是被同步源拥有的，
+ * 直接改字段会被拒。换句话说这张票本身处理完了，只是**这张表结构上写不进去**。
+ * 归成 `internal` 会让票据上挂一句看起来像插件坏了的话，还会被当成可重试错误
+ * 反复重试；其实重试一万次也一样。所以要单独识别，退化成只读回执并说清怎么办。
+ *
+ * 两个码都认：外层是 800074911，内层 status_code 800004105。
+ * 除了码表还看 msg 关键词兜底，理由同 `isFieldMissingError`。
+ */
+const SYNC_TABLE_FORBIDDEN_ERROR_CODES = new Set([800074911, 800004105])
+
+/**
+ * 判断一个错误是不是「这张表是同步表，不允许写」。
+ *
+ * 导出是为了让自测能直接喂一段真实的飞书报错文本进来验证，
+ * 而不是去构造一个完整的多维表格。
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isSyncTableForbiddenError (error) {
+  if (!error || typeof error !== 'object') return false
+  const message = String(/** @type {any} */ (error).message ?? '')
+  const codeMatch = message.match(/(?:报错|错误码)\s*(\d+)/)
+  if (codeMatch && SYNC_TABLE_FORBIDDEN_ERROR_CODES.has(Number(codeMatch[1]))) return true
+  if (/ConnectorSyncTableActionForbidden/i.test(message)) return true
+  if (/syncTable/i.test(message) && /(can not|cannot)/i.test(message)) return true
+  // 内层 status_code 也可能被抓进同一段文本里。
+  return /\b800004105\b|\b800074911\b/.test(message)
+}
+
+/**
  * 判断一个错误是不是「表里没有这个字段」。
  *
  * 两种证据任一成立就算：业务码在白名单里，或 msg 里同时出现字段与「不存在」的意思。
@@ -1330,6 +1368,18 @@ export function createFeishuSource (options = {}) {
           written: false,
           note: `工单表里没有「${FEISHU_COLUMNS.status} / ${FEISHU_COLUMNS.result} / ${FEISHU_COLUMNS.handledAt}」这几列，本次不回填（票本身已处理完）。`
             + `请确认表结构，或关掉 writeBack 退化成只读：${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+      // 同步表（数据由连接器同步进来的多维表格）结构上不接受直接写记录：
+      // 这和「少一列」一样是配置问题，不是故障，也不该被当成可重试错误反复重试。
+      if (isSyncTableForbiddenError(error)) {
+        return {
+          written: false,
+          note: '这张多维表格是「同步表」，数据由连接器（飞书集成/其他系统）同步进来，'
+            + '飞书不允许直接改里面的行，所以处理结果回填不进去（票本身已处理完）。'
+            + '要么在原系统里看结果，要么把 writeBack 关掉（设置页「回填工单表」→ writeBack=false），'
+            + '要么换成一张自己建的、非同步的多维表格来收工单。'
+            + `飞书原话：${error instanceof Error ? error.message : String(error)}`,
         }
       }
       throw error

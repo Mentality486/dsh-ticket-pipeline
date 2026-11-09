@@ -517,19 +517,37 @@ function makeSecretReader (ctx) {
  * 造一个「只说配没配、绝不返回值」的凭据描述器，供 pipeline_doctor 用。
  * 宿主 credentials 服务有 describe(ref) 就直接用；没有就用 resolve() 结果映射成布尔。
  *
+ * ## 为什么每次都重新取 ctx.get('credentials')，而不是在 apply 时取一次
+ *
+ * 这个服务和 `tools` / `storageDomain` 不一样，**不在 `inject` 里**（也不想加：
+ * 加了就等于声明「没有凭据服务这插件就起不来」，而 mock 项目、纯界面浏览其实不需要它）。
+ * 代价是它的挂载时刻不保证早于本插件的 `apply()`。以前这里在 apply 时就
+ * `ctx.get('credentials')` 取一次并缓存，取不到就 `return null` 且永不重试 ——
+ * 结果宿主里明明有凭据、飞书扫描也确实读到了 secret（能发出真的 `data.setRecord`
+ * 请求），体检却一直报「⚠️ 凭据服务不可用（ctx.credentials 缺席）」。
+ *
+ * 现在和 `makeSecretReader` 用同一套口径：**惰性、每次重取**。描述器本身永远返回非空
+ * 对象，取不到服务的证据由 `available()` 表达，好让体检区分「服务没挂上」和
+ * 「服务在、但这个 ref 没配」——这两件事对用户的处理方式完全不同。
+ *
  * @param {any} ctx
- * @returns {{ describe: (ref: string) => Promise<{ configured: boolean } | undefined> } | null}
+ * @returns {{ available: () => boolean, describe: (ref: string) => Promise<{ configured: boolean } | undefined> }}
  */
-function makeCredentialsDescriber (ctx) {
-  let credentials = null
-  try {
-    credentials = ctx.get('credentials')
-  } catch {
-    credentials = null
+export function makeCredentialsDescriber (ctx) {
+  function current () {
+    try {
+      return ctx.get('credentials') ?? null
+    } catch {
+      return null
+    }
   }
-  if (!credentials) return null
   return {
+    available () {
+      return Boolean(current())
+    },
     async describe (ref) {
+      const credentials = current()
+      if (!credentials) return undefined
       if (typeof credentials.describe === 'function') {
         const hit = await credentials.describe(ref)
         if (hit) return { configured: Boolean(hit.configured) }

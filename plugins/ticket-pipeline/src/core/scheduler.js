@@ -495,8 +495,8 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       if (store.getTicket(key)?.phase === 'pending') {
         await onPhase('worktree-ready', {})
       }
-      await markExtra(key, 'worktree-ready', `${workspaceAction}；工作目录 ${ws.worktreePath || '（未建，离线跑）'}${ws.branch ? `，分支 ${ws.branch}` : ''}${ws.workspacePath ? `，项目工作区 ${ws.workspacePath}` : ''}`)
-      await markNode(key, 'workspace', `${workspaceAction}；工作目录 ${ws.worktreePath || '（未建，离线跑）'}${ws.branch ? `，分支 ${ws.branch}` : ''}${ws.workspacePath ? `，项目工作区 ${ws.workspacePath}` : ''}`)
+      await markExtra(key, 'worktree-ready', `工作目录 ${ws.worktreePath || '（未建，离线跑）'}${ws.branch ? `，分支 ${ws.branch}` : ''}${ws.workspacePath ? `，项目工作区 ${ws.workspacePath}` : '，未归属到项目工作区'}`)
+      await markNode(key, 'workspace', `${workspaceAction}${ws.repoPath ? `；检出 ${ws.repoPath}` : ''}`)
 
       await onPhase('planning', {
         module: located.module ?? row.module,

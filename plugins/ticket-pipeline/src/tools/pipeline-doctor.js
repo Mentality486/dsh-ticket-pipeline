@@ -105,6 +105,20 @@ if (!gitOk) {
 // ── 2. 项目仓库 ──────────────────────────────────
 const config = options.getConfig() ?? {}
 const projects = Array.isArray(config.projects) ? config.projects : []
+
+// 总开关单独说：`enabled` 缺省是 false，一个全新用户把项目、凭据、仓库都配好之后
+// 体检照样「通过」，然后永远等不到票 —— 因为没人告诉他开关还关着。
+// 这不算「必须修复的问题」（没装坏），但必须**显式**说出来，不能只躺在提醒里。
+const pipelineEnabled = config.enabled === true
+if (pipelineEnabled) {
+  lines.push('✅ 总开关：已开启，会按 pollIntervalMinutes 自动扫表')
+} else {
+  lines.push('⏸️ 总开关：关着（enabled=false）——不会自动扫表，也不会跑任何票。'
+    + '去设置页「参数」页签把 enabled 打开，或者直接调一次 pipeline_scan 手动跑一轮。')
+  warnings.push('流水线总开关是关的（enabled=false）：配好了也不会自动运行，'
+    + '需要在设置页「参数」页签打开 enabled（或每次手动 pipeline_scan）。')
+}
+
 if (projects.length === 0) {
   warnings.push('没有配置任何项目（projects 为空）——流水线不会监控任何工单表。')
 }
@@ -225,14 +239,29 @@ for (const project of projects) {
 }
 
 // ── 3. 凭据 ──────────────────────────────────────
+//
+// 这里要分清两种「拿不到凭据」，因为它们对用户的处理方式完全不同：
+//   a. 宿主压根没挂 credentials 服务   —— 装坏了 / 组合不对，得改 profile；
+//   b. 服务在，只是这个 ref 还没填      —— 去设置页的「凭据」页签填一下就好。
+// 以前两种情况都会走 describe() 然后一律显示成「无法查询」，或者更糟：
+// 描述器在 apply 时就缓存成 null，于是明明配好了也永远报「服务不可用」。
+// 现在描述器自带 available()，先问一句服务在不在，再逐个问 ref 配没配。
 const creds = options.credentials
-if (creds && typeof creds.describe === 'function') {
+const credsUsable = Boolean(creds) && typeof creds.describe === 'function'
+const credsAvailable = credsUsable
+  && (typeof creds.available === 'function' ? creds.available() : true)
+if (credsUsable && credsAvailable) {
   for (const ref of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'GITLAB_TOKEN']) {
     try {
       const hit = await creds.describe(ref)
-      const ok = Boolean(hit?.configured)
+      if (!hit) {
+        // describe 回 undefined = 服务在这一刻没了（刚被卸载），不是「没配」。
+        lines.push(`⚠️ 凭据 ${ref}：查询时凭据服务不见了`)
+        continue
+      }
+      const ok = Boolean(hit.configured)
       if (!ok && ref !== 'GITLAB_TOKEN') {
-        warnings.push(`凭据 ${ref} 未配置 —— 飞书扫描将无法工作。`)
+        warnings.push(`凭据 ${ref} 未配置 —— 飞书扫描将无法工作。去设置页「凭据」页签填一下。`)
       }
       if (!ok && ref === 'GITLAB_TOKEN') {
         // 本阶段不需要：交付形态是工作区里的本地提交，不连远程、不开 MR。
@@ -244,8 +273,16 @@ if (creds && typeof creds.describe === 'function') {
       lines.push(`⚠️ 凭据 ${ref}：无法查询`)
     }
   }
+} else if (credsUsable) {
+  // 服务描述器在，但此刻 ctx.get('credentials') 还是空的。
+  problems.push(
+    '凭据服务没挂上（ctx.get("credentials") 取不到）——飞书扫描读不到 app_secret、'
+    + '设置页「凭据」页签也会是空的。这是宿主组合的问题（不是配置问题）：'
+    + '确认 profile 里挂了这个凭据服务，或者重新安装插件后完全重启 DSH。',
+  )
+  lines.push('⚠️ 凭据服务不可用（ctx.get("credentials") 取不到）——见上面的问题说明。')
 } else {
-  lines.push('⚠️ 凭据服务不可用（ctx.credentials 缺席）——飞书扫描无法读取 app_secret。')
+  lines.push('ℹ️ 凭据：本插件的体检没有拿到凭据描述器（内部接线问题，不影响跑票）')
 }
 
 // ── 4. 执行器与通知 ──────────────────────────────

@@ -41,7 +41,7 @@ import { runGitlabChecks } from './gitlab-checks.mjs'
 import { runQqmailChecks } from './push-qqmail-checks.mjs'
 import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
-import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout } from '../src/index.js'
+import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
 import {
   comparePluginTrees,
@@ -429,7 +429,11 @@ async function main () {
   })
 
   section('6. 启动恢复')
-  await check('中间态票从当前阶段继续，不从头重跑', async () => {
+  await check('中间态票恢复后必须回到 pending，否则 pickNext 永远捡不起来', async () => {
+    // 真坑（2026-11-09，真机 3 张 sandbox 票永久卡死）：旧实现恢复成 planning/testing，
+    // 寓意是「停在本步重做」，但 `pickNext()` **只挑 pending**，而 `tick()` 的唯一入口
+    // 就是 `pickNext()` —— 恢复日志说 resumed:1，票却一步也不再动，
+    // `pipeline_reset` 又只认 failed/needs-info/gone，救不回来。
     const repo = makeMemoryRepo()
     const store = new TicketStore({ repo, log: silent })
     const source = createMockSource()
@@ -444,21 +448,49 @@ async function main () {
     })
     assert.equal(result.resumed, 1)
     const row = store.getTicket(k('rec-mock-001'))
-    assert.equal(row.phase, 'planning', '应该停在 planning 重做，而不是回到 pending')
-    assert.equal(row.worktreePath, 'D:/wt/x', '工作区还在就要接着用')
+    assert.equal(row.phase, 'pending', '恢复后必须是 pending，中间态没有任何代码会再捡它')
+    assert.equal(row.worktreePath, 'D:/wt/x', '工作区还在就要接着用，坐标别清')
+    assert.equal(row.branch, 'ticket-rec-mock-001-r1', '分支也要留着')
+    assert.ok(/上次停在/.test(row.lastError ?? ''), `lastError 要写清上次停在哪：${row.lastError}`)
+    const next = store.pickNext()
+    assert.ok(next, '恢复完之后 pickNext 必须能捡到它')
+    assert.equal(next.recordId, 'rec-mock-001')
   })
 
-  await check('工作区丢了 → 退回 worktree-ready 重建', async () => {
+  await check('工作区丢了 → 清坐标回 pending，让执行器重建', async () => {
     const repo = makeMemoryRepo()
     const store = new TicketStore({ repo, log: silent })
     const source = createMockSource()
     const scan = await source.scan(new AbortController().signal)
     await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
-    await store.setPhase(k('rec-mock-001'), 'planning', { worktreePath: 'D:/wt/gone' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/wt/gone',
+      branch: 'ticket-x-r1',
+      commit: { sha: 'deadbeef', branch: 'ticket-x-r1', files: [] },
+      mr: { iid: 7, url: 'http://gitlab/x/-/merge_requests/7', draft: true },
+    })
 
     const result = await recoverPending({ store, worktreeExists: async () => false, log: silent })
     assert.equal(result.reset, 1)
-    assert.equal(store.getTicket(k('rec-mock-001')).phase, 'worktree-ready')
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'pending')
+    assert.equal(row.worktreePath, undefined, '工作区没了，坐标要清掉')
+    assert.equal(row.branch, undefined)
+    assert.equal(row.commit, undefined, '旧 sha 在新历史里不存在，必须清')
+    assert.equal(row.mr, undefined, '旧 MR 指向的分支已经没了，必须清')
+    assert.ok(store.pickNext(), '清完坐标也要能被捡起来')
+
+    // 反过来：工作区还在时不能清坐标（否则白丢一个已经建好的检出）。
+    const repo2 = makeMemoryRepo()
+    const store2 = new TicketStore({ repo: repo2, log: silent })
+    await store2.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    // worktree-ready 不能直接跳 testing（阶段表里没有这条边），先走到 planning 再走。
+    await store2.setPhase(k('rec-mock-001'), 'planning', { worktreePath: 'D:/wt/keep', branch: 'ticket-y-r1' })
+    await store2.setPhase(k('rec-mock-001'), 'testing', {})
+    await recoverPending({ store: store2, worktreeExists: async () => true, log: silent })
+    const kept = store2.getTicket(k('rec-mock-001'))
+    assert.equal(kept.worktreePath, 'D:/wt/keep', '工作区有效时绝不能把坐标清掉')
+    assert.equal(kept.phase, 'pending')
   })
 
   await check('needs-info 恢复时不动它', async () => {
@@ -1300,7 +1332,8 @@ async function main () {
         stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'),
         stderr: '',
       }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
+      // enabled 必须显式 true：缺省是 false，体检会（正确地）报「总开关关着」。
+      getConfig: () => ({ enabled: true, projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
       credentials: { describe: async (ref) => ({ configured: true }) },
     })
     const out = await tool.execute({}, {})
@@ -1310,6 +1343,107 @@ async function main () {
     assert.ok(out.text.includes('检出干净'), '缺省模式下要报告检出是否干净')
     assert.ok(out.text.includes('改代码落点'), '要把改代码落在哪里说出来')
     assert.ok(out.text.includes('项目工作区检出里'), '缺省是就地改，不是隔离 worktree')
+    assert.ok(out.text.includes('总开关：已开启'), '开关开着要说出来，人才知道会自动扫表')
+  })
+
+  await check('凭据描述器：服务晚于 apply() 挂上也能用（真机上飞书能读到 secret，体检却报缺席）', async () => {
+    // 真实现象：宿主里 credentials 服务是存在的、飞书也确实读到了 app_secret
+    // （真链路回填发出了 data.setRecord，被多维表格权限挡回 ConnectorSyncTableActionForbidden），
+    // 但 pipeline_doctor 一直报「⚠️ 凭据服务不可用（ctx.credentials 缺席）」。
+    // 原因是描述器在 apply() 那一刻取一次并缓存成 null，之后永不重取。
+    // credentials 不在 inject 里（故意的：mock 项目不需要它），所以挂载时刻没有保证。
+    let service = null
+    const ctx = { get: (name) => (name === 'credentials' ? service : undefined) }
+    const describer = makeCredentialsDescriber(ctx)
+    assert.equal(describer.available(), false, '服务还没挂上时 available() 必须说实话')
+    assert.equal(await describer.describe('FEISHU_APP_SECRET'), undefined, '没服务时 describe 回 undefined')
+
+    // 服务挂上来了（apply 之后），描述器必须能自己发现，不需要重启插件。
+    service = { describe: async (ref) => ({ configured: ref === 'FEISHU_APP_SECRET' }) }
+    assert.equal(describer.available(), true, '服务挂上后 available() 必须变 true')
+    assert.equal((await describer.describe('FEISHU_APP_SECRET')).configured, true)
+    assert.equal((await describer.describe('FEISHU_APP_ID')).configured, false)
+
+    // 只有 resolve()（没有 describe）的服务也要能映射成布尔，且绝不把明文漏出来。
+    service = { resolve: async (ref) => (ref === 'FEISHU_APP_ID' ? { value: 'cli_secret_value' } : undefined) }
+    assert.equal((await describer.describe('FEISHU_APP_ID')).configured, true)
+    assert.equal((await describer.describe('GITLAB_TOKEN')).configured, false)
+
+    // 服务被卸掉之后也不能抛，只回落成 undefined。
+    service = null
+    assert.equal(describer.available(), false)
+    assert.equal(await describer.describe('FEISHU_APP_ID'), undefined)
+  })
+
+  await check('pipeline_doctor 区分「凭据服务没挂上」和「这个 ref 没配」', async () => {
+    const base = {
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+    }
+
+    // a. 服务没挂上 —— 这是「装坏了/组合不对」，要进 problems（不是 warning），并说清怎么办。
+    const missing = await createPipelineDoctorTool({
+      ...base,
+      credentials: makeCredentialsDescriber({ get: () => undefined }),
+    }).execute({}, {})
+    assert.equal(missing.ok, false, `凭据服务缺席时不该报全绿：${missing.text}`)
+    assert.ok(
+      missing.problems.some((p) => p.includes('凭据服务没挂上')),
+      `要进 problems：${JSON.stringify(missing.problems)}`,
+    )
+    assert.ok(missing.text.includes('app_secret'), '要说清后果（读不到 app_secret）')
+    assert.ok(missing.text.includes('重启'), '要给出下一步动作')
+
+    // b. 服务在、但 ref 没配 —— 这是用户自己能修的，归 warnings 并指到设置页。
+    const empty = await createPipelineDoctorTool({
+      ...base,
+      credentials: makeCredentialsDescriber({ get: () => ({ describe: async () => ({ configured: false }) }) }),
+    }).execute({}, {})
+    assert.ok(
+      empty.warnings.some((w) => w.includes('凭据 FEISHU_APP_SECRET 未配置')),
+      `服务在但没配要进 warnings：${JSON.stringify(empty.warnings)}`,
+    )
+    assert.ok(
+      empty.warnings.some((w) => w.includes('「凭据」页签')),
+      '要告诉用户去哪填（设置页凭据页签）',
+    )
+    assert.ok(!empty.problems.some((p) => p.includes('凭据服务没挂上')), '服务在的时候不能说服务没挂上')
+  })
+
+  await check('pipeline_doctor 必须说出总开关状态（enabled 缺省 false，新用户配完也不跑）', async () => {
+    // 真实现象：全新用户把项目、凭据、仓库都配好，体检报「环境体检通过」，
+    // 然后永远等不到票 —— 因为 enabled 缺省 false，而以前体检一个字都不提它。
+    const make = (enabled) => createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({
+        code: 0,
+        stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'),
+        stderr: '',
+      }),
+      getConfig: () => ({
+        enabled,
+        projects: [{ name: 'pms', match: { platform: 'mock' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'qqmail',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+
+    const off = await make(false).execute({}, {})
+    assert.ok(off.text.includes('总开关：关着'), `关着时必须显式说：${off.text}`)
+    assert.ok(off.text.includes('enabled'), '要点名是哪个键')
+    assert.ok(
+      off.warnings.some((w) => w.includes('总开关是关的')),
+      `也要进 warnings：${JSON.stringify(off.warnings)}`,
+    )
+    assert.ok(off.text.includes('pipeline_scan'), '要给出绕路办法（手动跑一轮）')
+    // 关着不是「装坏了」，不该判成 problems —— 否则用户会以为环境有故障。
+    assert.equal(off.problems.length, 0, `关开关不是故障：${JSON.stringify(off.problems)}`)
+
+    const on = await make(true).execute({}, {})
+    assert.ok(on.text.includes('总开关：已开启'), `开着也要说一声：${on.text}`)
+    assert.ok(!on.warnings.some((w) => w.includes('总开关')), '开着就不该再提醒开关')
   })
 
   await check('pipeline_doctor 报 git 不可用 + remote 连不上 + mock 提醒', async () => {
@@ -2998,6 +3132,23 @@ function makeFakeCtx ({ domain, registered }) {
     for (let i = 1; i < timeline.length; i += 1) {
       assert.ok(timeline[i].at >= timeline[i - 1].at, `第 ${i} 条的 at 不能比上一条早`)
     }
+  })
+
+  await check('时间线：「工作区就绪」和「检查工作区」两站说的不是同一句话（别重复记账）', async () => {
+    const { scheduler, store } = harness()
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    const ready = timeline.find((e) => e.node === 'worktree-ready')
+    const workspace = timeline.find((e) => e.node === 'workspace')
+    assert.ok(ready, '要有 worktree-ready 这一站')
+    assert.ok(workspace, '要有 workspace 这一站')
+    assert.ok(typeof ready.detail === 'string' && ready.detail.length > 0, '工作区就绪要说明目录/分支')
+    assert.ok(typeof workspace.detail === 'string' && workspace.detail.length > 0, '检查工作区要说明是新建还是复用')
+    // 上一版两站套的是同一个字符串（都是「票据上还没有工作区，新建/登记一个；工作目录 …」），
+    // 读起来像同一条日志被记了两遍。现在互补：就绪站报坐标，检查站报「复用/新建/重建」的判定。
+    assert.notEqual(ready.detail, workspace.detail, `两站不能是同一句话：${ready.detail}`)
+    assert.ok(/工作目录|项目工作区/.test(ready.detail), `工作区就绪要给出坐标：${ready.detail}`)
+    assert.ok(/(复用|新建|重新准备|已失效)/.test(workspace.detail), `检查工作区要给出判定：${workspace.detail}`)
   })
 
   await check('时间线：执行器通过 onFlow 报上来的 ④ 会话也记进去（含模型/分支）', async () => {

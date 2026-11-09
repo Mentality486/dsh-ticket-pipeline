@@ -6,12 +6,25 @@
  * 已经建好的工作区接着用，已经开过的 MR 先查一遍再决定要不要开。
  *
  * 三条规则（架构文档 §7.6）：
- * 1. `worktreePath` 还在、`git rev-parse` 通过 → 从当前 phase 接着走
- * 2. `worktreePath` 没了 → 回退到 `worktree-ready` 之前，让执行器重建
- * 3. 分支被删 / 被改 → 不重用，同样回退
+ * 1. `worktreePath` 还在、`git rev-parse` 通过 → 保留坐标，放回队列接着用
+ * 2. `worktreePath` 没了 → 清掉坐标，放回队列让执行器重建
+ * 3. 分支被删 / 被改 → 不重用，同样清坐标
+ *
+ * ## 为什么最终状态是 `pending` 而不是「停在原来的中间态」
+ *
+ * 这里踩过一次真坑（2026-11-09，真机上 3 张 sandbox 票永久卡死）：
+ * 旧实现把票恢复成 `planning` / `testing` 这类中间态，用意是「停在本步重做」。
+ * 但 `TicketStore.pickNext()` **只挑 `pending`** —— 中间态是留给启动恢复处理的，
+ * 而恢复做完之后**没有任何代码路径会再把它们交给执行器**：`tick()` 的唯一入口
+ * 就是 `pickNext()`。结果就是恢复日志说「resumed: 1」，票却一步也不再动。
+ * 更糟的是 `pipeline_reset` 只认 failed / needs-info / gone，救不回中间态。
+ *
+ * 所以恢复的终态统一成 `pending`，把「上次停在哪一步」写进 `lastError` 供人看。
+ * 工作区坐标保留下来，`runOne` 会先问 `isStaleWorkspaceCoords`：坐标还有效就
+ * **直接复用**那个工作区（不会重新 clone / 重新建 worktree），语义上仍是「接着用」。
  */
 
-import { TERMINAL, canTransition } from '../contracts/types.js'
+import { TERMINAL } from '../contracts/types.js'
 import { toPipelineError } from '../contracts/errors.js'
 
 /**
@@ -21,19 +34,21 @@ import { toPipelineError } from '../contracts/errors.js'
  */
 
 /**
- * 每种中间态在「工作区还在」时应该从哪继续。
+ * 中间态票恢复后统一回到 `pending`（理由见文件头）。
  *
- * 注意这里不是「跳到下一步」而是「停在本步重做」：
- * agent 上一轮可能一行没改，直接当成改完了会漏活。
- * 让它从当前阶段重新报一遍，比猜「它到底做完了没有」安全。
+ * 这张表只用来生成给人看的一句话，说明「上次停在哪儿」——
+ * 它不再决定恢复后写入哪个 phase。
  */
-const RESUME_PHASE = Object.freeze({
-  'worktree-ready': 'planning',
-  'planning': 'planning',
-  'editing': 'planning', // 回到规划：让它重新确认要改什么，避免改一半的残留被当成完成
-  'testing': 'testing',
-  'mr-opening': 'mr-opening',
+const RESUME_LABEL = Object.freeze({
+  'worktree-ready': '上次停在「工作区就绪」',
+  'planning': '上次停在「规划改动」',
+  'editing': '上次停在「改代码」',
+  'testing': '上次停在「跑验证」',
+  'mr-opening': '上次停在「提交 / 开 MR」',
 })
+
+/** 需要「回到队列重跑」的中间态（`pending` 与终态都不在这里）。 */
+const RESUMABLE_PHASES = Object.freeze(Object.keys(RESUME_LABEL))
 
 /**
  * 扫一遍存储，把中间态的票安排回队列。
@@ -73,61 +88,59 @@ export async function recoverPending ({ store, worktreeExists, log, now }) {
         continue
       }
 
+      // 认识不了的中间态（以后加了新 phase 但忘了更新这张表）就原样留着，
+      // 别硬改成 pending —— 那等于悄悄替人做了决定。
+      if (!RESUMABLE_PHASES.includes(row.phase)) {
+        skipped += 1
+        logInfo('启动恢复：不认识的中间态，先不动', { projectId: row.projectId, recordId: row.recordId, phase: row.phase })
+        continue
+      }
+
       const pathOk = row.worktreePath
         ? await (worktreeExists ? worktreeExists(row.worktreePath) : Promise.resolve(true))
         : false
 
+      // 无论工作区还在不在，终态都是 `pending`（理由见文件头）：
+      // 只有 `pending` 才会被 `pickNext()` 捡起来跑。区别只在**保不保坐标**。
       if (!pathOk) {
-        // 工作区没了：退回 worktree-ready 之前，让执行器下一轮重建。
-        // 不直接回 pending —— 那样会连「上一轮已经定位到哪个文件」都丢掉，
-        // 而 worktree-ready 恰好是「建工作区」的入口。
-        const target = 'worktree-ready'
-        if (canTransition(row.phase, target) || row.phase === 'worktree-ready') {
-          await store.setPhase(row.key, target, {
-            worktreePath: undefined,
-            branch: undefined,
-            baseCommit: undefined,
-            // 要退回 mr-opening 之前，就跑不回那条 MR 上了：工作区一重建就是新分支
-            // （分支名带 revisionCount），旧 MR 指向的是被删掉的分支。不清掉的话，
-            // 通知里会挂着一条已经作废的链接，人点进去以为活还在。
-            // commit 同理：新工作区是新检出，旧 sha 在新历史里根本不存在。
-            mr: undefined,
-            commit: undefined,
-            lastError: '工作区丢失，启动恢复时重建',
-          })
-          reset += 1
-          logInfo('启动恢复：工作区不在，重建', { projectId: row.projectId, recordId: row.recordId, was: row.phase })
-        } else {
-          // 状态机不允许直接从当前 phase 回到 worktree-ready（比如 mr-opening），
-          // 那就往前推一步到 pending，保留已完成的 MR 信息由执行器自己去查重。
-          await store.setPhase(row.key, 'pending', {
-            worktreePath: undefined,
-            branch: undefined,
-            baseCommit: undefined,
-            // 同上：pending 是比 mr-opening 更靠前的阶段，旧 MR 的坐标必须一起清掉。
-            // 这里原本还指望执行器「自己去查重」，但那要求执行器知道旧 MR 的存在；
-            // 存储里留一条作废记录，最可能的结局是下轮通知把人引到一条死链上。
-            mr: undefined,
-            commit: undefined,
-            lastError: '工作区丢失，启动恢复时重新排队',
-          })
-          reset += 1
-          logInfo('启动恢复：工作区不在，回队列', { projectId: row.projectId, recordId: row.recordId, was: row.phase })
-        }
+        // 工作区没了：坐标全清，让执行器下一轮重新准备。
+        // 尤其是 `mr` / `commit`：新工作区是新检出、新分支（分支名带 revisionCount），
+        // 旧 MR 指向的分支已经不存在、旧 sha 在新历史里也找不到。不清掉的话，
+        // 通知里会挂着一条作废链接，人点进去以为活还在。
+        const reason = row.worktreePath ? '工作区丢失，启动恢复时重新排队' : '上次没来得及建工作区，启动恢复时重新排队'
+        await store.setPhase(row.key, 'pending', {
+          worktreePath: undefined,
+          branch: undefined,
+          baseCommit: undefined,
+          mr: undefined,
+          commit: undefined,
+          lastError: reason,
+          enqueuedAt: nowFn(),
+        })
+        reset += 1
+        logInfo('启动恢复：工作区不在，清坐标回队列', {
+          projectId: row.projectId,
+          recordId: row.recordId,
+          was: row.phase,
+          hadWorktreePath: Boolean(row.worktreePath),
+        })
         continue
       }
 
-      const target = RESUME_PHASE[row.phase]
-      if (target && canTransition(row.phase, target)) {
-        await store.setPhase(row.key, target, {
-          lastError: undefined,
-          enqueuedAt: nowFn(),
-        })
-        resumed += 1
-        logInfo('启动恢复：从当前阶段继续', { projectId: row.projectId, recordId: row.recordId, from: row.phase, to: target })
-      } else {
-        skipped += 1
-      }
+      // 工作区还在：坐标留着，让 `runOne` 直接复用（`isStaleWorkspaceCoords` 会再确认一遍）。
+      // 恢复完 phase 是 pending，所以「上次停在哪」只能写进 lastError 让人看见。
+      const was = RESUME_LABEL[row.phase] ?? `上次停在「${row.phase}」`
+      await store.setPhase(row.key, 'pending', {
+        lastError: `${was}，启动恢复后重新排队（工作区沿用，不会重新 clone）`,
+        enqueuedAt: nowFn(),
+      })
+      resumed += 1
+      logInfo('启动恢复：放回队列，工作区沿用', {
+        projectId: row.projectId,
+        recordId: row.recordId,
+        was: row.phase,
+        to: 'pending',
+      })
     } catch (error) {
       logInfo('启动恢复：这一条处理失败，跳过', {
         projectId: row.projectId,

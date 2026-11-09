@@ -119,7 +119,7 @@ export async function apply (ctx, config) {
   // 2. 适配器：projects[] → sources[]、locator、executor、push
   // 3. 内核：createScheduler({ store, sources, locator, executor, push, ... })
   // 4. 注册四个工具：pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset
-  // 5. 启动恢复：recoverPending()，把跑到一半的票从当前 phase 接着走
+  // 5. 启动恢复：recoverPending()，把跑到一半的票放回 pending（工作区坐标有效就沿用）
   // 6. 注册 ctx.interval 轮询（enabled 关着时 tick 直接返回 disabled）
 }
 ```
@@ -152,7 +152,7 @@ export async function apply (ctx, config) {
 |---|---|---|
 | 定时扫描 | `ctx.interval(() => tick(), Config.pollIntervalMinutes * 60_000)` | **唯一默认入口**，默认 3 分钟 |
 | 手动扫描 | 工具 `pipeline_scan` | 直接调 `tick()`，返回本轮结论 |
-| 启动恢复 | `apply` 末尾扫一遍 `TicketStore` | 未到终态的票从当前 phase 接着走 |
+| 启动恢复 | `apply` 末尾扫一遍 `TicketStore` | 未到终态的票放回 `pending`（工作区坐标有效则沿用，失效则清掉重建） |
 | 外部事件 | 适配器可选 `onExternalChange()` | 不支持就不实现，内核只轮询 |
 
 **不用 `ctx.schedule`**：它是「持久提醒」，绑会话、靠往会话追加 follow-up 投递；本插件要的是进程内的周期任务，`ctx.interval` 才是对的工具（`ctx.timer` 服务存在，但混入后的 `ctx.interval`/`ctx.timeout` 才是常用调用形态，两者等价）。
@@ -664,8 +664,14 @@ export const TERMINAL: Phase[] = ['done', 'skipped', 'failed', 'gone']
 差别在副作用：**保留改代码落点**（缺省就是项目工作区的检出，本来也不会删；开了 `isolateWorktree` 则是那个隔离目录）、发通知、释放租约；超时还要先 `agent.cancel()`。
 而可重试错误且 `attempt < maxAttempts` 走的是**回 `pending`**（`attempt++`、回队首、同样保留改代码落点）。
 
-**回退路径**（`recover.js`，§7.6）：`worktreePath` 不在时优先退到 `worktree-ready`；
-若当前 phase 不允许（实际不会发生，上表每个中间态都允许），再退一步回 `pending` 并清掉工作区坐标。
+**回退路径**（`recover.js`，§7.6）：**恢复的终态统一是 `pending`**，区别只在保不保工作区坐标 ——
+`worktreePath` 还在且 `git rev-parse` 通过就留着（`runOne` 会先问 `isStaleWorkspaceCoords`，坐标有效就直接复用那个检出，不重新 clone）；
+不在就清掉 `worktreePath`/`branch`/`baseCommit`/`commit`/`mr` 再回 `pending`，让执行器重建。
+「上次停在哪一步」写进 `lastError` 给人看。
+
+> **为什么不是「停在原中间态重做」**：`store.pickNext()` 只挑 `pending`，而 `tick()` 的唯一入口就是 `pickNext()`；
+> 恢复成 `planning`/`testing` 之后**没有任何代码路径会再把它交给执行器**（真机事故：3 张 sandbox 票永久卡死，
+> 恢复日志说 `resumed: 1`，票却一步不动，`pipeline_reset` 又只认 failed/needs-info/gone，救不回来）。
 
 **人工重开有两个入口、同一个动作**（`store.resetByHuman`）：表格里「是否处理」由非收票值 → 收票值，
 或直接调 `pipeline_reset` 工具（§4.3）。
@@ -711,10 +717,16 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 
 1. 读 `TicketRecordRow` 里 `phase ∉ TERMINAL` 的全部记录
 2. 对每条：
-   - `worktreePath` 存在且 `git -C <path> rev-parse --is-inside-work-tree` 通过 → 从当前 phase 接着走
-   - `worktreePath` 不存在 → 重新走组合根的 `prepareWorkspace`：`isolateWorktree` 关（缺省）时它就地复用项目工作区检出（重新校验干净），打开时才 `git worktree add`；phase 回退到 `worktree-ready`（不可复用脏状态）
-   - 分支已被删 / 已被改 → 重建，不重用
+   - `worktreePath` 存在且 `git -C <path> rev-parse --is-inside-work-tree` 通过 → **保留坐标**，phase 放回 `pending`（`runOne` 会先问 `isStaleWorkspaceCoords`，坐标仍然有效就直接复用这个检出，不重新 clone / 不重新 `worktree add`）
+   - `worktreePath` 不存在或不通过 → 清掉 `worktreePath`/`branch`/`baseCommit`/`commit`/`mr`，phase 放回 `pending`，让组合根的 `prepareWorkspace` 下一轮重建：`isolateWorktree` 关（缺省）时就地复用项目工作区检出，打开时才 `git worktree add`
+   - 分支已被删 / 已被改 → 同样清坐标重建，不重用
+   - 「上次停在哪一步」写进 `lastError`（`上次停在「跑验证」，启动恢复后重新排队（工作区沿用，不会重新 clone）`），因为 phase 已经统一成 `pending`，光看 phase 看不出中断点
 3. **不从头重跑**：已经改过的文件不重改；已经做过的本地提交不重做（新工作区是新检出，旧 sha 不存在，恢复时 `commit` 会被清掉）；可选的 draft MR 也不重开（先查 `merge_requests?source_branch=X&state=opened`）
+
+> **恢复终态必须是 `pending`，不能是原中间态。** `store.pickNext()` 只挑 `pending`，而 `tick()` 的唯一入口就是 `pickNext()` ——
+> 恢复成 `planning`/`testing` 之后没有任何代码路径会再把它交给执行器。真机事故（2026-11-09）：三张 sandbox 票
+> 停在 `testing`/`planning`，每轮启动恢复都报 `resumed: 1`，票一步不动；`pipeline_reset` 只认 failed/needs-info/gone，
+> 也救不回来。这是「看起来恢复了、其实死透了」的典型，所以恢复后统一回队列。
 
 **恢复流程覆盖不到 `failed`**：它只遍历 `listActive()`（pending 与中间态）。`failed` 是终态，
 人照着通知「拨走再拨回处理中」重开之后，票带着**原样的**工作区坐标回到调度器 ——
