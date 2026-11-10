@@ -109,7 +109,17 @@ const PRIORITY_MAP = new Map([
 /** 飞书错误码 → 我们的错误分类。 */
 const AUTH_ERROR_CODES = new Set([99991663, 99991664, 99991665, 99991668, 99991672, 1254301])
 const NOT_FOUND_ERROR_CODES = new Set([1254043, 1254045, 1254290])
-const INVALID_INPUT_ERROR_CODES = new Set([1254005, 1254006, 1254007])
+/**
+ * 「这个 token 不是你要的那个对象 / 参数不对」。
+ *
+ * 1254003 `WrongBaseToken` 属于这一族：拿一个电子表格的 token 去问多维表格的
+ * `apps/{token}/tables`，飞书回的就是它。**必须归成 invalid-input 而不是 internal** ——
+ * `shouldTrySheet()` 只在 invalid-input / not-found 这类「类型不对」的错上才会
+ * 再试一次电子表格；归成 internal 就会被当成真故障直接抛出去，于是「只贴了一个裸
+ * token 的电子表格」永远走不到电子表格分支（实测 2026-11-10：wiki 里的电子表格
+ * 只贴裸 token 时，报的就是 `internal: 飞书接口报错 1254003`）。
+ */
+const INVALID_INPUT_ERROR_CODES = new Set([1254003, 1254005, 1254006, 1254007])
 const RATE_LIMIT_ERROR_CODES = new Set([99991400, 99991403])
 
 /**
@@ -844,8 +854,20 @@ export function createFeishuSource (options = {}) {
   /**
    * 从用户填的值里抠出 `spreadsheetToken`。
    *
-   * 三种写法都要认：整条表格链接（`…/sheets/shtcnXXX?sheet=YYY`）、裸 token、wiki 换算出来的 obj_token。
-   * 电子表格的行身份、工作表定位都基于这个 token，抠错了整条链路都读不到东西。
+   * 四种写法都要认：
+   * 1. 整条表格链接 —— `/sheets/<token>`
+   * 2. **整条 wiki 链接** —— `/wiki/<token>`（知识库里的电子表格，用户从地址栏复制出来就是这个）
+   * 3. 裸 token
+   * 4. wiki 换算出来的 obj_token（本身也是裸 token，走第 3 条）
+   *
+   * 第 2 条是补的漏洞：以前只认 `/sheets/` 和裸 token，wiki 链接两处都匹配不上，
+   * 函数兜底「原样返回整串」，于是整条 URL 被 `encodeURIComponent` 拼进
+   * `/open-apis/sheets/v3/spreadsheets/<…>/sheets/query`，飞书回 `404 page not found`
+   * —— 表现就是「配了电子表格但一张票都收不到」，而且日志里看不出是 URL 没拆开。
+   *
+   * 实测（2026-11-10）：wiki token 与 obj_token **两者都能当 spreadsheetToken 用**，
+   * `sheets/v3/…/sheets/query` 和 `sheets/v2/…/values` 都吃。所以这里不需要额外
+   * 调 `get_node` 换算，抠出 wiki token 直接用即可，少一次往返。
    *
    * @param {unknown} raw
    * @returns {string}
@@ -853,8 +875,23 @@ export function createFeishuSource (options = {}) {
   function extractSheetToken (raw) {
     const text = String(raw ?? '').trim()
     if (text.length === 0) return ''
-    const urlMatch = text.match(/\/sheets\/([A-Za-z0-9]+)/)
-    if (urlMatch) return urlMatch[1]
+    // 顺序有讲究：/sheets/ 与 /wiki/ 都可能出现在同一条链接里（wiki 面板套 sheet 面板），
+    // 先认 /sheets/ 更贴近用户意图。
+    const sheetUrlMatch = text.match(/\/sheets\/([A-Za-z0-9]+)/)
+    if (sheetUrlMatch) return sheetUrlMatch[1]
+    const wikiUrlMatch = text.match(/\/wiki\/([A-Za-z0-9]+)/)
+    if (wikiUrlMatch) return wikiUrlMatch[1]
+    // 带协议的 URL 但既不是 /sheets/ 也不是 /wiki/：说明这条链接不是电子表格，
+    // 或者飞书改了 URL 形态。**别把它当 token 用** —— 那只会拼出 404 且误导人。
+    // 明确报出来，比静默失败强。
+    if (/^https?:\/\//i.test(text)) {
+      throw new PipelineError(
+        'invalid-input',
+        `认不出这条链接里的电子表格 token：${text}。`
+          + '支持形如 https://<域名>/sheets/<token>（本地表格）或 https://<域名>/wiki/<token>（知识库里的表格）。'
+          + '也可以只填 token 本身。',
+      )
+    }
     const bare = text.match(/^([A-Za-z0-9]+)$/)
     if (bare) return bare[1]
     return text

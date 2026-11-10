@@ -30,7 +30,7 @@
  */
 
 import { resolveRecordIds } from '../contracts/record-filter.js'
-import { parseBitableUrl } from '../contracts/types.js'
+import { parseFeishuLink } from '../contracts/types.js'
 import { FEISHU_SEMANTIC_FIELD_NAMES } from '../contracts/feishu-columns.js'
 
 /**
@@ -530,10 +530,12 @@ function normalizePlatform (platform) {
  *
  * @param {unknown} raw
  * @param {number} index
- * @returns {{ value?: object, issues: Array<{ message: string, path: string[] }> }}
+ * @returns {{ value?: object, issues: Array<{ message: string, path: string[] }>, warnings?: string[] }}
  */
 function validateProject (raw, index) {
   const issues = []
+  /** @type {string[]} */
+  const warnings = []
   // 文案用「第 N 个项目 · 中文 label（原始路径）」：项目卡片上看到的是「飞书 appToken」
   // 这种中文名，而配置文件里能搜到的是 `match.appToken` —— 两个都得给，人才连得上。
   const fail = (path, message, fix) => {
@@ -570,32 +572,78 @@ function validateProject (raw, index) {
   //   ③ spreadsheetToken +（sheetId 或 sheetName）（电子表格显式绑定）
   //   ④ docNamePattern（按云文档名模糊匹配，两种表型都认）
   // 另外 tableKind 是逃生阀：显式写 bitable / sheet 就跳过表型探测。
+  //
+  // ## 为什么「只给一个 token」也算够（2026-11-10 改）
+  //
+  // 以前要求 `appToken` 必须配 `tableId`、`spreadsheetToken` 必须配 `sheetId/sheetName`。
+  // 但面板现在只有**一个**入口：粘贴工单表链接。而链接不一定带齐这些参数 ——
+  // 知识库里的表是 `/wiki/<token>`（没有 table= / sheet=），干净的电子表格链接也可能
+  // 不带 `?sheet=`。那两种情况下运行期本来就能自己解决：
+  //   · 多维表格缺 tableId → `resolveBitableTableByIdentity` 会按 `docNamePattern`
+  //     或「表里恰好只有一张」去定位；
+  //   · 电子表格缺 sheetId → `resolveWorksheet` 会取第一张可见工作表。
+  // 配置层硬拦等于「运行期能跑，配置层不让存」—— 人只能去手改 YAML 绕过，
+  // 这正是「填来填去都填了、根本不清楚用哪个」的来源之一。
+  // 所以这里只要求「至少有一个定位依据」，把「缺 tableId / 缺 sheetId」降级为运行期
+  // 自动解决。真的解析不出来时，`resolveTable()` 会给出带具体原因的错误。
   if (platform === 'feishu') {
-    const rawAppToken = typeof match.appToken === 'string' ? match.appToken : ''
-    const fromUrl = parseBitableUrl(rawAppToken)
-    const explicitTableId = typeof match.tableId === 'string' && match.tableId.length > 0 ? match.tableId : fromUrl.tableId
-    const hasBitable = rawAppToken.trim().length > 0 && explicitTableId.length > 0
+    const rawAppToken = typeof match.appToken === 'string' ? match.appToken.trim() : ''
     const rawSpreadsheetToken = typeof match.spreadsheetToken === 'string' ? match.spreadsheetToken.trim() : ''
-    const sheetTarget = typeof match.sheetId === 'string' ? match.sheetId.trim() : ''
-    const sheetTargetName = typeof match.sheetName === 'string' ? match.sheetName.trim() : ''
-    const hasSheet = rawSpreadsheetToken.length > 0 && (sheetTarget.length > 0 || sheetTargetName.length > 0)
-    const hasPattern = typeof match.docNamePattern === 'string' && match.docNamePattern.length > 0
+    const hasPattern = typeof match.docNamePattern === 'string' && match.docNamePattern.trim().length > 0
     const tableKind = typeof match.tableKind === 'string' ? match.tableKind.trim() : ''
 
     if (tableKind.length > 0 && tableKind !== 'bitable' && tableKind !== 'sheet') {
       fail('match.tableKind', '只能写 bitable 或 sheet（留空表示让它自己探测）', '这一格一般不用填：留空，插件会按 token 自动认出表型')
     }
-    if (!hasBitable && !hasSheet && !hasPattern) {
-      fail('match', 'feishu 项目必须给①appToken+tableId（或多维表格链接里的 ?table=）②spreadsheetToken + sheetId/sheetName（电子表格）③docNamePattern（按文件名匹配）之一',
+    if (rawAppToken.length === 0 && rawSpreadsheetToken.length === 0 && !hasPattern) {
+      fail('match', 'feishu 项目必须给①工单表链接/token（多维表格或电子表格都行）②spreadsheetToken ③docNamePattern（按文件名匹配）之一',
         '最省事的做法：在面板的项目卡片里把工单表链接整条贴进「工单表链接」；不想用链接就填「表名匹配」（例如 PMS项目管理系统工单）')
     }
-    if (rawSpreadsheetToken.length > 0 && !hasSheet) {
-      fail('match.spreadsheetToken', '给了电子表格 token 就得同时给 sheetId（工作表 id）或 sheetName（工作表名），否则不知道该读哪一张',
-        '补上「工作表名」（给人看的名字，例如 Sheet1）或「工作表 id」（sh 开头那串）')
+    // 两套 token 同时存在：以前是静默的，运行期按 `resolveTable()` 的优先级取一个 ——
+    // 于是「填了两套、到底用哪套」只能去读源码才知道。这正是用户反馈的
+    // 「填来填去都填了，根本不清楚用的那个」。这里不改行为（改行为会悄悄改变
+    // 现有配置的收票来源），只把「实际会用哪套」说清楚。
+    if (rawAppToken.length > 0 && rawSpreadsheetToken.length > 0) {
+      const actual = tableKind === 'sheet' ? '电子表格' : (tableKind === 'bitable' ? '多维表格' : '电子表格（按 resolveTable 的优先级：有 spreadsheetToken 就先当成电子表格）')
+      warnings.push(
+        `项目 ${name || `#${index}`} 同时填了多维表格（appToken）和电子表格（spreadsheetToken）两套 —— 实际按${actual}取工单，另一套不起作用。` +
+        '建议只留一个：在项目卡片里把工单表链接贴进「工单表链接」，它会自动清掉另一套。'
+      )
+    }
+    // 链接里没有 `?table=`、也没配 docNamePattern：分两种情形。
+    //
+    // `/base/<token>` 是**多维表格自己的地址栏形态**，飞书一定会在后面带 `?table=tbl…`
+    // （不带的那条是「这个 base 的首页」，仍然能打开，但没说清是哪张数据表）。
+    // 既然是坏输入，就该在配置层拦下 —— 放行到运行期，人多半只会看到
+    // 「匹配到 N 张表」这种要自己回头猜原因的错误。
+    //
+    // `/wiki/<token>` 不能同样处理：知识库里的表**从来**不带 `?table=`，它的表型
+    // 甚至要到运行时问 `get_node` 才知道。硬拦就等于把 wiki 表全挡在门外。
+    const baseTokenLike = /\/base\//i.test(rawAppToken)
+    // `?table=` 可能在两处：显式写进 match.tableId，或者就在链接的 query 里。
+    // 只查前者会把「贴了一条带 ?table= 的完整链接」误判成缺表 —— 而那恰恰是最推荐的写法。
+    const urlTableId = parseFeishuLink(rawAppToken).tableId
+    const hasBitableKeys = rawAppToken.length > 0 && (
+      (typeof match.tableId === 'string' && match.tableId.trim().length > 0) || urlTableId.length > 0
+    )
+    if (baseTokenLike && !hasBitableKeys && !hasPattern && rawSpreadsheetToken.length === 0) {
+      fail('match.appToken', '这条多维表格链接里没有 `?table=`，也没配 docNamePattern（表名匹配）',
+        '在飞书里打开这张多维表格，复制浏览器地址栏里带 `?table=tbl…` 的完整链接；或者填「表名匹配」让插件按表名去找')
+    }
+    // 其它形态（裸 token、/sheets/…）缺配套参数就只提醒：运行期能自己解决
+    // （电子表格缺 sheetId → 取第一张可见工作表；多维表格缺 tableId → 表里恰好
+    // 一张就成，多张会报错并列出现有表名）。配置层判断不了有几张表，所以不拦。
+    const looksLikeUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawAppToken)
+    if (looksLikeUrl && !baseTokenLike && !hasBitableKeys && !hasPattern && rawSpreadsheetToken.length === 0) {
+      warnings.push(
+        `项目 ${name || `#${index}`} 的工单表链接里没有 \`?table=\`、也没配「表名匹配」（docNamePattern）—— ` +
+        '运行时只能在「这张表里恰好只有一张数据表」时自动定位；有多张会报错并列出现有表名。' +
+        '稳妥起见把链接换成浏览器地址栏里带 `?table=tbl…` 的那一条，或填上表名匹配。'
+      )
     }
   }
 
-  if (issues.length > 0) return { issues }
+  if (issues.length > 0) return { issues, warnings }
 
   /** @type {any} */
   const value = {
@@ -780,14 +828,14 @@ function validateProject (raw, index) {
     if (Object.keys(verify).length > 0) value.verify = verify
   }
 
-  return { value, issues }
+  return { value, issues, warnings }
 }
 
 /**
  * 校验 `projects[]`。
  *
  * @param {unknown} raw
- * @returns {{ value?: object[], issues?: Array<{ message: string, path?: string[] }> }}
+ * @returns {{ value?: object[], issues?: Array<{ message: string, path?: string[] }>, warnings?: string[] }}
  */
 function validateProjects (raw) {
   if (raw === undefined || raw === null) {
@@ -800,9 +848,14 @@ function validateProjects (raw) {
   const value = []
   /** @type {Array<{ message: string, path?: string[] }>} */
   const issues = []
+  /** @type {string[]} */
+  const warnings = []
   const seen = new Set()
   for (const [i, entry] of raw.entries()) {
     const result = validateProject(entry, i)
+    // 警告不影响「这个项目能不能用」，所以即使有 issues 也一并收上来 ——
+    // 人修错的时候能同时看到「你还填了两套 token」这条，不用修完再跑一遍才发现。
+    if (result.warnings && result.warnings.length > 0) warnings.push(...result.warnings)
     if (result.issues && result.issues.length > 0) {
       issues.push(...result.issues)
       continue
@@ -815,8 +868,8 @@ function validateProjects (raw) {
     seen.add(name)
     value.push(/** @type {any} */ (result.value))
   }
-  if (issues.length > 0) return { issues }
-  return { value }
+  if (issues.length > 0) return { issues, warnings }
+  return { value, warnings }
 }
 
 /**
@@ -1029,7 +1082,12 @@ export function validateConfig (raw) {
   // 为什么值得做：`pollInvervalMinutes`（少一个字母）在过去是完全静默的 ——
   // 插件照常启动、照常按 3 分钟轮询，人以为自己配的是 30 分钟，查半天查不出原因。
   // 而 `flatten()` 早就把这些键收进 map 了，检查一次几乎没有成本。
-  const warnings = collectUnknownKeyWarnings(flat)
+  const warnings = [
+    // 项目级警告（例如「同时填了多维表格与电子表格两套 token」）排在前面：
+    // 它比「有个键拼错了」更接近「我的票为什么不对」。
+    ...(projects.warnings && projects.warnings.length > 0 ? projects.warnings : []),
+    ...collectUnknownKeyWarnings(flat),
+  ]
 
   if (issues.length > 0) return { issues, warnings }
   return { value: attachWarnings(nested, warnings), warnings }

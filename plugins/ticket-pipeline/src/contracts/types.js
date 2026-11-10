@@ -317,7 +317,9 @@ export function parseFeishuLink (raw) {
   if (baseToken.length > 0) return { kind: 'bitable', appToken: baseToken, spreadsheetToken: '', tableId, viewId, sheetId: '', path: segments.join('/') }
 
   const wikiToken = at('wiki')
-  if (wikiToken.length > 0) return { kind: 'wiki', appToken: wikiToken, spreadsheetToken: '', tableId, viewId, sheetId: '', path: segments.join('/') }
+  // `sheetId` 要带上：wiki 里既可能放多维表格、也可能放电子表格，而 `?sheet=` 只有
+  // 在它确实是电子表格时才有意义。丢掉它会让「一个工作簿里多张工作表」退回「取第一张」。
+  if (wikiToken.length > 0) return { kind: 'wiki', appToken: wikiToken, spreadsheetToken: '', tableId, viewId, sheetId, path: segments.join('/') }
 
   const sheetToken = at('sheets') || at('sheet')
   if (sheetToken.length > 0) return { kind: 'sheet', appToken: '', spreadsheetToken: sheetToken, tableId: '', viewId: '', sheetId, path: segments.join('/') }

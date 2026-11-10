@@ -1750,6 +1750,78 @@ export async function runFeishuChecks (check) {
     ...overrides,
   })
 
+  await check('电子表格：裸 token 探多维表格报 1254003 WrongBaseToken 时要降级去试电子表格', async () => {
+    // 真实事故（2026-11-10）：wiki 里的电子表格，用户只贴了一个裸 token（没带 /wiki/）。
+    // 适配器的分派逻辑是「先按多维表格试、类型不对再试电子表格」，而 1254003
+    // 当时不在 INVALID_INPUT_ERROR_CODES 里，被归成 `internal` ⇒ shouldTrySheet()
+    // 返回 false ⇒ 直接抛「飞书接口报错 1254003」，一张票都收不到。
+    // 这条用例把「1254003 属于类型不对、值得再试」钉死。
+    // 假服务端要真的对那个 token 报 1254003，**而且要走 HTTP 200 + 业务码**那条路：
+    // 真机实测（2026-11-10）飞书就是回 200 在 body 里给 code:1254003。用
+    // `failAppTokens` 会回 HTTP 400，适配器在 `!response.ok` 那层就抛了，
+    // 走不到错误码映射 —— 那样测的就不是这条 bug。
+    const server = makeSheetServer({
+      tablesFailCode: 1254003,
+    })
+    const { source } = makeSource(server, {
+      appToken: 'MuVEsnmEbhnYH8tDUyvc0c6Wnch',
+      tableId: '',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, '1254003 之后必须降级到电子表格并读出票')
+    assert.ok(
+      server.requests.some((r) => r.url.includes('/sheets/v3/spreadsheets/')),
+      '降级之后必须真的去查工作表清单',
+    )
+  })
+
+  await check('电子表格：spreadsheetToken 填的是整条 wiki 链接时，要抠出 token 再请求（不能把 URL 原样拼进接口）', async () => {
+    // 真实事故（2026-11-10）：用户在面板里把 `https://x.feishu.cn/wiki/It5g…?sheet=3a5d28`
+    // 整条贴进 spreadsheetToken，适配器 `extractSheetToken` 只认 `/sheets/<token>` 和裸 token，
+    // 两处都不匹配就「原样返回整串」，于是整条 URL 被 encodeURIComponent 拼进
+    // `/sheets/v3/spreadsheets/<整条URL>/sheets/query`，飞书回 `404 page not found`
+    // —— 表现就是「电子表格一张票都收不到」。
+    // 这条用例盯两件事：① 请求路径里的 token 段是裸 token，不含 `://` 与 `/`；
+    // ② 真的能读出票来。
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'https://x.feishu.cn/wiki/WIKISHEETTOKEN?sheet=sh1',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    const queryRequest = server.requests.find((r) => r.url.includes('/sheets/v3/spreadsheets/'))
+    assert.ok(queryRequest, '必须真的去查工作表清单')
+    assert.ok(
+      queryRequest.url.includes('/sheets/v3/spreadsheets/WIKISHEETTOKEN/sheets/query'),
+      `token 段必须是抠出来的裸 token，实际 ${queryRequest.url}`,
+    )
+    assert.ok(
+      !/spreadsheets\/[^/]*(%|:\/\/)/.test(queryRequest.url),
+      `token 段不许出现编码字符或协议头，实际 ${queryRequest.url}`,
+    )
+    assert.equal(result.created.length, 1, '整条 wiki 链接也要能读出票')
+  })
+
+  await check('电子表格：spreadsheetToken 填了认不出的链接时要报错，不能静默拼 404', async () => {
+    // 「静默失败比报错更误导」：认不出的链接以前会原样拼进接口，404 之后
+    // 人只能猜是 token 错、表错还是权限错。现在带协议头却认不出就直接说清楚。
+    const server = makeSheetServer()
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'https://x.feishu.cn/docx/SOMEDOCID',
+      sheetId: 'sh1',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input' && error.message.includes('/wiki/'),
+      '认不出的链接要报 invalid-input 并说清支持哪两种形态',
+    )
+  })
+
   await check('电子表格：wiki 节点 obj_type=sheet 时走电子表格分支，不再报「不是多维表格」', async () => {
     // 这就是用户「贴电子表格链接进来直接报错」的那条路：以前 get_node 硬写了
     // obj_type='bitable'，服务端只回答「是不是多维表格」，sheet 一律被拒。
