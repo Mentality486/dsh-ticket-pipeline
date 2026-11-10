@@ -3290,6 +3290,48 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(JSON.stringify(noTable.issues), /docNamePattern/, '报错要说清还能怎么补（docNamePattern 兜底）')
   })
 
+  await check('电子表格 token 只贴一条 wiki 链接也能过校验（面板只有一个「工单表链接」入口）', async () => {
+    // 面板把三个入口（工单表组 / 飞书电子表格组 / 工单表链接行）并成了一个：
+    // 用户贴进来的可能是 `/wiki/<token>`，而 wiki 链接**不带** `?table=` 或 `?sheet=`
+    // —— 表型要运行时问 get_node 才知道。配置层要是硬要求 spreadsheetToken 必须配
+    // sheetId，就等于「运行期能跑、配置层不让存」，逼人回去手改 YAML。
+    const url = 'https://vcn6ijgss3oy.feishu.cn/wiki/It5gwQ9sMizJh0kdbDhc2rBfnug'
+    const result = validateConfig({
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: url }, repo: { path: 'D:/repo' } }],
+    })
+    assert.ok(result.value, `wiki 链接应当通过校验，实际 issues：${JSON.stringify(result.issues ?? [])}`)
+    assert.equal(result.value.projects[0].match.spreadsheetToken, url, '原值要留着，适配器还要从里面抠 token')
+  })
+
+  await check('多维表格与电子表格两套 token 同时填：不拦，但要警告「另一套不起作用」', async () => {
+    // 用户报的原话是「填来填去都填了，根本不清楚用的那个」。运行期 resolveTable()
+    // 有明确优先级，所以不是错；但人看不出来 —— 必须有一条警告点名哪套生效。
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: {
+          platform: 'feishu',
+          appToken: 'bascnABCDEFGH',
+          tableId: 'tblWhRSGf0osJqrE',
+          spreadsheetToken: 'shtcnXYZ',
+          sheetId: 'sh1',
+        },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `两套并存不该被拦，实际 issues：${JSON.stringify(result.issues ?? [])}`)
+    assert.ok(Array.isArray(result.warnings), 'warnings 要透到 validateConfig 顶层')
+    assert.ok(
+      result.warnings.some((w) => w.includes('两套') && w.includes('不起作用')),
+      `要有「两套 token 并存」的警告，实际 ${JSON.stringify(result.warnings)}`,
+    )
+    // 点名的是哪一套生效：spreadsheetToken 存在时 resolveTable 走电子表格。
+    assert.ok(
+      result.warnings.some((w) => w.includes('电子表格')),
+      '警告要说清实际按哪一套取工单',
+    )
+  })
+
   await check('buildSourceOptions：飞书项目的 recordIds 一路透到适配器', async () => {
     const { SOURCES, buildSourceOptions } = await import('../src/index.js')
     const opts = buildSourceOptions(SOURCES.feishu, {
@@ -5168,6 +5210,39 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(out.tickets[0].phaseLabel, '工作区已就绪', `票面阶段要有中文：${out.tickets[0].phaseLabel}`)
     assert.ok(Array.isArray(out.tiers) && out.tiers.length > 0, '汇总行要能直接画')
     assert.equal(typeof out.text, 'string', 'text 也要带着（工具与面板同源）')
+  })
+
+  await check('remote.status(includeDone)：勾上「显示历史」才把收尾的票拉进来', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const scan = await env.source.scan(new AbortController().signal)
+    // 一张留在队列里、一张直接落成终态：不传 includeDone 时只该看到前者。
+    await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await env.store.enqueue(scan.created[1], { phase: 'done', attempt: 1 })
+    const remote = new TicketPipelineRemote({
+      getConfig: () => env.config,
+      doctorOptions: {},
+      store: env.store,
+    })
+    const withoutHistory = await remote.status()
+    assert.equal(withoutHistory.tickets.length, 1, `缺省只列未收尾的：${withoutHistory.tickets.length}`)
+    assert.ok(
+      !withoutHistory.tickets.some((row) => row.phase === 'done'),
+      '缺省那一屏不该出现终态票'
+    )
+    // 显式 false 与不传完全等价 —— 面板两个分支（初始 / 点掉开关）走的是同一个口径。
+    const explicitFalse = await remote.status(false)
+    assert.equal(explicitFalse.tickets.length, 1, '显式 false 要和不传一样')
+    // 非布尔一律当 false，不从别的类型里猜意图（面板传事件对象是真实会踩的坑）。
+    const truthyish = await remote.status('true')
+    assert.equal(truthyish.tickets.length, 1, '只有严格的 true 才算要看历史')
+    const withHistory = await remote.status(true)
+    assert.equal(withHistory.tickets.length, 2, `勾上后两张都要：${withHistory.tickets.length}`)
+    assert.ok(
+      withHistory.tickets.some((row) => row.phase === 'done'),
+      '勾上后终态票必须在里面'
+    )
+    assert.equal(withHistory.view, 'tickets', '仍然走明细视图（面板要能挂按钮）')
   })
 
   await check('remote.status()：没有 store 时给人话，不抛 TypeError', async () => {

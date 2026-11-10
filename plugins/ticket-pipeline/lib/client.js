@@ -198,7 +198,45 @@ window.__ModuleLoader__.load({
           method: 'status',
           invocation: { kind: 'direct' },
           result: { mode: 'strict', typeSymbol: 'ticket-pipeline#PipelineStatus', create: function () { return { parse: function (value) { return value } } } },
-          parameters: [],
+          // 唯一一个「可选参数」的只读方法：includeDone 决定这一屏要不要连
+          // 已收尾的票一起给（面板上的「显示历史」开关）。不传等于 false。
+          parameters: [
+            {
+              name: 'includeDone',
+              wire: 'includeDone',
+              description: '要不要连已收尾的票一起给（看历史用）；不传等于 false',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/status:includeDone',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'boolean') throw new TypeError('status: includeDone 必须是布尔值')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/status:includeDone',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'boolean') throw new TypeError('status: includeDone 必须是布尔值')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
         },
         {
           id: 'ticket-pipeline#ticketPipeline/scan',
@@ -684,13 +722,22 @@ window.__ModuleLoader__.load({
         key: 'match',
         label: '工单表',
         fields: [
-          { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '多维表格的表 id（形如 tblXXXX，地址里 ?table= 后面那段）。粘贴链接时宿主会自动填它；手上有链接就不用管这一格。' },
-          { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 token 时的兜底：按云文档名的片段找表（例：PMS项目管理系统工单）。适合「表名固定、但表是别人新建的、token 会变」的场景；找不到或找到多张都会报错。' },
+          // ⚠️ 这里刻意**没有** tableId 输入框。
+          //
+          // 以前「工单表」组里有 tableId、下面还有一整组「飞书电子表格」的
+          // spreadsheetToken/sheetId，卡片顶部再挂一条「工单表链接」—— 三个入口都能定位
+          // 同一张表，人填了两处之后无从判断到底哪处生效（实际生效的是 resolveTable()
+          // 的优先级，只有读源码才知道）。
+          //
+          // 现在只留一个入口：卡片最上面的「工单表链接」。宿主 `setProjectTable()` 负责
+          // 解析表型、写 token、并把另一套互斥字段清掉。想手填 token 也走那个框
+          // （它接受裸 app_token / shtcn…）。下面这些是**定位之外的**行为参数。
+          { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
           // 工作表名两边都用：金山拿它挑工作表，飞书电子表格也一样（同一个键，
           // 所以只在这里画一次 —— 画两次会变成两个输入框绑同一个草稿键）。
           { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text', hint: '表格底部那个标签页的名字（如「工单」）。金山文档与飞书电子表格都用这一项；留空则用第一张可见工作表。' },
-          { path: ['match', 'statusValues'], from: 'statusValues', label: '在处理中的状态值', kind: 'list', hint: '逗号分隔；状态列取这些值时才算「在处理中」。' },
-          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true, hint: '只扫某一个视图时填（多维表格地址里 ?view= 后面那段）；留空表示整张表。' },
+          { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', advanced: true, hint: '不贴链接时的兜底：按云文档名的片段找表（例：PMS项目管理系统工单）。找到多张会报错。' },
+          { path: ['match', 'viewId'], from: 'viewId', label: '视图 viewId', kind: 'text', advanced: true, hint: '只扫某一个视图时填（多维表格地址里 ?view= 后面那段）；留空表示整张表。贴链接时会自动带上。' },
           { path: ['match', 'recordIds'], from: 'recordIds', label: '只处理这些工单', kind: 'list', advanced: true, hint: '逗号分隔的 record id；留空表示整张表。' },
           { path: ['match', 'allowedImageHosts'], from: 'allowedImageHosts', label: '允许的截图主机', kind: 'list', advanced: true, hint: '逗号分隔的主机名白名单；截图链接来自外部输入，不放行的一律拒绝。' },
         ],
@@ -707,24 +754,15 @@ window.__ModuleLoader__.load({
         ],
       },
       {
+        // 这一组以前叫「飞书电子表格」，第一格是「电子表格链接或 token」——
+        // 与顶部「工单表链接」、上面「工单表」组的 tableId 三者都能定位同一张表。
+        // 现在定位只剩「工单表链接」一个入口，这里只留**读取行为**参数
+        // （表头在哪行、怎么认行身份、列名覆盖…），label 也跟着改成中性的名字：
+        // 叫「飞书电子表格」会让人以为「电子表格要在这里配、多维表格在别处配」。
         key: 'sheet',
-        label: '飞书电子表格',
+        label: '表格读取参数',
         onlyFor: 'feishu',
         fields: [
-          {
-            path: ['match', 'spreadsheetToken'],
-            from: 'spreadsheetToken',
-            label: '电子表格链接或 token',
-            kind: 'text',
-            hint: '工单表如果是「电子表格」（不是多维表格），把浏览器地址栏那条链接整条贴进来就行，插件会自己认出 spreadsheetToken。填了这个就不用填上面的 appToken/tableId。',
-          },
-          {
-            path: ['match', 'sheetId'],
-            from: 'sheetId',
-            label: '工作表 id',
-            kind: 'text',
-            hint: '可选。留空就按上面的「工作表名」找；两个都不填则取第一张可见工作表。表 id 形如 shXXXXXX，在表格里右键工作表标签能看到。',
-          },
           {
             path: ['match', 'sheetHeaderRow'],
             from: 'sheetHeaderRow',
@@ -778,7 +816,7 @@ window.__ModuleLoader__.load({
             kind: 'select',
             options: ['', 'bitable', 'sheet'],
             advanced: true,
-            hint: '自动探测有时会多花一次请求。明确知道是哪种就选死，省掉探测；留空=自动。',
+            hint: '自动探测有时会多花一次请求。明确知道是哪种就选死，省掉探测；留空=自动（推荐）。',
           },
         ],
       },
@@ -1174,6 +1212,33 @@ window.__ModuleLoader__.load({
 
     var PROJ_OPEN_KEY = 'ticket-pipeline:open-projects'
 
+    /**
+     * 运行页签「显示历史」开关记在 localStorage。
+     *
+     * 不记的后果是每次重开面板都回到「只看未收尾」，而票跑完之后那一屏本来就
+     * 是空的 —— 人会以为历史被删了。存一个 '1' 就够，不存 JSON。
+     */
+    var RUN_HISTORY_KEY = 'ticket-pipeline:run-history'
+
+    function readRunHistory () {
+      try {
+        if (typeof localStorage === 'undefined') return false
+        return localStorage.getItem(RUN_HISTORY_KEY) === '1'
+      } catch (error) {
+        return false
+      }
+    }
+
+    function writeRunHistory (on) {
+      try {
+        if (typeof localStorage === 'undefined') return
+        if (on) localStorage.setItem(RUN_HISTORY_KEY, '1')
+        else localStorage.removeItem(RUN_HISTORY_KEY)
+      } catch (error) {
+        // 存不下就算了：这一屏照样能切，只是下次回到缺省。
+      }
+    }
+
     function readProjMap () {
       try {
         if (typeof localStorage === 'undefined') return {}
@@ -1355,26 +1420,22 @@ window.__ModuleLoader__.load({
       }
 
       if (platform === 'feishu') {
-        // 飞书能读两种表，绑定方式三选一（对应 `src/core/config.js:validateProject`）：
-        //   ① 多维表格：appToken + tableId（appToken 由「粘贴链接」或手填 key 写入）
-        //   ② 电子表格：spreadsheetToken（面板字段「电子表格链接或 token」）
-        //   ③ 表名匹配：docNamePattern（按云文档名模糊找）
-        // 三条都没有才是错误；有一条就放过，且**明说**走的是哪条 —— 上一版只认
-        // 「有 appToken 或有表名匹配」，把电子表格这条完全漏掉，配对了也报红。
+        // 定位工单表只剩**一个**入口：卡片顶部的「工单表链接」（宿主 `setProjectTable()`
+        // 解析表型、写 token、清掉另一套）。所以这里的判定要跟着化简：
+        //   · 宿主回 `hasAppToken`（多维表格或 wiki token 已写入），或
+        //   · 已有 `spreadsheetToken`（电子表格 token 已写入），或
+        //   · 填了 `docNamePattern`（按云文档名找）
+        // 有一条就够 —— **不再要求** tableId/sheetId 配套：这两种配套参数
+        // 运行期能自己补（表里恰好一张数据表 / 取第一张可见工作表），
+        // 以前在这里硬要求，等于把「链接里没带 ?table=」的合法配置判成红的。
         var pattern = read(['match', 'docNamePattern']).trim()
         var hasToken = Boolean(record && record.hasAppToken)
-        var tableId = read(['match', 'tableId']).trim()
         var sheetToken = read(['match', 'spreadsheetToken']).trim()
-        var sheetName = read(['match', 'sheetName']).trim()
-        var sheetId = read(['match', 'sheetId']).trim()
-        var hasBitable = hasToken && tableId.length > 0
-        var hasSheet = sheetToken.length > 0 && (sheetId.length > 0 || sheetName.length > 0)
-        if (!hasBitable && !hasSheet && pattern.length === 0) {
+        if (!hasToken && sheetToken.length === 0 && pattern.length === 0) {
           add(['match', 'docNamePattern'], 'soft',
-            '这个飞书项目还没绑定任何工单表。三种方式选一种：'
-            + '① 在上面的「工单表链接」里粘贴多维表格链接（推荐，宿主会解析并保存 token）；'
-            + '② 填「电子表格链接或 token」+ 工作表名/id；'
-            + '③ 在这里填表名匹配（按文件名模糊找）。')
+            '这个飞书项目还没绑定任何工单表。把工单表的浏览器地址整条贴进卡片最上面的「工单表链接」——'
+            + '多维表格、电子表格、知识库里的表都行，插件自己认表型。'
+            + '没有链接的话，在这里填「表名匹配」按文件名找。')
         }
       }
 
@@ -1720,6 +1781,9 @@ window.__ModuleLoader__.load({
       '.tp-run-dot.tp-off{background:#9ca3af}',
       '.tp-run-tiers{font-size:12px;color:var(--dsw-alias-label-secondary,#61666b);',
       '  margin:0 0 6px;line-height:1.6}',
+      // 「显示历史」开关：跟一排按钮并排，所以不许换行、不许抢宽度。
+      '.tp-run-history{flex:0 0 auto;white-space:nowrap;cursor:pointer;',
+      '  display:flex;align-items:center;gap:4px;user-select:none}',
       '.tp-run-row{border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04));padding:8px 0}',
       '.tp-run-row:first-child{border-top:0}',
       '.tp-run-row-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
@@ -2092,7 +2156,10 @@ window.__ModuleLoader__.load({
       if (data && !enabled) {
         emptyText = '总开关是关的，插件不会扫表、不会建工作区、不会提交。去「参数」页签把它打开。'
       } else if (data && tickets.length === 0) {
-        emptyText = '当前没有未收尾的票。确认总开关已开、项目已配好，然后点「跑一轮」看看。'
+        emptyText = props.history
+          ? '库里还没有任何票 —— 这个插件的票据只增不删，一张都没跑过就是空的。'
+          : '当前没有未收尾的票。确认总开关已开、项目已配好，然后点「跑一轮」看看。'
+          + '已经跑完的历史票，勾上上面的「显示历史」就能看到。'
       }
 
       return h('section', { className: 'tp-card' },
@@ -2101,6 +2168,19 @@ window.__ModuleLoader__.load({
           h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } },
             props.polling ? h('span', { className: 'tp-note' }, '盯着…') : null,
             props.message.length > 0 ? h('span', { className: 'tp-ok' }, props.message) : null,
+            // 「显示历史」：缺省关着。宿主 status() 按它决定 includeDone ——
+            // 关着时只列未收尾的票（票全跑完就是一屏空），勾上就把终态票也拉进来。
+            h('label', {
+              className: 'tp-note tp-run-history',
+              title: '连已收尾（已完成 / 已交付 / 失败 / 已删除）的票一起列出来。票据只增不删，所以历史是一直在的。',
+            },
+            h('input', {
+              type: 'checkbox',
+              checked: props.history === true,
+              disabled: !props.available,
+              onChange: function (event) { props.onHistory(event.target.checked) },
+            }),
+            '显示历史'),
             h('button', {
               type: 'button',
               className: 'tp-btn tp-sm',
@@ -2363,17 +2443,19 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'tp-field tp-link-row' },
         h('div', { className: 'tp-field-label' }, '工单表链接',
           h('span', { className: 'tp-badge' + (props.hasToken ? ' tp-ok' : '') }, props.tokenText)),
+        // 这一行现在管着整个「工单表在哪」：多维表格、电子表格、知识库里的表都走这里。
+        // 所以说明要写清「你不用先分辨表型，插件自己认」—— 这正是以前三个入口
+        // 并存时最大的困惑（填了两处，不知道哪处生效）。
         h('p', { className: 'tp-help' },
-          '把浏览器地址栏那条**完整**链接贴进来（多维表格 /base/…?table=…、电子表格 /sheets/…、wiki /wiki/…），'
-          + '点「用这条链接」由宿主解析并保存。'
-          + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'),
+          '把工单表的浏览器地址整条贴进来，**不用管它是多维表格还是电子表格** —— 插件自己认表型并取出工单。'
+          + '多维表格 /base/…?table=…、电子表格 /sheets/…、知识库 /wiki/… 都行；也可以只贴 token。'),
         h('div', { className: 'tp-link-input' },
           h('input', {
             className: 'tp-input',
             type: 'text',
             value: text,
             disabled: disabled,
-            placeholder: 'https://xxx.feishu.cn/base/bascn…?table=tbl…',
+            placeholder: 'https://xxx.feishu.cn/wiki/… 或 /base/…?table=… 或 /sheets/…',
             autoComplete: 'off',
             onChange: function (event) { setText(event.target.value) },
             onKeyDown: function (event) {
@@ -2388,7 +2470,9 @@ window.__ModuleLoader__.load({
             onClick: function () { props.onPasteLink(props.index, text.trim()) },
           }, busy ? '写入中…' : '用这条链接')),
         h('p', { className: 'tp-help' },
-          '没有链接也行：填下面的「表名匹配」让插件按文件名找表，或者把 app_token 直接贴进上面这个框（形如 bascn…）。'),
+          '写入时宿主会**把另一套定位字段清掉**（多维表格与电子表格的 token 不会同时留着），所以这里只有一个框。'
+          + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'
+          + '实在没有链接：可以在高级设置里填「表名匹配」让插件按文件名找表。'),
         props.message ? h('p', { className: 'tp-ok' }, props.message) : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
@@ -2667,7 +2751,9 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'tp-proj' + (open ? '' : ' tp-collapsed') },
         head,
-        open ? h('div', { className: 'tp-proj-body' }, [wpsNotice, ...sections, tokenRow]) : null)
+        // 链接行放在**最上面**：现在它是定位工单表的唯一入口，折在最后一行
+        // 会让人先看见一堆「表头在第几行」这种细节，再猜「表到底在哪配」。
+        open ? h('div', { className: 'tp-proj-body' }, [wpsNotice, tokenRow, ...sections]) : null)
     }
 
     /** 这张卡片里有多少个字段改过（用于「已改 N 项」徽标）。 */
@@ -2896,6 +2982,14 @@ window.__ModuleLoader__.load({
       var [runOpen, setRunOpen] = useState({})
       // 轮询开关。点「跑一轮」后打开，跑完 / 离开页签 / 10 分钟后关掉。
       var [runPolling, setRunPolling] = useState(false)
+      // 「显示历史」开关：缺省关着（这一屏先回答「还要我做什么」）。
+      //
+      // 为什么要这个开关：以前宿主把 includeDone 写死成 false，于是票一旦
+      // 全部收尾，运行页签就是一屏空白 —— 「历史在哪查」只能回对话里问。
+      // 但反过来缺省就带全部也不对：票据只增不删，跑上一个月开屏要渲染几百行。
+      // 记进 localStorage：这是「我现在想看历史」的一次性意图，但重开面板
+      // 又变回空白会让人以为历史没了，所以宁可记住。
+      var [runHistory, setRunHistory] = useState(readRunHistory)
 
       var isPage = props.view !== 'summary'
 
@@ -3027,10 +3121,19 @@ window.__ModuleLoader__.load({
         })
       }, [getNamespace])
 
-      var loadRun = useCallback(function () {
+      /**
+       * 读一屏运行状态。
+       *
+       * `historyOverride` 只在「刚点完开关」时用：setState 是异步的，直接读
+       * `runHistory` 会拿到旧值、多白光一次。**而且必须只认布尔** ——
+       * 这个函数同时被当成 `onClick` 处理器传下去（`onRefresh: loadRun`），
+       * 那里第一个参数是事件对象，不是布尔。
+       */
+      var loadRun = useCallback(function (historyOverride) {
         var ns = requireRunNamespace('读状态')
         if (!ns) return Promise.resolve()
-        return ns.status().then(function (response) {
+        var wantHistory = typeof historyOverride === 'boolean' ? historyOverride : runHistory
+        return ns.status(wantHistory).then(function (response) {
           if (!response || !response.ok) {
             setRunError('读状态失败：' + ((response && response.error && response.error.message) || '未知错误'))
             return
@@ -3040,7 +3143,7 @@ window.__ModuleLoader__.load({
         }, function (error) {
           setRunError('读状态失败：' + (error && error.message ? error.message : String(error)))
         })
-      }, [getNamespace])
+      }, [getNamespace, runHistory])
 
       useEffect(function () {
         if (!isPage) return
@@ -3815,6 +3918,15 @@ window.__ModuleLoader__.load({
         })
       }
 
+      function onRunHistory (on) {
+        var next = on === true
+        setRunHistory(next)
+        writeRunHistory(next)
+        // 立刻按新口径重读一次，不等下一次轮询 —— 这个开关的全部意义就是
+        // 「我现在就要看到那些票」。
+        loadRun(next)
+      }
+
       function onDoctor () {
         var ns = getNamespace('ticketPipeline')
         if (!ns) {
@@ -3970,6 +4082,8 @@ window.__ModuleLoader__.load({
             onCancel: onRunCancel,
             onRerun: onRunRerun,
             onRefresh: loadRun,
+            history: runHistory,
+            onHistory: onRunHistory,
           })
         },
         projects: function () {

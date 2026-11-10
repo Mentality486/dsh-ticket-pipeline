@@ -179,9 +179,14 @@ export class TicketPipelineRemote {
     } else {
       ops.push({ op: 'set', path: [...base, 'appToken'], value: parsed.appToken })
       ops.push({ op: 'unset', path: [...base, 'spreadsheetToken'] })
-      ops.push({ op: 'unset', path: [...base, 'sheetId'] })
       if (parsed.tableId.length > 0) ops.push({ op: 'set', path: [...base, 'tableId'], value: parsed.tableId })
       if (parsed.viewId.length > 0) ops.push({ op: 'set', path: [...base, 'viewId'], value: parsed.viewId })
+      // wiki 链接里的表可能是电子表格：`?sheet=` 就是那张工作表的 id。留着它，
+      // 探测出表型之后 `resolveWorksheet` 才能挑对工作表，而不是退回「取第一张」。
+      // 反过来，不带 `?sheet=` 的 wiki 链接说明它要么是多维表格、要么只有一张表 ——
+      // 这时把旧的 sheetId 清掉才对，否则会拿别的表的 id 去查。
+      if (parsed.sheetId.length > 0) ops.push({ op: 'set', path: [...base, 'sheetId'], value: parsed.sheetId })
+      else ops.push({ op: 'unset', path: [...base, 'sheetId'] })
       // `tableKind` 是逃生阀：wiki 链接表型要到运行时问接口，这里不写死，
       // 免得把「探测」换成「猜对了没事、猜错了静默读错表」。
       ops.push({ op: 'unset', path: [...base, 'tableKind'] })
@@ -218,16 +223,22 @@ export class TicketPipelineRemote {
    * 运行页签的一屏快照 —— 与 `pipeline_status` 工具同一个 `collectStatus()`。
    *
    * 固定取 `view: 'tickets'`：面板要的是「一张票一行、能挂按钮」的明细，
-   * 不是按项目聚合的战报。`includeDone: false` 是缺省口径（见票 #16 B 段：
-   * 进去先看「还要我做什么」，历史用展开的方式看）。
+   * 不是按项目聚合的战报。
+   *
+   * `includeDone` 由面板的「显示历史」开关决定（缺省 false）：进去先看
+   * 「还要我做什么」。以前这里写死 false，于是票一旦全部收尾，那一屏就是空的 ——
+   * 「历史在哪查」因此变成一句只能靠对话工具回答的问题。票据只增不删，
+   * 所以反过来的缺省（一律带全部）也不合适：跑上一个月开屏就要渲染几百行。
+   *
+   * @param {boolean} [includeDone] 连已收尾的票一起给（看历史）；不传等于 false
    */
-  async status () {
+  async status (includeDone) {
     requireStore(this.store, 'status')
     return collectStatus({
       store: this.store,
       getConfig: this.getConfig,
       gitRunner: this.gitRunner ?? null,
-    }, { view: 'tickets', includeDone: false })
+    }, { view: 'tickets', includeDone: includeDone === true })
   }
 
   /**

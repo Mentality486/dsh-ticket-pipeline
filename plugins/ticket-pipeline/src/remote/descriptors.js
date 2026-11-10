@@ -188,6 +188,34 @@ function setProjectTable () {
 }
 
 /**
+ * 运行页签的 `status(includeDone?)`。
+ *
+ * 为什么要带一个参数：缺省只给「还要我做什么」（`includeDone: false`），
+ * 票全跑完之后那一屏就是空的 —— 用户原话是「在哪里能查到历史的工单处理流程」。
+ * 但也不能反过来缺省就带全部：票只增不删，跑上一个月以后开屏就要渲染几百行。
+ * 所以做成面板上的一个「显示历史」开关，由人决定这一屏看哪一段。
+ *
+ * 参数可选：不传等于 `false`（与工具 `pipeline_status` 的 `includeDone` 同名同义）。
+ */
+function status () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/status`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'status',
+    invocation: { kind: 'direct' },
+    result: pipelineStatusSnapshot,
+    parameters: [
+      parameter('status', 'includeDone', '要不要连已收尾的票一起给（看历史用）；不传等于 false', (value) => {
+        if (value === undefined) return undefined
+        if (typeof value !== 'boolean') throw new TypeError('status: includeDone 必须是布尔值')
+        return value
+      }, true),
+    ],
+  }
+}
+
+/**
  * 面板「运行」页签的「重跑」按钮：`reset(recordId, projectId?)`。
  *
  * 与工具 `pipeline_reset` 的参数表一字不差 —— 少一个可选参数，
@@ -221,7 +249,7 @@ export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('branches'),
   setProjectTable(),
   // 运行页签（#16）：先 status 拉一屏，再 scan / cancel / reset 三个动作。
-  method('status'),
+  status(),
   method('scan'),
   method('cancel'),
   reset(),

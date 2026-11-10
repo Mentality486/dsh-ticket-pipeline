@@ -273,23 +273,39 @@ function makeSettingsResponse () {
  * 刻意放一张「要人处理的失败票」+ 一张「正在跑的票」：
  * 前者验「重跑」按钮挂没挂对地方，后者验「取消当前」可不可点。
  * tiers 由宿主算，这里照真实形状给 —— 面板不该自己数 phase。
+ *
+ * `withHistory` 为真时再补一张**终态票**，对应「勾上显示历史」那一屏：
+ * 宿主 collectStatus 在 includeDone 时才把终态票放进来，面板只负责画。
  */
-function makeRunSnapshot () {
+function makeRunSnapshot (withHistory) {
   return {
     enabled: true,
     view: 'tickets',
     projects: [],
-    counts: { failed: 1, pending: 1 },
-    filteredCounts: { failed: 1, pending: 1 },
+    counts: withHistory === true ? { failed: 1, pending: 1, done: 1 } : { failed: 1, pending: 1 },
+    filteredCounts: withHistory === true ? { failed: 1, pending: 1, done: 1 } : { failed: 1, pending: 1 },
     tiers: [
       { label: '需要你处理', count: 1 },
       { label: '待人工验证', count: 0 },
       { label: '正在跑', count: 1 },
-      { label: '已交付', count: 0 },
+      { label: '已交付', count: withHistory === true ? 1 : 0 },
       { label: '已退役', count: 0 },
     ],
     queue: { pendingCount: 1, runnableCount: 1, nextRecordId: 'recRunning001', orderRule: 'priority-desc', backoff: [] },
-    tickets: [
+    tickets: (withHistory === true
+      ? [
+          {
+            projectId: 'pms',
+            recordId: 'recDoneOld',
+            phase: 'done',
+            phaseLabel: '已完成（已验证）',
+            problemSummary: '上个月那张已经跑完的票',
+            canReset: false,
+            cancelledByUser: false,
+            deliveryIssues: [],
+          },
+        ]
+      : []).concat([
       {
         projectId: 'pms',
         recordId: 'recFailed001',
@@ -311,7 +327,7 @@ function makeRunSnapshot () {
         cancelledByUser: false,
         deliveryIssues: [],
       },
-    ],
+    ]),
     config: {},
     text: '【流水线状态】',
   }
@@ -322,7 +338,7 @@ function makeHost () {
     mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0,
     pickDirectory: [], setProjectTable: [],
     // 运行页签（#16）四个新方法各记一份，断言要验「点了按钮有没有真的发出去」。
-    status: 0, scan: 0, cancel: 0, reset: [],
+    status: 0, statusArgs: [], scan: 0, cancel: 0, reset: [],
   }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
@@ -391,11 +407,22 @@ function makeHost () {
           item.parameters.length === 2 &&
           item.parameters.every((param) => param.codec?.mode === 'strict')),
         contribution.descriptors.map((item) => item.method).join(' | '))
-      // 运行页签（#16）依赖的四个方法：三个无参 + reset 一个必填一个可选。
+      // 运行页签（#16）依赖的四个方法：scan / cancel 两个无参，status 一个可选参
+      // （includeDone，就是面板上的「显示历史」），reset 一个必填一个可选。
       // 这里按 method 名字查，不按位置 —— 位置一挪，按位置写的断言会静默失效。
-      check('描述符里有 status / scan / cancel 三个无参方法',
-        ['status', 'scan', 'cancel'].every((name) => contribution.descriptors.some((item) =>
+      check('描述符里有 scan / cancel 两个无参方法',
+        ['scan', 'cancel'].every((name) => contribution.descriptors.some((item) =>
           item.method === name && item.parameters.length === 0 && item.invocation.kind === 'direct')),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      check('status 带一个可选参数 includeDone（面板「显示历史」开关）',
+        contribution.descriptors.some((item) => {
+          if (item.method !== 'status') return false
+          if (item.parameters.length !== 1) return false
+          const [includeDone] = item.parameters
+          return includeDone.wire === 'includeDone' &&
+            includeDone.acceptsUndefined === true &&
+            includeDone.codec?.mode === 'strict'
+        }),
         contribution.descriptors.map((item) => item.method).join(' | '))
       check('描述符里有 reset：recordId 必填、projectId 可选',
         contribution.descriptors.some((item) => {
@@ -431,9 +458,14 @@ function makeHost () {
         // status：缺省回一份「有一张要人处理的失败票」的队列快照 ——
         // 断言要验的是「票列表画出来没有、重跑按钮挂在哪一行」，
         // 所以夹具里必须有一张 canReset 为真的票。
-        status: async () => {
+        //
+        // `includeDone` 会被原样记进 calls.statusArgs（断言验的是「开关有没有
+        // 真的传到宿主」，不是「面板自己筛了没有」——筛选是宿主 collectStatus 的事）。
+        // 传 true 时多回一张终态票，模拟「勾上显示历史后历史票出现」。
+        status: async (includeDone) => {
           calls.status += 1
-          return { ok: true, value: makeRunSnapshot() }
+          calls.statusArgs.push(includeDone)
+          return { ok: true, value: makeRunSnapshot(includeDone === true) }
         },
         scan: async () => {
           calls.scan += 1
@@ -795,6 +827,42 @@ async function main () {
     check('点「重跑」调的是宿主 reset(recordId)，只传一个参数',
       ctx.calls.reset.length === 1 && ctx.calls.reset[0] === 'recFailed001',
       JSON.stringify(ctx.calls.reset))
+  }
+
+  // 「显示历史」开关：缺省关着（这一屏先回答「还要我做什么」），
+  // 勾上要把 includeDone=true 传给宿主，并且历史票出现在列表里。
+  // 断言验的是「开关有没有真的传到宿主」—— 筛选是 collectStatus 的事，面板不重算。
+  check('运行页签有「显示历史」开关，且缺省是关的',
+    (() => {
+      const box = findInput(tree, (node) => node.props.type === 'checkbox')
+      return box !== undefined && box.props.checked === false
+    })(),
+    JSON.stringify(findAll(tree, (node) => node.props && node.props.type === 'checkbox').map((node) => node.props.checked)))
+  check('缺省（没勾历史）传给宿主的是 includeDone=false',
+    ctx.calls.statusArgs.length > 0 && ctx.calls.statusArgs[ctx.calls.statusArgs.length - 1] === false,
+    JSON.stringify(ctx.calls.statusArgs))
+  check('缺省那一屏不含已收尾的老票', textOf(tree).indexOf('recDoneOld') < 0, textOf(tree).slice(0, 200))
+
+  const historyBox = findInput(tree, (node) => node.props.type === 'checkbox')
+  if (historyBox !== undefined) {
+    historyBox.props.onChange({ target: { checked: true } })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('勾上「显示历史」后传给宿主 includeDone=true',
+      ctx.calls.statusArgs[ctx.calls.statusArgs.length - 1] === true,
+      JSON.stringify(ctx.calls.statusArgs))
+    check('勾上「显示历史」后终态票出现在列表里',
+      textOf(tree).indexOf('recDoneOld') >= 0, textOf(tree).slice(0, 400))
+    // 再点掉：状态要回到 false，且立刻按新口径重读一次。
+    const again = findInput(tree, (node) => node.props.type === 'checkbox')
+    if (again !== undefined) {
+      again.props.onChange({ target: { checked: false } })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      tree = await render(Panel, { view: 'page' })
+      check('再点掉「显示历史」后回到 includeDone=false',
+        ctx.calls.statusArgs[ctx.calls.statusArgs.length - 1] === false,
+        JSON.stringify(ctx.calls.statusArgs))
+    }
   }
 
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
@@ -1356,13 +1424,17 @@ async function main () {
     check('保存成功后「未保存」徽标消失', textOf(tree).indexOf('未保存') < 0, textOf(tree).slice(0, 240))
   }
 
-  // ⑦ 飞书电子表格（ADR-0005）与「选择目录」。
+  // ⑦ 飞书表格读取参数（ADR-0005）与「选择目录」。
   //
   // 这一组断言钉的是两件很容易「看着有、其实没接上」的事：
-  // 1. 电子表格那组字段真的画出来了，而且三个特殊 kind 都画对了控件
+  // 1. 表格读取参数那组字段真的画出来了，而且三个特殊 kind 都画对了控件
   //    （select 有选项、columns 显示成一行文本、保存时要变回对象）；
   // 2. 「选择目录」按钮真的调到了宿主的 uiWorkspace.pickDirectory，
   //    而且**只改草稿不写宿主** —— 否则「撤销」就撤销不回来了。
+  //
+  // 另外还钉一条**反向**断言：定位工单表只剩「工单表链接」一个入口，
+  // 面板里不许再出现 spreadsheetToken / tableId 的输入框 —— 三个入口并存时
+  // 用户填了两处却不知道哪处生效，这正是要根治的问题。
   resetRender()
   tree = await render(Panel, { view: 'page' })
   // tableKind / sheetRange / sheetColumns 是高级项，缺省收起 —— 先勾「显示全部字段」。
@@ -1373,10 +1445,14 @@ async function main () {
     if (advBox !== undefined) advBox.props.onChange({ target: { checked: true } })
     tree = await render(Panel, { view: 'page' })
   }
-  check('飞书项目渲染出「飞书电子表格」一组',
-    textOf(tree).indexOf('飞书电子表格') >= 0, textOf(tree).slice(0, 400))
-  check('电子表格 token 有输入框（且显示的是宿主下发的值）',
-    findInput(tree, (node) => node.props.value === 'shtcnAbcd1234') !== undefined)
+  check('飞书项目渲染出「表格读取参数」一组',
+    textOf(tree).indexOf('表格读取参数') >= 0, textOf(tree).slice(0, 400))
+  check('定位工单表只剩「工单表链接」一个入口',
+    textOf(tree).indexOf('工单表链接') >= 0)
+  check('面板里不再有电子表格 token 输入框（收进「工单表链接」）',
+    findInput(tree, (node) => node.props.value === 'shtcnAbcd1234') === undefined)
+  check('面板里不再有多维表格 tableId 输入框（收进「工单表链接」）',
+    findInput(tree, (node) => node.props.value === 'tbl123') === undefined)
   check('表头行号渲染成输入框而不是下拉',
     findInput(tree, (node) => node.props.value === '1') !== undefined)
 
