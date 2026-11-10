@@ -105,10 +105,11 @@ export function createMockExecutor (options = {}) {
 
       if (outcome === 'skipped') {
         // 合法的成功路径：提交做了，但验证没跑成 —— 但必须写清楚为什么。
+        // testOutcome 用新名字 `not-run`（`skipped` 留给 phase，两个意思撞词会读错）。
         return makeExecResult({
           phase: 'skipped',
           changedFiles: mockChanged,
-          testOutcome: 'skipped',
+          testOutcome: 'not-run',
           testDetail: 'mock 执行器不跑真实构建与测试',
           commit,
           plan: {

@@ -105,6 +105,86 @@ window.__ModuleLoader__.load({
           result: { mode: 'strict', typeSymbol: 'ticket-pipeline#BranchList', create: function () { return { parse: function (value) { return value } } } },
           parameters: [],
         },
+        {
+          // 唯一带参的方法：面板「粘贴工单表链接」。浏览器只把链接交出去，
+          // 解析与落盘都在宿主做 —— appToken 明文永远不进浏览器（见 src/remote/host.js）。
+          // 参数必须两件都给 codec 与 strictCodec，且 wire 显式写成同名：
+          // 网关的 assertExactArguments 按 wire 集合精确比对，多一个少一个都拒。
+          id: 'ticket-pipeline#ticketPipeline/setProjectTable',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'setProjectTable',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ProjectWriteResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [
+            {
+              name: 'index',
+              wire: 'index',
+              description: 'projects[] 里的下标（从 0 开始），面板按 projects() 的顺序给',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/setProjectTable:index',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      var number = typeof value === 'number' ? value : Number(String(value).trim())
+                      if (!Number.isInteger(number) || number < 0) throw new TypeError('setProjectTable: index 必须是 ≥0 的整数')
+                      return number
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/setProjectTable:index',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      var number = typeof value === 'number' ? value : Number(String(value).trim())
+                      if (!Number.isInteger(number) || number < 0) throw new TypeError('setProjectTable: index 必须是 ≥0 的整数')
+                      return number
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+            {
+              name: 'url',
+              wire: 'url',
+              description: '用户粘贴的整条飞书链接（多维表格 / wiki / 电子表格），或裸 token',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/setProjectTable:url',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('setProjectTable: url 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/setProjectTable:url',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('setProjectTable: url 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
+        },
       ],
     }
 
@@ -129,7 +209,7 @@ window.__ModuleLoader__.load({
       { ref: 'FEISHU_APP_SECRET', label: '飞书 App Secret', hint: '同上，App Secret。只读工单表需要 bitable:app:readonly 权限。' },
       { ref: 'QQMAIL_AUTH_CODE', label: 'QQ 邮箱授权码', hint: 'QQ 邮箱 → 设置 → 账户 → 开启 SMTP 服务后拿到的授权码，不是登录密码。' },
       { ref: 'GITLAB_TOKEN', label: 'GitLab Token', hint: '真实执行器开 MR 时才需要；mock 模式不影响。' },
-      { ref: 'PUSHPLUS_TOKEN', label: 'PushPlus token', hint: '也可以用下面的配置项 pushplus.token；两者取其一即可。' },
+      { ref: 'PUSHPLUS_TOKEN', label: 'PushPlus token', hint: '填这里就行。通知适配器选 PushPlus 时用它，不写进配置文件。' },
     ]
 
     /** 读 a.b.c 这种路径。 */
@@ -278,7 +358,7 @@ window.__ModuleLoader__.load({
     // 约束文案完全由 descriptor 的 meta 推导（min/max/enum/default），不写死任何字段名：
     // 宿主加字段、改范围时面板自动跟上。
 
-    /** 一句话约束提示，例如「1–60」「可选：feishu / wps / mock / webform」「缺省 30」。 */
+    /** 一句话约束提示，例如「1–60」「可选：feishu / wps / mock」「缺省 30」。 */
     function constraintOf (leaf) {
       var meta = leaf.node.meta || {}
       var parts = []
@@ -317,7 +397,12 @@ window.__ModuleLoader__.load({
         for (var i = 0; i < meta.enum.length; i += 1) {
           if (String(meta.enum[i]) === value) return null
         }
-        return { level: 'error', text: '只能是 ' + meta.enum.join(' / ') }
+        // 报错要带上「该填什么」，不然人只知道错了、不知道下一步做什么。
+        // 缺省值就写在 descriptor 里（meta.default），直接拿来当推荐值。
+        var pick = meta.default !== undefined && meta.default !== null
+          ? '；不确定就先用缺省 ' + String(meta.default)
+          : ''
+        return { level: 'error', text: '只能是 ' + meta.enum.join(' / ') + pick }
       }
 
       if (leaf.node.type === 'number') {
@@ -325,9 +410,14 @@ window.__ModuleLoader__.load({
         // 同上：空表示回落缺省，不是错误。
         if (raw.length === 0) return null
         var num = Number(raw)
-        if (!Number.isFinite(num)) return { level: 'error', text: '必须是数字' }
-        if (meta.min !== undefined && num < meta.min) return { level: 'error', text: '不能小于 ' + meta.min }
-        if (meta.max !== undefined && num > meta.max) return { level: 'error', text: '不能大于 ' + meta.max }
+        var range = meta.min !== undefined && meta.max !== undefined
+          ? '填 ' + meta.min + '–' + meta.max + ' 之间的整数'
+          : meta.min !== undefined
+            ? '填不小于 ' + meta.min + ' 的整数'
+            : meta.max !== undefined ? '填不大于 ' + meta.max + ' 的整数' : '填一个数字'
+        if (!Number.isFinite(num)) return { level: 'error', text: '必须是数字（' + range + '）' }
+        if (meta.min !== undefined && num < meta.min) return { level: 'error', text: '不能小于 ' + meta.min + '（' + range + '）' }
+        if (meta.max !== undefined && num > meta.max) return { level: 'error', text: '不能大于 ' + meta.max + '（' + range + '）' }
         return null
       }
 
@@ -373,29 +463,24 @@ window.__ModuleLoader__.load({
 
     // ── 高级配置项 ──────────────────────────────────────────────
     //
-    // 33 个配置项一屏放不下，但真正天天要动的就那几个。缺省只显示下面这些「日常」
-    // 键，其余收进每组自己的「高级设置」折叠区 —— **不是删掉**，点一下就露出来。
+    // 判断标准只有一条：**用户在没有出故障的情况下不会想调它**。
+    // 满足这条的收进每组自己的「高级设置」折叠区 —— **不是删掉**，点一下就露出来。
+    //
+    // 反例（上一版被错藏起来的）：`maxAttempts` 重试次数 —— 人一开始就会问「跑挂了
+    // 重试几次」；已经移出。`branchPrefix` 留在高级里，因为 CI 按前缀触发的人才关心。
     //
     // 判断用**键名**而不是 meta 标记：schema 是宿主发下来的，宿主加字段时不会知道
     // 本插件想把谁归成高级；而且键名表改起来一眼看得出范围。
     var ADVANCED_CONFIG_KEYS = {
-      // 扫描与队列：翻页/退役/并发都是「出问题才调」的旋钮。
-      safePageRun: true,
-      goneAfterScans: true,
-      concurrency: true,
-      // 租约与重试：心跳、重试次数同上；租约存活留着 —— 抢票冲突时会想改它。
-      leaseHeartbeatSeconds: true,
-      maxAttempts: true,
-      // 执行：切 worktree 前 fetch、分支名前缀、worktree 保留时长、回填状态值。
-      fetchBeforeCreate: true,
+      // 高级组（config.js 里 CONFIG_GROUPS 的 advanced 组）：出事才调，平时别碰。
+      leaseTtlMinutes: true,
       branchPrefix: true,
       worktreeRetentionHours: true,
-      writeBackStatus: true,
-      // 通知：QQ 邮箱的 SMTP 细节、PushPlus 渠道/模板/回执地址。
-      'qqmail.port': true,
-      'qqmail.secure': true,
-      'pushplus.channel': true,
-      'pushplus.template': true,
+      keepSession: true,
+      // agent 与模型组：换模型/输出上限是偶发动作，缺省收着。
+      maxTokens: true,
+      agentPreset: true,
+      // 通知：回执地址要自己搭一个 HTTP 端点才有意义，收着。
       'pushplus.callbackUrl': true,
     }
 
@@ -403,12 +488,63 @@ window.__ModuleLoader__.load({
       return ADVANCED_CONFIG_KEYS[key] === true
     }
 
+    // `enabled` 不归任何分组：它是整页的总开关，置顶单独画。
+    //
+    // 为什么从组里摘出来：它原来在「杂项」组最底下，而缺省只展开一组 —— 新人装完
+    // 打开面板看不见「怎么开始」，这是评审里最刺眼的一条。总开关不属于任何一组，
+    // 因为它管的是「这个插件要不要干活」，而不是某一类参数。
+    var MASTER_KEY = 'enabled'
+
+    // 通知组按 `pushAdapter` 条件显隐。返回「这一档要露哪些键 + 一句说明」。
+    //
+    // 以前是 `onlyFor: '<platform>'` 只管项目卡片里的平台段；这里把它推广成通用的
+    // 「按某个字段的当前草稿值决定显隐」。**不要**再单独造第二张硬编码键名表 ——
+    // 判断依据只有这一处，改判定就改这一个函数。
+    var NOTIFY_GROUP_LABEL = '通知'
+
+    function notifyVisibility (adapter) {
+      if (adapter === 'qqmail') {
+        return {
+          keep: ['pushAdapter', 'notifyOn', 'qqmail.host', 'qqmail.encryption', 'qqmail.user', 'qqmail.to'],
+          note: '当前走 QQ 邮箱。授权码不在这里填，去「凭据」页填 QQMAIL_AUTH_CODE。',
+        }
+      }
+      if (adapter === 'pushplus') {
+        return {
+          keep: ['pushAdapter', 'notifyOn', 'pushplus.channel', 'pushplus.callbackUrl'],
+          note: '当前走 PushPlus。token 不在这里填，去「凭据」页填 PUSHPLUS_TOKEN。',
+        }
+      }
+      return {
+        keep: ['pushAdapter', 'notifyOn'],
+        note: '当前是 mock：不会真的发通知，只往插件日志里写一行。换成 qqmail / pushplus 才会出现对应字段。',
+      }
+    }
+
+    // 枚举值的中文说法。**只影响显示**，写下去的还是左边那个原值 ——
+    // 别在这里顺手「翻译」配置值，否则校验和适配器都会认不出来。
+    var ENUM_LABELS = {
+      workExecutor: {
+        mock: 'mock（只走流程，不改代码）',
+        agent: 'agent（真的改代码）',
+      },
+      pushAdapter: {
+        mock: 'mock（不发真通知）',
+        qqmail: 'QQ 邮箱',
+        pushplus: 'PushPlus',
+      },
+      'qqmail.encryption': {
+        tls: 'tls（465 端口直连加密，推荐）',
+        starttls: 'starttls（587 端口先明文再升级）',
+      },
+    }
+
     // ── 项目清单 ────────────────────────────────────────────────
     // 项目的 schema 是 `unknown`（宿主不往 schema 里放 projects 子树），所以字段表
     // 只能在这里手写一份。它对应 `src/core/config.js` 的 `validateProject`：
     // 改那边记得回来对一下。`from` 是 host `describeProject()` 的扁平字段名。
 
-    var PLATFORMS = ['feishu', 'wps', 'mock', 'webform']
+    var PLATFORMS = ['feishu', 'wps', 'mock']
 
     // 每一组、每个字段都可以标 `advanced: true`（缺省视图下收起，勾「显示全部字段」才出现）。
     // 另有 `onlyFor: '<platform>'`：整组只在平台等于该值时出现 —— 金山那五个键对飞书项目
@@ -430,8 +566,8 @@ window.__ModuleLoader__.load({
         key: 'match',
         label: '工单表',
         fields: [
-          { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '飞书多维表格的 table id；与 appToken 一起构成显式绑定。' },
-          { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 tableId 时按文件名模糊匹配（例：PMS项目管理系统工单）。' },
+          { path: ['match', 'tableId'], from: 'tableId', label: '工单表 tableId', kind: 'text', hint: '多维表格的表 id（形如 tblXXXX，地址里 ?table= 后面那段）。粘贴链接时宿主会自动填它；手上有链接就不用管这一格。' },
+          { path: ['match', 'docNamePattern'], from: 'docNamePattern', label: '表名匹配', kind: 'text', hint: '不给 token 时的兜底：按云文档名的片段找表（例：PMS项目管理系统工单）。适合「表名固定、但表是别人新建的、token 会变」的场景；找不到或找到多张都会报错。' },
           // 工作表名两边都用：金山拿它挑工作表，飞书电子表格也一样（同一个键，
           // 所以只在这里画一次 —— 画两次会变成两个输入框绑同一个草稿键）。
           { path: ['match', 'sheetName'], from: 'sheetName', label: '工作表名', kind: 'text', hint: '表格底部那个标签页的名字（如「工单」）。金山文档与飞书电子表格都用这一项；留空则用第一张可见工作表。' },
@@ -809,7 +945,7 @@ window.__ModuleLoader__.load({
     // key 带插件前缀避免和别的插件撞；存不下就退化成「每次都按默认展开」，不影响功能。
 
     var OPEN_KEY = 'ticket-pipeline:open-groups'
-    var DEFAULT_OPEN_GROUP = '扫描与队列'
+    var DEFAULT_OPEN_GROUP = '行为'
 
     function readOpenMap () {
       try {
@@ -991,6 +1127,42 @@ window.__ModuleLoader__.load({
       return { byKey: byKey, errorCount: errorCount }
     }
 
+    /** 数一下问题表里某个等级有几条（保存失败时先说条数）。 */
+    function countIssues (byKey, level) {
+      var count = 0
+      for (var key in byKey) {
+        if (!hasKey(byKey, key)) continue
+        if (byKey[key] !== undefined && byKey[key] !== null && byKey[key].level === level) count += 1
+      }
+      return count
+    }
+
+    /**
+     * 滚到第一个标红的字段。
+     *
+     * 为什么需要：保存失败时错误集中在下面几十个字段里，而报错条在顶部 ——
+     * 人看到「保存失败」之后得自己往下翻才能找到是哪一格红的，中间还会怀疑是不是
+     * 网络问题。这里替他把视线送过去。
+     */
+    function scrollToFirstIssue () {
+      if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return
+      var target = null
+      try {
+        target = document.querySelector('.tp-invalid') || document.querySelector('.tp-field-err')
+      } catch (error) {
+        return
+      }
+      if (target === null || target === undefined) return
+      if (typeof target.scrollIntoView === 'function') {
+        try {
+          target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+        } catch (error) {
+          // 老浏览器不认 options 对象，退回无参调用；再失败就算了，不影响保存本身。
+          try { target.scrollIntoView() } catch (ignored) {}
+        }
+      }
+    }
+
 
     /**
      * 单个项目的即时校验，返回按草稿 key 索引的问题表。
@@ -1020,10 +1192,14 @@ window.__ModuleLoader__.load({
       }
 
       var platform = read(['match', 'platform']).trim()
-      if (platform.length === 0) {
-        add(['match', 'platform'], 'error', '只能是 feishu / wps / mock / webform')
+      // webform 已移除：它曾经是「演示平台」，但水位只在内存里、重启就把同一批工单重收一遍。
+      // 老配置里的 webform 要给一条能照做的迁移提示，而不是一句「只能是 …」。
+      if (platform === 'webform') {
+        add(['match', 'platform'], 'error', 'webform 源已移除；请改成 mock（离线演示）或 feishu（真实工单表）')
+      } else if (platform.length === 0) {
+        add(['match', 'platform'], 'error', '只能是 ' + PLATFORMS.join(' / '))
       } else if (PLATFORMS.indexOf(platform) < 0) {
-        add(['match', 'platform'], 'error', '只能是 feishu / wps / mock / webform')
+        add(['match', 'platform'], 'error', '只能是 ' + PLATFORMS.join(' / '))
       }
 
       var repoPath = read(['repo', 'path']).trim()
@@ -1034,11 +1210,26 @@ window.__ModuleLoader__.load({
       }
 
       if (platform === 'feishu') {
+        // 飞书能读两种表，绑定方式三选一（对应 `src/core/config.js:validateProject`）：
+        //   ① 多维表格：appToken + tableId（appToken 由「粘贴链接」或手填 key 写入）
+        //   ② 电子表格：spreadsheetToken（面板字段「电子表格链接或 token」）
+        //   ③ 表名匹配：docNamePattern（按云文档名模糊找）
+        // 三条都没有才是错误；有一条就放过，且**明说**走的是哪条 —— 上一版只认
+        // 「有 appToken 或有表名匹配」，把电子表格这条完全漏掉，配对了也报红。
         var pattern = read(['match', 'docNamePattern']).trim()
         var hasToken = Boolean(record && record.hasAppToken)
-        if (!hasToken && pattern.length === 0) {
+        var tableId = read(['match', 'tableId']).trim()
+        var sheetToken = read(['match', 'spreadsheetToken']).trim()
+        var sheetName = read(['match', 'sheetName']).trim()
+        var sheetId = read(['match', 'sheetId']).trim()
+        var hasBitable = hasToken && tableId.length > 0
+        var hasSheet = sheetToken.length > 0 && (sheetId.length > 0 || sheetName.length > 0)
+        if (!hasBitable && !hasSheet && pattern.length === 0) {
           add(['match', 'docNamePattern'], 'soft',
-            'feishu 项目需要 appToken+tableId（显式绑定）或表名匹配（docNamePattern）二选一；appToken 只能在配置文件里写。')
+            '这个飞书项目还没绑定任何工单表。三种方式选一种：'
+            + '① 在上面的「工单表链接」里粘贴多维表格链接（推荐，宿主会解析并保存 token）；'
+            + '② 填「电子表格链接或 token」+ 工作表名/id；'
+            + '③ 在这里填表名匹配（按文件名模糊找）。')
         }
       }
 
@@ -1272,6 +1463,19 @@ window.__ModuleLoader__.load({
       '.tp-switch-row{display:flex;align-items:center;gap:8px}',
       '.tp-switch-state{font-size:12px;color:var(--dsw-alias-label-tertiary,#81858c)}',
 
+      // 总开关：整页最上面一条，比字段稍微重一点（底色 + 描边），
+      // 因为它不是普通配置，是「这个插件要不要干活」的总闸。
+      '.tp-master{display:flex;flex-wrap:wrap;align-items:flex-start;gap:10px;',
+      '  padding:12px 14px;margin:0 0 14px;border-radius:var(--dsw-radius-sm,8px);',
+      '  border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb)}',
+      '.tp-master-main{display:flex;align-items:flex-start;gap:10px;flex:1 1 320px;min-width:0}',
+      '.tp-master-text{display:flex;flex-direction:column;gap:3px;min-width:0}',
+      '.tp-master-title{font-size:13px;font-weight:600;line-height:1.45}',
+      '.tp-master-hint{font-size:12px;line-height:1.5;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-master .tp-help,.tp-master .tp-err{flex:1 1 100%;margin:0}',
+
       // 徽标：比上一版更淡。之前每个徽标都有描边 + 底色，一排看下来像按钮。
       '.tp-badge{font-size:11px;font-weight:500;line-height:16px;padding:0 6px;',
       '  border-radius:var(--dsw-radius-xs,4px);white-space:nowrap;',
@@ -1341,6 +1545,11 @@ window.__ModuleLoader__.load({
       '.tp-pick{display:flex;gap:6px;align-items:center}',
       '.tp-pick .tp-input{flex:1 1 auto;min-width:0}',
       '.tp-pick-btn{flex:0 0 auto;white-space:nowrap}',
+      // 「粘贴工单表链接」：输入框 + 按钮横排，与「选择目录」同一套手感。
+      '.tp-link-row{grid-column:1/-1}',
+      '.tp-link-input{display:flex;gap:6px;align-items:center}',
+      '.tp-link-input .tp-input{flex:1 1 auto;min-width:0}',
+      '.tp-link-input .tp-btn{flex:0 0 auto;white-space:nowrap}',
 
       '.tp-empty{padding:16px 0;font-size:13px;line-height:1.6;',
       '  color:var(--dsw-alias-label-tertiary,#81858c)}',
@@ -1421,8 +1630,12 @@ window.__ModuleLoader__.load({
           }),
           h('span', { className: 'tp-switch-state' }, Boolean(draftValue) ? '已开启' : '已关闭'))
       } else if (Array.isArray(meta.enum) && meta.enum.length > 0) {
+        // option 文本走 ENUM_LABELS 给中文，但 **value 仍是原值** ——
+        // 写下去、跑校验、进适配器都用左边那个英文枚举，别在这一层做翻译。
+        var enumLabels = ENUM_LABELS[keyOf(leaf)] || {}
         var options = meta.enum.map(function (value) {
-          return h('option', { key: value, value: value }, value)
+          var text = typeof enumLabels[value] === 'string' ? enumLabels[value] : value
+          return h('option', { key: value, value: value }, text)
         })
         control = h('select', {
           className: 'tp-select',
@@ -1576,27 +1789,84 @@ window.__ModuleLoader__.load({
             }, props.busy ? '体检中…' : '立即体检'))),
         props.available
           ? h('p', { className: 'tp-note' },
-            '检查 git 链路、项目仓库与远端、凭据配置、执行器与通知适配器，以及正在跑的插件是不是比本地源码旧。只读，不改任何东西。')
+            '检查 git 链路、项目仓库与远端、凭据、飞书连通性（能不能读到表和数据）、通知通道、执行器，'
+            + '以及正在跑的插件是不是比本地源码旧。只读，不改任何东西、不写表格。')
           : h('p', { className: 'tp-err' },
             '宿主 Remote 没挂上（typert 服务缺席）。命令行里仍然可以跑 pipeline_doctor 工具。'),
         report
           ? h(Fragment, null,
+            // 三档分开说。把「跑不了」和「跑得不好」混成一句，人会去修不重要的那条。
             report.ok
-              ? h('p', { className: 'tp-note', style: { marginTop: '8px' } }, '✅ 通过' + (report.warnings.length > 0 ? '（有 ' + report.warnings.length + ' 条提醒）' : ''))
-              : h('p', { className: 'tp-err' }, '❌ 发现 ' + report.problems.length + ' 个必须修复的问题'),
+              ? h('p', { className: 'tp-note', style: { marginTop: '8px' } },
+                '✅ 通过' + (report.warnings.length > 0 ? '（有 ' + report.warnings.length + ' 条提醒）' : ''))
+              : h('p', { className: 'tp-err' },
+                (report.blockers && report.blockers.length > 0
+                  ? '❌ ' + report.blockers.length + ' 个阻断（不修就跑不了票）'
+                  : '')
+                + (report.blockers && report.blockers.length > 0 && report.problems.length > 0 ? '，' : '')
+                + (report.problems.length > 0 ? report.problems.length + ' 个必须修复' : '')),
             h('pre', { className: 'tp-pre' }, report.text))
           : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
 
     /**
-     * 「配置」卡片：把 33 个配置项按 meta.group 分组、每组可折叠。
+     * 页面顶部的总开关。
      *
-     * 两层降噪（用户要的「化繁为简」）：
-     *   1. **组级折叠** —— 「扫描与队列」「租约与重试」这些一整组收起来，只留最核心
-     *      的一组摊开（见 `isGroupOpen` 的缺省）。
-     *   2. **组内「高级设置」折叠区** —— 每组里不常动的旋钮（翻页条数、心跳秒数、
-     *      SMTP 端口……）再收一层，缺省不画。改过的或有错的字段永远露出来。
+     * 它管的是「这个插件要不要干活」—— 关着的时候不扫表、不建工作区、不提交，
+     * 所以它不属于任何一组配置，而是整页的前提。放最上面并且单独画，是因为
+     * 它原来埋在折叠组最底下，新人装完打开面板根本找不到「怎么开始」。
+     */
+    function renderMasterSwitch (leaf, props) {
+      var meta = leaf.node.meta || {}
+      var key = keyOf(leaf)
+      var on = Boolean(props.draft[key])
+      var changed = !sameDraft(props.draft[key], props.initialDraft[key])
+      var issue = props.issues ? props.issues[key] : undefined
+      return h('div', { className: 'tp-master' },
+        h('div', { className: 'tp-master-main' },
+          h(Switch, {
+            checked: on,
+            disabled: props.disabled,
+            label: '总开关',
+            onChange: function (next) { props.onEdit(key, next) },
+          }),
+          h('div', { className: 'tp-master-text' },
+            h('span', { className: 'tp-master-title' },
+              h('span', { className: 'tp-master-label' }, '总开关'),
+              h('span', null, on ? '已开启：会按下面的间隔自动扫表跑票' : '已关闭：不会扫表、不会建工作区、不会提交'),
+              changed ? h('span', { className: 'tp-badge tp-on', style: { marginLeft: '8px' } }, '已改') : null),
+            h('span', { className: 'tp-master-hint' },
+              on
+                ? '想让它停下来就关掉这里；正在跑的那张票不会被打断，用「运行」里的取消才停得住。'
+                : '配好项目与凭据之后再打开。用 mock 执行器 + mock 通知可以先空跑一遍看看流程。'))),
+        changed
+          ? h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: props.disabled,
+            onClick: function () { props.onRevert(key) },
+          }, '撤销')
+          : null,
+        typeof meta.description === 'string' && meta.description.length > 0
+          ? h('p', { className: 'tp-help' }, meta.description)
+          : null,
+        issue !== undefined && issue !== null
+          ? h('p', { className: issue.level === 'error' ? 'tp-err' : 'tp-note' }, issue.message)
+          : null)
+    }
+
+    /**
+     * 「配置」卡片：把配置项按 meta.group 分组、每组可折叠。
+     *
+     * 三层信息层级（这就是「化繁为简」的全部做法，没有隐藏任何东西）：
+     *   0. **总开关**单独置顶，不属于任何组。
+     *   1. **组级折叠** —— 缺省只摊开「行为」一组，其余收起（见 `isGroupOpen`）。
+     *   2. **组内「高级设置」折叠区** —— 不常动的旋钮再收一层，缺省不画。
+     * 改过的或有错的字段无论在哪一层收起，都会自己露出来。
+     *
+     * 通知组还按 `pushAdapter` 的当前值条件显隐（见 `notifyVisibility`）：选了 QQ 邮箱
+     * 就没必要看 PushPlus 的字段，反过来也一样。
      *
      * 卡片里**不再有第二套「保存 / 放弃改动」按钮**：之前顶部操作条一套、卡片里
      * 又一套，两套按钮长得几乎一样，点哪个会把什么写下去说不清。现在只有顶部那
@@ -1615,45 +1885,82 @@ window.__ModuleLoader__.load({
             '设置镜像里找不到命名空间 "' + NAMESPACE + '"。插件可能没启用，或 loader entry 的 id 不是这个值。'))
       }
 
-      var groups = groupLeaves(leaves)
+      // 总开关先摘出来：它不属于任何一组，画在卡片最上面。
+      var masterLeaf = null
+      var rest = []
+      for (var m = 0; m < leaves.length; m += 1) {
+        if (keyOf(leaves[m]) === MASTER_KEY) masterLeaf = leaves[m]
+        else rest.push(leaves[m])
+      }
+
+      // 通知组按 pushAdapter 的**当前草稿值**显隐 —— 用草稿而不是保存值，
+      // 这样换适配器不用先保存就能看见对应字段（不然还得猜「填完保存才出现」）。
+      //
+      // schema 里根本没有 pushAdapter 这个键时（宿主版本旧、或字段一时没下发），
+      // **不做任何隐藏** —— 藏错方向会让用户以为字段丢了，比多看一眼糟糕得多。
+      var hasAdapterLeaf = false
+      for (var a = 0; a < rest.length; a += 1) {
+        if (keyOf(rest[a]) === 'pushAdapter') { hasAdapterLeaf = true; break }
+      }
+      var adapter = typeof draft.pushAdapter === 'string' ? draft.pushAdapter : 'mock'
+      var notifyRule = hasAdapterLeaf ? notifyVisibility(adapter) : null
+
+      var groups = groupLeaves(rest)
       var sections = groups.map(function (group) {
         // 必须用 map 而不是 for + var：`var key` 是函数作用域，放进 for 里所有
         // 闭包（onRevert / onChange）会一起指向最后一项 —— 改第 1 个字段会写到
         // 第 N 个字段上。map 每次调用都是一个新的作用域，天然没这个问题。
         var changedCount = 0
-        var all = group.leaves.map(function (leaf) {
-          var key = keyOf(leaf)
-          var changed = !sameDraft(draft[key], props.initialDraft[key])
+        var isNotify = notifyRule !== null && group.label === NOTIFY_GROUP_LABEL
+        var hiddenByAdapter = []
+        var all = []
+        for (var g = 0; g < group.leaves.length; g += 1) {
+          var leafKey = keyOf(group.leaves[g])
+          // 条件隐藏的键：**改过的或有错的永远露出来**（同高级折叠那条硬约束），
+          // 否则换回适配器之前的旧值会变成看不见的暗配置。
+          if (isNotify && notifyRule.keep.indexOf(leafKey) < 0) {
+            var dirtyHidden = !sameDraft(draft[leafKey], props.initialDraft[leafKey])
+            var badHidden = props.issues && props.issues[leafKey] !== undefined
+            if (!dirtyHidden && !badHidden) { hiddenByAdapter.push(leafKey); continue }
+          }
+          var changed = !sameDraft(draft[leafKey], props.initialDraft[leafKey])
           if (changed) changedCount += 1
+          all.push({ key: leafKey, changed: changed, leaf: group.leaves[g] })
+        }
+        var nodes = all.map(function (entry) {
           return {
-            key: key,
-            changed: changed,
+            key: entry.key,
+            changed: entry.changed,
             node: h(Field, {
-              key: key,
-              leaf: leaf,
-              value: draft[key],
-              base: props.initialDraft[key],
+              key: entry.key,
+              leaf: entry.leaf,
+              value: draft[entry.key],
+              base: props.initialDraft[entry.key],
               disabled: disabled,
-              secretSet: Boolean(props.secrets && props.secrets[key]),
-              issue: props.issues ? props.issues[key] : undefined,
-              changed: changed,
-              onRevert: function () { props.onRevert(key) },
-              onChange: function (next) { props.onEdit(key, next) },
+              secretSet: Boolean(props.secrets && props.secrets[entry.key]),
+              issue: props.issues ? props.issues[entry.key] : undefined,
+              changed: entry.changed,
+              onRevert: function () { props.onRevert(entry.key) },
+              onChange: function (next) { props.onEdit(entry.key, next) },
             }),
           }
         })
         var core = []
         var advanced = []
-        for (var i = 0; i < all.length; i += 1) {
+        for (var i = 0; i < nodes.length; i += 1) {
           // 改过的和有错的永远露出来，不跟着「高级」一起藏 —— 否则折叠就成了遮蔽。
-          if (isAdvancedConfigKey(all[i].key) && !all[i].changed && !(props.issues && props.issues[all[i].key])) {
-            advanced.push(all[i].node)
+          if (isAdvancedConfigKey(nodes[i].key) && !nodes[i].changed && !(props.issues && props.issues[nodes[i].key])) {
+            advanced.push(nodes[i].node)
           } else {
-            core.push(all[i].node)
+            core.push(nodes[i].node)
           }
         }
 
-        var children = [h('div', { key: 'core', className: 'tp-fields' }, core)]
+        var children = []
+        if (isNotify && notifyRule.note.length > 0) {
+          children.push(h('p', { key: 'adapter-note', className: 'tp-constraint' }, notifyRule.note))
+        }
+        children.push(h('div', { key: 'core', className: 'tp-fields' }, core))
         if (advanced.length > 0) {
           var advOpen = props.isAdvOpen(group.label)
           children.push(h('div', { key: 'adv', className: 'tp-adv' },
@@ -1684,8 +1991,10 @@ window.__ModuleLoader__.load({
         h('h3', null, '配置',
           h('span', { style: { marginLeft: 'auto' } },
             props.dirty
-              ? h('span', { className: 'tp-ok' }, '有未保存的改动')
+              ? h('span', { className: 'tp-ok' },
+                '有 ' + (typeof props.changedCount === 'number' ? props.changedCount : 0) + ' 项改动未保存')
               : null)),
+        masterLeaf ? renderMasterSwitch(masterLeaf, props) : null,
         h('p', { className: 'tp-note' },
           '点组名折叠整组；组里的「高级设置」再收一层不常动的旋钮。',
           '改过的和有错的字段无论收起与否都会露出来。'),
@@ -1693,6 +2002,61 @@ window.__ModuleLoader__.load({
         props.errorCount > 0
           ? h('p', { className: 'tp-err' }, props.errorCount + ' 项待修 —— 修好才能保存')
           : null,
+        props.error ? h('p', { className: 'tp-err' }, props.error) : null)
+    }
+
+    /**
+     * 「粘贴工单表链接」那一行（只在飞书项目上出现）。
+     *
+     * 为什么不是一个 appToken 输入框：appToken 能换出 access token，宿主从来不下发
+     * 它的明文（只给 `hasAppToken` + 首尾几位），所以面板里「填一个明文 token」
+     * 根本没有地方存 —— 上一版就是只读一行字，结果新增飞书项目只能手改 YAML。
+     *
+     * 现在改成让人粘**地址栏那条链接**：浏览器把整串交给宿主，
+     * 宿主 `parseFeishuLink()` 解析出 appToken（或 spreadsheetToken）再落盘。
+     * 明文只在宿主进程里出现一次，浏览器内存与请求体里都没有它。
+     *
+     * 三种绑定方式在这里并列写出来，是因为它们各有各的适用场景，人应该一眼能选：
+     *   · 粘链接 —— 推荐，手上有表就有链接
+     *   · 表名匹配（下面「工单表」组里的 `docNamePattern`）—— 表名固定、token 会变
+     *   · 手填 token —— 别人只给了 token 时
+     */
+    function FeishuTableLinkRow (props) {
+      var [text, setText] = useState('')
+      var busy = props.busy === true
+      var disabled = props.disabled === true || busy
+      var canSubmit = !disabled && text.trim().length > 0
+
+      return h('div', { className: 'tp-field tp-link-row' },
+        h('div', { className: 'tp-field-label' }, '工单表链接',
+          h('span', { className: 'tp-badge' + (props.hasToken ? ' tp-ok' : '') }, props.tokenText)),
+        h('p', { className: 'tp-help' },
+          '把浏览器地址栏那条**完整**链接贴进来（多维表格 /base/…?table=…、电子表格 /sheets/…、wiki /wiki/…），'
+          + '点「用这条链接」由宿主解析并保存。'
+          + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'),
+        h('div', { className: 'tp-link-input' },
+          h('input', {
+            className: 'tp-input',
+            type: 'text',
+            value: text,
+            disabled: disabled,
+            placeholder: 'https://xxx.feishu.cn/base/bascn…?table=tbl…',
+            autoComplete: 'off',
+            onChange: function (event) { setText(event.target.value) },
+            onKeyDown: function (event) {
+              if (event.key === 'Enter' && canSubmit) props.onPasteLink(props.index, text.trim())
+            },
+          }),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: !canSubmit,
+            title: '交给宿主解析并写进配置（浏览器不接触明文 token）',
+            onClick: function () { props.onPasteLink(props.index, text.trim()) },
+          }, busy ? '写入中…' : '用这条链接')),
+        h('p', { className: 'tp-help' },
+          '没有链接也行：填下面的「表名匹配」让插件按文件名找表，或者把 app_token 直接贴进上面这个框（形如 bascn…）。'),
+        props.message ? h('p', { className: 'tp-ok' }, props.message) : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
 
@@ -1918,8 +2282,15 @@ window.__ModuleLoader__.load({
       })
 
       // appToken：宿主只下发 hasAppToken + 打码预览，明文永不出宿主。
-      // 这里绝不提供输入框 —— 填了也没地方存，还会让人以为存进了凭据库。
-      // 只在飞书项目上画：这是 feishu 专属的只读状态，别的平台显示它只会添乱。
+      //
+      // 所以这里**没有** appToken 输入框。但「没有输入框」不等于「没法配」：
+      // 上一版就卡在这儿 —— 新增一个飞书项目只能去手改 cordis.patch.yml，
+      // 文档也跟着把「改 appToken」写成必经步骤。
+      //
+      // 现在给的是另一条路：让人把浏览器地址栏那条链接**整条贴进来**，
+      // 由宿主解析出 appToken 并落盘（`ticketPipeline.setProjectTable`）。
+      // 明文从头到尾没进过浏览器，落盘的也只有 match.appToken 一个字段。
+      // 只在飞书项目上画：这是 feishu 专属的东西，别的平台显示它只会添乱。
       var platformKey = projectKey(index, ['match', 'platform'])
       var platformNow = hasKey(draft, platformKey)
         ? String(draft[platformKey])
@@ -1928,13 +2299,17 @@ window.__ModuleLoader__.load({
         ? '已配置' + (record.appTokenPreview ? '（' + record.appTokenPreview + '）' : '')
         : '未配置'
       var tokenRow = platformNow === 'feishu'
-        ? h('div', { className: 'tp-field' },
-          h('div', { className: 'tp-field-label' }, '飞书 appToken',
-            h('span', { className: 'tp-badge' + (record && record.hasAppToken ? ' tp-ok' : '') }, tokenText)),
-          h('p', { className: 'tp-help' },
-            '只读：appToken 里有明文密钥，宿主不会下发到浏览器。要改请改 profile 的 ',
-            h('code', null, 'cordis.patch.yml'),
-            '。'))
+        ? h(FeishuTableLinkRow, {
+          key: 'feishu-link',
+          index: index,
+          tokenText: tokenText,
+          hasToken: !!(record && record.hasAppToken),
+          disabled: disabled,
+          busy: props.linkBusy === true,
+          message: props.linkMessage || '',
+          error: props.linkError || '',
+          onPasteLink: props.onPasteLink,
+        })
         : null
 
       return h('div', { className: 'tp-proj' + (open ? '' : ' tp-collapsed') },
@@ -1986,11 +2361,9 @@ window.__ModuleLoader__.load({
             '（工单来源）、',
             h('code', null, 'repo.path'),
             '（本地检出根目录）。',
-            '飞书来源还要在 ',
-            h('code', null, 'cordis.patch.yml'),
-            ' 里手填 ',
-            h('code', null, 'match.appToken'),
-            '（面板不显示明文密钥，详见文档 §3.0.1）。'))
+            '飞书来源还有一条更省事的路：等项目卡片建好之后，把工单表的',
+            '浏览器地址栏链接整条贴进卡片里的「工单表链接」，由宿主解析并保存 ——',
+            '不需要手改配置文件，面板也不会显示完整 token。'))
       } else {
         body = h('div', null, list.map(function (item, index) {
           // 分支候选按 index 对（宿主的 `branches()` 与 `projects()` 用的是同一次
@@ -2011,6 +2384,10 @@ window.__ModuleLoader__.load({
             branchNote: entry && entry.ok === false && entry.reason ? entry.reason : '',
             onPickDirectory: props.onPickDirectory,
             picking: props.picking === true,
+            onPasteLink: props.onPasteLink,
+            linkBusy: props.linkBusy === index,
+            linkMessage: props.linkMessage && props.linkMessage.index === index ? props.linkMessage.text : '',
+            linkError: props.linkError && props.linkError.index === index ? props.linkError.text : '',
             open: props.isProjectOpen(index),
             showAdvanced: props.showAdvanced,
             onToggle: props.onToggleProject,
@@ -2126,6 +2503,13 @@ window.__ModuleLoader__.load({
       var [branchBusy, setBranchBusy] = useState(false)
       // 「选择目录」正在挑（原生选择器是模态的，挡住按钮防连点）。
       var [picking, setPicking] = useState(false)
+
+      // 「粘贴工单表链接」的进行中状态与回话，都按项目下标存。
+      // 为什么按 index 而不是一个全局 busy：卡片是逐个渲染的，全局 busy 会让
+      // 「第 2 个项目在写」把第 1 个项目的按钮也灰掉，看起来像卡住了。
+      var [linkBusy, setLinkBusy] = useState(-1)
+      var [linkMessage, setLinkMessage] = useState(null)
+      var [linkError, setLinkError] = useState(null)
 
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
       // 当前页签：整页一次只摊开一块，其余收在页签标题里（见 TABS）。
@@ -2517,8 +2901,49 @@ window.__ModuleLoader__.load({
           })
       }
 
-      function onToggleAdv (label) {
-        setAdvMap(function (previous) {
+      /**
+       * 「粘贴工单表链接」：把整条链接交给宿主解析并落盘。
+       *
+       * 关键点在**这里不解析链接**。`parseFeishuLink()` 是纯函数、浏览器里也有，
+       * 但一旦在这边解析出 appToken，明文就进了浏览器内存（还会进请求体），
+       * 这就破了「明文不出宿主」这条线。所以这里只做一件事：把原样的字符串发出去。
+       *
+       * 宿主 `setProjectTable(index, url)` 的失败会以 rejected promise 的形式回来
+       * （网关的 `invokePrepared` 直接 rethrow 业务异常），message 就是我们要显示的那句。
+       */
+      function onPasteLink (index, url) {
+        var ns = getNamespace('ticketPipeline')
+        if (!ns || typeof ns.setProjectTable !== 'function') {
+          setLinkError({ index: index, text: '宿主 Remote 没挂上「粘贴链接」通道（typert 缺席或插件版本旧）。可以手动填 app_token，或刷新页面重试。' })
+          return
+        }
+        setLinkBusy(index)
+        setLinkMessage(null)
+        setLinkError(null)
+        Promise.resolve()
+          .then(function () { return ns.setProjectTable(index, url) })
+          .then(function (response) {
+            setLinkBusy(-1)
+            if (!response || !response.ok) {
+              var message = response && response.error && response.error.message
+                ? response.error.message
+                : '未知错误'
+              setLinkError({ index: index, text: '没能写进去：' + message })
+              return
+            }
+            var value = response.value || {}
+            setLinkMessage({ index: index, text: value.note || '已保存。' })
+            // 写完必须重读项目：`hasAppToken` / `appTokenPreview` 都变了，
+            // 不重读就会一直显示「未配置」—— 人以为没成功，会再点一次。
+            loadProjects()
+          }, function (error) {
+            setLinkBusy(-1)
+            var message = error && error.message ? error.message : String(error)
+            setLinkError({ index: index, text: '没能写进去：' + message })
+          })
+      }
+
+      function onToggleAdv (label) {        setAdvMap(function (previous) {
           var copy = Object.assign({}, previous)
           copy[label] = !(copy[label] === true)
           try { localStorage.setItem(ADV_OPEN_KEY, JSON.stringify(copy)) } catch (error) {}
@@ -2663,8 +3088,12 @@ window.__ModuleLoader__.load({
             var message = detail.message || '未知错误'
             var mapped = mapServerIssues(message, configKeys)
             setServerIssues(mapped.byKey)
+            // 冲突时最重要的一句话是「你刚才那些改动没存进去」—— 原来只写「请重试」，
+            // 用户会以为已经存了一半。所以这里必须报出具体条数。
+            var lostCount = ops.length
             var head = detail.code === 'SETTINGS_CONFLICT'
-              ? '配置在别处被改过，已重新载入，请重试。'
+              ? '配置在别处被改过，已重新载入。你刚才那 ' + lostCount +
+                ' 项改动没有保存，请重新改一遍再点保存。'
               : '保存失败：' + message
             // 兜底：宿主如果把 projects 这段整体判成「不可写」，回来的就是
             // `Config field "projects" is not declared` / `is not volatile` 这类
@@ -2674,6 +3103,13 @@ window.__ModuleLoader__.load({
               head += '\n项目配置这段被宿主拒了。先把上面这段错误原文发给我，或者临时改 profile 的 cordis.patch.yml 里本行的 config.projects 顶上。'
             }
             if (mapped.top.length > 0) head += '\n' + mapped.top
+            // 把「有几项没通过校验」说在前面：原来只回一段 `invalid config: …` 原文，
+            // 人得自己数哪几条、还得自己滚回去找。现在先给条数，再滚到第一个标红的地方。
+            var errorCount = countIssues(mapped.byKey, 'error')
+            if (errorCount > 0) {
+              head = '有 ' + errorCount + ' 项没通过校验，已在下方标红。' + '\n' + head
+              scrollToFirstIssue()
+            }
             setSaveError(head)
             return loadSettings()
           }
@@ -2916,7 +3352,11 @@ window.__ModuleLoader__.load({
           var projectBad = projectIssueCount
           if (projectBad > 0) { count = projectBad; bad = true }
         } else if (key === 'doctor') {
-          count = doctorReport && doctorReport.ok === false ? doctorReport.problems.length : 0
+          // 角标只数「挡跑票」的那些：把提醒也数进去，角标会常年挂着一个数字，
+          // 人就会学会忽略它 —— 那这个角标就白做了。
+          count = doctorReport && doctorReport.ok === false
+            ? ((doctorReport.blockers ? doctorReport.blockers.length : 0) + doctorReport.problems.length)
+            : 0
           bad = count > 0
         }
         if (count === 0) return null
@@ -2997,6 +3437,10 @@ window.__ModuleLoader__.load({
             pickDirectory: props.pickDirectory,
             picking: picking,
             onPickDirectory: typeof props.pickDirectory === 'function' ? onPickDirectory : undefined,
+            onPasteLink: onPasteLink,
+            linkBusy: linkBusy,
+            linkMessage: linkMessage,
+            linkError: linkError,
             showAdvanced: showAdvanced,
             onToggleAdvanced: setShowAdvanced,
             isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },
@@ -3014,6 +3458,7 @@ window.__ModuleLoader__.load({
             secrets: secretMap,
             disabled: saving,
             dirty: dirty,
+            changedCount: configChangedCount,
             saving: saving,
             error: '',
             message: '',

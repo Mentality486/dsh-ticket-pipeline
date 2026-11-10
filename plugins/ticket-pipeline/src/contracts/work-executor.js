@@ -28,6 +28,10 @@
  *   人在 GUI 里也就看不到这张票的会话属于哪个项目。缺省时退化成用 `worktreePath` 当 cwd。
  * @property {string} [workspaceId] 宿主的 WorkspaceId，用于把会话显式归属到工作区（headless 下为空）
  * @property {string} prompt 已经渲染好的任务书（纯文本）
+ * @property {(sessionId: string) => void | Promise<void>} [onSessionId] 会话一起来就把 id 交给调度器。
+ *   为什么要单独一个回调：票失败（抛异常）、超时、被取消时执行器根本**返回不了结果**，
+ *   会话 id 只有它自己知道 —— 不在这里交出去，人在失败的票上就永远看不到「处理会话」，
+ *   也就没法点进那次会话看它到底怎么想的。可选，老调用方不传不影响行为。
  * @property {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图
  * @property {unknown[]} images 截图引用数组（saveImage 的返回值），content 里只用到了非空项
  * @property {Record<string, any>} config 生效中的插件配置
@@ -61,8 +65,12 @@
  * @property {Phase} phase 终态：done / skipped / failed
  * @property {Plan} [plan] 执行器产出的方案（进 MR 描述）
  * @property {string[]} changedFiles
- * @property {'passed'|'failed'|'skipped'} testOutcome
- * @property {string} [testDetail] skipped 时必须写原因
+ * @property {'passed'|'failed'|'not-run'} testOutcome
+ *   `not-run` = 验证**没跑**（没配命令、命令起不来），这一票的改动未经证明。
+ *   老数据里这个位置写的是 `'skipped'` —— 同一个意思，换个名字是因为
+ *   `skipped` 曾经一词三义（phase 叫 skipped 表示「验证跑过但没过」，这里却表示
+ *   「压根没跑」），人和代码都读不明白。读老数据时统一归一成 `not-run`。
+ * @property {string} [testDetail] not-run 时必须写原因
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 走远程 GitLab 开出来的 MR
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 在工作区检出里做出来的本地提交
  * @property {string} [sessionId] 这次执行用的会话 id。会话默认保留在项目工作区名下，
@@ -84,7 +92,7 @@
  * - 返回前必须已经把改动落成**可交付的东西**：默认是在工作区检出里做一次本地提交
  *   （`commit`，写清工单溯源）；配了 GitLab 的部署还会同时开 draft MR（`mr`）。
  *   两样都没有时必须在 `error` 里说明为什么没有。
- * - `testOutcome: 'skipped'` 是**合法成功路径**：环境起不来就记 skipped，
+ * - `testOutcome: 'not-run'` 是**合法成功路径**：环境起不来就记 not-run，
  *   但必须把原因写进 `testDetail`（进而进提交说明/通知），不能默默略过。
  *
  * @typedef {Object} WorkExecutor
@@ -112,10 +120,27 @@ export function assertWorkExecutor (candidate, label = 'WorkExecutor') {
 }
 
 /**
+ * 老数据里的 `testOutcome: 'skipped'` 归一成 `'not-run'`。
+ *
+ * 不写迁移脚本：这是个只影响**读**的展示字段，老票一年后再也不会被重新跑一遍；
+ * 每个读它的地方都过一次这个函数，比在存储里批量改写安全得多（写坏一张票比展示错一行严重）。
+ *
+ * @param {unknown} outcome
+ * @returns {'passed'|'failed'|'not-run'|undefined}
+ */
+export function normalizeTestOutcome (outcome) {
+  if (outcome === 'passed') return 'passed'
+  if (outcome === 'failed') return 'failed'
+  // 'not-run' 是新名字；'skipped' 是老数据里同一个意思（注意：**不是** phase 的 skipped）。
+  if (outcome === 'not-run' || outcome === 'skipped') return 'not-run'
+  return undefined
+}
+
+/**
  * 结果归一 + 一致性校验。
  *
  * 这里拦住两类最常见的执行器 bug：
- * 1. 返回 `skipped` 却没写 `testDetail` —— 人看到结果不知道没被真跑过。
+ * 1. 返回 `not-run` 却没写 `testDetail` —— 人看到结果不知道没被真跑过。
  * 2. 返回 `done`/`skipped` 却既没 `commit` 也没 `mr` —— 流程承诺「返回前必须已把改动落成可交付的东西」。
  *
  * @param {Partial<ExecResult>} input
@@ -126,20 +151,23 @@ export function makeExecResult (input) {
   if (phase !== 'done' && phase !== 'skipped' && phase !== 'failed') {
     throw new Error(`makeExecResult: phase 必须是 done / skipped / failed，实际是 ${String(phase)}`)
   }
-  const testOutcome = input.testOutcome ?? 'skipped'
-  if (testOutcome !== 'passed' && testOutcome !== 'failed' && testOutcome !== 'skipped') {
-    throw new Error(`makeExecResult: testOutcome 非法：${String(testOutcome)}`)
+  // 入参仍收老名字 'skipped'：第三方执行器（含自测里的手写 executor）不会跟着一起改名，
+  // 在这里统一归一，比让它们各自踩一次「非法 testOutcome」友好。
+  const normalizedOutcome = normalizeTestOutcome(input.testOutcome ?? 'not-run')
+  if (normalizedOutcome === undefined) {
+    throw new Error(`makeExecResult: testOutcome 非法：${String(input.testOutcome)}`)
   }
+  const testOutcome = normalizedOutcome
 
   const changedFiles = Array.isArray(input.changedFiles) ? input.changedFiles.filter((f) => typeof f === 'string') : []
 
   if ((phase === 'done' || phase === 'skipped') && !input.mr && !input.commit) {
     throw new Error(`makeExecResult: phase=${phase} 时必须给出 commit 或 mr（流程承诺返回前已把改动落成可交付的东西）`)
   }
-  if (testOutcome === 'skipped' && (phase === 'done' || phase === 'skipped')) {
+  if (testOutcome === 'not-run' && (phase === 'done' || phase === 'skipped')) {
     const detail = typeof input.testDetail === 'string' ? input.testDetail.trim() : ''
     if (detail.length === 0) {
-      throw new Error('makeExecResult: testOutcome=skipped 时必须写 testDetail（说明为什么没跑）')
+      throw new Error('makeExecResult: testOutcome=not-run 时必须写 testDetail（说明为什么没跑）')
     }
   }
   if (phase === 'failed' && !input.error) {

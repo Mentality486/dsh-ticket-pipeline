@@ -470,7 +470,7 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 | 阶段 | 内容 | 判据 |
 | --- | --- | --- |
 | 第二步 | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| **第二步半（已完成）** | **飞书电子表格支持（本文档）** | 代码与自测已完成（`dev-run` 384 → **404**、`feishu-checks` 60 → **80**）；真表读数据待 §8.2 人工前置完成后验证 |
+| **第二步半（已完成）** | **飞书电子表格支持（本文档）** | 代码与自测已完成（`dev-run` 384 → **451**、`feishu-checks` 60 → **80**）；真表读数据待 §8.2 人工前置完成后验证 |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |
 
@@ -544,7 +544,7 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 - `node plugins/ticket-pipeline/scripts/dev-run.mjs` → **通过 404 项，失败 0 项**（原基线 384；19 条电子表格断言 + 1 条「回填退化成只读回执」）。
 - `node plugins/ticket-pipeline/scripts/feishu-checks.mjs` → **80 条全过**，含**只读断言**（全程不出现对 sheets 的写请求）。
 - `node plugins/ticket-pipeline/scripts/client-check.mjs` → 通过；面板项目字段 **29** 项与宿主 descriptor 对得上（`sheetName` 去重后从 30 降下来）。
-- `node plugins/ticket-pipeline/scripts/client-smoke.mjs` → 通过（**143** 条 `check(`）。
+- `node plugins/ticket-pipeline/scripts/client-smoke.mjs` → 通过（**175** 条 `check(`）。
 
 ### 12.4 仍未验证（需要人工前置）
 

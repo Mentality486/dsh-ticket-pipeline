@@ -1657,11 +1657,11 @@ export async function runGitlabChecks (check) {
     assert.equal(await snapshotProtectedPaths({}, '/r'), undefined)
   })
 
-  await check('执行器：没配 verify 时 testOutcome=skipped 且仍开 draft MR（合法成功路径）', async () => {
+  await check('执行器：没配 verify 时 testOutcome=not-run 且仍开 draft MR（合法成功路径）', async () => {
     const env = makeRunEnv({ verify: undefined })
     const result = await env.executor.run(env.ticket, env.target, env.ctx)
-    assert.equal(result.testOutcome, 'skipped')
-    assert.ok(result.testDetail && result.testDetail.length > 0, 'skipped 必须写清原因')
+    assert.equal(result.testOutcome, 'not-run')
+    assert.ok(result.testDetail && result.testDetail.length > 0, 'not-run 必须写清原因')
     assert.ok(result.mr, '环境没起来也要开 MR —— 契约里这是合法成功路径')
   })
 
@@ -1690,13 +1690,13 @@ export async function runGitlabChecks (check) {
     assert.ok(result.mr)
   })
 
-  await check('执行器：验证命令起不来（ENOENT）记 skipped 而不是 failed', async () => {
+  await check('执行器：验证命令起不来（ENOENT）记 not-run 而不是 failed', async () => {
     const env = makeRunEnv({
       verify: { test: 'mvn -o test' },
       runCommandImpl: async () => { throw new Error('spawn mvn ENOENT') },
     })
     const result = await env.executor.run(env.ticket, env.target, env.ctx)
-    assert.equal(result.testOutcome, 'skipped', '环境起不来是 skipped，不是代码有问题')
+    assert.equal(result.testOutcome, 'not-run', '环境起不来是 not-run，不是代码有问题')
     assert.ok(/ENOENT/.test(result.testDetail), `原因要写清楚：${result.testDetail}`)
     assert.ok(result.mr, '仍然开 draft MR')
   })

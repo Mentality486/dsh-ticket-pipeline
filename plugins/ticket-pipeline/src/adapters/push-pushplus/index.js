@@ -29,10 +29,19 @@ const ENDPOINT = 'https://www.pushplus.plus/send'
 const REQUEST_TIMEOUT_MS = 15_000
 
 /**
+ * PushPlus token 在 `ctx.credentials` 里的键名。
+ *
+ * 与 `QQMAIL_AUTH_CODE` 同一套机制：token 是密钥，不写进明文配置
+ * （那份配置会被设置面板渲染出来，也会落进 cordis.patch.yml）。
+ */
+export const PUSHPLUS_SECRET_REF = 'PUSHPLUS_TOKEN'
+
+/**
  * 造一个 PushPlus 通知适配器。
  *
  * @param {Object} options
- * @param {string} options.token PushPlus token
+ * @param {string} [options.token] PushPlus token（直接给，自测用；生产走 getSecret）
+ * @param {(ref: string) => Promise<string | undefined>} [options.getSecret] 读凭据（组合根注入）
  * @param {string} [options.channel] 默认 `clawbot`
  * @param {string} [options.template] 默认 `txt`（富模板在 ClawBot 里只显示前 50 字）
  * @param {string} [options.callbackUrl] 送达回执地址
@@ -41,7 +50,8 @@ const REQUEST_TIMEOUT_MS = 15_000
  * @returns {import('../../contracts/push-adapter.js').PushAdapter}
  */
 export function createPushplusPush (options = {}) {
-  const token = typeof options.token === 'string' ? options.token.trim() : ''
+  const staticToken = typeof options.token === 'string' ? options.token.trim() : ''
+  const getSecret = typeof options.getSecret === 'function' ? options.getSecret : null
   const channel = typeof options.channel === 'string' && options.channel.length > 0 ? options.channel : 'clawbot'
   const template = typeof options.template === 'string' && options.template.length > 0 ? options.template : 'txt'
   const callbackUrl = typeof options.callbackUrl === 'string' ? options.callbackUrl.trim() : ''
@@ -50,9 +60,29 @@ export function createPushplusPush (options = {}) {
   const warn = log.warn ?? (() => {})
   const debug = log.debug ?? (() => {})
 
+  /**
+   * 取 token：先看构造期给的，再看凭据。
+   *
+   * 每次发都重新取，不缓存：人在面板里补填凭据之后，下一封通知就该能用上，
+   * 不必重启宿主。凭据读取失败不当成致命错误（和 qqmail 一样），只是这一封发不出去。
+   *
+   * @returns {Promise<string>} 空串表示没有 token
+   */
+  async function resolveToken () {
+    if (staticToken.length > 0) return staticToken
+    if (!getSecret) return ''
+    try {
+      const fetched = await getSecret(PUSHPLUS_SECRET_REF)
+      return typeof fetched === 'string' ? fetched.trim() : ''
+    } catch (error) {
+      warn('pushplus：读凭据失败（' + PUSHPLUS_SECRET_REF + '）：' + String(error?.message ?? error))
+      return ''
+    }
+  }
+
   // token 缺失不在构造时抛：插件装上时配置往往是空的，抛在这里会让整个插件挂载失败。
   // 改成第一次真正要发的时候报 auth 错误，票照常跑完、只是通知失败（内核不回滚状态）。
-  if (token.length === 0) warn('pushplus：没有配置 token，通知会全部失败')
+  if (staticToken.length === 0 && !getSecret) warn('pushplus：没有配置 token（也没有注入凭据读取器），通知会全部失败')
 
   return {
     id: 'pushplus',
@@ -60,8 +90,9 @@ export function createPushplusPush (options = {}) {
     async send (input, signal) {
       const msg = makeNotifyMessage(input)
 
+      const token = await resolveToken()
       if (token.length === 0) {
-        throw new PipelineError('auth', 'pushplus：没有配置 token，无法推送')
+        throw new PipelineError('auth', `pushplus：没有配置 token，无法推送（在「凭据」页填 ${PUSHPLUS_SECRET_REF}）`)
       }
       if (typeof doFetch !== 'function') {
         throw new PipelineError('internal', 'pushplus：当前运行时没有 fetch')
@@ -157,15 +188,18 @@ function renderContent (msg) {
 /**
  * 供 `src/index.js` 从配置里摘出本适配器需要的那几个值。
  *
+ * **token 不在这里**：它是密钥，走 `ctx.credentials` 的 PUSHPLUS_TOKEN，
+ * 由组合根用 getSecret 注入（与 qqmail 的授权码同一套）。
+ *
  * @param {import('../core/config.js').validateConfig extends never ? never : any} config
- * @returns {{ token: string, channel: string, template: string, callbackUrl: string }}
+ * @returns {{ channel: string, template: string, callbackUrl: string }}
  */
 export function pushplusOptionsFromConfig (config) {
   const pushplus = config?.pushplus ?? {}
   return {
-    token: String(pushplus.token ?? ''),
     channel: String(pushplus.channel ?? 'clawbot'),
-    template: String(pushplus.template ?? 'txt'),
+    // ClawBot 的富模板只显示前 50 字，所以模板恒为 txt —— 不再给用户配。
+    template: 'txt',
     callbackUrl: String(pushplus.callbackUrl ?? ''),
   }
 }

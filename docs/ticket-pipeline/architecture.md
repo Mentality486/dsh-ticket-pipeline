@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-09，**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数）、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.3）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-10，**`pipeline_status` 缺省改成「按项目聚合的总览」** —— 新增 `view: 'overview' | 'tickets'`（缺省 overview），`summarizeProjects` / `renderProjectOverview` / `compactTicketLine` / `lastActivityAt` / `tierCounts`，总览恒为全库口径不受 `includeDone` 影响，见 §11.5；上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数）、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -69,9 +69,13 @@
               │TicketSource│ │RepoLocator│ │WorkExec│ │PushAdapter│
               └─────┬──────┘ └─────┬─────┘ └──┬─────┘ └┬──────────┘
                     │              │          │        │
-          飞书 / WPS / webform   projects[]   agent    PushPlus
-              / mock             查表         + commit  / qqmail / mock
+          飞书 / WPS / mock      projects[]   agent    PushPlus
+                                            查表         + commit  / qqmail / mock
 ```
+
+> `webform` 源已于 2026-11-09 移除（工单 #18）：它当年是 ADR-0001「加平台只加目录」的第一个实证，
+> 但水位只在内存里、重启就把同一批工单重收一遍，留着等于留一条「看起来能用、实际会重跑」的路。
+> 实现留档在 `plugins/ticket-pipeline/scripts/fixtures/source-webform/`（`scripts/` 不进安装包）。
 
 内核**四个接口都要用，一个都不实现**。它不知道飞书长什么样、不知道 GitLab 的 URL 怎么拼、不知道该改哪个文件。它只知道：拿到票 → 建工作区 → 让执行器干活 → 把结果推出去 → 记住进度。
 
@@ -186,7 +190,7 @@ async function tick () {
 | 工具 | 作用 | 关键边界 |
 |---|---|---|
 | `pipeline_scan` | 立刻推一轮 | 不绕过单飞，正在跑时返回 `already-running`；不动 `enabled` |
-| `pipeline_status` | 只读查队列与历史 | 不改任何状态 |
+| `pipeline_status` | 只读查队列与历史 | 不改任何状态。**缺省 `view: 'overview'`** 给按项目聚合的总览（全库口径，`includeDone` 不参与）；`view: 'tickets'` 才是逐票明细，传 `recordId` 时一律走明细 |
 | `pipeline_cancel` | 取消当前在跑的那一票 | 落 `failed` + `lastError='cancelled by user'`，**不通知**，工作区保留；空闲时返回 `cancelled:false` |
 | `pipeline_reset` | 人工重开一张卡住的票 | 只对 `failed` / `needs-info` / `gone` 生效；同名 recordId 冲突时要求补 `projectId`，不猜 |
 | `pipeline_doctor` | 环境体检（只读） | 查 git 链路 / 每个项目仓库能否 `ls-remote` / 凭据有没有 / 执行器与通知器配的是哪个；以及**正在跑的安装副本是不是比本地源码旧**（只进「提醒」，不改任何东西） |
@@ -272,7 +276,11 @@ export interface TicketSource {
    * - 只在票跑成 `done` / `skipped` 之后被调用**一次**，绝不在扫描或重试中间调。
    * - 写不进去不算失败：目标表没有这几列、应用没写权限，都返回 `{ written: false, note }`
    *   而不是抛 —— 票已经处理完了，回填是附加动作。
-   * - 只有真正的传输 / 鉴权异常才抛，内核会把它记进 `writeBack.note`，票态不回退。
+   * - **`written: false` 时必须用 `retryable` 说清「还能不能救」**（ADR-0007）：
+   *   `retryable: false` = 结构/配置上写不进去（同步表、少列、电子表格首版不支持回填），
+   *   再试一百次也是同一个错误；内核当场放弃并让人去改表格。留空视同 `false`。
+   * - 只有真正的传输 / 鉴权异常才抛，内核会把它记进 `writeBack.note`，票态不回退；
+   *   内核按 `errors.js` 的三张分类表推导该错可不可重试。
    * - 不实现也行（老适配器），内核静默跳过。
    */
   writeResult? (
@@ -282,11 +290,18 @@ export interface TicketSource {
   ): Promise<WriteBackReceipt>
 }
 
-/** 回执：写了没、写了哪些列、为什么没写成。落到票据的 `writeBack` 上。 */
+/**
+ * 回执：写了没、写了哪些列、为什么没写成、还能不能救。落到票据的 `writeBack` 上。
+ *
+ * `note` 会同时进表格、通知正文与 `pipeline_status`，**都是给人看的** ——
+ * 不要拼 `kind: ` 这类内部前缀，分类放进 `errorKind`。
+ */
 export type WriteBackReceipt = {
   written: boolean
   fields?: string[]      // 实际写成功的列名，pipeline_status 直接列出来
-  note?: string          // written=false 时的原因
+  note?: string          // written=false 时的原因（人话）
+  retryable?: boolean    // written=false 时：再试一次有没有意义（留空视同 false）
+  errorKind?: ErrorKind  // written=false 时的错误分类（程序用，不给人看）
 }
 
 export type ScanResult = {
@@ -376,8 +391,8 @@ export type ExecResult = {
   phase: Phase                             // 终态：done / skipped / failed
   plan?: Plan                              // 执行器产出的方案（进提交说明 / MR 描述）
   changedFiles: string[]
-  testOutcome: 'passed' | 'failed' | 'skipped'
-  testDetail?: string                      // skipped 时必须写原因
+  testOutcome: 'passed' | 'failed' | 'not-run'   // not-run = 验证没跑成（没配命令 / 起不来）；老数据写 'skipped'，读时归一
+  testDetail?: string                      // not-run 时必须写原因
   commit?: { sha: string; branch: string; files: string[] }  // 在工作区检出里做出来的本地提交（本阶段交付形态）
   mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
   sessionId?: string                       // 这一轮处理用的 agent 会话 id（记到票据上，人可以直接点进去追问）
@@ -394,7 +409,7 @@ export type ExecResult = {
 有了它，`pipeline_status` 才会打出「处理会话：…（可在会话列表里点进去继续问）」，回填进表格「处理结果」列的那段话里也有一行 `处理会话：`。
 **注意通知正文里没有这一行** —— `renderNotifyBody()` 只写 `本地提交：` / `draft MR：` / `改动文件：` / `验证：` 那几段。
 
-**`testOutcome: 'skipped'` 是合法成功路径**：环境起不来（比如 MySQL 连不上、端口被占）就记 skipped 仍然做本地提交，但**必须把原因写进提交说明**，不能默默略过 —— 人 `git show` 才知道「这个改动没被真跑过」。
+**`testOutcome: 'not-run'` 是合法成功路径**（老数据里写 `'skipped'`，读时由 `normalizeTestOutcome()` 归一）：环境起不来（比如 MySQL 连不上、端口被占）就记 not-run 仍然做本地提交，但**必须把原因写进 `testDetail`**，不能默默略过 —— 人 `git show` 才知道「这个改动没被真跑过」。改名理由：`skipped` 这个词已经被 phase 占用（phase=skipped 是「验证跑了但没过」），两个意思撞同一个词，人和代码都会读错。
 
 **`workspacePath` 与 `worktreePath` 是两个不同的东西**：前者是**项目工作区** ——
 `projects[].repo.path` 那个目录在宿主的 `workspaceRegistry` 里的一条登记（一个项目一条，
@@ -563,7 +578,7 @@ type TicketRecordRow = {
   baseCommit?: string
   plan?: Plan
   changedFiles?: string[]
-  testOutcome?: 'passed' | 'failed' | 'skipped'
+  testOutcome?: 'passed' | 'failed' | 'not-run'
   commit?: { sha: string; branch: string; files: string[] }  // 工作区检出里的本地提交（本阶段交付形态）
   mr?: { iid: number; url: string; draft: boolean }          // 远程 GitLab 开出来的 draft MR（可选出口）
   sessionId?: string                   // 这一轮处理用的 agent 会话 id（会话留在项目工作区名下）
@@ -808,7 +823,7 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 | 情况 | 处理 |
 |---|---|
 | 截图取不到 | `needs-info` + 通知人补图；票留在队列，不阻塞后面的票 |
-| 测试环境起不来 | `testOutcome = 'skipped'`，仍做本地提交，原因写进提交说明 |
+| 测试环境起不来 | `testOutcome = 'not-run'`，仍做本地提交，原因写进 `testDetail` |
 | `RepoLocator` 标了 `ambiguous` | 照常跑，prompt 里列候选并要求定不了就问人 |
 | 目标仓库读不到 | `network` 处理，重试到上限 |
 | 单据内容为空（`description` 空） | 直接 `invalid-input` → `failed` + 通知（这票没法做） |
@@ -816,7 +831,7 @@ const t = ctx.timeout(() => controller.abort(new Error('ticket-timeout')),
 ### 8.3 通知文案模板
 
 标题：`【{projectId}】{状态短语}｜{problemSummary}`（`{状态短语}` 见 §7.1 的中文名，
-`skipped` 在通知里叫「已提交但未验证」）。
+`skipped` 在通知里叫「已交付（验证未通过，待人工验证）」；注意它不是失败，通知按 `info` 级推。）
 
 正文（`scheduler.renderNotifyBody`）：
 
@@ -835,7 +850,7 @@ draft MR：{url}                ← 只有开了远程出口（repo.gitlab.enabl
 …
 验证：通过 / 未跑成 —— {原因} / 未通过
 
-（改动已提交到工作区，但验证没跑通，请人工确认）   ← 仅 skipped 的尾注
+（改动已交付到工作区检出；验证命令没通过，请人工确认这份改动是否可用）   ← 仅 skipped 的尾注
 ```
 
 失败分支是另一套：`失败原因：{lastError}` + `工作区保留在：{worktreePath}` + 一句「修好之后把表格里
@@ -881,7 +896,7 @@ export const Config = {
     name: string               // 项目唯一标识 = ticket.projectId
     description?: string       // 项目描述，进 agent 定位提示
     match: {                   // 工单表怎么定位（表级绑定）；各平台专有键见下
-      platform: 'feishu' | 'wps' | 'mock' | 'webform'
+      platform: 'feishu' | 'wps' | 'mock'   // webform 已于 2026-11-09 移除（见 §15 / 工单 #18）
       // ── 飞书 ──
       appToken?: string        // 飞书多维表格 app_token；也可以直接写整条表格 URL（从 ?table= / ?view= 解析出下面两格）
       tableId?: string         // 飞书数据表 id（显式优先；不写则由 appToken 链接里的 ?table= 补上）
@@ -1052,7 +1067,7 @@ src/
 │   │   ├── index.js               ← 平台适配（扫表、收票、截图归一）
 │   │   ├── xlsx.js                ← 零依赖 xlsx 解析（表头定位、列别名、行号 recordId）
 │   │   └── zip.js                 ← 零依赖 zip 解包
-│   ├── source-webform/            ← 网页表单（内存 records，最小实现）
+│   ├── source-webform/            ← 已移除（2026-11-09，工单 #18）；留档在 scripts/fixtures/source-webform/
 │   ├── locator-table/             ← 通用仓库定位器：按 projectId 查 projects[]
 │   ├── executor-agent/            ← 真 agent 改码 → 跑验证 → 在工作区检出里做本地提交（可选出口才开 draft MR）
 │   │   ├── index.js               ← 主流程（起 agent、preset、基线快照、受保护路径快照、collect、verify、篡改自检、commitLocally、keepSession、可选 openDraftMr）；含敏感名单 SENSITIVE_FILE_PATTERNS（8 大类 41 条）
@@ -1096,7 +1111,7 @@ export const SOURCES = {
   feishu:  { capabilities: ['watermark','secret','localFile','scanTuning'], factory: createFeishuSource },
   wps:     { capabilities: ['watermark','scanTuning'], factory: createWpsSource,
              match: { build: (match) => wpsOptionsFromMatch(match) } },
-  webform: { capabilities: [], factory: createWebformSource },
+  // webform 已于 2026-11-09 移除（水位只在内存、重启即重收），留档在 scripts/fixtures/
 }
 export const EXECUTORS = { mock: createMockExecutor, agent: createAgentExecutor }
 export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, qqmail: createQqmailPush }
@@ -1119,7 +1134,7 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 
 面板全在 `lib/client.js`（浏览器侧，不碰内核）。宿主 → 浏览器这条链路走自建的 typert Remote，
 描述符在 `plugins/ticket-pipeline/src/remote/descriptors.js`：**不 import 任何宿主包**，所以注册与
-`$mount` 共用同一份纯 JSON，不需要 codegen。四个无参 direct 方法：
+`$mount` 共用同一份纯 JSON，不需要 codegen。五个 direct 方法（前四个无参，第五个带参）：
 
 | 方法 | 返回 | 用途 |
 |---|---|---|
@@ -1127,6 +1142,14 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 | `ticketPipeline.config()` | 配置快照 | 渲染整棵设置表单 |
 | `ticketPipeline.projects()` | 项目清单的**扁平视图** | 渲染项目卡片；`appToken` 只给 `hasAppToken` + `appTokenPreview`（前 4…后 4），**明文绝不下发** |
 | `ticketPipeline.branches()` | 每个项目检出的分支清单 | 给 `repo.baseBranch` / `repo.targetBranch` 当候选（`listBranches()` 跑 `git for-each-ref`）；按项目 index 对齐，某个项目配错只让它自己空着 |
+| `ticketPipeline.setProjectTable(index, url)` | 写入后的项目投影 + 一句人话 | 面板「粘贴工单表链接」唯一入口：浏览器只转交整条 URL，**宿主**用 `parseFeishuLink()` 解析出 app_token / spreadsheetToken，再经 `ctx.get('settings').mutate()` 写进 profile。这样 `match.appToken` 不用手改文件，而明文也永远不会出现在浏览器内存或请求体里 |
+
+**`setProjectTable` 是唯一带参的 Remote 方法**，它的参数形状受两条约束（`@deepseek-ai/dsh-api-gateway`
+与 `-typert-registry` 的实际行为）：浏览器侧按 `descriptor.parameters` 的**位置**组装 args、只写
+`value !== undefined` 的项；宿主侧 `assertExactArguments()` 按 `wire` 名字做精确集合比对，多一个少一个都拒。
+所以每个参数都必须显式写 `name` + `wire` + `source:'json'` + `codec` + `strictCodec`（生成代码里
+`codec` 与 `strictCodec` 是同一份的两个引用，两边都写才和上游一致）；`scripts/client-check.mjs` 的
+`checkParameters()` 逐参数核对这条，两端任何一处写歪都会在自检里红。
 
 **`projects` 子树必须自己标 `meta.volatile = true`**（`config.js` 的 `buildProjectsDescriptor`）。
 宿主的 `isVolatilePath(schema, path)` 只沿 `schema.dict` 下钻、**完全不认 `inner`**，而 `projects` 是数组 ——
@@ -1375,6 +1398,11 @@ await store.setPhase(key, finalPhase, {
 - **清一项用 `clearPendingEffect(key, name)`，刻意不走 `setPhase`**：`setPhase` 会重写 `finishedAt`，
   让「这票跑了多久」失真（见 `store.js` 的 `clearPendingEffect` 注释）。它只动 `pendingEffects` 一个字段，
   两个子项都清空时把整个字段删掉（而不是留一个 `{}`）。
+- **待办只在「动作真的做成了」时清**（ADR-0007 修订了这条）：以前不论成败都清，于是「回填写失败了」
+  这件事在存储里彻底消失 —— `replayPendingEffects()` 永远捞不到它，表格里那一行就永远停在
+  「处理中」，而没有任何地方会说这件事。真机 `reczz28VYQARkYBL` 就是这么丢的。
+  现在的规则：写成功 → 清；写失败且可重试 → 留着待办并累加 `attempts`；写失败且不可重试
+  （飞书同步表 / 少列 / 电子表格不回填）→ 清掉待办**同时**把人必须自己动手这件事记进 `delivery.writeBack.giveUp`。
 - **启动时 `replayPendingEffects()` 补做**：只捞 `pendingEffects && TERMINAL.includes(row.phase)` 的票，
   补发通知前先记日志。`src/index.js` 的 `apply` 里在启动阶段调它一次。
 - **`enqueue` / `revise` / `resetByHuman` 都不继承 `pendingEffects`**：那是「上一轮已经到终态、但事后动作还没补完」
@@ -1383,7 +1411,36 @@ await store.setPhase(key, finalPhase, {
 - `pipeline_status` 会打一行「待补：回填表格」/「待补：通知」，接口里也有 `pendingEffects` 字段 ——
   否则表格停在「处理中」没人知道。
 
-### 11.2 租约是 best-effort，不是原子 CAS
+### 11.2 交付维度（`delivery`）：与 phase 正交
+
+`phase` 答的是「流程走到哪一站」，`done` 只说明执行器认为活干完了。它**不**说明：
+
+- 有没有可 review 的改动（执行器可能说 done 却既没有本地提交也没有 MR）；
+- 表格三列写成了没有；
+- 通知真的发出去了没有。
+
+这三件事各有各的失败方式，且都不改变 phase。把它们挤进 phase 只会让状态机变成笛卡尔积，
+所以单独记一个与 phase 正交的 `delivery` 维度，落在票据行上：
+
+```js
+delivery = {
+  commit?:   { ok, at, error?, errorKind?, attempts?, giveUp? },
+  writeBack?: DeliveryState,
+  notify?:   DeliveryState,
+}
+```
+
+- **写入点是三处**：`runOne` 终态之后（commit）、回填段之后（writeBack）、`notifyFor` 里（notify）。
+- **读法**：`delivery[name].ok === false` 就是「该交给人的东西没交到」；`giveUp === true`
+  表示「已放弃，人必须自己动手」。`pipeline_status` 用它给票标题行加后缀、算「交付未完成」计数。
+- **为什么不复用 `writeBack` / `pendingEffects`**：`writeBack` 只是回执（写没写成），
+  `pendingEffects` 只是「还没做完的事」的标记；前者说不出「放弃了」，后者说不出「做过了但失败了」。
+  而 `notify` 连回执都没有 —— 它彻底是新的。
+- 错误分类走 `errors.js` 的三张互斥表（`RETRYABLE_KINDS` / `FATAL_KINDS` / `CANCELLED_KINDS`），
+  用 `retryPolicy(kind)` 得到 `retry` / `fatal` / `cancelled`。任何 kind 必须恰好落在一张表里
+  （自测里有断言遍历 `ERROR_KINDS` 检查）—— `aborted` 曾经两张表都不在，导致分类是空的。
+
+### 11.3 租约是 best-effort，不是原子 CAS
 
 早先文档里把租约写成「CAS」（compare-and-swap）。实际宿主 `storageDomain` 的 table API 只有
 `get` / `entries` / `put` / `delete`，**没有 compare-and-swap 原语**，`read` 与 `put` 之间也没有互斥。
@@ -1396,7 +1453,7 @@ await store.setPhase(key, finalPhase, {
 这不是「保证不会双跑」，而是「正常路径下单飞 + 抢到了能发现」。多进程同表跑同一票仍有极小的双跑窗口
 （例如两边同时在 read 与 put 之间），代价是同一票可能被改两遍；`leaseTtlMinutes` 只影响「多久算过期」。
 
-### 11.3 关键节点流程日志（时间线）
+### 11.4 关键节点流程日志（时间线）
 
 以前想知道「票卡在哪了」只能靠翻插件日志：日志是按时间散落的、没有结构，看到「阶段 → testing」之后
 迟迟没有下一条，也说不清是卡在跑验证里还是已经死了。现在票据行上挂一个 `timeline` 数组，把
@@ -1444,6 +1501,41 @@ await store.setPhase(key, finalPhase, {
 
 - **④ 只有真 agent 执行器会记**：`executor-mock` 不调 `onFlow`（合法，老调用方不传等于不记时间线）；
   真 agent 的 `reportFlow` 也包了 `try/catch`，`onFlow` 抛错只记日志、不影响跑票。
+
+### 11.5 `pipeline_status` 的两种视图：总览（缺省）与明细
+
+以前 `pipeline_status` 只有一种输出形态：逐票一段，且 `includeDone` 缺省 `false` 会先把终态票筛掉。
+两个后果在日常使用里都很难受：①票全跑完时只回一句「这次筛选一条都没命中」，明明库里有 6 张票；
+②票一多，每票十几行，想看「哪个项目卡了」得从头往下翻。
+
+现在加一个**视图参数** `view`（`src/tools/pipeline-status.js`）：
+
+- `view: 'overview'`（**缺省**）：按项目聚合的总览。
+  `summarizeProjects(rows)` 按 `row.projectId` 分组（空串当 `null` 归一组），每组算
+  `{total, counts, tiers, needsYouCount, needsYou[≤3], awaitingReviewCount, awaitingReview[≤3], runningCount, running[≤3], queuedCount, latestActivityAt}`
+  —— `needsYou` 是 `failed` + `needs-info`（要人动手的），`running` 是「非终态、非 pending、非 needs-info」。
+  项目排序：`needsYouCount` 降 → `runningCount` 降 → `awaitingReviewCount` 降 → `projectId` 升。
+  渲染在 `renderProjectOverview(projects, rowsByProject, now)`：抬头 `━━ 项目总览：N 张票 / M 个项目 ━━`，
+  每个项目一行 `【pms】共 3 张｜需要你处理 1｜已交付 2｜最近动静 90 时 18 分前`，项目内每票一行
+  `compactTicketLine`（`✗/· recordId｜阶段｜模块｜站⑤（已跑 X）｜最近动静｜失败原因`），
+  **每项目最多 `OVERVIEW_ROWS_PER_PROJECT = 8` 张**，超出折成「……还有 N 张没列出（明细用 view="tickets" 看全）」
+  —— 折叠只影响行数，`total` 仍是真实总数。
+- `view: 'tickets'`：原来的明细（逐票一段、带完整流程日志）。`dev-run` 里 20 处老断言都显式传这条路，
+  所以老行为一字未变。
+- **传了 `recordId` 一律走明细**，不受 `view` 影响（查询单票时人要看的就是细节）。
+
+两个刻意的口径决定：
+
+- **总览永远按全库算**，`includeDone` / `limit` / `recordId` 都不参与。`filteredScope` 也据此改成
+  `hasRecordId || (!overview && !includeDone)` —— 否则「总览 + includeDone:false」会被当成「筛过」，
+  又回到「一条都没命中」那种答非所问。
+- **新增 `view` 而不是改 `includeDone` 的缺省语义**：`includeDone` 已被 `dev-run` 里 22 处调用依赖，
+  改缺省等于让几十条断言一夜换输出，而它们的断言对象其实与「总览」无关。
+
+`lastActivityAt(row)` 是这两个视图共用的「最近动静」口径：候选 `finishedAt` / `timeline` 末条 `at` /
+`startedAt` / `enqueuedAt`，过滤 `Number.isFinite` 后取 **max**（reset 过的票 `startedAt` 可能比时间线更早；
+老票可能只有 `enqueuedAt`）。`tierCounts(counts)` 与 `formatDistribution` 共用 `PHASE_TIERS`，
+未识别的 phase 归「其它」—— 两处各写一份档位表迟早出现「汇总说 1 张需处理，明细里却找不到」。
 
 ---
 
@@ -1536,7 +1628,7 @@ fatal: unable to fork
 
 | 项 | 影响 | 何时定 |
 |---|---|---|
-| Web UI 面板 | 设置页已落地（**四个页签：项目 / 参数 / 凭据 / 体检**，一次只画一页；33 个字段 / 7 组 + 项目清单可增删可编辑 + 分支下拉 + 两层折叠、「显示全部字段」开关与组内「高级设置」、Label 置顶 + Switch、下划线式页签 + 宿主 `settings-card-*` token、4 个 Remote 方法）；队列看板仍未做（`lib/client.js` 已有挂载点） | 有人真的想看队列时 |
+| Web UI 面板 | 设置页已落地（**四个页签：项目 / 参数 / 凭据 / 体检**，一次只画一页；24 个字段 / 4 组 + 项目清单可增删可编辑 + 分支下拉 + 两层折叠 + 总开关置顶、「显示全部字段」开关与组内「高级设置」、Label 置顶 + Switch、下划线式页签 + 宿主 `settings-card-*` token、**5 个 Remote 方法**（含带参的 `setProjectTable`）+ 项目卡片「粘贴工单表链接」）；队列看板仍未做（`lib/client.js` 已有挂载点，见 #16） | 有人真的想看队列时 |
 | 多张工单指向同一模块的冲突 | 当前靠串行天然规避，但是「时间换安全」 | 出现真冲突时 |
 | 处理人绑定规则 | 当前不绑（只看 `statusValues`） | 有人抱怨「谁都能被派活」时 |
 | 金山文档的开放平台取数通道 | 现在只能靠 `match.sheetUrl` + 全局 fetch（大概率要登录态），或宿主注入 `fetchSheet` | 要真跑多张金山表时 |
@@ -1606,6 +1698,12 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 > 拦在启动前 —— 文档写的「贴一条链接就够」就成了空话。两边共用同一个纯函数，
 > 解析规则只有一处，不会漂移。`feishuOptionsFromMatch` 里显式 `tableId` / `viewId` **优先**于
 > 链接里的问号参数（别让 URL 覆盖人的明确意图）。
+>
+> 同一族里还有 `parseFeishuLink(raw)`（也住 `src/contracts/types.js`，`appToken` 的上一族）。
+> 分工是：`parseBitableUrl` 回答「这条 `appToken` 里带的 `?table=`/`?view=` 是多少」（配置校验与
+> `feishuOptionsFromMatch` 用）；`parseFeishuLink` 回答「人贴的这条链接是哪一种表、token 是什么」
+> （面板「粘贴工单表链接」用）。后者**只跑在宿主进程里**（`remote/host.js` 的 `setProjectTable`），
+> 浏览器只转交原始字符串 —— appToken 明文不进浏览器内存与请求体，这是 #11 定下的安全边界。
 
 `docNamePattern` 先当正则用（`new RegExp(pattern,'i')`），正则不合法就退回「包含」。
 
@@ -1794,8 +1892,8 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 两个组各画一次会变成两个输入框绑同一个草稿键。`sheetColumns`（列名覆盖）用一行文本
 `description=我的列名, status=我的状态`，保存时由 `parseColumnsDraft()` 解析回对象。
 
-**自测**：`dev-run` 384 → **404**（19 条电子表格断言，含**只读断言**：全程不出现对 sheets 的写请求）；
-`feishu-checks` 60 → **80**；`client-smoke` **143** 条 `check(`。
+**自测**：`dev-run` 384 → **451**（19 条电子表格断言，含**只读断言**：全程不出现对 sheets 的写请求）；
+`feishu-checks` 60 → **80**；`client-smoke` **175** 条 `check(`。
 
 完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`（§12 是实施结果与三处
 与设计不同的决定）；决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。

@@ -277,7 +277,7 @@ export function createQqmailPush (options = {}) {
               throw new PipelineError(
                 'auth',
                 'qqmail：' + host + ':' + port + ' 不支持 STARTTLS，拒绝在明文连接上发送授权码'
-                + '（465 = TLS 直连，587 = STARTTLS，请核对 qqmail.port / qqmail.secure）',
+                + '（要么用 qqmail.encryption = tls 走 465 直连，要么用 starttls 走 587）',
               )
             }
             warn('qqmail：本机测试端口 ' + port + ' 不加密直发，生产环境不要这么配')
@@ -451,20 +451,27 @@ export function dotStuff (text) {
  * 授权码不在这里：它在 ctx.credentials 的 QQMAIL_AUTH_CODE 下，
  * 由组合根用 getSecret 注入 —— 密钥不落进明文配置（那份配置会被设置面板显示出来）。
  *
+ * 端口与 secure 也不再单独配：用户只需要回答「怎么加密」，端口由它派生。
+ * 这两个值必须成对（465/tls、587/starttls），拆成两个键就有 4 种组合，其中
+ * 两种是错的（465+starttls 连不上、587+tls 握手失败），而报错发生在连网之后。
+ *
  * @param {any} config
  * @returns {{ host: string, port: number, secure: boolean, user: string, to: string }}
  */
 export function qqmailOptionsFromConfig (config) {
   const qqmail = config?.qqmail ?? {}
-  const port = Number(qqmail.port ?? 465)
+  const encryption = qqmail.encryption === 'starttls' ? 'starttls' : 'tls'
   return {
     host: String(qqmail.host ?? 'smtp.qq.com'),
-    port: Number.isFinite(port) && port > 0 ? port : 465,
-    // secure 默认 true：漏配时宁可连 465 失败，也不要静默默认走明文。
-    secure: qqmail.secure === undefined ? true : Boolean(qqmail.secure),
+    ...encryptionToTransport(encryption),
     user: String(qqmail.user ?? '').trim(),
     to: String(qqmail.to ?? '').trim(),
   }
+}
+
+/** 加密方式 → `{ port, secure }`。缺省 tls：漏配时宁可连 465 失败，也不要静默走明文。 */
+export function encryptionToTransport (encryption) {
+  return encryption === 'starttls' ? { port: 587, secure: false } : { port: 465, secure: true }
 }
 
 // ── 内部工具 ───────────────────────────────────────────────

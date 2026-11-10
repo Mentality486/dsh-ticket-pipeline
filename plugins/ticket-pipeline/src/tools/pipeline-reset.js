@@ -52,8 +52,8 @@ export function createPipelineResetTool (options) {
       '把一张卡住的工单（failed / needs-info / gone）放回队列，让它重新跑一遍。'
       + '只对这三种状态生效；done / skipped 这类验收结果和正在跑的票都不动。'
       + '跑之前建议先用 pipeline_status 确认 recordId 与当前阶段。'
-      + '这是「把是否处理拨走再拨回处理中」之外的另一条人工重开入口：'
-      + 'failed 票不会自动重试，没有这个工具就只能去表格里手工拨。',
+      + '这是重开入口里**推荐**的那一条：'
+      + 'failed 票不会自动重试，没有这个工具就只能去表格里手工拨（而拨表格会整票重做一遍、覆盖旧回填）。',
     parameters: {
       recordId: {
         type: 'string',
@@ -127,6 +127,7 @@ export function createPipelineResetTool (options) {
             + '这个工具只对 failed（失败）、needs-info（等人补信息）、gone（表格行已删）三种生效：'
             + '它们是「跑不下去、等人接手」的收尾态。\n'
             + '排队中或正在跑的票本来就会接着走；done / skipped 是已经验收过的结果，重开等于重做一遍。\n'
+            + '真要重做（连内容一起）：直接改表格里这一行，把「是否处理」拨回「处理中」——那条路会覆盖旧的回填结果。\n'
             + '想确认它到底停在哪、为什么停，用 pipeline_status。',
         }
       }

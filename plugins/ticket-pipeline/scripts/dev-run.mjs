@@ -24,14 +24,16 @@ import { createMockSource } from '../src/adapters/source-mock/index.js'
 import { createMockExecutor } from '../src/adapters/executor-mock/index.js'
 import { createMockPush } from '../src/adapters/push-mock/index.js'
 import { createTableLocator } from '../src/adapters/locator-table/index.js'
-import { makeExecResult } from '../src/contracts/work-executor.js'
-import { PipelineError } from '../src/contracts/errors.js'
-import { canTransition, TIMELINE_NODES } from '../src/contracts/types.js'
+import { makeExecResult, normalizeTestOutcome } from '../src/contracts/work-executor.js'
+import { PipelineError, ERROR_KINDS, RETRYABLE_KINDS, FATAL_KINDS, CANCELLED_KINDS, retryPolicy } from '../src/contracts/errors.js'
+import { canTransition, PHASE_LABEL, TIMELINE_NODES, phaseLabel, parseFeishuLink } from '../src/contracts/types.js'
 import { fingerprintOf } from '../src/contracts/types.js'
-import { validateConfig, describeConfig } from '../src/core/config.js'
+import { validateConfig, describeConfig, CONFIG_FIELDS, CONFIG_GROUPS, BUILTIN_LIMITS, assertGroupCoverage } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
+import { createPipelineScanTool } from '../src/tools/pipeline-scan.js'
 import { createPipelineResetTool } from '../src/tools/pipeline-reset.js'
 import { createPipelineDoctorTool } from '../src/tools/pipeline-doctor.js'
+import { describeProbeFailure, probeFeishuConnectivity } from '../src/adapters/source-feishu/probe.js'
 import { createPipelineStatusTool } from '../src/tools/pipeline-status.js'
 import { stripUndefined } from '../src/tools/define.js'
 import { sanitizeBranchName } from '../src/core/branch-name.js'
@@ -43,6 +45,8 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
+import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
+import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
   comparePluginTrees,
   fingerprintOfEntries,
@@ -114,7 +118,6 @@ function harness (options = {}) {
     enabled: true,
     maxAttempts: 2,
     leaseTtlMinutes: 10,
-    leaseHeartbeatSeconds: 60,
     ticketTimeoutMinutes: 40,
     worktreeRetentionHours: 24,
     notifyOn: ['done', 'skipped', 'failed', 'needs-info'],
@@ -133,6 +136,12 @@ function harness (options = {}) {
     prepareWorkspace: options.prepareWorkspace,
     removeWorktree: options.removeWorktree,
     worktreeExists: options.worktreeExists,
+    // 心跳间隔是内置常量（60 秒）。自测要把它压到毫秒级，走这个注入口而不是配置项
+    // —— 配置项已经删掉了，删的理由是「配错会让两个进程同时改同一个 worktree」。
+    leaseHeartbeatMsOverride: options.leaseHeartbeatMsOverride,
+    // 站点心跳同样固定在 60 秒（它只影响「看起来多久没动」的粒度）。
+    // 自测要验证心跳合并逻辑，也得能压到毫秒级。
+    timelineHeartbeatMsOverride: options.timelineHeartbeatMsOverride,
   })
   return { repo, store, source, executor, push, locator, config, scheduler }
 }
@@ -164,15 +173,67 @@ async function main () {
     assert.equal(fingerprintOf(t), fingerprintOf(t))
   })
 
-  await check('makeExecResult 拦住 skipped 没写 testDetail', () => {
+  await check('makeExecResult 拦住 done/skipped 没写 testDetail', () => {
+    // 入参名仍收老名字 'skipped'（第三方执行器不会跟着改名），内部归一成 'not-run'。
     assert.throws(
       () => makeExecResult({ phase: 'skipped', changedFiles: [], testOutcome: 'skipped', mr: { iid: 1, url: 'x' } }),
+      /testDetail/,
+    )
+    // 新名字同样要拦住：漏了 testDetail 就没人知道为什么没跑。
+    assert.throws(
+      () => makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'not-run', mr: { iid: 1, url: 'x' } }),
       /testDetail/,
     )
   })
 
   await check('makeExecResult 拦住 done 没给 mr', () => {
     assert.throws(() => makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed' }), /mr/)
+  })
+
+  // 「粘贴工单表链接」的解析器。这是唯一一处允许把工单表的 token 写成人类
+  // 会写的形态的地方 —— 它跑在宿主进程里（浏览器只把整条 URL 原样转交），
+  // 所以这里错了会直接让人配不上表。
+  await check('parseFeishuLink：多维表格 / wiki / 电子表格链接都能认出来', () => {
+    const base = parseFeishuLink('https://pms.feishu.cn/base/bascnABCDEFGH?table=tblXYZ&view=vew1')
+    assert.equal(base.kind, 'bitable')
+    assert.equal(base.appToken, 'bascnABCDEFGH')
+    assert.equal(base.tableId, 'tblXYZ')
+    assert.equal(base.viewId, 'vew1')
+
+    const wiki = parseFeishuLink('https://pms.feishu.cn/wiki/wikcnABCDEFGH')
+    assert.equal(wiki.kind, 'wiki', 'wiki 里的表要先靠 node_token 反查，不能当成 appToken 直接写')
+    assert.equal(wiki.appToken, 'wikcnABCDEFGH')
+
+    const sheet = parseFeishuLink('https://pms.feishu.cn/sheets/shtcnABCDEFGH?sheet=sh123')
+    assert.equal(sheet.kind, 'sheet')
+    assert.equal(sheet.spreadsheetToken, 'shtcnABCDEFGH')
+    assert.equal(sheet.sheetId, 'sh123')
+  })
+
+  await check('parseFeishuLink：带语言前缀、http、裸 token 都认', () => {
+    // 飞书会在路径里塞 /zh-CN/ 之类的语言段，取 token 时要跳过它。
+    const localized = parseFeishuLink('https://pms.feishu.cn/zh-CN/base/bascnABCDEFGH?table=tblXYZ')
+    assert.equal(localized.kind, 'bitable')
+    assert.equal(localized.appToken, 'bascnABCDEFGH')
+    assert.equal(localized.tableId, 'tblXYZ')
+
+    assert.equal(parseFeishuLink('http://pms.feishu.cn/base/bascnABCDEFGH').appToken, 'bascnABCDEFGH')
+
+    // 裸 token：只给了 token 的人也得能用。
+    const bareBit = parseFeishuLink('bascnABCDEFGH')
+    assert.equal(bareBit.kind, 'bitable')
+    assert.equal(bareBit.appToken, 'bascnABCDEFGH')
+    const bareSheet = parseFeishuLink('shtcnABCDEFGH')
+    assert.equal(bareSheet.kind, 'sheet')
+    assert.equal(bareSheet.spreadsheetToken, 'shtcnABCDEFGH')
+  })
+
+  await check('parseFeishuLink：认不出来的必须是 unknown，不能瞎猜', () => {
+    // 猜错的代价是把一张毫不相干的表写进配置，下一轮扫描才会炸 —— 宁可当场说不会。
+    for (const raw of ['', '   ', '这不是链接', 'abc', 'https://example.com/foo/bar', undefined, null, 42]) {
+      assert.equal(parseFeishuLink(raw).kind, 'unknown', `应当判成 unknown：${String(raw)}`)
+    }
+    assert.equal(parseFeishuLink('https://pms.feishu.cn/base/').appToken, '', '只有 /base/ 没有 token 也得是空的')
   })
 
   section('2. 队列与租约')
@@ -294,7 +355,7 @@ async function main () {
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'needs-info', '截图取不到应该是 needs-info，不是 failed')
     assert.equal(push.messages.length, 1)
-    assert.match(push.messages[0].title, /等你补信息/)
+    assert.match(push.messages[0].title, /等你补充?信息/)
   })
 
   await check('执行器返回 failed → failed + 通知', async () => {
@@ -312,9 +373,253 @@ async function main () {
     await scheduler.tick()
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'skipped')
-    assert.equal(row.testOutcome, 'skipped')
+    // #09：testOutcome 改名 not-run（'skipped' 这个词留给 phase，两个意思撞词会读错）。
+    assert.equal(row.testOutcome, 'not-run')
     assert.ok(row.testDetail, '必须写清为什么没跑')
     assert.match(push.messages[0].body, /未跑成/)
+  })
+
+  await check('skipped 的用户可见文案不以「没成」收尾，且通知按 info 级推', async () => {
+    // #01：skipped 是合法成功终态（TERMINAL 里有它），用户该做的是人工验证、不是重跑。
+    // 以前四处中文全以「没跑通/未验证」收尾，通知还按 warn 级推 —— 用户第一反应是「失败了，得重跑」。
+    const negative = /没跑通|未跑通|未验证|已本地提交，但/
+    assert.equal(negative.test(PHASE_LABEL.skipped), false, `PHASE_LABEL.skipped 不能以否定式收尾：${PHASE_LABEL.skipped}`)
+    assert.equal(negative.test(TIMELINE_NODES.skipped.label), false, `时间线短标签不能以否定式收尾：${TIMELINE_NODES.skipped.label}`)
+
+    const { scheduler, store, push } = harness({ executor: createMockExecutor({ outcome: 'skipped' }) })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'skipped')
+    assert.equal(push.messages.length, 1)
+    // done 与 skipped 同级：都是「知道一下就行」，不该吓人。
+    assert.equal(push.messages[0].level, 'info', `skipped 通知不该是 warn 级：${push.messages[0].level}`)
+    assert.equal(negative.test(push.messages[0].title), false, `通知标题不要否定式：${push.messages[0].title}`)
+    assert.equal(negative.test(push.messages[0].body), false, `通知正文不要否定式：${push.messages[0].body}`)
+  })
+
+  await check('testOutcome 改名 not-run：老数据 skipped 读时归一，非法值被拒', () => {
+    // #09：'skipped' 这个词已经被 phase 占用（phase=skipped 是「验证跑了但没过」），
+    // 而 testOutcome 里的 'skipped' 是「验证根本没跑」。两个意思撞同一个词，
+    // 人和代码都会读错，所以 outcome 改名 'not-run'。
+    assert.equal(normalizeTestOutcome('not-run'), 'not-run')
+    assert.equal(normalizeTestOutcome('skipped'), 'not-run', '老数据里的 skipped 与新名字同义')
+    assert.equal(normalizeTestOutcome('passed'), 'passed')
+    assert.equal(normalizeTestOutcome('failed'), 'failed')
+    assert.equal(normalizeTestOutcome(undefined), undefined, '没写过就是没写过，不猜')
+    assert.equal(normalizeTestOutcome('随便什么'), undefined)
+    // 入参仍收老名字，返回体统一是新名字 —— 第三方执行器不必跟着改名。
+    const result = makeExecResult({
+      phase: 'done', changedFiles: [], testOutcome: 'skipped',
+      testDetail: '没配验证命令', mr: { iid: 1, url: 'x' },
+    })
+    assert.equal(result.testOutcome, 'not-run')
+  })
+
+  await check('phaseLabel：done 必须分出「已验证 / 未跑验证」', () => {
+    // #09：混成一个「已完成」，没配验证命令的项目会以为自己全绿。
+    assert.equal(phaseLabel({ phase: 'done', testOutcome: 'passed' }), '已完成（已验证）')
+    assert.equal(phaseLabel({ phase: 'done', testOutcome: 'not-run' }), '已完成（未跑验证）')
+    assert.equal(phaseLabel({ phase: 'done', testOutcome: 'skipped' }), '已完成（未跑验证）', '老数据等价')
+    assert.equal(phaseLabel({ phase: 'done' }), '已完成', '没有 testOutcome 的老票不猜')
+    // 非 done 的阶段标签仍走 PHASE_LABEL，行为不变。
+    assert.equal(phaseLabel({ phase: 'skipped', testOutcome: 'failed' }), PHASE_LABEL.skipped)
+    assert.equal(phaseLabel({ phase: 'failed' }), PHASE_LABEL.failed)
+  })
+
+  await check('failed 票也留 sessionId：失败之后能点回那一轮会话', async () => {
+    // #09：真机上唯一那张 failed 票，全部信息只有「agent 没有产生任何文件改动」，
+    // 没有 sessionId —— 人想追问「它当时到底在干什么」就只能去会话列表里翻。
+    // 会话 id 只有执行器知道，而票抛异常时执行器**返回不了结果**，
+    // 所以必须靠 ctx.onSessionId 提前交出来。
+    const executor = {
+      id: 'fails-after-session',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('planning')
+        await ctx.onSessionId?.('ticket-demo-rec-mock-001-42')
+        // 用不可重试的 kind：可重试的（internal/network/rate-limit）会让票回 pending 重排，
+        // 这条用例要的是「落成 failed 终态之后会话 id 还在」。
+        throw new PipelineError('invalid-input', '任务书里没说清要改哪个文件')
+      },
+    }
+    const { scheduler, store, push } = harness({ executor })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed')
+    assert.equal(row.sessionId, 'ticket-demo-rec-mock-001-42', `失败的票要留住会话 id：${row.sessionId}`)
+    assert.match(push.messages[0].body, /处理会话：ticket-demo-rec-mock-001-42/, push.messages[0].body)
+  })
+
+  await check('pipeline_status：全库分布按「需要你处理 / 待人工验证 / 已交付」分档', async () => {
+    // #01：原来按 phase 枚举顺序拼一行，「待人工验证 2」和「失败 1」并列，
+    // 人分不清哪一类要自己动手。最重的一档即使为 0 也要留行。
+    const rows = [
+      { key: k('a'), projectId: DEMO, recordId: 'a', phase: 'failed', attempt: 0 },
+      { key: k('b'), projectId: DEMO, recordId: 'b', phase: 'skipped', attempt: 0 },
+      { key: k('c'), projectId: DEMO, recordId: 'c', phase: 'done', attempt: 0 },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(out.text, /全库分布：需要你处理：失败 1/, `最重的一档要排第一：${out.text}`)
+    assert.match(out.text, /待人工验证：1/, `skipped 单独成档：${out.text}`)
+    assert.match(out.text, /已交付：1/, `done 归入已交付：${out.text}`)
+
+    // 一张票都没有时，「需要你处理：0」仍要在 —— 空白不等于零。
+    const empty = await createPipelineStatusTool({
+      store: { listTickets: () => [] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({}, {})
+    assert.match(empty.text, /需要你处理：0/, `空库也要能一眼确认没事：${empty.text}`)
+  })
+
+  await check('pipeline_status：缺省视图按项目聚合，一眼看完所有项目', async () => {
+    // 动机：以前只有「一张票十几行」的明细，票一多就得翻完才拼得出
+    // 「每个项目现在什么情况」。而且明细缺省会筛掉终态票，全跑完的库里
+    // 默认一条都不显示 —— 而人往往正是想知道「都跑完没有」。
+    const rows = [
+      { key: k('p1-a'), projectId: 'pms', recordId: 'p1-a', phase: 'failed', attempt: 0, lastError: 'internal: agent 没有产生任何文件改动', enqueuedAt: 1_000 },
+      { key: k('p1-b'), projectId: 'pms', recordId: 'p1-b', phase: 'done', attempt: 0, enqueuedAt: 2_000 },
+      { key: k('p2-a'), projectId: 'sandbox', recordId: 'p2-a', phase: 'skipped', attempt: 0, enqueuedAt: 3_000 },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({}, {})
+
+    assert.equal(out.view, 'overview', '缺省视图是总览')
+    assert.match(out.text, /━━ 项目总览：3 张票 \/ 2 个项目 ━━/, `要有总览抬头：${out.text}`)
+    assert.match(out.text, /【pms】共 2 张/, `每个项目一行战报：${out.text}`)
+    assert.match(out.text, /【sandbox】共 1 张/, `第二个项目也要在：${out.text}`)
+    // 全库口径：done/skipped 这些终态票必须在总览里 —— 这正是明细缺省会漏掉的。
+    assert.ok(out.text.includes('p1-b'), `终态票也要出现在总览里：${out.text}`)
+    assert.ok(out.text.includes('p2-a'), `skipped 也要出现：${out.text}`)
+    // 待你动手的项目排前面（pms 有 1 张失败，sandbox 没有）。
+    assert.ok(out.text.indexOf('【pms】') < out.text.indexOf('【sandbox】'), `要动手的项目排前面：${out.text}`)
+    // 每票一行，不是十几行：三张票 + 两行项目头 + 抬头 + 尾注。
+    const ticketLines = out.text.split('\n').filter((line) => /^    [·✗] /.test(line))
+    assert.equal(ticketLines.length, 3, `每票一行：${ticketLines.join(' | ')}`)
+    // 机器可读：运行页签不该自己再按项目分组一次。
+    assert.equal(out.projects.length, 2)
+    assert.equal(out.projects[0].projectId, 'pms', '有需你处理的项目排第一')
+    assert.equal(out.projects[0].total, 2)
+    assert.equal(out.projects[0].needsYouCount, 1)
+    assert.equal(out.projects[0].needsYou[0].recordId, 'p1-a')
+    assert.equal(out.projects[0].needsYou[0].lastError, 'internal: agent 没有产生任何文件改动')
+    assert.equal(out.projects[1].awaitingReviewCount, 1, 'skipped 归入待人工验证')
+    assert.equal(typeof out.projects[0].latestActivityAt, 'number')
+  })
+
+  await check('pipeline_status：总览每项目最多列 8 张，超出的折成一句', async () => {
+    // 总览的用途是「一眼看完」，不是把明细再抄一遍。一个项目几十张票时
+    // 全列出来就是第二个明细视图。
+    const rows = Array.from({ length: 11 }, (_, i) => ({
+      key: k(`many-${i}`), projectId: 'pms', recordId: `many-${i}`, phase: 'done', attempt: 0, enqueuedAt: 1_000 + i,
+    }))
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({}, {})
+    const ticketLines = out.text.split('\n').filter((line) => /^    [·✗] /.test(line))
+    assert.equal(ticketLines.length, 8, `最多 8 行：${ticketLines.length}`)
+    assert.match(out.text, /……还有 3 张没列出（明细用 view="tickets" 看全）/, `要指路去明细：${out.text}`)
+    // 折叠只影响渲染，机器可读的计数必须是全的。
+    assert.equal(out.projects[0].total, 11, '折叠不许把总数算少')
+  })
+
+  await check('pipeline_status：view="tickets" 保持原有明细；传 recordId 时一律走明细', async () => {
+    // 老调用方（22 处自测断言 + 用户习惯）靠明细，必须能原样拿回来。
+    const rows = [
+      { key: k('d1'), projectId: DEMO, recordId: 'd1', phase: 'done', attempt: 0, module: '列表页' },
+      { key: k('d2'), projectId: DEMO, recordId: 'd2', phase: 'editing', attempt: 0, module: '详情页' },
+    ]
+    const detail = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.equal(detail.view, 'tickets')
+    assert.match(detail.text, /· \[demo\] d1｜已完成｜/, `明细要回到一张票一段：${detail.text}`)
+    assert.ok(!detail.text.includes('项目总览'), `明细视图不该出现总览：${detail.text}`)
+
+    // 传了 recordId 就是看这一张：总览里没有「只看一张」这回事。
+    const one = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({ recordId: 'd2' }, {})
+    assert.equal(one.view, 'overview', 'view 参数照原样回显，但实际走的是明细')
+    assert.equal(one.tickets.length, 1, '只给这一张')
+    assert.equal(one.tickets[0].recordId, 'd2')
+    assert.match(one.text, /· \[demo\] d2｜修改中｜/, `单票要看明细：${one.text}`)
+    assert.ok(!one.text.includes('项目总览'), `单票不该给总览：${one.text}`)
+
+    // 总览也不该跟着 includeDone 抖动 —— 它永远按全库算。
+    const overviewIgnoresIncludeDone = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({ includeDone: false }, {})
+    assert.match(overviewIgnoresIncludeDone.text, /【demo】共 2 张/, `总览永远是全库口径：${overviewIgnoresIncludeDone.text}`)
+  })
+
+  await check('pipeline_status：队列说明写清「谁是下一个、怎么排、为什么串行」', async () => {
+    // #17：并发恒 1 让「排队」成为常态，但以前一个字都不解释。
+    // 三张 pending 按优先级/发现日期排：high 的先，同优先级发现日期早的先。
+    const rows = [
+      { key: k('low'), projectId: DEMO, recordId: 'low', phase: 'pending', priority: 'low', foundAt: '2026-11-01', enqueuedAt: 1, problemSummary: '低优先级那张' },
+      { key: k('hi-late'), projectId: DEMO, recordId: 'hi-late', phase: 'pending', priority: 'high', foundAt: '2026-11-05', enqueuedAt: 3, problemSummary: '高优先级但报得晚' },
+      { key: k('hi-early'), projectId: DEMO, recordId: 'hi-early', phase: 'pending', priority: 'high', foundAt: '2026-11-02', enqueuedAt: 2, problemSummary: '高优先级且报得早' },
+    ]
+    // 「下一个」必须直接问 pickNext()，不许这里再排一遍 —— 排序规则写两份会分道扬镳。
+    // 故意让 pickNext 返回一张「按本文件的排序不可能选中」的票：
+    // 若实现偷偷自己排，这条断言就会挂。
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows, pickNext: () => rows[2] },
+      getConfig: () => validateConfig({}).value,
+      now: () => 10_000,
+    }).execute({}, {})
+    assert.match(out.text, /队列：3 张在等（同一时刻只跑一张）/, `要说明有几张在等：${out.text}`)
+    assert.match(out.text, /下一个：\[demo\] hi-early（优先级 高）｜高优先级且报得早/, `下一个要具体到 recordId：${out.text}`)
+    assert.match(out.text, /排法：优先级高的先跑 → 发现日期早的先跑 → 入队早的先跑/, `排序规则要写出来：${out.text}`)
+    assert.match(out.text, /为什么一次只跑一张/, `要顺手回答「能不能并发」：${out.text}`)
+    // 机器可读：运行页签与告警不该自己再排一遍。
+    assert.equal(out.queue.pendingCount, 3)
+    assert.equal(out.queue.runnableCount, 3)
+    assert.equal(out.queue.nextRecordId, 'hi-early', 'queue.nextRecordId 必须来自 pickNext()')
+    assert.deepEqual(out.queue.backoff, [])
+  })
+
+  await check('pipeline_status：退避中的票与普通 pending 必须一眼可分', async () => {
+    // #17：退避用的是 pending + enqueuedAt = 未来时刻，phase 一模一样。
+    // 以前两行文字完全相同，人看到「排队中」等十分钟，分不清是等还是卡住。
+    const now = 1_000_000
+    const rows = [
+      // 普通 pending：enqueuedAt 在过去
+      { key: k('normal'), projectId: DEMO, recordId: 'normal', phase: 'pending', priority: 'high', enqueuedAt: now - 60_000, problemSummary: '正常排队的' },
+      // 退避中：enqueuedAt 在 2 分钟后，且带着上次的错
+      { key: k('back'), projectId: DEMO, recordId: 'back', phase: 'pending', priority: 'high', enqueuedAt: now + 120_000, lastError: 'agent 没有产生任何文件改动', problemSummary: '上次失败在退避的' },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows },
+      getConfig: () => validateConfig({}).value,
+      now: () => now,
+    }).execute({ view: 'tickets' }, {})
+    assert.match(out.text, /back｜排队中（退避中，还要等 2 分 0 秒）｜/, `状态行要带退避与剩余时间：${out.text}`)
+    assert.match(out.text, /正在退避：还要等 2 分 0 秒 才会被重新捞起来/, `建议行要说清在退避：${out.text}`)
+    assert.match(out.text, /上次失败：agent 没有产生任何文件改动/, `退避要带上次失败原因：${out.text}`)
+    // 普通那张不能被误标成退避
+    assert.match(out.text, /normal｜排队中｜/, `普通 pending 不许出现「退避中」：${out.text}`)
+    // 退避中的不算「前面还有 N 张」：pickNext 根本不会挑它
+    assert.match(out.text, /队列里的下一张就是它/, `可跑队列里它排第一：${out.text}`)
+    assert.equal(out.queue.backoff.length, 1)
+    assert.equal(out.queue.backoff[0].recordId, 'back')
+    assert.equal(out.queue.backoff[0].remainingMs, 120_000)
+    assert.equal(out.queue.backoff[0].reason, 'agent 没有产生任何文件改动')
+  })
+
+  await check('pipeline_status：没有 pending 票时队列那一段完全不出现', async () => {
+    // 空噪音也是一种伤害：全是终态的库里不该冒出一句「队列：0 张在等」。
+    const rows = [
+      { key: k('d'), projectId: DEMO, recordId: 'd', phase: 'done', attempt: 0 },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.ok(!out.text.includes('队列：'), `没有 pending 时不许出现队列段：${out.text}`)
+    assert.ok(!out.text.includes('为什么一次只跑一张'), `没有 pending 时也不许出现串行解释：${out.text}`)
+    assert.equal(out.queue.pendingCount, 0)
+    assert.equal(out.queue.nextRecordId, null)
   })
 
   await check('超时 → failed + 通知，worktree 保留', async () => {
@@ -358,7 +663,10 @@ async function main () {
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'pending', '可重试错误要让票留在队列里，不能判死')
     assert.equal(row.attempt, 1)
-    assert.match(row.lastError ?? '', /rate-limit/)
+    // #08：lastError 只放人话，分类进 lastErrorKind —— 用户不该看见 `rate-limit:` 这种内部标识符。
+    assert.match(row.lastError ?? '', /上游限流/)
+    assert.equal(row.lastErrorKind, 'rate-limit', '分类要进结构化字段，不能拼进给人看的文案')
+    assert.ok(!String(row.lastError).includes('rate-limit'), 'lastError 里不能出现内部 kind 前缀')
     assert.ok((row.enqueuedAt ?? 0) > 0, '要写退避后的入队时间')
     assert.equal(push.messages.length, 0, '还没最终失败，不用打扰人')
   })
@@ -604,7 +912,7 @@ async function main () {
   await check('跑票期间定期续租，长票不会被别的进程抢走', async () => {
     const { scheduler, store } = harness({
       executor: createMockExecutor({ stepsDelayMs: 120 }),
-      config: { leaseHeartbeatSeconds: 0.02 },
+      leaseHeartbeatMsOverride: 20,
     })
     const original = store.renewLease.bind(store)
     let renewals = 0
@@ -620,7 +928,7 @@ async function main () {
   await check('续租失败 → 让出这票：回 pending、不通知人', async () => {
     const { scheduler, store, push } = harness({
       executor: createMockExecutor({ stepsDelayMs: 200 }),
-      config: { leaseHeartbeatSeconds: 0.02 },
+      leaseHeartbeatMsOverride: 20,
     })
     // 模拟租约被别的进程抢走：续租一律失败。
     store.renewLease = async () => false
@@ -659,10 +967,157 @@ async function main () {
   })
 
   await check('describeConfig：token 打码，送达回执地址照常显示', async () => {
-    const result = validateConfig({ pushplus: { token: 'secret-token', callbackUrl: 'https://cb.example/hook' } })
+    // pushplus.token 已经从配置面删掉了（token 走凭据），所以打码逻辑改用
+    // 仍然存在的、名字里带 token 的路径来验证：projects[].match.appToken。
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'cli_secret_app_token', tableId: 'tbl1' },
+        repo: { path: 'D:/repo' },
+      }],
+      pushplus: { callbackUrl: 'https://cb.example/hook' },
+    })
+    assert.ok(result.value, `校验应当通过：${JSON.stringify(result.issues ?? [])}`)
     const described = describeConfig(result.value)
-    assert.equal(described['pushplus.token'], '***(已配置)')
+    assert.equal(described.projects[0].match.appToken, '***(已配置)', 'appToken 是密钥，必须打码')
+    assert.equal(described.projects[0].match.tableId, 'tbl1', '非密钥字段照常显示')
     assert.equal(described['pushplus.callbackUrl'], 'https://cb.example/hook')
+    // 已经删掉的键不该再出现在 describeConfig 的输出里（否则面板会把死键画出来）。
+    assert.equal('pushplus.token' in described, false, '已删的配置键不能还留在 describe 输出里')
+    assert.equal('logLevel' in described, false)
+  })
+
+  await check('配置面收敛到 24 个键 / 4 个分组，且每个键都归到了组里', async () => {
+    // 涨键是有代价的：每多一个键，面板就多一格要人判断的东西，文档就多一行。
+    // 这条断言把当前数字钉住 —— 想加键必须先回答「为什么这个人必须懂这件事」。
+    const keys = Object.keys(CONFIG_FIELDS)
+    assert.equal(keys.length, 24, '顶层配置字段应当是 24 个，实际：' + keys.join(', '))
+    assert.equal(CONFIG_GROUPS.length, 4, '分组应当是 4 组')
+    assertGroupCoverage() // 漏写分组会在这里抛
+    // 死键必须真的死了：这两个键曾经在面板上可编辑、改了什么也不发生。
+    assert.equal('concurrency' in CONFIG_FIELDS, false, 'concurrency 是死配置，必须删掉')
+    assert.equal('logLevel' in CONFIG_FIELDS, false, 'logLevel 是死配置，必须删掉')
+    // 收成内置常量的 4 个键不能再出现在配置面上（否则又是「配了不生效」）。
+    for (const key of ['safePageRun', 'goneAfterScans', 'leaseHeartbeatSeconds', 'fetchBeforeCreate']) {
+      assert.equal(key in CONFIG_FIELDS, false, key + ' 已收成内置常量，不该再是配置项')
+    }
+    assert.equal(BUILTIN_LIMITS.safePageRun, 20)
+    assert.equal(BUILTIN_LIMITS.goneAfterScans, 3)
+    assert.equal(BUILTIN_LIMITS.leaseHeartbeatSeconds, 60)
+    assert.equal(BUILTIN_LIMITS.fetchBeforeCreate, true)
+  })
+
+  await check('老配置里留着已删的键：不报错、不生效、不静默改变行为', async () => {
+    // 别人的 cordis.patch.yml 已经写着这些键了。删键不能变成「升级后插件装不上」。
+    const legacy = {
+      safePageRun: 50,
+      goneAfterScans: 9,
+      concurrency: 4,
+      leaseHeartbeatSeconds: 5,
+      fetchBeforeCreate: false,
+      logLevel: 'debug',
+      pushplus: { token: 'leftover', template: 'html' },
+      qqmail: { port: 587, secure: false },
+    }
+    const result = validateConfig(legacy)
+    assert.ok(result.value, '老配置必须能加载：' + JSON.stringify(result.issues ?? []))
+    assert.equal(result.issues ?? undefined, undefined, '删掉的键不该产生校验错误')
+    // 它们既不进归一后的配置，也不该偷偷改掉新键的默认值。
+    for (const key of ['safePageRun', 'goneAfterScans', 'concurrency', 'leaseHeartbeatSeconds', 'fetchBeforeCreate', 'logLevel']) {
+      assert.equal(key in result.value, false, key + ' 已删除，不该出现在归一后的配置里')
+    }
+    assert.equal(result.value.qqmail.encryption, 'tls', '老的 qqmail.port 不该顶掉新键的默认值')
+  })
+
+  await check('pushplus 的 token 只走凭据，不从配置里读', async () => {
+    // 这条是真实事故：凭据页写着「填这里就行」，但 pushplus 分支根本没传 getSecret，
+    // 用户填了凭据、通知永远发不出去，只留一条 warn。
+    const { createPushplusPush, PUSHPLUS_SECRET_REF } = await import('../src/adapters/push-pushplus/index.js')
+    const seen = []
+    const push = createPushplusPush({
+      getSecret: async (ref) => {
+        seen.push(ref)
+        return 'token-from-credentials'
+      },
+      fetch: async (url, init) => {
+        const body = JSON.parse(init.body)
+        assert.equal(body.token, 'token-from-credentials', '发出去的 token 必须来自凭据')
+        return { ok: true, status: 200, json: async () => ({ code: 200 }) }
+      },
+    })
+    const out = await push.send({ title: 't', body: 'b' }, undefined)
+    assert.equal(out.accepted, true)
+    assert.deepEqual(seen, [PUSHPLUS_SECRET_REF], '必须按 PUSHPLUS_TOKEN 取凭据')
+    // 配置里不再有 pushplus.token 这个键（token 落进 yml 就等于明文泄露）。
+    assert.equal('pushplus.token' in validateConfig({}).value.pushplus, false)
+  })
+
+  await check('pipeline_scan：总开关关着就说 disabled，且不启动任何后台工作', async () => {
+    // 以前这里只承诺、不实现：代码永远返回 triggered，用户看到「已触发」以为在跑，
+    // 其实 tick() 立刻返回 disabled，什么都没发生。
+    let tickCalls = 0
+    const tool = createPipelineScanTool({
+      tick: async () => { tickCalls += 1; return { status: 'ok' } },
+      isRunning: () => false,
+      getConfig: () => ({ enabled: false }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.status, 'disabled')
+    assert.equal(tickCalls, 0, '开关关着时不该起后台任务')
+    assert.match(out.text, /enabled/)
+    assert.match(out.text, /改配置|设置面板/)
+  })
+
+  await check('pipeline_scan：正在跑就说 already-running，不叠第二轮', async () => {
+    let tickCalls = 0
+    const tool = createPipelineScanTool({
+      tick: async () => { tickCalls += 1; return { status: 'ok' } },
+      isRunning: () => true,
+      getConfig: () => ({ enabled: true }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.status, 'already-running')
+    assert.equal(tickCalls, 0, '已经在跑时不能再触发一轮')
+    assert.match(out.text, /不叠加/)
+    assert.match(out.text, /pipeline_status/)
+  })
+
+  await check('pipeline_scan：空闲时触发一轮，但不等它跑完（fire-and-forget）', async () => {
+    // 同步等会让宿主工具通道超时、报 not lossless JSON（生产实锤过），
+    // 所以这条断言的核心是「tick 还没结束就返回了」。
+    let resolveTick = null
+    let tickCalls = 0
+    const tool = createPipelineScanTool({
+      tick: () => {
+        tickCalls += 1
+        return new Promise((resolve) => { resolveTick = resolve })
+      },
+      isRunning: () => false,
+      getConfig: () => ({ enabled: true }),
+    })
+    const out = await tool.execute({ skipScan: true }, {})
+    assert.equal(out.status, 'triggered')
+    assert.equal(tickCalls, 1)
+    assert.equal(out.scan, null, '还没跑完，扫表结果只能是 null')
+    assert.equal(out.ran, null)
+    assert.match(out.text, /pipeline_status/, '必须告诉人下一步去哪看结果')
+    assert.equal(typeof resolveTick, 'function', 'tick 应该真的被调起来了')
+    resolveTick({ status: 'ok' })
+  })
+
+  await check('pipeline_scan：后台那一轮炸了要有日志，不能静默', async () => {
+    const logged = []
+    const tool = createPipelineScanTool({
+      tick: async () => { throw new Error('扫表炸了') },
+      isRunning: () => false,
+      getConfig: () => ({ enabled: true }),
+      log: (message, detail) => logged.push([message, detail]),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.status, 'triggered')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(logged.length, 1, '后台失败必须留痕')
+    assert.match(String(logged[0][1]?.reason ?? ''), /扫表炸了/)
   })
 
   await check('pipeline_cancel 空闲时如实说没东西可取消', async () => {
@@ -680,11 +1135,36 @@ async function main () {
     await new Promise((resolve) => setTimeout(resolve, 50))
     const out = await tool.execute({}, {})
     assert.equal(out.cancelled, true)
+    // #02：重开入口只有 pipeline_reset 这一条，取消文案必须先把人指向它，
+    // 不要把「拨表格」当成主路径（那条路会整票重做并覆盖旧回填）。
+    assert.match(out.text, /pipeline_reset/)
+    assert.ok(out.text.indexOf('pipeline_reset') < out.text.indexOf('拨回'), '先提 reset，再提拨表格')
     await running
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'failed')
     assert.equal(row.lastError, 'cancelled by user')
     assert.equal(push.messages.length, 0, '人工取消不打扰人')
+  })
+
+  await check('pipeline_status 把「你取消的」和「它自己挂的」分开说', async () => {
+    // #02：取消与真失败共用 phase=failed，只能靠 lastError 区分。
+    // 不区分的话，人会把「我按的取消」当成「它挂了」，白紧张一场。
+    const rows = [
+      { key: k('c'), projectId: DEMO, recordId: 'c', phase: 'failed', attempt: 0, lastError: 'cancelled by user' },
+      { key: k('f'), projectId: DEMO, recordId: 'f', phase: 'failed', attempt: 0, lastError: 'internal: agent 没有产生任何文件改动' },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+
+    assert.match(out.text, /失败（你取消的）/, `取消的票要在状态里认出来：${out.text}`)
+    assert.match(out.text, /这张票是你取消的/, '取消的票不要用「去修好它」的语气')
+    // 内部标识符不该漏到用户眼前：'cancelled by user' 只该出现在存储里。
+    assert.equal(out.text.includes('cancelled by user'), false, `不要把内部标识符念给人听：${out.text}`)
+    // 真失败那张不能也挂上「你取消的」—— 否则人以为可以不管。
+    const fLine = out.text.split('\n').find((line) => /^· \[.*\] f｜/.test(line))
+    assert.ok(fLine, `真失败那张要有一行：${out.text}`)
+    assert.equal(fLine.includes('你取消的'), false, `真失败不冒充用户取消：${fLine}`)
   })
 
   section('11. §5.1 A 组链路断点：截图进 prompt / 真实工作区 / 失败原因 / 人工重开')
@@ -1149,7 +1629,9 @@ async function main () {
     assert.equal(push.messages.length, 1)
     const body = push.messages[0].body
     assert.ok(!body.includes('[object Object]'), `通知正文不能出现对象字符串化：${body}`)
-    assert.match(body, /失败原因：internal: mock：真实失败原因/, '失败原因要是这次的错误，不是运行前的旧值')
+    // #08：正文只给人话，不拼 `internal:` 前缀。分类进 lastErrorKind，不进正文。
+    assert.match(body, /失败原因：mock：真实失败原因/, '失败原因要是这次的错误，不是运行前的旧值')
+    assert.ok(!body.includes('internal:'), `通知正文不能出现内部 kind 前缀：${body}`)
   })
 
   await check('done 的通知不残留上一轮的失败原因', async () => {
@@ -1206,7 +1688,8 @@ async function main () {
     await scheduler.tick()
     const retried = store.getTicket(k('rec-mock-001'))
     assert.equal(retried.phase, 'pending', '可重试错误要让票留在队列里')
-    assert.match(retried.lastError ?? '', /rate-limit/, '退避时要写下这一轮的原因')
+    assert.match(retried.lastError ?? '', /上游限流/, '退避时要写下这一轮的原因')
+    assert.equal(retried.lastErrorKind, 'rate-limit', '分类进 lastErrorKind')
 
     // 退避到期，再跑一轮 —— 这次成功
     boom = false
@@ -1333,7 +1816,7 @@ async function main () {
         stderr: '',
       }),
       // enabled 必须显式 true：缺省是 false，体检会（正确地）报「总开关关着」。
-      getConfig: () => ({ enabled: true, projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
+      getConfig: () => ({ enabled: true, projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' }, isolateWorktree: false }),
       credentials: { describe: async (ref) => ({ configured: true }) },
     })
     const out = await tool.execute({}, {})
@@ -1379,18 +1862,19 @@ async function main () {
     const base = {
       ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
     }
 
-    // a. 服务没挂上 —— 这是「装坏了/组合不对」，要进 problems（不是 warning），并说清怎么办。
+    // a. 服务没挂上 —— 这是「装坏了/组合不对」，要进阻断（不是 warning），并说清怎么办。
+    // 它挡的是整条跑票链路：读不到 app_secret 就换不到 token，一张票都收不到。
     const missing = await createPipelineDoctorTool({
       ...base,
       credentials: makeCredentialsDescriber({ get: () => undefined }),
     }).execute({}, {})
     assert.equal(missing.ok, false, `凭据服务缺席时不该报全绿：${missing.text}`)
     assert.ok(
-      missing.problems.some((p) => p.includes('凭据服务没挂上')),
-      `要进 problems：${JSON.stringify(missing.problems)}`,
+      missing.blockers.some((p) => p.includes('凭据服务没挂上')),
+      `要进 blockers：${JSON.stringify(missing.blockers)}`,
     )
     assert.ok(missing.text.includes('app_secret'), '要说清后果（读不到 app_secret）')
     assert.ok(missing.text.includes('重启'), '要给出下一步动作')
@@ -1401,14 +1885,14 @@ async function main () {
       credentials: makeCredentialsDescriber({ get: () => ({ describe: async () => ({ configured: false }) }) }),
     }).execute({}, {})
     assert.ok(
-      empty.warnings.some((w) => w.includes('凭据 FEISHU_APP_SECRET 未配置')),
-      `服务在但没配要进 warnings：${JSON.stringify(empty.warnings)}`,
+      empty.blockers.some((w) => w.includes('凭据 FEISHU_APP_SECRET 未配置')),
+      `服务在但没配要进 blockers（收不到票就跑不了）：${JSON.stringify(empty.blockers)}`,
     )
     assert.ok(
-      empty.warnings.some((w) => w.includes('「凭据」页签')),
+      empty.text.includes('「凭据」页签'),
       '要告诉用户去哪填（设置页凭据页签）',
     )
-    assert.ok(!empty.problems.some((p) => p.includes('凭据服务没挂上')), '服务在的时候不能说服务没挂上')
+    assert.ok(!empty.blockers.some((p) => p.includes('凭据服务没挂上')), '服务在的时候不能说服务没挂上')
   })
 
   await check('pipeline_doctor 必须说出总开关状态（enabled 缺省 false，新用户配完也不跑）', async () => {
@@ -1425,7 +1909,7 @@ async function main () {
         enabled,
         projects: [{ name: 'pms', match: { platform: 'mock' }, repo: { path: 'D:/repo/pms' } }],
         workExecutor: 'agent',
-        pushAdapter: 'qqmail',
+        pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' },
       }),
       credentials: { describe: async () => ({ configured: true }) },
     })
@@ -1438,8 +1922,9 @@ async function main () {
       `也要进 warnings：${JSON.stringify(off.warnings)}`,
     )
     assert.ok(off.text.includes('pipeline_scan'), '要给出绕路办法（手动跑一轮）')
-    // 关着不是「装坏了」，不该判成 problems —— 否则用户会以为环境有故障。
+    // 关着不是「装坏了」，不该判成 problems 或 blockers —— 否则用户会以为环境有故障。
     assert.equal(off.problems.length, 0, `关开关不是故障：${JSON.stringify(off.problems)}`)
+    assert.equal(off.blockers.length, 0, `关开关不是阻断：${JSON.stringify(off.blockers)}`)
 
     const on = await make(true).execute({}, {})
     assert.ok(on.text.includes('总开关：已开启'), `开着也要说一声：${on.text}`)
@@ -1471,7 +1956,7 @@ async function main () {
       gitRunner: async (argv) => (argv[0] === 'ls-remote'
         ? { code: 0, stdout: '', stderr: '' }
         : { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git', gitlab: { enabled: true } } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git', gitlab: { enabled: true } } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
       credentials: { describe: async () => ({ configured: true }) },
       detectBaseBranch: async () => 'v2.x',
       probeRemote,
@@ -1490,7 +1975,7 @@ async function main () {
     const noRemote = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.example.com/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
       credentials: { describe: async () => ({ configured: true }) },
       probeRemote: async () => { probed += 1; return { ok: true } },
     })
@@ -1506,7 +1991,7 @@ async function main () {
         if (argv[0] === 'status') return { code: 0, stdout: ' M a.ts\0?? b.ts\0', stderr: '' }
         return { code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }
       },
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: false }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' }, isolateWorktree: false }),
       credentials: { describe: async () => ({ configured: true }) },
     })
     const out = await tool.execute({}, {})
@@ -1523,7 +2008,7 @@ async function main () {
     const isolated = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', isolateWorktree: true }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' }, isolateWorktree: true }),
       credentials: { describe: async () => ({ configured: true }) },
     })
     const out3 = await isolated.execute({}, {})
@@ -1537,7 +2022,7 @@ async function main () {
       ...NO_VERSION_CHECK,
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
       credentials: { describe: async () => ({ configured: true }) },
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
     }
 
     const detected = createPipelineDoctorTool({ ...base, detectBaseBranch: async () => 'v2.x' })
@@ -1557,7 +2042,7 @@ async function main () {
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : 'true', stderr: '' }),
       credentials: { describe: async () => ({ configured: true }) },
       detectBaseBranch: async () => { called = true; return 'main' },
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git', baseBranch: 'v2.x' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms', remote: 'http://gitlab.local/mk/pms.git', baseBranch: 'v2.x' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
     })
     const out = await tool.execute({}, {})
     assert.equal(called, false, '配置写了就不该再猜')
@@ -1597,7 +2082,7 @@ async function main () {
     const tool = createPipelineDoctorTool({
       comparePluginVersion: async () => stale(),
       gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
-      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail' }),
+      getConfig: () => ({ projects: [{ name: 'pms', match: { platform: 'feishu' }, repo: { path: 'D:/repo/pms' } }], workExecutor: 'agent', pushAdapter: 'qqmail', qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com', to: 'b@qq.com' } }),
       credentials: { describe: async () => ({ configured: true }) },
     })
     const out = await tool.execute({}, {})
@@ -1642,6 +2127,226 @@ async function main () {
     assert.equal(out4.ok, true, '比不出来不该算问题')
     assert.ok(out4.text.includes('无法比对'), `要说清是比不出来：${out4.text}`)
     assert.ok(!out4.text.includes('插件不是最新'), '比不出来不能说它落后')
+  })
+
+  // ── 体检扩面：飞书连通性 / 通知完整性 / 三档结论 ──────────────────
+  // 这四件事（权限没开、版本没发布、不是协作者、通知通道没填全）在本地完全看不出来，
+  // 以前只能等第一张票跑挂才暴露，而那时用户手里一条线索都没有。
+  await check('体检：飞书 App Secret 填错 → 报「不匹配」+ 具体修法（含错误码）', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'bascn', tableId: 'tbl1' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async (ref) => (ref === 'FEISHU_APP_SECRET' ? 'wrong-secret' : 'cli_app'),
+      // 探针走真实现，只把 fetch 换成离线桩：这样验的是「码表 → 人话 + 修法」整条链，
+      // 而不是我在测试里手工拼一个理想对象。
+      probeFeishu: (input) => probeFeishuConnectivity({
+        ...input,
+        fetch: async () => ({
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ code: 10014, msg: 'app secret invalid' }),
+          text: async () => JSON.stringify({ code: 10014, msg: 'app secret invalid' }),
+        }),
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false, '认证过不了就跑不了票')
+    assert.ok(out.text.includes('App ID / App Secret 不匹配'), `要说人话：${out.text}`)
+    assert.ok(out.text.includes('10014'), '要带错误码，方便拿去搜')
+    assert.ok(out.text.includes('凭证与基础信息'), '要给具体去哪修')
+    assert.ok(out.blockers.length > 0, '认证失败要进阻断档')
+  })
+
+  await check('体检：应用不是表协作者 → 说清「读不到数据」+ 怎么加回来', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'bascn', tableId: 'tbl1' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+      probeFeishu: async () => ({
+        skipped: false,
+        token: { ok: true, message: 'token 有效' },
+        projects: [{
+          name: 'pms',
+          kind: 'bitable',
+          table: 'tbl1',
+          metadata: { ok: false, message: '表不存在，或者应用不是这张表的协作者（1254043）', fix: '表格 →「…」→「更多」→「添加文档应用」，加为可编辑协作者。', code: 1254043 },
+        }],
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false)
+    assert.ok(out.text.includes('读不到表元数据'), `要点出是哪一层失败：${out.text}`)
+    assert.ok(out.text.includes('添加文档应用'), '要给「怎么加回来」的动作')
+    assert.ok(out.blockers.some((b) => b.includes('飞书项目 pms')), '要指名是哪个项目')
+  })
+
+  await check('体检：通知通道不完整算阻断，不算提醒（票跑完发不出通知等于白跑）', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [],
+        workExecutor: 'agent',
+        pushAdapter: 'qqmail',
+        qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'a@qq.com' }, // 故意缺 to
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false, '缺 to 就发不出邮件')
+    assert.ok(out.blockers.some((b) => b.includes('通知通道不完整')), `要进阻断：${JSON.stringify(out.blockers)}`)
+    assert.ok(out.text.includes('qqmail.to'), '要点名缺哪个字段')
+    assert.ok(out.text.includes('「通知」组'), '要指到设置页哪一组')
+    // 而且不能说「体检通过」——这是最容易让人放心的假象。
+    assert.ok(!out.text.includes('环境体检通过'), '有阻断时不能说通过')
+  })
+
+  await check('体检：pushAdapter=mock 时明说不会真的发通知', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ enabled: true, projects: [], workExecutor: 'agent', pushAdapter: 'mock' }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, true, `mock 是合法配置，不该算问题：${out.text}`)
+    assert.ok(out.text.includes('不会真的发'), `要明说 mock 不发真消息：${out.text}`)
+    assert.ok(out.warnings.some((w) => w.includes('mock')), 'mock 归提醒档')
+  })
+
+  await check('体检：飞书探针超时/炸了都不让体检失败，只记一行', async () => {
+    const base = {
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'bascn', tableId: 'tbl1' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+    }
+    const threw = await createPipelineDoctorTool({
+      ...base,
+      probeFeishu: async () => { throw new Error('socket hang up') },
+    }).execute({}, {})
+    assert.ok(!threw.text.includes('环境体检通过') || threw.blockers.length === 0, '探针炸了不该伪装成全绿')
+    assert.ok(threw.text.includes('检查过程出错'), `要说清是探测本身出错，不是飞书那边的结论：${threw.text}`)
+    assert.ok(threw.text.includes('socket hang up'), '要把原始错误带出来')
+
+    // 超时同理：探针内部把 abort 归一成「检查超时」，体检只展示、不抛。
+    const timedOut = await createPipelineDoctorTool({
+      ...base,
+      probeFeishu: async () => {
+        const err = new Error('The operation was aborted')
+        err.name = 'AbortError'
+        return { skipped: false, token: describeProbeFailure(err), projects: [] }
+      },
+    }).execute({}, {})
+    assert.ok(timedOut.text.includes('超时'), `超时要单独说：${timedOut.text}`)
+    assert.ok(timedOut.text.includes('网络'), '要提示可能是网络问题')
+  })
+
+  await check('体检：总开关关着时给出「接下来四步」清单', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ enabled: false, projects: [], workExecutor: 'agent', pushAdapter: 'mock' }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.ok(out.text.includes('接下来四步'), `首跑要给清单：${out.text}`)
+    assert.ok(out.text.includes('「凭据」页签'), '第一步是配凭据')
+    assert.ok(out.text.includes('创建版本并发布'), '第二步要提醒发布版本（最常漏的一步）')
+    assert.ok(out.text.includes('总开关'), '第四步是打开开关')
+    // 顺序也要对：先凭据，最后才是开关 —— 反过来用户会先开开关再配凭据，中间白扫好几轮。
+    // 只在「接下来四步」这一段里比位置：前面正文里也有「凭据」两个字。
+    const stepsStart = out.text.indexOf('接下来四步')
+    assert.ok(stepsStart >= 0, '要能找到清单起点')
+    const steps = out.text.slice(stepsStart)
+    assert.ok(steps.indexOf('「凭据」页签') < steps.indexOf('总开关'), `顺序不能反：${steps}`)
+  })
+
+  await check('体检：飞书连接失败都被归一成人话（码表 / 未知码 / 网络错 / 超时）', async () => {
+    // 走真探针 + 假 fetch，每一档都验「用户看到的那句话」。
+    // 不直接 new 内部错误类：那样测的是我的构造函数，不是用户的体验。
+    const probeWith = (fetchImpl, extra = {}) => probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'bascn', tableId: 'tbl1' } }],
+      fetch: fetchImpl,
+      ...extra,
+    })
+    const jsonOnce = (body) => {
+      let sent = 0
+      return async () => {
+        sent += 1
+        // 第一个请求是认证：认证失败后探针不会再发后面的请求。
+        void sent
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => body,
+          text: async () => JSON.stringify(body),
+        }
+      }
+    }
+
+    // a. 码表命中：要给「人话 + 去哪修」。
+    const auth = await probeWith(jsonOnce({ code: 10014, msg: 'invalid app_secret' }))
+    assert.equal(auth.token.ok, false)
+    assert.equal(auth.token.message, 'App ID / App Secret 不匹配')
+    assert.ok(auth.token.fix.includes('凭证与基础信息'), '修法要具体到飞书后台哪个页面')
+    assert.equal(auth.token.code, 10014)
+
+    // b. 未知码：也要能看懂，且把原始码与 msg 带出来，方便拿去搜。
+    const unknown = await probeWith(jsonOnce({ code: 88888, msg: 'something odd' }))
+    assert.ok(unknown.token.message.includes('88888'), `未知码要把码带出来：${unknown.token.message}`)
+    assert.ok(unknown.token.message.includes('something odd'), '原话要留着')
+
+    // c. 网络错（连不上）：要说「不是配置问题」，否则人会去改 App Secret。
+    const netErr = await probeWith(async () => {
+      const error = new Error('getaddrinfo ENOTFOUND open.feishu.cn')
+      error.code = 'ENOTFOUND'
+      throw error
+    })
+    assert.ok(netErr.token.message.includes('连不上'), `网络错要说连不上：${netErr.token.message}`)
+    assert.ok(netErr.token.message.includes('不是配置问题'), '要让人别去改凭据')
+
+    // d. 超时：10 秒（这里压到 20ms）没回来，要说「可能是网络」，不能报成凭据错。
+    //    桩必须真的响应 abort —— 否则探针那个 await 永远不 settle，
+    //    定时器一烧完事件循环就空了，node 会静默退出（这条用例踩过一次）。
+    const timedOut = await probeWith(
+      (url, init) => new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const error = new Error('The operation was aborted')
+          error.name = 'AbortError'
+          reject(error)
+        })
+      }),
+      { timeoutMs: 20 },
+    )
+    assert.ok(timedOut.token.message.includes('超时'), `超时要单独说：${timedOut.token.message}`)
+    assert.ok(timedOut.token.message.includes('网络'), '要提示可能是网络问题')
+    assert.ok(!timedOut.token.message.includes('App Secret'), '超时不能冤枉成凭据填错')
   })
 
   // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
@@ -1979,7 +2684,7 @@ function makeFakeCtx ({ domain, registered }) {
       store: { listTickets: () => rows },
       getConfig: () => validateConfig({}).value,
     })
-    const out = await tool.execute({ includeDone: true }, {})
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
 
     // JSON.stringify 会把 undefined 悄悄丢掉，所以不能靠它验证 ——
     // 要真走一遍宿主那条「lossless JSON」判据：递归找 undefined。
@@ -2042,12 +2747,18 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(registered.some((tool) => tool.name === 'pipeline_scan'), 'agent 执行器下工具仍要注册')
   })
 
-  await check('model 默认留空（跟随会话默认模型），不钉死某个会被限流的模型', async () => {
-    // 真实事故：插件把 model 钉成 deepseek-v4.1-flash，那天上游配额耗尽，
+  await check('model 与 provider 默认都留空（跟随会话默认），不钉死会被限流的模型/provider', async () => {
+    // 真实事故一：插件把 model 钉成 deepseek-v4.1-flash，那天上游配额耗尽，
     // 整条流水线每一张票都死在「模型调用失败」上。留空 = 跟随宿主当前选择。
+    // 真实事故二：provider 缺省写成 'workbuddy'，换一台宿主（没有这个 provider）
+    // 之后每一张票都在建会话那一步炸；而且面板上「留空跟随默认」永远填不出来
+    // —— draftValueOf 会把空值回落成 meta.default。所以默认值必须是空串。
     const { value: config } = validateConfig({})
     assert.equal(config.model, '', 'model 默认应当是空串（空串在执行器里表示「不下发模型参数」）')
-    assert.equal(config.provider, 'workbuddy', 'provider 默认与 profile 一致')
+    assert.equal(config.provider, '', 'provider 默认应当是空串（空串 = 跟随当前会话默认）')
+    // 空串不能变成「下发一个空 provider」：执行器必须整条不写这个键。
+    const { agentOptionsFromConfig } = await import('../src/adapters/executor-agent/index.js')
+    assert.equal('provider' in agentOptionsFromConfig(config), false, 'provider 留空时不能给宿主下发空串')
   })
 
   section('12e. 平台可插拔：状态值可配 + 金山文档真的接进组合根')
@@ -2330,8 +3041,11 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(round.created.map((ticket) => ticket.recordId), ['rec-mock-002'], '只该收点名的那张')
   })
 
-  await check('webform 源也认 recordIds，且名单外的记录不会被判成「已删除」', async () => {
-    const { createWebformSource } = await import('../src/adapters/source-webform/index.js')
+  await check('recordIds 收窄对「内存水位型」源也成立：名单外的记录不会被判成「已删除」', async () => {
+    // webform 源已从产品里移除（工单 #18：水位只在内存、重启就重收一遍），
+    // 但它当年验证的这条契约对所有源都成立，所以实现搬到 scripts/fixtures/ 留档，
+    // 用例继续跑 —— 不是「删测试过关」，是「测试对象从产品移到留档实现」。
+    const { createWebformSource } = await import('./fixtures/source-webform/index.js')
     const source = createWebformSource({
       projectId: 'wf',
       recordIds: ['b'],
@@ -2341,6 +3055,28 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(first.created.map((ticket) => ticket.recordId), ['b'])
     const second = await source.scan()
     assert.deepEqual(second.disappeared, [], '名单外的 a 从来就没进水位，不该报退役')
+  })
+
+  await check('webform 源已从产品里移除：PLATFORMS 不含它，老配置拿到的是迁移提示', async () => {
+    const { PLATFORMS, REMOVED_PLATFORMS } = await import('../src/core/config.js')
+    assert.equal(PLATFORMS.includes('webform'), false, 'webform 不该再出现在 PLATFORMS 里')
+    assert.ok(REMOVED_PLATFORMS.webform, '已移除的平台要有迁移提示，不能只说「只能是 …」')
+    // 组合根里也不该再有这个源（否则配置校验拒绝了、装配层却还留着死代码）。
+    const { SOURCES } = await import('../src/index.js')
+    assert.equal('webform' in SOURCES, false, 'SOURCES 里不该再有 webform')
+    // 老配置：报错必须说得清「怎么改」，而不是「不认识这个词」。
+    const result = validateConfig({
+      projects: [{
+        name: 'old',
+        match: { platform: 'webform' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.equal(result.value, undefined, 'webform 配置应当被拒绝')
+    const message = (result.issues ?? []).map((issue) => issue.message).join('\n')
+    assert.match(message, /已移除/, '要说明它被移除了')
+    assert.match(message, /mock/, '要给出可照做的替代（mock）')
+    assert.match(message, /feishu/, '要给出可照做的替代（feishu）')
   })
 
   await check('describeConfig 会把收窄名单透出来（排障时先看这一轮在处理哪几张票）', async () => {
@@ -2776,7 +3512,7 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(row.sessionId, 'ticket-demo-rec-session-1', '会话 id 要存下来')
 
     const tool = createPipelineStatusTool({ store, getConfig: () => validateConfig({}).value })
-    const out = await tool.execute({ includeDone: true }, {})
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
     assert.match(out.text, /处理会话：ticket-demo-rec-session-1/, `状态里要指出会话在哪：${out.text}`)
     assert.equal(out.tickets[0].sessionId, 'ticket-demo-rec-session-1', '返回体也要带 sessionId')
   })
@@ -2787,18 +3523,165 @@ function makeFakeCtx ({ domain, registered }) {
       { key: k('r-no'), projectId: DEMO, recordId: 'r-no', phase: 'done', attempt: 0, writeBack: { written: false, note: 'auth: 应用没有写权限' } },
     ]
     const tool = createPipelineStatusTool({ store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value })
-    const out = await tool.execute({ includeDone: true }, {})
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
     assert.match(out.text, /回填表格：成功（是否处理、处理结果、处理日期）/, `成功要写清三列：${out.text}`)
     assert.match(out.text, /回填表格：没写成 —— auth: 应用没有写权限/, `失败要带原因：${out.text}`)
   })
 
-  await check('skipped 的回填首句要说「验证没跑通，需要人工确认」', async () => {
-    // skipped 是「提交做了、验证没跑通」。回填如果写成「已改完」，
+  // #05：以前 pipeline_status 每票只给一个 sha，人要 review 还得离开 GUI 去敲 git show。
+  // 下面三条覆盖：解析器（含 rename / 二进制）、describeCommit 的降级、以及
+  // 「pipeline_status 里真的多渲了改动摘要」。
+  section('16a. 改动摘要：pipeline_status 直接告诉人「这次改了什么」')
+
+  await check('parseShowSummaryZ：raw + numstat 两段合并，rename 与二进制都不出错', async () => {
+    // 真机输出形态（本机 git 2.45 实测）：先全部 raw 记录，再全部 numstat 记录，
+    // 段间只有 NUL 没有换行；rename 在 raw 段是「状态/旧/新」，在 numstat 段是
+    // `0\t0\t` + 空串 + 旧 + 新。二进制是 `-\t-\tpath`。
+    const stdout = [
+      ':100644 100644 2ae8088 4e8b263 M', 'README.md',
+      ':100644 000000 ba077a4 0000000 D', 'b.txt',
+      ':100644 100644 e64015c e64015c R100', 'a.txt', 'c.txt',
+      ':000000 100644 0000000 fa49b07 A', 'd.txt',
+      ':000000 100644 0000000 abc1234 A', 'logo.png',
+      '1\t1\tREADME.md',
+      '0\t1\tb.txt',
+      '0\t0\t', 'a.txt', 'c.txt',
+      '18\t0\td.txt',
+      '-\t-\tlogo.png',
+      '',
+    ].join('\0')
+    const files = parseShowSummaryZ(stdout)
+    assert.equal(files.length, 5, `五个文件都要认出来：${JSON.stringify(files)}`)
+    assert.deepEqual(
+      files.map((f) => [f.status, f.path, f.insertions, f.deletions, f.binary === true]),
+      [
+        ['update', 'README.md', 1, 1, false],
+        ['delete', 'b.txt', 0, 1, false],
+        ['move', 'c.txt', 0, 0, false],
+        ['create', 'd.txt', 18, 0, false],
+        ['create', 'logo.png', undefined, undefined, true],
+      ],
+      `状态/路径/行数都要对上：${JSON.stringify(files)}`,
+    )
+    assert.equal(files[2].from, 'a.txt', 'rename 要保留旧路径')
+    // 空输出（空提交）不能炸。
+    assert.deepEqual(parseShowSummaryZ(''), [])
+    assert.deepEqual(parseShowSummaryZ(undefined), [])
+  })
+
+  await check('describeCommit：一次调用拿全、逐文件上限截断、取不到就降级不抛', async () => {
+    const calls = []
+    const fakeSpawn = (stdout, code = 0, stderr = '') => async (argv, opts) => {
+      calls.push({ argv, opts })
+      return { code, stdout, stderr }
+    }
+    const stdout = [
+      ':100644 100644 1 2 M', 'a.js',
+      ':100644 100644 3 4 M', 'b.js',
+      '10\t2\ta.js',
+      '30\t4\tb.js',
+      '',
+    ].join('\0')
+    const one = await describeCommit({ gitRunner: fakeSpawn(stdout), worktreePath: 'D:/repo', sha: 'abc123' })
+    assert.equal(one.ok, true)
+    assert.equal(one.fileCount, 2)
+    assert.equal(one.insertions, 40, '总插入行数按 numstat 求和')
+    assert.equal(one.deletions, 6)
+    assert.equal(one.files[0].statusLabel, '修改', '状态要翻成中文，与 MR 描述同一套说法')
+    assert.equal(calls.length, 1, `必须一次进程调用，实际 ${calls.length} 次`)
+    assert.deepEqual(calls[0].argv.slice(0, 4), SHOW_SUMMARY_ARGS.slice(0, 4))
+    assert.equal(calls[0].opts.cwd, 'D:/repo', '在改代码目录里跑')
+
+    // 上限：超过 limit 只列前 limit 个，其余报个数。
+    const many = []
+    const manyNum = []
+    for (let i = 0; i < 25; i += 1) {
+      many.push(':100644 100644 1 2 M', `f${i}.js`)
+      manyNum.push(`1\t1\tf${i}.js`)
+    }
+    const big = await describeCommit({
+      gitRunner: fakeSpawn([...many, ...manyNum, ''].join('\0')), worktreePath: 'D:/repo', sha: 'abc',
+    })
+    assert.equal(big.fileCount, 25)
+    assert.equal(big.files.length, COMMIT_SUMMARY_FILE_LIMIT, '逐文件最多列 20 个')
+    assert.equal(big.truncated, true)
+    assert.equal(big.hiddenCount, 5)
+
+    // 三种「取不到」都要降级成 { ok:false }，不许抛：读不到摘要不该让整条 status 失败。
+    const missing = await describeCommit({
+      gitRunner: fakeSpawn('', 128, 'fatal: bad object abc\n'), worktreePath: 'D:/repo', sha: 'abc',
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.reason, /bad object/, `要带上 git 的原话：${missing.reason}`)
+    assert.equal((await describeCommit({ gitRunner: fakeSpawn(''), worktreePath: '', sha: 'abc' })).ok, false, '没目录要降级')
+    assert.equal((await describeCommit({ gitRunner: null, worktreePath: 'D:/repo', sha: 'abc' })).ok, false, '没 git 链路要降级')
+    assert.equal((await describeCommit({ gitRunner: fakeSpawn(''), worktreePath: 'D:/repo', sha: '' })).ok, false, '没 sha 要降级')
+    const boom = await describeCommit({
+      gitRunner: async () => { throw new Error('spawn EPERM') }, worktreePath: 'D:/repo', sha: 'abc',
+    })
+    assert.equal(boom.ok, false, '执行器抛错也要降级')
+    assert.match(boom.reason, /EPERM/)
+  })
+
+  await check('pipeline_status 每票多渲「改动摘要」，取不到时只多一行说明', async () => {
+    const rows = [
+      {
+        key: k('r-sum'), projectId: DEMO, recordId: 'r-sum', phase: 'done', attempt: 0,
+        worktreePath: 'D:/repo', commit: { sha: '3433b3a93e82abcdef', branch: 'v2.x' },
+      },
+      {
+        key: k('r-nocommit'), projectId: DEMO, recordId: 'r-nocommit', phase: 'failed', attempt: 0,
+        worktreePath: 'D:/repo', lastError: 'agent 没有产生任何文件改动',
+      },
+    ]
+    const stdout = [':100644 100644 1 2 M', 'src/a.js', ':000000 100644 0 3 A', 'src/b.js', '42\t7\tsrc/a.js', '18\t0\tsrc/b.js', ''].join('\0')
+    const tool = createPipelineStatusTool({
+      store: { listTickets: () => rows },
+      getConfig: () => validateConfig({}).value,
+      gitRunner: async () => ({ code: 0, stdout, stderr: '' }),
+      now: () => 1_000,
+    })
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(out.text, /改动摘要：2 个文件，\+60 \/ −7/, `要报总数：${out.text}`)
+    assert.match(out.text, /\+42 \/ −7  src\/a\.js（修改）/, `要逐文件：${out.text}`)
+    assert.match(out.text, /\+18 \/ −0  src\/b\.js（新增）/, `新增也要有标签：${out.text}`)
+    assert.equal(out.tickets[0].commitSummary.fileCount, 2, '返回体带上机器可读摘要')
+    assert.equal(out.tickets[1].commitSummary, null, '没有提交的票给 null，不是 undefined（lossless JSON）')
+
+    // 取不到时：只有一行「取不到」，不抛、不刷屏，整条 status 照常完整。
+    const brokenTool = createPipelineStatusTool({
+      store: { listTickets: () => rows },
+      getConfig: () => validateConfig({}).value,
+      gitRunner: async () => ({ code: 128, stdout: '', stderr: 'fatal: not a git repository\n' }),
+      now: () => 1_000,
+    })
+    const broken = await brokenTool.execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(broken.text, /改动摘要：取不到（fatal: not a git repository）/, `要带原因：${broken.text}`)
+    assert.match(broken.text, /已经收尾|失败了/, '其余内容仍要完整可读')
+    assert.equal(broken.tickets[0].commitSummary.ok, false)
+
+    // 压根没注入 gitRunner（宿主没有 git 链路）时也要能跑。
+    const noGit = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 1_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(noGit.text, /改动摘要：取不到（宿主没有可用的 git 执行链路）/, noGit.text)
+  })
+
+  await check('renderCommitSummary：没有摘要时一行都不多说', async () => {
+    const lines = []
+    renderCommitSummary(undefined, (line) => lines.push(line))
+    renderCommitSummary(null, (line) => lines.push(line))
+    assert.deepEqual(lines, [], 'failed 票不该多出空行或「取不到」噪音')
+  })
+
+  await check('skipped 的回填首句要说「待人工验证」，不能写成已完成', async () => {    // skipped 是「提交做了、验证没通过」。回填如果写成「已改完」，
     // 人看到表里那行「是」就不会再去看验证报告了。
+    // 也不能写成「没跑通」这种否定式收尾（#01）——它是交付成功、待人工验证。
     const { scheduler, source } = harness({ executor: createMockExecutor({ outcome: 'skipped' }) })
     await scheduler.tick()
     assert.equal(source.writes.length, 1, 'skipped 也要回填')
-    assert.match(source.writes[0].result, /验证没跑通，需要人工确认/, `首句要提示人工确认：${source.writes[0].result}`)
+    assert.match(source.writes[0].result, /待人工验证/, `首句要提示人工验证：${source.writes[0].result}`)
+    assert.equal(/没跑通|未跑通|未验证/.test(source.writes[0].result), false, `不要用否定式收尾：${source.writes[0].result}`)
   })
 
   section('16b. 事后动作补偿（pendingEffects）与租约诚实化')
@@ -2823,6 +3706,237 @@ function makeFakeCtx ({ domain, registered }) {
     await scheduler.tick()
     assert.equal(push.messages.length, 1)
     assert.doesNotMatch(push.messages[0].body, /回填表格/, `成功时不该有回填行：${push.messages[0].body}`)
+  })
+
+  // ── #08：交付维度 ────────────────────────────────────────────
+  // 真机 reczz28VYQARkYBL：改动/验证/提交/通知全成，只有回填被飞书同步表挡住
+  // （800074911 ConnectorSyncTableActionForbidden），而插件把整票判成「成功」，
+  // 表格里那一行永远停在「处理中」。根因不是「忘了一条日志」，是模型缺一维：
+  // phase 答「走到哪一站」，没有字段答「该交给人的东西交到了没有」。
+  section('16c. 交付维度：票完了 ≠ 东西交到你手上了')
+
+  await check('三个错误分类表互斥且覆盖全部 kind（别再造出「两张表都不在」的 aborted）', () => {
+    for (const kind of ERROR_KINDS) {
+      const hits = [RETRYABLE_KINDS.has(kind), FATAL_KINDS.has(kind), CANCELLED_KINDS.has(kind)].filter(Boolean).length
+      assert.equal(hits, 1, `kind=${kind} 必须恰好落在一张表里（现在落在 ${hits} 张）`)
+    }
+    assert.equal(retryPolicy('network'), 'retry')
+    assert.equal(retryPolicy('rate-limit'), 'retry')
+    assert.equal(retryPolicy('unsupported'), 'fatal')
+    assert.equal(retryPolicy('aborted'), 'cancelled')
+    // 以前 aborted 两张表都不在：既不算可重试也不算致命，分类是空的。
+    assert.equal(RETRYABLE_KINDS.has('aborted') || FATAL_KINDS.has('aborted'), false)
+    assert.equal(CANCELLED_KINDS.has('aborted'), true)
+  })
+
+  await check('delivery 三项各自独立：提交成、回填败、通知成', async () => {
+    const source = createMockSource()
+    source.setFailWrite(true)
+    const { scheduler, store, push } = harness({ source })
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '回填失败不改票态')
+    assert.ok(row.delivery, '票行必须有 delivery')
+    assert.equal(row.delivery.commit?.ok, true, '有本地提交 = 交付成了')
+    assert.equal(row.delivery.writeBack?.ok, false, '回填失败要如实记下来')
+    assert.equal(row.delivery.notify?.ok, true, '通知发出去了')
+    assert.equal(push.messages.length, 1)
+    // 回填是 network 错（可重试）⇒ 留着待办 + giveUp=false
+    assert.equal(row.delivery.writeBack.giveUp, false, '可重试的不能标成已放弃')
+    assert.ok(row.pendingEffects?.writeBack, '可重试失败要留待补做')
+    assert.equal(row.pendingEffects.writeBack.attempts, 1, '待办要记「试过几次」')
+    // note 不再带 `network: ` 前缀（#08 的 D 条）
+    assert.ok(!String(row.writeBack.note).startsWith('network:'), `note 不该带 kind 前缀：${row.writeBack.note}`)
+    assert.equal(row.delivery.writeBack.errorKind, 'network', '分类进结构化字段')
+  })
+
+  await check('回填不可重试（飞书同步表）→ 当场放弃、giveUp=true、不再留待办', async () => {
+    // 这张表结构上不接受直接写记录，再试一百次也是同一个 800074911。
+    // 留着待办只会让每次启动都对着它撞一遍，还要在状态页上一直亮着「会再试一次」。
+    const source = createMockSource()
+    const original = source.writeResult.bind(source)
+    source.writeResult = async (recordId, payload, signal) => ({
+      written: false,
+      retryable: false,
+      errorKind: 'unsupported',
+      note: '这张多维表格是「同步表」，飞书不允许直接改里面的行',
+    })
+    void original
+    const { scheduler, store, push } = harness({ source })
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '回填失败不改票态')
+    assert.equal(row.delivery.writeBack?.ok, false)
+    assert.equal(row.delivery.writeBack.giveUp, true, '不可重试要标成已放弃')
+    assert.equal(row.pendingEffects?.writeBack, undefined, '放弃之后不该再留着待补做')
+    assert.equal(row.delivery.writeBack.errorKind, 'unsupported')
+    // 通知里要明说「别再等了」
+    assert.match(push.messages[0].body, /不是再试一次能好的/, push.messages[0].body)
+  })
+
+  await check('done 却没有提交 → 交付记成没交出去（不能因为票面写着已完成就当它成了）', async () => {
+    const executor = {
+      id: 'done-without-commit',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('mr-opening')
+        // 故意**不**走 makeExecResult：契约层会直接拦住「done 但没有 commit/mr」，
+        // 而这里要验的是内核自己那一层防线 —— 万一第三方执行器绕过了契约检查，
+        // 交付维度也得如实记下「没有可 review 的东西」。
+        return { phase: 'done', changedFiles: [], testOutcome: 'passed' }
+      },
+    }
+    const { scheduler, store } = harness({ executor })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.ok(row, '票要留在库里（不能凭空消失）')
+    assert.equal(row.delivery.commit?.ok, false, '没有提交也没有 MR 要记成没交付')
+    assert.match(row.delivery.commit.error ?? '', /既没有本地提交也没有 MR/)
+  })
+
+  await check('pipeline_status：交付未完成在标题行与全库分布里都看得见', async () => {
+    const source = createMockSource()
+    source.setFailWrite(true)
+    const { scheduler, store } = harness({ source })
+    await scheduler.tick()
+    const status = createPipelineStatusTool({
+      store,
+      getConfig: () => validateConfig({ enabled: true }).value,
+    })
+    const out = await status.execute({ view: 'tickets', includeDone: true }, {})
+    // 标题行后缀：只有回填失败时用短说法「（表格未回写）」，多项失败才逐个列。
+    assert.match(out.text, /已完成（已验证）｜.*（表格未回写）|（表格未回写）/, out.text)
+    assert.match(out.text, /交付未完成：1 张/, out.text)
+    assert.match(out.text, /交付·回填表格：没做成/, out.text)
+    assert.match(out.text, /会再自动试一次/, out.text)
+    // 机器可读：delivery 与 deliveryIssues 都要给出来，运行页签不用自己再拼
+    assert.equal(out.tickets[0].delivery.writeBack.ok, false)
+    assert.equal(out.tickets[0].deliveryIssues[0].name, 'writeBack')
+    assert.equal(out.tickets[0].deliveryIssues[0].giveUp, false)
+  })
+
+  // #06：通知是用户接触这个插件最频繁的界面（一张票一封），但原来只是一份
+  // 「事实清单」——有项目、序号、sha、改动文件数，唯独没有一句「关我什么事」。
+  // 判定行固定在第一行，因为手机邮件列表预览只取前 1–2 行。
+  await check('通知第一行是判定行，六种情形各有各的句式', async () => {
+    // ① done + 验证通过 + 回填成功 → 不用你做
+    {
+      const { scheduler, push } = harness()
+      await scheduler.tick()
+      const body = push.messages[0].body
+      const first = body.split('\n')[0]
+      assert.ok(first.startsWith('【'), `判定行必须在第一行，实际第一行是：${JSON.stringify(first)}`)
+      assert.equal(first, '【不用你做，知道一下就行】', `done 全绿时不该要求人做事：${first}`)
+      assert.equal(body.includes('要你做'), false, `一切正常时正文不该出现「要你做」：${body}`)
+    }
+
+    // ② done + 验证通过 + 回填失败 → 要人手工回填
+    {
+      const source = createMockSource()
+      source.setFailWrite(true)
+      const { scheduler, push } = harness({ source })
+      await scheduler.tick()
+      assert.equal(push.messages[0].body.split('\n')[0], '【要你做：去表格里手工回填这一行的「处理结果」】', push.messages[0].body)
+    }
+
+    // ③ done 但验证没跑成（workExecutor 没配 verify 命令）→ 要人自己验一遍。
+    //    这一档最容易被误当成「验过了」，所以必须与 ① 分开。
+    {
+      const executor = {
+        id: 'done-without-verify',
+        async run (ticket, target, ctx) {
+          await ctx.onPhase('editing')
+          await ctx.onPhase('testing')
+          await ctx.onPhase('mr-opening')
+          return makeExecResult({
+            phase: 'done',
+            changedFiles: [],
+            testOutcome: 'skipped',
+            testDetail: '没有配置验证命令（verify.test 为空）',
+            commit: { sha: 'abcdef123456', branch: 'ticket-demo', files: [] },
+          })
+        },
+      }
+      const { scheduler, push } = harness({ executor })
+      await scheduler.tick()
+      const body = push.messages[0].body
+      assert.equal(body.split('\n')[0], '【要你做：这票没跑过验证，请人工验一遍】', body)
+      assert.match(body, /验证：未跑成/, body)
+    }
+
+    // ④ skipped（验证跑了但没过）→ 要人确认这份改动能不能用
+    {
+      const { scheduler, push } = harness({ executor: createMockExecutor({ outcome: 'skipped' }) })
+      await scheduler.tick()
+      assert.equal(push.messages[0].body.split('\n')[0], '【要你做：改动已交付但验证没过，请人工确认】', push.messages[0].body)
+    }
+
+    // ⑤ failed → 要人重跑
+    {
+      const { scheduler, push } = harness({ executor: createMockExecutor({ outcome: 'failed' }) })
+      await scheduler.tick()
+      assert.equal(push.messages[0].body.split('\n')[0], '【要你做：这票失败了】', push.messages[0].body)
+    }
+
+    // ⑥ needs-info（截图取不到）→ 要人补图
+    {
+      const source = createMockSource({ failScreenshot: true })
+      source.seeds[0].screenshot = { kind: 'path', path: 'D:/shots/1.png' }
+      const { scheduler, push } = harness({ source, saveImage: async () => {} })
+      await scheduler.tick()
+      assert.equal(push.messages[0].body.split('\n')[0], '【要你做：补一张截图】', push.messages[0].body)
+    }
+  })
+
+  await check('通知里带「处理会话」，收到邮件想追问能找到那个会话', async () => {
+    // 断点 B3：原来只有渲染到「处理结果」列的分支会写会话 id，通知正文从来不写，
+    // 用户想追问只能回 GUI 翻会话列表。说法与 renderWriteBackResult 保持一致。
+    const executor = {
+      id: 'with-session',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: [],
+          testOutcome: 'passed',
+          sessionId: 'ticket-demo-rec-mock-001-1234567890',
+          commit: { sha: 'abcdef123456', branch: 'ticket-demo', files: [] },
+        })
+      },
+    }
+    const { scheduler, push } = harness({ executor })
+    await scheduler.tick()
+    const body = push.messages[0].body
+    assert.match(body, /处理会话：ticket-demo-rec-mock-001-1234567890/, `通知里要能直接看到会话 id：${body}`)
+  })
+
+  await check('验证失败时通知给 testDetail 加免责句（跨票耦合的失败容易误判）', async () => {
+    // testDetail 是验证命令 stdout/stderr 的完整尾部（末 8 行），不按本票改动过滤。
+    // 真机出现过「别的票的用例挂了、被写进这封通知」，人第一反应是自己的票把别人弄挂了。
+    const executor = {
+      id: 'failed-with-detail',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'skipped',
+          changedFiles: [],
+          testOutcome: 'failed',
+          testDetail: '✗ 行程分段天数（与本票无关）\n✗ 表单提交状态（与本票无关）',
+          commit: { sha: 'abcdef123456', branch: 'ticket-demo', files: [] },
+        })
+      },
+    }
+    const { scheduler, push } = harness({ executor })
+    await scheduler.tick()
+    const body = push.messages[0].body
+    assert.match(body, /可能包含与本工单无关的用例失败/, `要有免责句：${body}`)
+    assert.match(body, /行程分段天数/, '免责句之后仍要把原始输出给人')
   })
 
   await check('一场跑完，pendingEffects 必须清干净（不清下次启动会重复补做）', async () => {
@@ -3068,7 +4182,7 @@ function makeFakeCtx ({ domain, registered }) {
       },
     ]
     const tool = createPipelineStatusTool({ store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value })
-    const out = await tool.execute({ includeDone: true }, {})
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
     assert.match(out.text, /待补做：回填表格、发通知/, `要列出还没做完的动作：${out.text}`)
     assert.deepEqual(out.tickets[0].pendingEffects, { writeBack: true, notify: true }, '返回体只暴露布尔，不摊内部载荷')
     assert.equal(out.tickets[0].writeBack, undefined, '还没回填就没有回执')
@@ -3076,7 +4190,7 @@ function makeFakeCtx ({ domain, registered }) {
     // 干净票不带这一行：每张终态票都挂一句「待补做」只会教人忽略它。
     const clean = [{ key: k('r-clean'), projectId: DEMO, recordId: 'r-clean', phase: 'done', attempt: 0 }]
     const tool2 = createPipelineStatusTool({ store: { listTickets: () => clean }, getConfig: () => validateConfig({}).value })
-    const out2 = await tool2.execute({ includeDone: true }, {})
+    const out2 = await tool2.execute({ view: 'tickets', includeDone: true }, {})
     assert.doesNotMatch(out2.text, /待补做/, `干净票不该有待补做行：${out2.text}`)
     assert.equal(out2.tickets[0].pendingEffects, undefined)
   })
@@ -3253,7 +4367,7 @@ function makeFakeCtx ({ domain, registered }) {
       getConfig: () => validateConfig({}).value,
       now: () => base + 300_000 + 95_000,
     })
-    const out = await tool.execute({ includeDone: true }, {})
+    const out = await tool.execute({ view: 'tickets', includeDone: true }, {})
     assert.match(out.text, /流程日志/, '要有时间线小节')
     assert.match(out.text, /现在停在第 ⑤ 站「处理工单问题」/, `要指出卡在第几站：${out.text}`)
     assert.match(out.text, /已 1 分 35 秒没动/, `要说清多久没动：${out.text}`)
@@ -3266,12 +4380,12 @@ function makeFakeCtx ({ domain, registered }) {
     }]
     const doneOut = await createPipelineStatusTool({
       store: { listTickets: () => mk('done', 'done', true) }, getConfig: () => validateConfig({}).value, now: () => 10_000,
-    }).execute({ includeDone: true }, {})
+    }).execute({ view: 'tickets', includeDone: true }, {})
     assert.match(doneOut.text, /已经收尾/, `终态要写「已收尾」：${doneOut.text}`)
 
     const needsOut = await createPipelineStatusTool({
       store: { listTickets: () => mk('needs-info', 'needs-info', false) }, getConfig: () => validateConfig({}).value, now: () => 10_000,
-    }).execute({ includeDone: true }, {})
+    }).execute({ view: 'tickets', includeDone: true }, {})
     assert.match(needsOut.text, /等你补充信息/, `needs-info 要写「在等人」：${needsOut.text}`)
     assert.match(needsOut.text, /不是插件卡死/, '要说清是等人不是卡死')
   })
@@ -3287,7 +4401,7 @@ function makeFakeCtx ({ domain, registered }) {
     }]
     const out = await createPipelineStatusTool({
       store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => base + 395_000,
-    }).execute({ includeDone: true }, {})
+    }).execute({ view: 'tickets', includeDone: true }, {})
     assert.equal(out.tickets[0].timeline.length, 2, '返回体要带完整时间线')
     assert.equal(typeof out.tickets[0].timeline[0].at, 'number', 'at 是 epoch ms')
     assert.equal(out.tickets[0].station.no, '⑤', '当前站定位到 editing 的编号')
@@ -3299,7 +4413,7 @@ function makeFakeCtx ({ domain, registered }) {
     const rows = [{ key: k('r-old'), projectId: DEMO, recordId: 'r-old', phase: 'done', attempt: 0 }]
     const out = await createPipelineStatusTool({
       store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 1_000,
-    }).execute({ includeDone: true }, {})
+    }).execute({ view: 'tickets', includeDone: true }, {})
     const offenders = []
     const walk = (value, path) => {
       if (value === undefined) { offenders.push(path || '<root>'); return }
@@ -3313,8 +4427,138 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(out.tickets[0].timeline, [], '没时间线就是空数组')
   })
 
-  await check('票据行里的数字键脏字段会被剔掉，且下一次写入把它从存储里清走', async () => {
+  section('16d. 长站点心跳：跑十几分钟也不能看起来像卡死')
+
+  await check('时间线：心跳只和心跳合并，不吃掉进站那条，也不占 80 条额度', async () => {
     const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.appendTimeline(key, 'testing', '进站了', true)
+    // 连打 5 次心跳：只能合成一条，且进站那条必须还在。
+    for (let i = 0; i < 5; i += 1) {
+      await store.appendTimeline(key, 'testing', `第 ${i} 次心跳`, true, undefined, { heartbeat: true })
+    }
+    const timeline = store.getTicket(key).timeline
+    assert.equal(timeline.length, 2, `进站 1 条 + 心跳 1 条：${timeline.map((e) => e.node).join(' → ')}`)
+    assert.equal(timeline[0].detail, '进站了', '进站那条不能被心跳吃掉')
+    assert.notEqual(timeline[0].heartbeat, true, '进站那条不是心跳')
+    assert.equal(timeline[1].heartbeat, true, '第二条是心跳')
+    assert.equal(timeline[1].detail, '第 4 次心跳', '心跳保留最新一条')
+
+    // 心跳不占封顶额度：站点记录仍然能存满 80 条。
+    const repo2 = makeMemoryRepo()
+    const store2 = new TicketStore({ repo: repo2, log: silent })
+    await store2.enqueue(ticket)
+    for (let i = 0; i < 80; i += 1) {
+      await store2.appendTimeline(key, 'editing', `第${i}站`, i % 2 === 0)
+    }
+    await store2.appendTimeline(key, 'editing', '心跳', true, undefined, { heartbeat: true })
+    const capped = store2.getTicket(key).timeline
+    assert.equal(capped.length, 80, `心跳不能把封顶挤爆：${capped.length}`)
+  })
+
+  await check('调度器：长站点跑起来会自己补心跳，人不会看到「13 分钟没动」', async () => {
+    // 执行器在 testing 站里停 180ms，心跳 40ms 一次 —— 至少要补出 2 条心跳。
+    const slowExecutor = {
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        await ctx.onPhase('testing')
+        await new Promise((resolve) => setTimeout(resolve, 180))
+        // 注意：这里不能再调 createMockExecutor().run(...) —— mock 内部第一步又是
+        // onPhase('editing')，会给 editing 记第二条进站记录（中间隔着 testing，
+        // 不满足「连续同 node 同 ok 才合并」）。直接返回结果最干净。
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: [],
+          testOutcome: 'passed',
+          mr: { iid: 1, url: 'mock://mr/1', draft: true },
+        })
+      },
+    }
+    const { scheduler, store } = harness({
+      executor: slowExecutor,
+      timelineHeartbeatMsOverride: 40,
+    })
+    await scheduler.tick()
+    const timeline = store.getTicket(k('rec-mock-001')).timeline
+    const heartbeats = timeline.filter((e) => e.heartbeat === true)
+    assert.ok(heartbeats.length >= 1, `长站点要补心跳：${timeline.map((e) => `${e.node}${e.heartbeat ? '(心跳)' : ''}`).join(' → ')}`)
+    assert.equal(heartbeats[0].node, 'testing', '心跳打在正在跑的那一站上')
+    assert.match(heartbeats[0].detail, /心跳/, 'detail 要说明这是心跳')
+
+    // 心跳不能把别的站搞乱：editing 只该有进站那一条。
+    const editingEntries = timeline.filter((e) => e.node === 'editing')
+    assert.equal(editingEntries.length, 1, `editing 只有进站一条：${editingEntries.length}`)
+    assert.notEqual(editingEntries[0].heartbeat, true)
+  })
+
+  await check('调度器：终态之后心跳立刻停，不会继续往时间线里塞', async () => {
+    const { scheduler, store } = harness({ timelineHeartbeatMsOverride: 10 })
+    await scheduler.tick()
+    const key = k('rec-mock-001')
+    const afterRun = store.getTicket(key).timeline.length
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const later = store.getTicket(key).timeline.length
+    assert.equal(later, afterRun, '跑完就该停定时器，不能被心跳继续写')
+  })
+
+  await check('pipeline_status：长站点报「这一站已经跑了多久」+ 经验区间，超了才提示可能卡住', async () => {
+    const base = 1_000_000
+    const mkRows = (elapsedMs) => [{
+      key: k('r-test'), projectId: DEMO, recordId: 'r-test', phase: 'testing', attempt: 0,
+      timeline: [
+        { node: 'discover', label: '获取工单', at: base, ok: true },
+        { node: 'testing', label: '跑验证', at: base + 60_000, ok: true },
+        // 心跳把「多久没动」推到最后一次心跳
+        { node: 'testing', label: '跑验证', at: base + 60_000 + elapsedMs - 30_000, ok: true, heartbeat: true },
+      ],
+    }]
+    // 8 分钟：在 3–15 分钟内，不该说「可能卡住」。
+    const okOut = await createPipelineStatusTool({
+      store: { listTickets: () => mkRows(8 * 60_000) },
+      getConfig: () => validateConfig({}).value,
+      now: () => base + 60_000 + 8 * 60_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(okOut.text, /通常 3–15 分钟/, `站点标签要带经验区间：${okOut.text}`)
+    assert.match(okOut.text, /这一站已经跑了|已经跑了 8 分/, `要报这一站跑了多久：${okOut.text}`)
+    assert.doesNotMatch(okOut.text, /可能卡住了/, '范围内不能吓人')
+    // 心跳不单独占一行：三站记录里只有两行站点。
+    const stationLines = okOut.text.split('\n').filter((line) => /^\s{4}\d{2}-\d{2} /.test(line))
+    assert.equal(stationLines.length, 2, `心跳不占行，只有 2 行站点：${stationLines.join(' | ')}`)
+    assert.equal(okOut.tickets[0].timeline.length, 3, '机器可读 timeline 保留全部记录')
+    assert.equal(okOut.tickets[0].stations.length, 2, 'stations 只留站点')
+    assert.equal(okOut.tickets[0].heartbeatCount, 1)
+    assert.equal(okOut.tickets[0].stationRange[1], 15, 'testing 的经验区间上界是 15 分钟')
+
+    // 20 分钟：超了上界，必须升级措辞。
+    const slowOut = await createPipelineStatusTool({
+      store: { listTickets: () => mkRows(20 * 60_000) },
+      getConfig: () => validateConfig({}).value,
+      now: () => base + 60_000 + 20 * 60_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(slowOut.text, /超过常见范围（3–15 分钟）/, `超范围要明说：${slowOut.text}`)
+    assert.match(slowOut.text, /可以再等等，也可以取消后重跑/, '要给出两条路')
+  })
+
+  await check('pipeline_status：短站点保持原来的「已 X 没动」，不被心跳改造影响', async () => {
+    const base = 1_000_000
+    const rows = [{
+      key: k('r-short'), projectId: DEMO, recordId: 'r-short', phase: 'editing', attempt: 0,
+      timeline: [{ node: 'editing', label: '处理工单问题', at: base, ok: true }],
+    }]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => base + 95_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(out.text, /现在停在第 ⑤ 站「处理工单问题」/, '站号与站名不变')
+    assert.match(out.text, /已 1 分 35 秒没动/, '没配经验区间的站仍然说「多久没动」')
+    assert.equal(out.tickets[0].stationRange, undefined, '短站点没有经验区间')
+  })
+
+  await check('票据行里的数字键脏字段会被剔掉，且下一次写入把它从存储里清走', async () => {    const repo = makeMemoryRepo()
     const store = new TicketStore({ repo, log: silent })
     const key = ticketKey(DEMO, 'r-dirty')
     await store.enqueue({

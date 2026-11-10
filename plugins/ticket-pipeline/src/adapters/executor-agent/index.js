@@ -11,8 +11,9 @@
  *    inject=next-step 不唤醒）。用 inject 会得到一个永远不动的 agent。
  * 3. **等结束**：`whenIdle()` 之后再比一次 `session.seq`，不轮询 `agent/status`。
  * 4. **验证**：命令从项目配置 `verify` 注入，执行器里**不硬编码任何命令**。
- *    环境起不来就记 `testOutcome:'skipped'` 并写清原因、照样交付 ——
- *    这是契约里明确的合法成功路径，不是失败。
+ *    环境起不来就记 `testOutcome:'not-run'` 并写清原因、照样交付 ——
+ *    这是契约里明确的合法成功路径，不是失败。（老数据里这个值是 `'skipped'`，
+ *    读时由 `normalizeTestOutcome()` 归一；改名是因为 `skipped` 已被 phase 占用。）
  * 5. **交付**：在工作区检出里 `git add -- <改动文件>` + `git commit -- <改动文件 ∪ 旧路径>`
  *    形成本地提交（`commitLocally`）。**不需要远程、不需要 GITLAB_TOKEN**。
  *    只有项目显式打开 `repo.gitlab.enabled: true` 时才额外走 GitLab Commits API
@@ -662,6 +663,19 @@ export function createAgentExecutor (options = {}) {
         flowWorkspaceLabel(ctx),
       ].filter(Boolean).join('，'))
 
+      // 会话 id 在 `agents.create` 之前就算出来了，但只有「真的建成了」才值得交出去。
+      // 交给调度器的理由：票后来抛异常 / 超时 / 被取消时，**执行器返回不了结果**，
+      // 调度器手上就只剩一条没有 sessionId 的 failed 票 —— 人看着「失败了」却找不到
+      // 那一轮会话，没法点进去看它到底怎么想的（评审里 failed 票「不可行动」的主因）。
+      // 这个回调是可选的，写失败不影响跑票。
+      if (typeof ctx.onSessionId === 'function') {
+        try {
+          await ctx.onSessionId(sessionId)
+        } catch (error) {
+          log('executor-agent：把会话 id 交给调度器失败（不影响跑票）', { sessionId, reason: String(error?.message ?? error) })
+        }
+      }
+
       /** 取消时 agent 上的工作量很大，中途要把它停下来，不能留着空转烧 token。 */
       const cancelAgent = () => {
         try {
@@ -772,7 +786,7 @@ export function createAgentExecutor (options = {}) {
               phase: 'failed',
               sessionId,
               changedFiles: [],
-              testOutcome: 'skipped',
+              testOutcome: 'not-run',
               testDetail: reason,
               blockedFiles: tampered,
               error: { kind: 'invalid-input', message: reason, retryable: false },
@@ -794,9 +808,19 @@ export function createAgentExecutor (options = {}) {
             throw failureError
           }
           // 没改动就不该交付：一次空的本地提交只会留下一行没有内容的 git 历史。
+          //
+          // 「没有文件改动」本身不是原因，只是现象 —— 人拿到这一句想去修，却不知道该往哪修。
+          // 这里把三条最可能的岔路直接写进文案（都是运行期真的会撞到的，不是猜的）：
+          //   1. 任务书没描述清/模型没读懂 → 它回了句话就结束了，一个文件都没碰；
+          //   2. 它其实改了，但改在 .agents/worktrees 之外或命中敏感名单 → 被 collectChanges 排掉；
+          //   3. 模型压根没拿到工具（preset 没挂上 / provider 没配）→ 它连读文件都做不到，
+          //      历史上真撞过：`prompt variable "{{model}}" has no value for this assembly`
+          //      会让每一张票都以这一句收场（feature-checklist 2026-11-05 那次）。
           const reason = collected.files.length > 0
             ? `agent 只动了敏感文件（${collected.files.join('、')}），按约定不提交，因此没有可交付的改动`
             : 'agent 没有产生任何文件改动'
+              + '（可能是：任务书没描述到要改哪里、它改的地方不在本项目检出里、'
+              + '或者它没拿到工具。先点开「处理会话」看它那一轮到底做了什么）'
           await ctx.onPhase('failed')
           return makeExecResult({
             phase: 'failed',
@@ -804,7 +828,7 @@ export function createAgentExecutor (options = {}) {
             // 才能在工作区里点进去看那一轮到底聊了什么。
             sessionId,
             changedFiles: [],
-            testOutcome: 'skipped',
+            testOutcome: 'not-run',
             testDetail: reason,
             // 被拦的文件必须能看见：只写日志的话，人在通知/MR 里只看到「没改动」，
             // 完全不知道 agent 其实动过东西、只是被名单拦下了。
@@ -897,7 +921,7 @@ export function createAgentExecutor (options = {}) {
           phase: 'failed',
           sessionId,
           changedFiles: [],
-          testOutcome: 'skipped',
+          testOutcome: 'not-run',
           testDetail: normalized.message,
           error: { kind: normalized.kind, message: normalized.message, retryable: normalized.retryable },
         })
@@ -1662,14 +1686,18 @@ function assertAllowedGit (argv) {
  * 三档结果，都要能如实写进 `testDetail`：
  * - `passed`：build 与 test 都过；
  * - `failed`：命令跑了但退出码非零 —— 这是**真的失败**，人要看；
- * - `skipped`：没配命令，或者命令根本起不来（`spawn` 抛 ENOENT）。
+ * - `not-run`：没配命令，或者命令根本起不来（`spawn` 抛 ENOENT）。
  *   按契约这是合法成功路径：照样交付，但原因必须写清楚。
+ *
+ * 名字为什么是 `not-run` 而不是 `skipped`：`skipped` 在本插件里已经被 phase 占用了
+ * （phase=skipped 表示「验证跑了但没通过」），两个意思撞在同一个词上，人和代码都会读错。
+ * 老数据里 `testOutcome: 'skipped'` 与 `not-run` 同义，读时用 `normalizeTestOutcome()` 归一。
  *
  * @param {any} options
  * @param {{ build?: string, test?: string }} verify
  * @param {string} cwd
  * @param {AbortSignal} signal
- * @returns {Promise<{ outcome: 'passed'|'failed'|'skipped', detail: string }>}
+ * @returns {Promise<{ outcome: 'passed'|'failed'|'not-run', detail: string }>}
  */
 export async function runVerification (options, verify, cwd, signal) {
   const commands = []
@@ -1678,13 +1706,13 @@ export async function runVerification (options, verify, cwd, signal) {
 
   if (commands.length === 0) {
     return {
-      outcome: 'skipped',
+      outcome: 'not-run',
       detail: '项目配置里没有 verify.build / verify.test 命令，本票没有跑验证（改动未经构建与测试证明）',
     }
   }
   if (typeof options.runCommand !== 'function') {
     return {
-      outcome: 'skipped',
+      outcome: 'not-run',
       detail: '本机没有注入命令执行器（options.runCommand），验证命令无法运行',
     }
   }
@@ -1700,12 +1728,12 @@ export async function runVerification (options, verify, cwd, signal) {
       // 配置写坏了（引号没闭合）：这是配置问题，不是代码问题。
       // 判 skipped 并写清楚，人去看 testDetail 就能改对；判 failed 会让人以为改的代码有问题。
       return {
-        outcome: 'skipped',
+        outcome: 'not-run',
         detail: `验证命令解析不了（${item.label}: ${item.command}）：${error instanceof Error ? error.message : String(error)}`,
       }
     }
     if (argv.length === 0) {
-      return { outcome: 'skipped', detail: `验证命令是空的（${item.label}），没有跑验证` }
+      return { outcome: 'not-run', detail: `验证命令是空的（${item.label}），没有跑验证` }
     }
     let result
     try {
@@ -1716,7 +1744,7 @@ export async function runVerification (options, verify, cwd, signal) {
       // 前者是环境问题，不该让票失败；后者是代码问题，人必须知道。
       const message = error instanceof Error ? error.message : String(error)
       return {
-        outcome: 'skipped',
+        outcome: 'not-run',
         detail: `验证命令起不来（${item.label}: ${item.command}）：${message}。改动未经验证，仍按约定交付（本地提交）。`,
       }
     }

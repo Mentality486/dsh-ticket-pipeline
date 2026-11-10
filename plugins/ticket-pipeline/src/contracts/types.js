@@ -1,9 +1,13 @@
 /**
  * 公共数据契约：`Ticket` / `ScreenshotRef` / `Phase` / `Plan` 等。
  *
- * 这里只有类型与纯数据工具，**不 import 任何东西**（`crypto` 除外，用同步版本）。
- * 契约层必须能随便被谁 import 而不产生副作用。
+ * 这里只有类型与纯数据工具，**不产生任何副作用**。契约层必须能随便被谁 import。
+ * 唯一的外部依赖是 `work-executor.js` 的 `normalizeTestOutcome` —— 它同样是零依赖纯函数，
+ * 放在这里是为了让「阶段标签」只有一份实现（调度器渲染通知标题、状态工具渲染票行
+ * 用的是同一个函数，不会各说各话）。
  */
+
+import { normalizeTestOutcome } from './work-executor.js'
 
 // ── phase 状态机 ────────────────────────────────────────────
 
@@ -36,10 +40,39 @@ export const PHASE_LABEL = Object.freeze({
   'mr-opening': '正在本地提交',
   'needs-info': '等你补充信息',
   'done': '已完成',
-  'skipped': '已本地提交，但未跑通验证',
+  'skipped': '已交付，待人工验证',
   'failed': '失败',
   'gone': '表格里已删除',
 })
+
+/**
+ * 带行上下文的阶段标签：**done 要分「验过」和「没验过」**。
+ *
+ * 为什么不能只改 `PHASE_LABEL`：那张字典只认识 phase，看不到这一票的
+ * `testOutcome`，而「已完成（已验证）」和「已完成（未跑验证）」是两个完全不同的
+ * 收尾 —— 前者人可以直接合，后者必须自己验一遍。混成一个「已完成」，
+ * 没配验证命令的项目会以为自己全绿。
+ *
+ * 只有一份实现（通知标题与状态工具都用它），否则同一个 phase 在两处会显示成两种说法。
+ *
+ * 老数据里 `testOutcome === 'skipped'` 与 `not-run` 同义，走 `normalizeTestOutcome` 归一。
+ *
+ * @param {{ phase?: string, testOutcome?: string }} [row]
+ * @returns {string}
+ */
+export function phaseLabel (row) {
+  const phase = row?.phase
+  if (phase !== 'done') {
+    if (phase === undefined) return '未知'
+    return PHASE_LABEL[phase] ?? String(phase)
+  }
+  const outcome = normalizeTestOutcome(row?.testOutcome)
+  if (outcome === 'passed') return '已完成（已验证）'
+  if (outcome === 'not-run') return '已完成（未跑验证）'
+  // 老数据可能没有 testOutcome（升级前收尾的票）：不猜，仍报「已完成」，
+  // 但要能看出它是「不知道验没验」而不是「验过了」。
+  return '已完成'
+}
 
 /**
  * 关键节点流程日志（时间线）的节点表。
@@ -76,7 +109,7 @@ export const TIMELINE_NODES = Object.freeze({
   'pending': { no: '·', label: '排队中' },
   'needs-info': { no: '·', label: '等你补充信息' },
   'done': { no: '·', label: '已完成' },
-  'skipped': { no: '·', label: '已提交但没跑通验证' },
+  'skipped': { no: '·', label: '待人工验证' },
   'failed': { no: '·', label: '失败' },
   'gone': { no: '·', label: '表格里已删除' },
 })
@@ -98,6 +131,9 @@ export const TIMELINE_NODES = Object.freeze({
  * @property {string} label 节点中文名（自包含，渲染时不查表也看得懂）
  * @property {number} at 这条记录写下的时刻，epoch 毫秒
  * @property {boolean} ok true=做成了 / false=没做成
+ * @property {boolean} [heartbeat] true=这是长站点的「还在跑」心跳，不是新站点。
+ *   心跳只和上一条心跳合并（不占封顶额度、不吃掉进站那条），
+ *   渲染时不单独占一行，只把「多久没动」的计时器往前推。
  * @property {string} [detail] 一句给人看的补充
  */
 
@@ -213,6 +249,80 @@ export function parseBitableUrl (raw) {
     tableId: (parsed.searchParams.get('table') ?? '').trim(),
     viewId: (parsed.searchParams.get('view') ?? '').trim(),
   }
+}
+
+/** 一条飞书链接能被认成什么。`unknown` 表示「看着像 URL，但认不出是哪张表」。 */
+export const FEISHU_LINK_KINDS = Object.freeze(['bitable', 'wiki', 'sheet', 'unknown'])
+
+/**
+ * 从浏览器地址栏那条链接里认出「这是哪张表、怎么定位它」。
+ *
+ * 为什么要有这个函数（而不是复用 `parseBitableUrl`）：`parseBitableUrl` 只啃
+ * `?table=` / `?view=` 两个问号参数，**不取路径里那段 token** —— 它的用途是
+ * 「用户把整条链接写进 `match.appToken` 时，tableId 从链接里补出来」。而这里要做的
+ * 是反过来的事：从链接里取出 **app_token 本身**，好让面板「粘贴链接」这条路不用
+ * 让人去找这个只能手改 YAML 的键。
+ *
+ * 认得四种形态（`feishu.cn` / `larksuite.com` 都算，域名不校验 —— 自建代理很常见）：
+ *
+ * - `/base/<appToken>?table=tblX&view=vewY` → 多维表格（`kind: 'bitable'`）
+ * - `/wiki/<nodeToken>?table=...`          → wiki 节点，表型要到运行时问接口（`kind: 'wiki'`）
+ * - `/sheets/<spreadsheetToken>?sheet=shX` → 电子表格（`kind: 'sheet'`）
+ * - 其它                                    → `kind: 'unknown'`，调用方必须报错而不是静默放过
+ *
+ * 也接受**裸 token**：形如 `bascnXXXX` / `shtcnXXXX` 这种没有协议头的串，按前缀猜表型。
+ * 这条不是便利，是安全阀：很多人手上只有 token（从别人那儿贴过来的），
+ * 让他必须先拼一条假链接才能用面板，等于把人推回手改 YAML。
+ *
+ * 纯函数、零依赖 —— 宿主与浏览器两侧共用同一份判断，免得出现
+ * 「面板说这是多维表格、宿主说是电子表格」这种事。
+ *
+ * @param {unknown} raw 用户粘贴的整条链接，或裸 token
+ * @returns {{ kind: 'bitable'|'wiki'|'sheet'|'unknown', appToken: string, spreadsheetToken: string, tableId: string, viewId: string, sheetId: string, path: string }}
+ */
+export function parseFeishuLink (raw) {
+  /** @type {{ kind: 'bitable'|'wiki'|'sheet'|'unknown', appToken: string, spreadsheetToken: string, tableId: string, viewId: string, sheetId: string, path: string }} */
+  const empty = { kind: 'unknown', appToken: '', spreadsheetToken: '', tableId: '', viewId: '', sheetId: '', path: '' }
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (text.length === 0) return empty
+
+  // 裸 token：没有 `://` 就按前缀猜（`shtcn` 是电子表格，其余当多维表格/wiki）。
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    if (/^shtcn/i.test(text)) return { ...empty, kind: 'sheet', spreadsheetToken: text, path: text }
+    if (/^[A-Za-z0-9_-]{8,}$/.test(text)) return { ...empty, kind: 'bitable', appToken: text, path: text }
+    return empty
+  }
+
+  let parsed
+  try {
+    parsed = new URL(text)
+  } catch {
+    return empty
+  }
+
+  const tableId = (parsed.searchParams.get('table') ?? '').trim()
+  const viewId = (parsed.searchParams.get('view') ?? '').trim()
+  const sheetId = (parsed.searchParams.get('sheet') ?? '').trim()
+
+  // 路径段：/base/<token>、/wiki/<token>、/sheets/<token>。第一段可能是语言前缀（/zh-CN/…），
+  // 所以按「找关键字那一段、取它的下一段」来读，而不是写死下标。
+  const segments = parsed.pathname.split('/').filter((part) => part.length > 0)
+  const at = (keyword) => {
+    const index = segments.indexOf(keyword)
+    if (index < 0) return ''
+    return (segments[index + 1] ?? '').trim()
+  }
+
+  const baseToken = at('base')
+  if (baseToken.length > 0) return { kind: 'bitable', appToken: baseToken, spreadsheetToken: '', tableId, viewId, sheetId: '', path: segments.join('/') }
+
+  const wikiToken = at('wiki')
+  if (wikiToken.length > 0) return { kind: 'wiki', appToken: wikiToken, spreadsheetToken: '', tableId, viewId, sheetId: '', path: segments.join('/') }
+
+  const sheetToken = at('sheets') || at('sheet')
+  if (sheetToken.length > 0) return { kind: 'sheet', appToken: '', spreadsheetToken: sheetToken, tableId: '', viewId: '', sheetId, path: segments.join('/') }
+
+  return { ...empty, tableId, viewId, sheetId, path: segments.join('/') }
 }
 
 /**

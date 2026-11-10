@@ -13,7 +13,7 @@
  * - 内核把票落成 `failed`，`lastError = 'cancelled by user'`；
  * - **不发通知**：人是自己取消的，不需要再被提醒一遍；
  * - 工作区保留（`worktreePath` 不清），方便人直接进去看改到哪了；
- * - 票不会自动重跑。要重跑还是老规矩：把「是否处理」拨走再拨回「处理中」。
+ * - 票不会自动重跑。要重跑用 `pipeline_reset`（传它的 recordId），不要去动表格。
  *
  * ## 边界
  *
@@ -34,7 +34,7 @@ export function createPipelineCancelTool (options) {
     description:
       '人工取消当前正在跑的那一张工单（并发恒 1，一轮只有一票在跑）。'
       + '取消后该票落成 failed、不发通知、工作区保留，'
-      + '要重跑仍需把表格里「是否处理」拨走再拨回「处理中」。'
+      + '要重跑用 pipeline_reset（传它的 recordId）。'
       + '当前没有票在跑时返回 cancelled=false（不是错误）。',
     parameters: {},
     // 机器可读字段放在返回值里，给人看的文本在 `text` 字段。
@@ -50,8 +50,9 @@ export function createPipelineCancelTool (options) {
       const lines = []
       if (cancelled) {
         lines.push('已发出取消信号：正在跑的那张票会中止。')
-        lines.push('它会落成 failed（原因：cancelled by user），不给你发通知，工作区保留。')
-        lines.push('要让它重跑：把表格里「是否处理」拨走，再拨回「处理中」。')
+        lines.push('它会落成 failed（原因：你取消的），不给你发通知，工作区保留。')
+        lines.push('要让它重跑：用 pipeline_reset 带上这张票的 recordId。')
+        lines.push('（另一条路是去表格里把「是否处理」拨走再拨回「处理中」，但那条路会重做一遍并覆盖旧回填，一般不推荐。）')
       } else {
         lines.push('当前没有票在跑，没有可取消的东西。')
         lines.push('想马上推进一轮，用 pipeline_scan。')

@@ -1773,6 +1773,10 @@ export function createFeishuSource (options = {}) {
     if (table.kind === 'sheet') {
       return {
         written: false,
+        // 结构上不支持，不是「再试一次就好了」：标成不可重试，
+        // 调度器才不会在每次启动补偿时对着同一张表再撞一遍（#08）。
+        retryable: false,
+        errorKind: 'unsupported',
         note: '这张工单表是飞书「电子表格」，首版只支持从电子表格读票、不支持回填'
           + '（多维表格才回填「是否处理 / 处理结果 / 处理日期」三列）。票本身已处理完；'
           + '要回填就把工单表换成多维表格，或把 writeBack 关掉。',
@@ -1796,6 +1800,8 @@ export function createFeishuSource (options = {}) {
       if (isFieldMissingError(error)) {
         return {
           written: false,
+          retryable: false,
+          errorKind: 'unsupported',
           note: `工单表里没有「${FEISHU_COLUMNS.status} / ${FEISHU_COLUMNS.result} / ${FEISHU_COLUMNS.handledAt}」这几列，本次不回填（票本身已处理完）。`
             + `请确认表结构，或关掉 writeBack 退化成只读：${error instanceof Error ? error.message : String(error)}`,
         }
@@ -1805,6 +1811,8 @@ export function createFeishuSource (options = {}) {
       if (isSyncTableForbiddenError(error)) {
         return {
           written: false,
+          retryable: false,
+          errorKind: 'unsupported',
           note: '这张多维表格是「同步表」，数据由连接器（飞书集成/其他系统）同步进来，'
             + '飞书不允许直接改里面的行，所以处理结果回填不进去（票本身已处理完）。'
             + '要么在原系统里看结果，要么把 writeBack 关掉（设置页「回填工单表」→ writeBack=false），'

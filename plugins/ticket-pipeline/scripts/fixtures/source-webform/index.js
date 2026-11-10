@@ -1,17 +1,26 @@
-// 演示平台：webform —— 一个内存表单工单源。
+// 【已从产品里移除，仅作留档】演示平台：webform —— 一个内存表单工单源。
 //
-// 作用是验证 ADR-0001 的承诺：新增一个平台只需要
+// 为什么删掉（2026-11-09，工单 #18）：
+//   它的水位只存在内存里（见下面的 `memoryWatermark`），进程重启后全部丢失 ⇒
+//   重启一次就把同一批工单当「新票」重收一遍。它也没有 writeResult（不回填）、
+//   没有截图能力。留着它 = 留着一条「看起来能用、实际会重跑」的路，
+//   而 `source-mock` 已经更好地承担了同一个角色（能落盘、能造票、是离线自测主力）。
+//
+// 为什么还留着这份文件：
+//   它是 ADR-0001「新增一个平台只需要加一个目录」的第一个实证 —— 当年正是靠它
+//   证明适配层边际成本极低。删实现、留证据：这个目录在 `scripts/` 下，
+//   而发布白名单只含 `src/lib/locale/icon/patch`，所以它**不会进安装包**。
+//   离线自测仍然 import 它来跑「recordIds 收窄」这类与平台无关的契约用例。
+//
+// 当年它验证的三件事（现在由 `source-mock` 承担）：
 //   1. 这个目录（适配器自己，实现 TicketSource 契约）
 //   2. src/index.js 的 SOURCES 表加一行
 //   3. src/core/config.js 的 PLATFORMS 表加一个字符串
 // 组合根与内核零改动。
-//
-// 场景：内部一个简单 HTTP 表单页收工单，配置里给 records（数组）即可，
-// 每轮 scan 直接从数组读当前状态 —— 内容改了指纹就变，删除了就退役。
 
-import { PipelineError } from '../../contracts/errors.js'
-import { createRecordFilter } from '../../contracts/record-filter.js'
-import { assertTicketSource } from '../../contracts/ticket-source.js'
+import { PipelineError } from '../../../src/contracts/errors.js'
+import { createRecordFilter } from '../../../src/contracts/record-filter.js'
+import { assertTicketSource } from '../../../src/contracts/ticket-source.js'
 
 // 平台能力：零依赖、无凭据、无截图，水位用适配器自带的内存兜底。
 export const capabilities = Object.freeze([])
@@ -30,10 +39,11 @@ export function createWebformSource (opts = {}) {
   const now = opts.now ?? Date.now
   const log = opts.log ?? console
 
-  // 内存水位（capabilities 为空，宿主不会注入持久化水位 —— 语义见 source-wps 同款兜底）
+  // 内存水位（capabilities 为空，宿主不会注入持久化水位 —— 语义见 source-wps 同款兜底）。
+  // ⚠️ 这就是它被删掉的原因：重启即丢，同一批工单会被重收一遍。
   const memoryWatermark = new Map()
 
-  // 收窄开关：三个平台的语义必须完全一致，否则「试点一单」在换源时行为就变了。
+  // 收窄开关：各平台的语义必须完全一致，否则「试点一单」在换源时行为就变了。
   const recordFilter = createRecordFilter(opts.recordIds, 'webform 工单源 recordIds')
 
   return assertTicketSource({

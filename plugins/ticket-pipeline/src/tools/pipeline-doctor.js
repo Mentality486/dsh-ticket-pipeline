@@ -15,8 +15,10 @@
  * 2. **每个项目的仓库**：路径存在、是 git 仓库（有 .git）、remote 能不能真的连上
  *    （走 `git ls-remote` 握手；连不上意味着 fetch/MR 全部失败）。
  * 3. **凭据**：用 credentials.describe()（只说配没配，绝不返回值）。
- * 4. **执行器/通知适配器**：是否还是 mock（mock 能跑通链路但不会真的改代码、发通知）。
- * 5. **插件版本**：正在跑的这份安装副本，是不是比本地源码旧（见下）。
+ * 4. **飞书连通性**：拿 token、读表元数据、读第一页数据，逐层报错并给修法。
+ * 5. **通知通道**：按 pushAdapter 的实际值查对应凭据齐不齐（不真发消息）。
+ * 6. **执行器/通知适配器**：是否还是 mock（mock 能跑通链路但不会真的改代码、发通知）。
+ * 7. **插件版本**：正在跑的这份安装副本，是不是比本地源码旧（见下）。
  *
  * ## 为什么要查版本
  *
@@ -30,9 +32,12 @@
  *
  * ## 边界
  *
- * - **只读**：不改任何文件、不跑任何会写盘的 git 命令。
- * - **不碰飞书**：连通性检查需要网络且会消耗接口配额，另在 scan 里天然覆盖。
- * - 某一项检查抛错不中断其它项 —— 体检就是要一次看到全部问题。
+ * - **只读**：不改任何文件、不跑任何会写盘的 git 命令、不写飞书任何表格。
+ * - **碰飞书，但只读**：连通性检查发的是认证 + 读元数据 + 读第一页，
+ *   绝不 setRecord。它不是「健康检查多此一举」——首跑失败里最高的四件事
+ *   （权限没开 / 版本没发布 / 表没加协作者 / 通道没凭据）在本地完全看不出来，
+ *   只能真连一次才知道；把这些留到「第一张票跑挂」，用户手里一条线索都没有。
+ * - **某一项检查抛错不中断其它项** —— 体检就是要一次看到全部问题。
  *
  * ## 两个调用方
  *
@@ -47,12 +52,27 @@
 import { defineTool, textBlocks } from './define.js'
 import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ } from '../contracts/git-status.js'
 import { comparePluginTrees, needsUpdate } from '../core/plugin-version.js'
+import { readConfigWarnings } from '../core/config.js'
+import { probeFeishuConnectivity } from '../adapters/source-feishu/probe.js'
+
+/** 「接下来的四步」清单：总开关还关着时追加，回答「我现在还差什么」。 */
+const NEXT_STEPS = [
+  '接下来四步（都在设置页里，点完这一轮就齐了）：',
+  '  1. 「凭据」页签：填 FEISHU_APP_ID 与 FEISHU_APP_SECRET（开放平台 →「凭证与基础信息」）；要用邮件通知再填 QQMAIL_AUTH_CODE。',
+  '  2. 飞书开放平台 →「权限管理」加权限 → **创建版本并发布**（不发布版本，权限不生效）。',
+  '  3. 「项目」页签：至少配一个项目（仓库路径 + 工单表链接），配完这里再体检一次应当全绿。',
+  '  4. 回「行为」组，把最上面的总开关打开 —— 不开它，前面配得再对也不会扫表。',
+]
 
 /**
  * @typedef {Object} DoctorOptions
  * @property {(argv: string[], opts?: { cwd?: string }) => Promise<{ code: number, stdout: string, stderr: string }> | null} [gitRunner]
  * @property {() => unknown} getConfig
- * @property {{ describe?: (ref: string) => Promise<{ configured: boolean, source?: string } | undefined> } | null} [credentials]
+ * @property {{ available?: () => boolean, describe?: (ref: string) => Promise<{ configured: boolean, source?: string } | undefined> } | null} [credentials]
+ * @property {(ref: string) => Promise<string | undefined>} [readSecret] 真读凭据值。只有飞书连通性检查要用
+ *   （换 tenant_access_token 必须有明文 secret）；不传就跳过飞书连通性检查。
+ * @property {(input: { appId: string, appSecret: string, projects: any[] }) => Promise<any>} [probeFeishu]
+ *   飞书连通性探针（自测注入离线桩；缺省用 source-feishu 的实现）。
  * @property {(runner: any, repoPath: string) => Promise<string>} [detectBaseBranch]
  * @property {(remote: string) => Promise<{ ok: boolean, reason?: string }>} [probeRemote]
  * @property {() => Promise<any>} [comparePluginVersion] 覆盖版本比对（自测用；缺省读真实文件系统）
@@ -61,9 +81,16 @@ import { comparePluginTrees, needsUpdate } from '../core/plugin-version.js'
 /**
  * 结果类型：一次体检的结论。
  *
+ * 三档严重度，语义必须分清 —— 混在一起就没人按它行动了：
+ *
+ * - `blockers`：**这一步不通就跑不了票**。配了错的东西 / 缺必需的凭据 / 连不上表。
+ * - `problems`：能跑，但跑出来的结果大概率不是你想要的（比如远端连不上、仓库不是 git）。
+ * - `warnings`：能跑且结果对，只是提醒（mock 执行器、装的是旧版插件）。
+ *
  * @typedef {Object} DoctorReport
- * @property {boolean} ok 是否没有「必须修复」的问题
- * @property {string[]} problems 必须修复的问题
+ * @property {boolean} ok 是否没有「阻断」项
+ * @property {string[]} blockers 阻断项（会导致跑不了）
+ * @property {string[]} problems 必须修复的问题（能跑但结果不对）
  * @property {string[]} warnings 提醒（不挡跑票）
  * @property {string} text 给人看的整段文案（工具渲染与 GUI 都用它）
  */
@@ -76,6 +103,7 @@ import { comparePluginTrees, needsUpdate } from '../core/plugin-version.js'
  */
 export async function runDoctor (options) {
 const lines = []
+const blockers = []
 const problems = []
 const warnings = []
 
@@ -121,6 +149,18 @@ if (pipelineEnabled) {
 
 if (projects.length === 0) {
   warnings.push('没有配置任何项目（projects 为空）——流水线不会监控任何工单表。')
+}
+
+// ── 2b. 配置里有没有不生效的键 ──────────────────────
+//
+// 为什么值得单独一节：`pollInvervalMinutes`（少一个字母）在过去是完全静默的 ——
+// 插件照常启动、照常按缺省 3 分钟轮询，人以为自己配了 30 分钟，查半天查不出原因。
+// 这类错本地看不出来（配置能加载、票也能跑），只有把「这个键不认识」说出来才有救。
+// 只算提醒：老配置里留着已删的键是合法的（见 config.js 的 REMOVED_CONFIG_KEYS）。
+const configWarnings = readConfigWarnings(config)
+for (const warning of configWarnings) {
+  warnings.push(warning)
+  lines.push(`⚠️ 配置：${warning}`)
 }
 for (const project of projects) {
   const name = project?.name ?? '(未命名)'
@@ -245,13 +285,32 @@ for (const project of projects) {
 //   b. 服务在，只是这个 ref 还没填      —— 去设置页的「凭据」页签填一下就好。
 // 以前两种情况都会走 describe() 然后一律显示成「无法查询」，或者更糟：
 // 描述器在 apply 时就缓存成 null，于是明明配好了也永远报「服务不可用」。
-// 现在描述器自带 available()，先问一句服务在不在，再逐个问 ref 配没配。
+const feishuProjects = projects.filter((project) => String(project?.match?.platform ?? '') === 'feishu')
+// 要查哪些凭据，取决于**实际配了什么**，不是一张写死的清单。
+// 以前不管有没有飞书项目都查 FEISHU_*、不管走哪个通道都不查通道凭据，
+// 结果是「体检全绿、通知必挂」—— 查的和用的是两回事。
+/** @type {Array<{ ref: string, blocker: boolean, why: string }>} */
+const requiredRefs = []
+if (feishuProjects.length > 0) {
+  requiredRefs.push({ ref: 'FEISHU_APP_ID', blocker: true, why: '飞书扫描要它换 tenant_access_token' })
+  requiredRefs.push({ ref: 'FEISHU_APP_SECRET', blocker: true, why: '飞书扫描要它换 tenant_access_token' })
+}
+const pushAdapter = typeof config.pushAdapter === 'string' ? config.pushAdapter : 'mock'
+if (pushAdapter === 'qqmail') {
+  requiredRefs.push({ ref: 'QQMAIL_AUTH_CODE', blocker: true, why: 'QQ 邮箱发信要它（不是登录密码，是「授权码」）' })
+}
+if (pushAdapter === 'pushplus') {
+  requiredRefs.push({ ref: 'PUSHPLUS_TOKEN', blocker: true, why: 'PushPlus 推送要它' })
+}
+// GITLAB_TOKEN 只在开了远程交付时才需要；缺了不算阻断（本阶段交付形态是本地提交）。
+requiredRefs.push({ ref: 'GITLAB_TOKEN', blocker: false, why: '只在你打开 repo.gitlab.enabled 之后需要' })
 const creds = options.credentials
 const credsUsable = Boolean(creds) && typeof creds.describe === 'function'
 const credsAvailable = credsUsable
   && (typeof creds.available === 'function' ? creds.available() : true)
 if (credsUsable && credsAvailable) {
-  for (const ref of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'GITLAB_TOKEN']) {
+  for (const item of requiredRefs) {
+    const ref = item.ref
     try {
       const hit = await creds.describe(ref)
       if (!hit) {
@@ -260,22 +319,22 @@ if (credsUsable && credsAvailable) {
         continue
       }
       const ok = Boolean(hit.configured)
-      if (!ok && ref !== 'GITLAB_TOKEN') {
-        warnings.push(`凭据 ${ref} 未配置 —— 飞书扫描将无法工作。去设置页「凭据」页签填一下。`)
-      }
-      if (!ok && ref === 'GITLAB_TOKEN') {
-        // 本阶段不需要：交付形态是工作区里的本地提交，不连远程、不开 MR。
-        lines.push('ℹ️ 凭据 GITLAB_TOKEN：未配置（本阶段不需要）')
+      if (!ok && !item.blocker) {
+        lines.push(`ℹ️ 凭据 ${ref}：未配置（${item.why}）`)
         continue
       }
-      lines.push(`${ok ? '✅' : '⚠️'} 凭据 ${ref}：${ok ? '已配置' : '未配置'}`)
+      if (!ok) {
+        // 阻断：这一步不过，飞书扫不了表 / 通知发不出去 —— 都是「跑不起来」，不是「跑得不好」。
+        blockers.push(`凭据 ${ref} 未配置 —— ${item.why}。去设置页「凭据」页签填一下。`)
+      }
+      lines.push(`${ok ? '✅' : '❌'} 凭据 ${ref}：${ok ? '已配置' : '未配置（阻断）'}`)
     } catch {
       lines.push(`⚠️ 凭据 ${ref}：无法查询`)
     }
   }
 } else if (credsUsable) {
   // 服务描述器在，但此刻 ctx.get('credentials') 还是空的。
-  problems.push(
+  blockers.push(
     '凭据服务没挂上（ctx.get("credentials") 取不到）——飞书扫描读不到 app_secret、'
     + '设置页「凭据」页签也会是空的。这是宿主组合的问题（不是配置问题）：'
     + '确认 profile 里挂了这个凭据服务，或者重新安装插件后完全重启 DSH。',
@@ -285,23 +344,111 @@ if (credsUsable && credsAvailable) {
   lines.push('ℹ️ 凭据：本插件的体检没有拿到凭据描述器（内部接线问题，不影响跑票）')
 }
 
-// ── 4. 执行器与通知 ──────────────────────────────
+// ── 4. 通知通道完整性 ────────────────────────────
+//
+// 凭据查完只是一半：`qqmail` 还必须有收件人与账号，否则凭据齐了也发不出去
+// （而且失败发生在「票已经跑完、正要通知你」的时刻，最难发现）。
+// 这里**不真发一封**：体检被点开时不该产生外部副作用。
+const pushLine = typeof config.pushAdapter === 'string' ? config.pushAdapter : '(默认)'
+if (pushAdapter === 'mock') {
+  warnings.push('pushAdapter=mock：通知走假推送（不会真的发邮件/微信），消息只写进插件日志。')
+  lines.push('ℹ️ 通知：mock（不会真的发；换成 qqmail / pushplus 才会真发）')
+} else if (pushAdapter === 'qqmail') {
+  const qqmail = config.qqmail ?? {}
+  const user = String(qqmail.user ?? '').trim()
+  const to = String(qqmail.to ?? '').trim()
+  const encryption = qqmail.encryption === 'starttls' ? 'starttls（587）' : 'tls（465）'
+  if (user.length === 0 || to.length === 0) {
+    const missingField = user.length === 0 ? 'qqmail.user（哪个 QQ 邮箱发的）' : 'qqmail.to（发给谁）'
+    blockers.push(`通知通道不完整：pushAdapter=qqmail 但 ${missingField} 没配 —— 票跑完了也发不出通知。去设置页「通知」组填上。`)
+    lines.push(`❌ 通知：qqmail 缺 ${missingField}`)
+  } else {
+    lines.push(`✅ 通知：QQ 邮箱（${user} → ${to}，加密方式 ${encryption}）`)
+    lines.push('　体检不会真发一封测试邮件（有副作用）。要验，跑一张 mock 票看日志。')
+  }
+} else if (pushAdapter === 'pushplus') {
+  lines.push('✅ 通知：PushPlus（体检不会真发；要验就跑一张 mock 票看日志）')
+} else {
+  blockers.push(`pushAdapter=${pushLine} 不是认识的通道（只能是 mock / pushplus / qqmail）——通知不会发出去。`)
+  lines.push(`❌ 通知：${pushLine}（不认识的值）`)
+}
+
+// ── 5. 飞书连通性 ────────────────────────────────
+//
+// 这是首跑失败率最高的一块，而它在本地完全看不出来：权限没开、版本没发布、
+// 表没把应用加成协作者 —— 三种都会让「看起来配好了」变成「一张票都收不到」。
+// 这里真连一次（只读），并且**每一层失败都带修法**。
+const probeFeishu = typeof options.probeFeishu === 'function' ? options.probeFeishu : null
+const readSecret = typeof options.readSecret === 'function' ? options.readSecret : null
+if (feishuProjects.length === 0) {
+  lines.push('ℹ️ 飞书连通性：没有 feishu 项目，跳过')
+} else if (!probeFeishu || !readSecret) {
+  // 没有注入探针（内部接线问题）不该打扰用户，但也不能假装查过了。
+  lines.push('ℹ️ 飞书连通性：本次体检没有启用远程探测（内部接线问题，不影响跑票）')
+} else {
+  let appId = ''
+  let appSecret = ''
+  try {
+    appId = String(await readSecret('FEISHU_APP_ID') ?? '').trim()
+    appSecret = String(await readSecret('FEISHU_APP_SECRET') ?? '').trim()
+  } catch (error) {
+    lines.push(`⚠️ 飞书连通性：读凭据失败（${error?.message ?? String(error)}）`)
+  }
+  try {
+    const probe = await probeFeishu({ appId, appSecret, projects })
+    if (probe?.skipped === true) {
+      lines.push(`ℹ️ 飞书连通性：${probe.skipReason ?? '跳过'}`)
+    } else {
+      // 认证层
+      if (probe?.token?.ok === true) {
+        lines.push(`✅ 飞书认证：${probe.token.message}`)
+      } else {
+        const fix = probe?.token?.fix ? ` —— 修复：${probe.token.fix}` : ''
+        // 错误码要印出来：用户拿它去搜 / 贴给人看，比截一张图有用得多。
+        const code = probe?.token?.code !== undefined ? `（飞书错误码 ${probe.token.code}）` : ''
+        blockers.push(`飞书认证没过：${probe?.token?.message ?? '原因未记录'}${code}${fix}`)
+        lines.push(`❌ 飞书认证：${probe?.token?.message ?? '不通过'}${code}`)
+      }
+      // 每个项目：元数据 → 数据
+      for (const item of probe?.projects ?? []) {
+        const name = item?.name ?? '(未命名)'
+        if (item?.metadata?.ok === true) {
+          lines.push(`✅ 飞书项目 ${name}：${item.metadata.message}`)
+        } else if (probe?.token?.ok === true) {
+          const fix = item?.metadata?.fix ? ` —— 修复：${item.metadata.fix}` : ''
+          const code = item?.metadata?.code !== undefined ? `（飞书错误码 ${item.metadata.code}）` : ''
+          blockers.push(`飞书项目 ${name}：读不到表元数据（${item?.metadata?.message ?? '原因未记录'}）${code}${fix}`)
+          lines.push(`❌ 飞书项目 ${name}：读不到表元数据（${item?.metadata?.message ?? '原因未记录'}）${code}`)
+        }
+        if (item?.records?.ok === true) {
+          lines.push(`　${item.records.message}`)
+        } else if (probe?.token?.ok === true && item?.metadata?.ok === true) {
+          const fix = item?.records?.fix ? ` —— 修复：${item.records.fix}` : ''
+          const code = item?.records?.code !== undefined ? `（飞书错误码 ${item.records.code}）` : ''
+          blockers.push(`飞书项目 ${name}：读不到表里的数据（${item?.records?.message ?? '原因未记录'}）${code}${fix}`)
+          lines.push(`　❌ 读不到数据：${item?.records?.message ?? '原因未记录'}${code}`)
+        }
+      }
+    }
+  } catch (error) {
+    // 探针自己炸了不该让体检失败 —— 记一行，继续。
+    lines.push(`⚠️ 飞书连通性：检查过程出错（${error?.message ?? String(error)}）`)
+  }
+}
+
+// ── 6. 执行器 ────────────────────────────────────
 const executor = typeof config.workExecutor === 'string' ? config.workExecutor : '(默认)'
-const push = typeof config.pushAdapter === 'string' ? config.pushAdapter : '(默认)'
 if (executor === 'mock') {
   warnings.push(`workExecutor=mock：工单会走假执行（不真改代码），只验证链路。`)
 }
-if (push === 'mock') {
-  warnings.push('pushAdapter=mock：通知走假推送（不会真的发邮件/微信）。')
-}
-lines.push(`ℹ️ 执行器：${executor}｜通知：${push}`)
+lines.push(`ℹ️ 执行器：${executor}｜通知：${pushLine}`)
 // 改代码的落点必须显式说出来：缺省是「直接在项目工作区里改」，
 // 这跟「每票一个隔离 worktree」是完全不同的风险面，人不该靠猜。
 lines.push(config.isolateWorktree === true
   ? 'ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）'
   : 'ℹ️ 改代码落点：项目工作区检出里（脏也能跑，只提交 agent 改过的文件）')
 
-// ── 5. 插件版本 ──────────────────────────────────
+// ── 7. 插件版本 ──────────────────────────────────
 // 「跑的是旧代码」不会报错，只表现为旧行为，所以必须主动比一次。
 // 基准是 profile 里声明的 file:/link: 源码目录，比的是会真被加载的那些文件。
 // 只进 warnings：装旧版插件票照样跑得完，算成 problems 会让人以为流水线坏了。
@@ -339,20 +486,32 @@ try {
 }
 
 // ── 汇总 ─────────────────────────────────────────
-const ok = problems.length === 0
+//
+// 三档的边界再强调一次（这里决定了用户按哪一条去行动）：
+//   blockers = 这一步不通就跑不了票；problems = 能跑但结果不对；warnings = 只是提醒。
+// 「跑不了」和「跑得不好」混在一起时，用户会去修不重要的那条，然后以为自己修好了。
+const ok = blockers.length === 0 && problems.length === 0
 const summary = ok
   ? `环境体检通过${warnings.length > 0 ? `，但有 ${warnings.length} 条提醒` : ''}。`
-  : `发现 ${problems.length} 个必须修复的问题。`
+  : [
+    blockers.length > 0 ? `${blockers.length} 个阻断问题（不修就跑不了票）` : '',
+    problems.length > 0 ? `${problems.length} 个必须修复的问题` : '',
+  ].filter(Boolean).join('、') + '。'
 const text = [
   `【环境体检】${summary}`,
   '',
   ...lines,
-  ...(problems.length > 0 ? ['', '必须修复：', ...problems.map(p => `· ${p}`)] : []),
+  ...(blockers.length > 0 ? ['', '阻断（不修就跑不了票）：', ...blockers.map(b => `· ${b}`)] : []),
+  ...(problems.length > 0 ? ['', '必须修复（能跑，但结果大概率不对）：', ...problems.map(p => `· ${p}`)] : []),
   ...(warnings.length > 0 ? ['', '提醒（不挡跑票）：', ...warnings.map(w => `· ${w}`)] : []),
+  // 开关关着的时候，人真正的问题往往不是「哪儿配错了」，而是「我下一步该干什么」。
+  // 只在人手点开体检时补这段：它不是告警，是一份行动清单。
+  ...(!pipelineEnabled ? ['', ...NEXT_STEPS] : []),
 ].join('\n')
 
 return {
   ok,
+  blockers,
   problems,
   warnings,
   text,
@@ -369,9 +528,11 @@ export function createPipelineDoctorTool (options) {
   return defineTool({
     name: 'pipeline_doctor',
     description:
-      '体检当前机器环境：git 执行链路、各项目仓库路径与 remote、凭据配置、执行器与通知适配器状态，'
-      + '以及正在跑的插件是不是比本地源码旧。'
-      + '安装插件后或跑票连续失败时先跑一次这个，一次看到全部环境问题。只读，不改任何东西。',
+      '体检当前机器环境：git 执行链路、各项目仓库路径与 remote、凭据配置、'
+      + '飞书连通性（能不能换 token / 读到表元数据 / 读到第一页数据，失败会给具体修法）、'
+      + '通知通道完整性、执行器与通知适配器状态，以及正在跑的插件是不是比本地源码旧。'
+      + '结论分三档：阻断（不修就跑不了票）/ 必须修复（能跑但结果不对）/ 提醒。'
+      + '安装插件后或跑票连续失败时先跑一次这个，一次看到全部环境问题。只读，不改任何东西、不写表格。',
     parameters: {},
     outputSchema: { type: 'object' },
     render: (value) => textBlocks(value.text),

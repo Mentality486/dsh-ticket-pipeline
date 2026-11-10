@@ -5,7 +5,7 @@
  * 把「能不能重试 / 要不要通知人」压在一个枚举上，内核才能稳定。
  */
 
-/** @typedef {'auth'|'network'|'rate-limit'|'not-found'|'invalid-input'|'aborted'|'internal'} ErrorKind */
+/** @typedef {'auth'|'network'|'rate-limit'|'not-found'|'invalid-input'|'unsupported'|'aborted'|'internal'} ErrorKind */
 
 /** 所有 kind 的运行时集合，用于校验。 */
 export const ERROR_KINDS = Object.freeze([
@@ -14,15 +14,35 @@ export const ERROR_KINDS = Object.freeze([
   'rate-limit',
   'not-found',
   'invalid-input',
+  'unsupported',
   'aborted',
   'internal',
 ])
 
-/** 可重试的 kind。 */
+/**
+ * 可重试的 kind。
+ *
+ * 判据只有一条：**再试一次可能就好了**吗。网络抖、服务端限流、对面 5xx 属于这一类。
+ */
 export const RETRYABLE_KINDS = Object.freeze(new Set(['network', 'rate-limit', 'internal']))
 
-/** 直接判定失败、必须通知人的 kind。 */
-export const FATAL_KINDS = Object.freeze(new Set(['auth', 'not-found', 'invalid-input']))
+/**
+ * 直接判定失败、必须通知人的 kind。
+ *
+ * 判据：**再试一百次也一样**，得有人去改配置或改权限。`unsupported` 也在这里 ——
+ * 它表示「平台结构上不接受这个操作」（例如往飞书同步表里写记录），
+ * 重试只会把同一个错误再撞一遍。
+ */
+export const FATAL_KINDS = Object.freeze(new Set(['auth', 'not-found', 'invalid-input', 'unsupported']))
+
+/**
+ * 取消。既不可重试也不是「失败」：人自己按的取消，重试等于违背他的意思。
+ *
+ * 单独一张表的存在意义：**每个 kind 必须恰好落在这三张表之一**（自测里有一条断言
+ * 遍历 `ERROR_KINDS` 检查这件事）。早先 `aborted` 两张表都不在，于是「落库当失败、
+ * 却又不通知人」这种半截行为没人发现。
+ */
+export const CANCELLED_KINDS = Object.freeze(new Set(['aborted']))
 
 /**
  * 适配器必须抛这个，不许抛裸 `Error('出错了')`。
@@ -50,6 +70,22 @@ export class PipelineError extends Error {
   get retryable () {
     return RETRYABLE_KINDS.has(this.kind)
   }
+}
+
+/**
+ * 一个 kind 的重试政策，三选一。
+ *
+ * 为什么要有这个函数而不是让调用方自己查两张表：查表很容易只查一张。
+ * `aborted` 当初就漏在两张表之外 —— 于是「被取消」既不被当成可重试，
+ * 也不被当成致命，两条分支都不接，票的行为取决于写的人碰巧先写了哪个 if。
+ *
+ * @param {ErrorKind} kind
+ * @returns {'retry'|'fatal'|'cancelled'}
+ */
+export function retryPolicy (kind) {
+  if (CANCELLED_KINDS.has(kind)) return 'cancelled'
+  if (RETRYABLE_KINDS.has(kind)) return 'retry'
+  return 'fatal'
 }
 
 /**

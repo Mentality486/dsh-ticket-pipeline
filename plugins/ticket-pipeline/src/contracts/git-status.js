@@ -135,6 +135,106 @@ export function parseNameStatusZ (stdout) {
 }
 
 /**
+ * 读「一次提交改了哪些文件、各几行」的参数。
+ *
+ * 为什么是 `--raw --numstat` 组合而不是 `--name-status` / `--shortstat`：
+ * - `--name-status` 与 `--numstat` 同时给时只有前者生效（两者互斥，实测），
+ *   所以想「一次进程调用同时拿到状态与行数」只能走 `--raw`（它和 `--name-status`
+ *   内容等价，但可以和 `--numstat` 共存）。
+ * - `--shortstat` 只给总数、不给逐文件，还得再 fork 一次。
+ * - `--format=` 让输出直接从 `:` 记录开始，不掺作者/日期/标题行。
+ *
+ * @type {readonly string[]}
+ */
+export const SHOW_SUMMARY_ARGS = Object.freeze([
+  'show', '--raw', '--numstat', '-z', '--format=', '--no-color',
+])
+
+/**
+ * 把 `git show --raw --numstat -z` 的输出拆成「每个文件改了多少行」。
+ *
+ * `-z` 下两段记录拼在一起：先是全部 `--raw` 记录（`:<mode> <mode> <sha> <sha> <状态>`
+ * 紧跟路径），然后是全部 `--numstat` 记录（`插入\t删除\t路径`）。段与段之间只有 NUL、
+ * **没有换行**，所以必须靠「这一段是不是以 `:` 开头」判断属于哪一段。
+ *
+ * 两个真实坑：
+ * 1. 重命名在 raw 段是「状态 / 旧路径 / 新路径」，在 numstat 段是
+ *    `0\t0\t` + 旧路径 + 新路径（第三段是空字符串），两边的路径段落数不一样。
+ * 2. 二进制文件的 numstat 是 `-\t-\t路径`，不是 0 —— 当成 0 会少报，当数字会得到 NaN。
+ *
+ * @param {string} stdout
+ * @returns {Array<{ status: 'create'|'update'|'delete'|'move', path: string, from?: string, insertions?: number, deletions?: number, binary?: boolean }>}
+ */
+export function parseShowSummaryZ (stdout) {
+  /** @type {Array<{ status: 'create'|'update'|'delete'|'move', path: string, from?: string, insertions?: number, deletions?: number, binary?: boolean }>} */
+  const files = []
+  /** @type {Map<string, number>} 路径 → files 下标，numstat 段靠它回填行数 */
+  const byPath = new Map()
+  const parts = String(stdout ?? '').split('\0')
+  for (let index = 0; index < parts.length; index += 1) {
+    const raw = parts[index]
+    if (typeof raw !== 'string') continue
+    // `--format=` 之后理论上不会有前导换行，但别让一个多余空行把整段记录判成「不认识」。
+    const text = raw.replace(/^\n+/, '')
+    if (text.length === 0) continue
+
+    if (text.charAt(0) === ':') {
+      const header = text.slice(1).split(' ')
+      if (header.length < 5) continue
+      const letter = String(header[4] ?? '').charAt(0).toUpperCase()
+      if (letter === 'R' || letter === 'C') {
+        const from = parts[index + 1]
+        const to = parts[index + 2]
+        if (typeof from !== 'string' || typeof to !== 'string') break
+        index += 2
+        /** @type {{ status: 'create'|'update'|'delete'|'move', path: string, from?: string }} */
+        const record = { status: letter === 'R' ? 'move' : 'create', path: to }
+        if (letter === 'R') record.from = from
+        byPath.set(to, files.length)
+        files.push(record)
+        continue
+      }
+      const path = parts[index + 1]
+      if (typeof path !== 'string' || path.length === 0) continue
+      index += 1
+      const status = letter === 'A' ? 'create' : letter === 'D' ? 'delete' : 'update'
+      byPath.set(path, files.length)
+      files.push({ status, path })
+      continue
+    }
+
+    const numstat = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(text)
+    if (!numstat) continue
+    const insertions = numstat[1] === '-' ? undefined : Number(numstat[1])
+    const deletions = numstat[2] === '-' ? undefined : Number(numstat[2])
+    let path = numstat[3]
+    if (path.length === 0) {
+      // 重命名：numstat 段的路径被拆成「旧路径 / 新路径」两段。
+      const from = parts[index + 1]
+      const to = parts[index + 2]
+      if (typeof from !== 'string' || typeof to !== 'string') break
+      index += 2
+      path = to
+    }
+    const at = byPath.get(path)
+    if (at === undefined) {
+      // 理论上 raw 段一定先给过每个文件，但两段是分开解析的：万一哪个 git 版本
+      // 只给了 numstat，也不能让这个文件凭空消失（消失=「这票没改它」，是错的结论）。
+      byPath.set(path, files.length)
+      files.push({ status: 'update', path })
+    }
+    const record = files[byPath.get(path)]
+    if (insertions === undefined || deletions === undefined) {
+      record.binary = true
+      continue
+    }
+    record.insertions = insertions
+    record.deletions = deletions
+  }
+  return files
+}
+
+/**
  * 把 status 的两字符状态码翻成动作。
  *
  * - `??` = 未跟踪 → create

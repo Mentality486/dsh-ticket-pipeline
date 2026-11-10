@@ -9,9 +9,11 @@
  * 找到对应的 source 与仓库，其余链路逻辑不变。
  */
 
-import { PipelineError, isAbortError, linkSignal, toPipelineError } from '../contracts/errors.js'
-import { TERMINAL, canTransition, TIMELINE_NODES } from '../contracts/types.js'
+import { PipelineError, isAbortError, linkSignal, retryPolicy, toPipelineError } from '../contracts/errors.js'
+import { TERMINAL, canTransition, TIMELINE_NODES, phaseLabel } from '../contracts/types.js'
 import { fingerprintChanged, summarize, ticketKey } from './store.js'
+import { BUILTIN_LIMITS } from './config.js'
+import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { renderTicketContent, renderTicketPrompt } from './prompt.js'
 
 /**
@@ -32,6 +34,17 @@ const RETRY_MAX_MS = 30 * 60_000
 /** 抖动幅度：±20%。 */
 const RETRY_JITTER = 0.2
 
+/**
+ * 长站点心跳间隔（毫秒）。
+ *
+ * 时间线只在「进站」时打一条，跑验证那 13 分钟里一条记录都没有 ——
+ * `pipeline_status` 只能说「已 13 分没动」，人会以为卡死然后取消整票。
+ * 每 60 秒补一条心跳，`at` 一直往前推，「多久没动」就永远是个小数字。
+ *
+ * 60 秒是内置常量，不做成配置项：它只影响「看起来多久没动」的粒度，
+ * 配大配小都没有业务含义，多一个旋钮只是多一处能配错的地方。
+ */
+const TIMELINE_HEARTBEAT_MS = 60_000
 /**
  * 算第 `attempt` 次失败后该等多久再重试。
  *
@@ -131,7 +144,7 @@ async function isStaleWorkspaceCoords ({ worktreePath, repoPath, currentRepoPath
  *   但那只覆盖 pending 与中间态 —— failed 是终态，人工重开之后仍然会带着陈旧坐标
  *   回到调度器，所以这里必须再判一次。不注入时跳过存在性检查（只比 repoPath）。
  */
-export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists }) {
+export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists, leaseHeartbeatMsOverride, timelineHeartbeatMsOverride }) {
   const logInfo = log ?? (() => {})
   const nowFn = now ?? (() => Date.now())
   const randomFn = random ?? (() => Math.random())
@@ -161,9 +174,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
    * 没有心跳，一张跑 40 分钟的票（租约 TTL 只有 10 分钟）会被别的进程抢走，
    * 两边在同一个 worktree 上同时改代码 —— 这是最难查的一类事故。
    *
-   * 单位是**秒**（配置项 `leaseHeartbeatSeconds`），这里换算成毫秒。
+   * 60 秒是内置常量（`BUILTIN_LIMITS.leaseHeartbeatSeconds`），不再暴露成配置项：
+   * 它必须显著小于 leaseTtlMinutes，配大只会制造上面那种事故，用户没有判断依据。
+   * `leaseHeartbeatMsOverride` 仅供自测把间隔压到毫秒级。
    */
-  const leaseHeartbeatMs = Math.max(0.001, Number(config.leaseHeartbeatSeconds ?? 60)) * 1000
+  const leaseHeartbeatMs = Number.isFinite(leaseHeartbeatMsOverride) && leaseHeartbeatMsOverride > 0
+    ? leaseHeartbeatMsOverride
+    : BUILTIN_LIMITS.leaseHeartbeatSeconds * 1000
 
   /** projectId → source，供按票定位截图源与扫描源。 */
   const sourceByProject = new Map()
@@ -253,6 +270,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         if (!fingerprintChanged(existing, ticket.fingerprint)) continue
         if (TERMINAL.includes(existing.phase) && existing.phase !== 'failed') {
           // done / skipped / gone 收到修订：表格里人改了什么，说明还想再处理一次。
+          //
+          // 这条 revivals 通道与 `pipeline_reset` 的分工（#02）：
+          // - revivals（这里）是「用户主动重做」：连内容一起重来一遍，**会覆盖旧回填结果**，
+          //   revisionCount 不涨，因为没有「同一份需求的第 N 版」可言；
+          // - pipeline_reset 是「重试失败的票」：只把失败/等信息的票放回队列，不改内容。
+          // 两条都保留，但用户文案只教 reset（拨表格那条在生产里通常点不到，
+          // 且它会重做一遍 —— 见 tools/pipeline-status.js 头注释）。
           await store.enqueue(ticket, { phase: 'pending', attempt: 0, enqueuedAt: nowFn() })
           counters.revivals += 1
           logInfo('终态票收到修订，重新入队', { projectId: ticket.projectId ?? projectId, recordId: ticket.recordId, was: existing.phase })
@@ -315,6 +339,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     // 用一个布尔记住「这次 abort 是超时引起的」。不能靠 catch 里比对错误消息：
     // abort 之后适配器抛的是它自己的取消错误，原始 abort reason 早就丢了。
     let timedOut = false
+    // 执行器起会话时把 sessionId 交上来（见 contracts/work-executor.js 的
+    // `ExecCtx.onSessionId`）。为什么要记在局部变量里：票在**执行器返回结果之前**
+    // 就抛异常/超时/被取消时，result 根本不存在，而 sessionId 只有执行器自己知道。
+    // 不记下来的话，失败的票上永远没有「处理会话」，人没法点进那一轮看它做了什么。
+    let runSessionId = ''
     const timeoutId = setTimeout(() => {
       timedOut = true
       handle.abort(new Error('ticket-timeout'))
@@ -352,6 +381,21 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       })()
     }, leaseHeartbeatMs)
 
+    /**
+     * 站点心跳：和租约心跳是**两个定时器**，不能合。
+     *
+     * 租约心跳必须跟着 `leaseHeartbeatMs` 走（自测会把它压到毫秒级），
+     * 站点心跳固定在 60 秒 —— 合在一起的话，一次自测跑下来会往时间线里塞
+     * 几百条心跳。`timelineHeartbeatMs` 同样只给自测用。
+     */
+    const timelineHeartbeatMs = Number.isFinite(timelineHeartbeatMsOverride) && timelineHeartbeatMsOverride > 0
+      ? timelineHeartbeatMsOverride
+      : TIMELINE_HEARTBEAT_MS
+    const stationHeartbeatId = setInterval(() => {
+      if (heartbeatStopped || leaseLost) return
+      heartbeatPending = Promise.all([heartbeatPending, heartbeatLongStation()]).then(() => undefined)
+    }, timelineHeartbeatMs)
+
     // 工作区坐标单独放一个可变对象 ws：row 是进 runOne 时的快照，
     // prepareWorkspace 的结果只写进了存储，不回填的话执行器收到的是空路径
     // —— 它会在一个不存在的目录里改代码。所以先建 ws、用 ws 调阶段回调、
@@ -369,6 +413,41 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     }
 
     /**
+     * 长站点心跳：跑验证可能十几分钟，时间线只在进站时打一条，中间全静默。
+     *
+     * 这不是新站点，是「这一站还在跑」的证据：`appendTimeline` 带
+     * `heartbeat: true`，只和上一条心跳合并，绝不吃掉进站那条 ——
+     * 所以「这一站什么时候开始的」永远留着，`pipeline_status` 才能把
+     * 「已跑 13 分钟」和「3 分钟前还有心跳」分开说。
+     *
+     * 只在三个可能很慢的站上打：planning / editing / testing。
+     * 其余站都是秒级，打心跳只会制造噪音。
+     */
+    const LONG_STATIONS = new Set(['planning', 'editing', 'testing'])
+    /** 当前所在的长站点（不在长站点上时是 null）。 */
+    let longStation = null
+    /** 当前长站点的进入时刻，用来算「这一站已经跑了多久」。 */
+    let longStationSince = 0
+
+    async function heartbeatLongStation () {
+      if (!longStation) return
+      const elapsedMs = Math.max(0, nowFn() - longStationSince)
+      const minutes = Math.floor(elapsedMs / 60_000)
+      const detail = minutes >= 1
+        ? `还在跑，这一站已经 ${minutes} 分钟（心跳，不是新站点）`
+        : '还在跑（心跳，不是新站点）'
+      try {
+        await store.appendTimeline(key, longStation, detail, true, undefined, { heartbeat: true })
+      } catch (error) {
+        // 心跳写不进去不是事故：票本身还在跑，只是这一段时间「看起来没动」。
+        logInfo('站点心跳写入失败（不影响跑票）', {
+          node: longStation,
+          reason: String(error?.message ?? error),
+        })
+      }
+    }
+
+    /**
      * 阶段回调：写存储 + 记日志。非法转移由 `setPhase` 拒绝，不抛。
      *
      * 第二参在契约（`contracts/work-executor.js` 的 `ExecCtx.onPhase`）里是
@@ -380,7 +459,6 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
      * 而 `setPhase` 用 `Object.entries(patch)` 展开它，于是「跑项目配置里的验证命令」
      * 这十四个字变成 `{0:'跑',1:'项',…,13:'令'}` 写进票据行，存储里多出十几个垃圾字段。
      */
-    /** @type {(phase: Phase, detailOrPatch?: string | Partial<TicketRecordRow>) => Promise<void>} */
     const onPhase = async (phase, detailOrPatch = {}) => {
       const isDetail = typeof detailOrPatch === 'string'
       const patch = isDetail ? {} : detailOrPatch
@@ -395,6 +473,15 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       const meta = TIMELINE_NODES[phase]
       if (meta && meta.no !== '·') {
         await markNode(key, phase, isDetail ? String(detailOrPatch) : '', true, meta.label)
+      }
+      // 换站就换心跳目标：长站点开表，其余站关表。
+      if (LONG_STATIONS.has(phase)) {
+        if (longStation !== phase) {
+          longStation = phase
+          longStationSince = nowFn()
+        }
+      } else {
+        longStation = null
       }
     }
 
@@ -464,7 +551,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           projectId,
           revisionCount: row.revisionCount,
           signal: handle.signal,
-          fetch: config.fetchBeforeCreate !== false,
+          fetch: BUILTIN_LIMITS.fetchBeforeCreate,
           // 已有 worktree **且坐标还有效**时把它传下去：工作区要补登，
           // 但分支与检出不该重建。坐标失效时一律不传，让实现重新建。
           worktreePath: staleCoords ? undefined : row.worktreePath,
@@ -524,6 +611,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 执行器内部才知道的那几站（主要是 ④ 创建会话：分支 + 模型）由它自己
         // 调 onFlow 报上来；这里只负责把它落到票据的时间线上，不让日志写失败炸整票。
         onFlow: (node, label, detail, ok) => markNode(key, node, detail, ok, label),
+        // 会话 id 先存着：执行器后面抛异常/超时/被取消时，返回值根本不存在，
+        // 只有这里能拿到「哪一次会话没干成活」。见上面的 runSessionId。
+        onSessionId: (sessionId) => {
+          if (typeof sessionId === 'string' && sessionId.length > 0) runSessionId = sessionId
+        },
       })
 
       // `WorkExecutor` 已经把 phase 走到 done/skipped/failed 之一，这里只落结果并通知。
@@ -532,7 +624,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 通知模板里 lastError 是直接拼进正文的，塞对象进去人只会看到 [object Object]。
       // 另外执行器返回成功时不带 error，此时必须显式写 undefined，
       // 否则上一次失败的原因会一直挂在票上骗人。
-      const finalLastError = result.error ? `${result.error.kind}: ${result.error.message}` : undefined
+      //
+      // **不拼 `kind: ` 前缀**（#08）：`internal:` 是分类枚举，不是人话。
+      // 真机上人看到「internal: agent 没有产生任何文件改动」的第一反应是
+      // 「internal 是什么？我该改哪里？」。分类仍然有用，但它属于程序，
+      // 所以单独存进 `lastErrorKind`，正文只给 message。
+      const finalLastError = result.error ? result.error.message : undefined
+      const finalLastErrorKind = result.error ? result.error.kind : undefined
       // 终态先落库，回填/通知后做 —— 这两步之间进程崩掉的话，票已经是 done 了，
       // 而表格没回填、通知也没发。谁都发现不了：票在队列里看起来一切正常。
       //
@@ -566,9 +664,29 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         sessionId: result.sessionId,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
+        lastErrorKind: finalLastErrorKind,
         pendingEffects: Object.keys(pendingEffects).length > 0 ? pendingEffects : undefined,
       })
       await markExtra(key, finalPhase, finalLastError ? `执行器收尾：${finalLastError}` : (result.commit?.sha ? `本地提交 ${String(result.commit.sha).slice(0, 12)}` : '执行器收尾，无本地提交'), finalPhase !== 'failed')
+
+      // ── 交付维度（#08）────────────────────────────────────────
+      // 改动提交是这里的第一项交付。done/skipped 却没有提交等于没东西可 review，
+      // 得记成「没交出去」，不能因为票面写着「已完成」就当它成了。
+      if (finalPhase === 'done' || finalPhase === 'skipped') {
+        if (result.commit?.sha) {
+          await store.setDelivery(key, 'commit', { ok: true, attempts: 1, error: undefined, giveUp: undefined })
+        } else if (result.mr?.url) {
+          // 只有 MR 没有本地提交也是合法交付（远程出口），不记失败。
+          await store.setDelivery(key, 'commit', { ok: true, attempts: 1, error: undefined, giveUp: undefined })
+        } else {
+          await store.setDelivery(key, 'commit', {
+            ok: false,
+            attempts: 1,
+            error: '执行器说做完了，但既没有本地提交也没有 MR —— 没有可 review 的改动',
+            errorKind: 'internal',
+          })
+        }
+      }
 
       // 回填工单表：只在「真的改完了」的时候写。failed 不写 —— 表里那一行还是
       // 「处理中」，人一眼就能看出这票没成，等着重新拨进队列。
@@ -588,7 +706,54 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 写失败时人不用去表格里一行行找。
         await store.setPhase(key, finalPhase, { writeBack: writeBackReceipt })
       }
-      if (writeBackPlanned) await clearPendingEffect(key, 'writeBack')
+      // 待办清不清，**只看写成了没有**（#08）。以前无论成败都清，
+      // 于是「写失败」这件事在存储里彻底消失 —— 启动补偿永远捞不到它，
+      // 表格里那一行就永远停在「处理中」，而没有任何地方会说这件事。
+      // 不清也有代价：每次启动都会再试一次。所以只有「值得再试」的才留着，
+      // 不可重试的（同步表、缺列、没权限）当场放弃并记成人话。
+      if (writeBackPlanned) {
+        if (writeBackReceipt === undefined) {
+          await clearPendingEffect(key, 'writeBack')
+        } else if (writeBackReceipt.written) {
+          await clearPendingEffect(key, 'writeBack')
+          await store.setDelivery(key, 'writeBack', {
+            ok: true,
+            attempts: 1,
+            error: undefined,
+            errorKind: undefined,
+            giveUp: undefined,
+          })
+        } else {
+          const retryable = writeBackReceipt.retryable === true
+          const pendingBefore = store.getTicket(key)?.pendingEffects?.writeBack
+          const attempts = Number(pendingBefore?.attempts ?? 0) + 1
+          if (retryable && attempts < maxAttempts) {
+            // 留着待办，下次启动（或人工重开）再试。attempts 记在待办里，
+            // 因为「试过几次」是待办自己的属性，票面下一次可能就成功了。
+            await store.retryPendingEffect(key, 'writeBack', {
+              error: writeBackReceipt.note ?? '回填失败',
+              errorKind: writeBackReceipt.errorKind,
+            })
+            await store.setDelivery(key, 'writeBack', {
+              ok: false,
+              attempts,
+              error: writeBackReceipt.note ?? '回填失败',
+              errorKind: writeBackReceipt.errorKind,
+              giveUp: false,
+            })
+          } else {
+            await clearPendingEffect(key, 'writeBack')
+            await store.setDelivery(key, 'writeBack', {
+              ok: false,
+              attempts,
+              error: writeBackReceipt.note ?? '回填失败',
+              errorKind: writeBackReceipt.errorKind,
+              // 不可重试，或重试用尽：人必须自己去改表格，别再让它一遍遍撞。
+              giveUp: true,
+            })
+          }
+        }
+      }
       if (writeBackReceipt === undefined) {
         await markNode(key, 'writeback', '按配置跳过（writeBack=false、源没有 writeResult，或这一站不是 done/skipped）')
       } else if (writeBackReceipt.written) {
@@ -612,13 +777,24 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         testDetail: result.testDetail,
         commit: result.commit,
         mr: result.mr,
+        // 会话 id 也要传：通知是用户最常看的界面，想追问「它当时怎么想的」得能
+        // 直接找到那个会话，而不是回 GUI 翻列表（断点 B3）。
+        sessionId: result.sessionId ?? row.sessionId,
         plan: result.plan ?? row.plan,
         lastError: finalLastError,
         // 回填结果要传给通知：表格没写成时通知正文里要如实写出来，
         // 否则人只看通知会以为这票整条链路都成了。
         writeBack: writeBackReceipt,
+        // 交付维度也带过去：通知正文要靠 `delivery.writeBack.giveUp` 决定
+        // 是说「会再自动试一次」还是「这不是再试一次能好的」（#08）。
+        delivery: store.getTicket(key)?.delivery,
       }, handle.signal)
-      if (pendingEffects.notify) await clearPendingEffect(key, 'notify')
+      // 待办只在通知**真的发出去了**的时候清（#08）。以前无条件清，于是
+      // 「通知发不出去」这件事在存储里消失，状态页一切正常而人什么都没收到。
+      // notifyFor 自己会把 delivery.notify 记成成功/失败，这里只读结果。
+      if (pendingEffects.notify && store.getTicket(key)?.delivery?.notify?.ok === true) {
+        await clearPendingEffect(key, 'notify')
+      }
       await markNode(key, 'notify', willNotify(finalPhase)
         ? `已按配置给 ${(config.notifyOn ?? ['done', 'skipped', 'failed', 'needs-info']).join('、')} 发消息`
         : `按配置不发（notifyOn 不含 ${finalPhase}）`)
@@ -648,6 +824,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 人工取消不通知；超时要通知（人不在电脑前，得知道卡住了）。
         // 超时同样是「落库了但通知没发」的窗口，登记待办（取消路径不通知，不登记）。
         await store.setPhase(key, 'failed', {
+          // 失败也要把会话 id 落下：人看到「失败了」之后第一件想做的事就是
+          // 「它当时在干什么」，没有 id 就只能去会话列表里翻。
+          sessionId: runSessionId.length > 0 ? runSessionId : undefined,
           lastError: timedOut ? `超时 ${timeoutMinutes} 分钟` : 'cancelled by user',
           pendingEffects: timedOut && willNotify('failed') ? { notify: true } : undefined,
         })
@@ -665,8 +844,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             baseCommit: ws.baseCommit,
             phase: 'failed',
             lastError: `超时 ${timeoutMinutes} 分钟`,
+            sessionId: runSessionId.length > 0 ? runSessionId : row.sessionId,
           })
-          if (willNotify('failed')) await clearPendingEffect(key, 'notify')
+          if (willNotify('failed') && store.getTicket(key)?.delivery?.notify?.ok === true) {
+            await clearPendingEffect(key, 'notify')
+          }
           await markNode(key, 'notify', '超时通知已发出（不传已 aborted 的 signal，免得被推送适配器吞掉）')
         }
         logInfo(timedOut ? '超时，已标 failed' : '被取消，已标 failed', { projectId, recordId, worktreePath: row.worktreePath })
@@ -687,10 +869,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         const dueAt = nowFn() + waitMs
         await store.setPhase(key, 'pending', {
           attempt,
-          lastError: `${normalized.kind}: ${normalized.message}`,
+          // 与前一处同理：不写 `kind: ` 前缀（#08）。分类进 lastErrorKind。
+          lastError: normalized.message,
+          lastErrorKind: normalized.kind,
           enqueuedAt: dueAt,
         })
-        await markExtra(key, 'failed', `第 ${attempt} 次没跑成（${normalized.kind}: ${normalized.message}），可重试，${Math.round(waitMs / 1000)} 秒后再来`, false)
+        await markExtra(key, 'failed', `第 ${attempt} 次没跑成（${normalized.message}），可重试，${Math.round(waitMs / 1000)} 秒后再来`, false)
         logInfo('可重试错误，退避后再来', { projectId, recordId, attempt, kind: normalized.kind, retryInMs: waitMs })
       } else {
         // 失败也是终态，同样有「落库了但通知没发」的窗口：DSH 重启一次，
@@ -698,10 +882,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 失败不回填（表里那行留在「处理中」是刻意留的信号），所以只有 notify。
         await store.setPhase(key, 'failed', {
           attempt,
-          lastError: `${normalized.kind}: ${normalized.message}`,
+          // 同上：失败终态也要留住会话 id，否则通知与状态里都没有可追问的入口。
+          sessionId: runSessionId.length > 0 ? runSessionId : undefined,
+          lastError: normalized.message,
+          lastErrorKind: normalized.kind,
           pendingEffects: willNotify('failed') ? { notify: true } : undefined,
         })
-        await markExtra(key, 'failed', `第 ${attempt} 次没跑成，已用尽重试：${normalized.kind}: ${normalized.message}`, false)
+        await markExtra(key, 'failed', `第 ${attempt} 次没跑成，已用尽重试：${normalized.message}`, false)
         // 工作区坐标要带 ws 的值，不能用 ...row：row 是进 runOne 时的快照，
         // 首次运行时里面根本没有 worktreePath，失败的票明明留着工作区，
         // 通知正文却会缺掉「工作区保留在」那一行 —— 人照着去修时找不到目录。
@@ -711,9 +898,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           branch: ws.branch,
           baseCommit: ws.baseCommit,
           phase: 'failed',
-          lastError: `${normalized.kind}: ${normalized.message}`,
+          sessionId: runSessionId.length > 0 ? runSessionId : row.sessionId,
+          lastError: normalized.message,
         }, handle.signal)
-        if (willNotify('failed')) await clearPendingEffect(key, 'notify')
+        if (willNotify('failed') && store.getTicket(key)?.delivery?.notify?.ok === true) {
+          await clearPendingEffect(key, 'notify')
+        }
         await markNode(key, 'notify', '失败通知已发出')
         logInfo('失败，已通知', { projectId, recordId, kind: normalized.kind, worktreePath: ws.worktreePath })
       }
@@ -723,6 +913,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       clearTimeout(timeoutId)
       heartbeatStopped = true
       clearInterval(heartbeatId)
+      clearInterval(stationHeartbeatId)
       // 心跳与收尾可能撞上（续租写回租约行、释放租约删掉它）。等它跑完再兜底释放一次，
       // 免得留下一条自己还占着的租约，把这张票挡住 10 分钟。
       if (heartbeatPending) {
@@ -874,7 +1065,36 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         if (receipt !== undefined) {
           await store.setPhase(row.key, row.phase, { writeBack: receipt })
         }
-        await clearPendingEffect(row.key, 'writeBack')
+        // 补做也失败了怎么办（#08）：这是补做，不是第一次 —— 第一次失败留下的待办
+        // 要按「还能不能救」再决定一次，不能像以前那样无论成败都清掉。
+        if (receipt === undefined || receipt.written) {
+          await clearPendingEffect(row.key, 'writeBack')
+          await store.setDelivery(row.key, 'writeBack', {
+            ok: true,
+            attempts: Number(effects.writeBack.attempts ?? 0) + 1,
+            error: undefined,
+            errorKind: undefined,
+            giveUp: undefined,
+          })
+        } else {
+          const attempts = Number(effects.writeBack.attempts ?? 0) + 1
+          const retryable = receipt.retryable === true
+          if (retryable && attempts < maxAttempts) {
+            await store.retryPendingEffect(row.key, 'writeBack', {
+              error: receipt.note ?? '回填失败',
+              errorKind: receipt.errorKind,
+            })
+          } else {
+            await clearPendingEffect(row.key, 'writeBack')
+          }
+          await store.setDelivery(row.key, 'writeBack', {
+            ok: false,
+            attempts,
+            error: receipt.note ?? '回填失败',
+            errorKind: receipt.errorKind,
+            giveUp: !(retryable && attempts < maxAttempts),
+          })
+        }
         await markNode(row.key, 'writeback', '启动补偿：上次进程在回填前退出了，这一站是补做', receipt?.written !== false)
         replayed += 1
       }
@@ -887,7 +1107,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           phase: current.phase,
         })
         await notifyFor(ticket, { ...current, phase: current.phase }, signal)
-        await clearPendingEffect(row.key, 'notify')
+        // notifyFor 自己会把 delivery.notify 写成成功/失败；待办只在**成功**时清，
+        // 否则「通知发不出去」这件事会被一次补做失败彻底抹掉。
+        if (store.getTicket(row.key)?.delivery?.notify?.ok === true) {
+          await clearPendingEffect(row.key, 'notify')
+        }
         await markNode(row.key, 'notify', '启动补偿：上次进程在通知前退出了，这条是补发不是新一轮')
         replayed += 1
       }
@@ -909,7 +1133,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
    * 3. **不传 handle.signal 之外的信号，且被取消就不写**。人按了取消，说明他不想
    *    这条链路再动任何远端状态。
    *
-   * 源没实现 `writeResult`（比如 webform / 老适配器）或配置里 `writeBack: false`
+   * 源没实现 `writeResult`（比如 mock 源 / 老适配器）或配置里 `writeBack: false`
    * 时直接返回 undefined —— 调用方据此知道「什么都没发生」，不必落库。
    *
    * @param {TicketSource | undefined} source
@@ -952,6 +1176,16 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         at: handledAt,
       }
       if (typeof receipt?.note === 'string' && receipt.note.length > 0) normalized.note = receipt.note
+      // 「没写成」是哪种没写成，决定了还能不能救（#08）：
+      //   - 源显式说「结构上不行」（同步表、缺列、电子表格不分回填）⇒ 不可重试，
+      //     再试一百次也是同一个错误，只会让启动补偿每次都撞一遍；
+      //   - 其它（网络、限流、鉴权过期）⇒ 值得再试一次。
+      // 适配器可以自己在回执上标 `retryable`；没标时按「有 note = 配置问题」推断，
+      // 因为适配器写 note 的地方全都是「这张表不能这么写」这一类。
+      if (!written) {
+        normalized.retryable = receipt?.retryable === true
+        if (typeof receipt?.errorKind === 'string') normalized.errorKind = receipt.errorKind
+      }
       logInfo(written ? '已回填工单表' : '工单表没写成', {
         projectId: ticket.projectId,
         recordId: ticket.recordId,
@@ -969,7 +1203,14 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         kind: reason.kind,
         reason: reason.message,
       })
-      return { written: false, note: `${reason.kind}: ${reason.message}` }
+      // note 里**不写 `kind: ` 前缀**（#08）：这段文字会进表格、进通知、进状态页，
+      // 都是给人看的。分类放 errorKind，程序自己用。
+      return {
+        written: false,
+        note: reason.message,
+        errorKind: reason.kind,
+        retryable: retryPolicy(reason.kind) === 'retry',
+      }
     }
   }
 
@@ -992,9 +1233,11 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     const notifyOn = Array.isArray(config.notifyOn) ? config.notifyOn : ['done', 'skipped', 'failed', 'needs-info']
     if (!notifyOn.includes(phase)) return
 
-    const level = phase === 'done' ? 'info' : phase === 'skipped' ? 'warn' : phase === 'needs-info' ? 'warn' : 'error'
+    const level = phase === 'done' ? 'info' : phase === 'skipped' ? 'info' : phase === 'needs-info' ? 'warn' : 'error'
     const projectTag = ticket.projectId ? `【${ticket.projectId}】` : ''
-    const title = `${projectTag}${phaseLabelOf(phase)}｜${summarize(ticket.description) || ticket.recordId}`
+    // 标题里的阶段名走 phaseLabel(row)：done 要能分出「已验证 / 未跑验证」，
+    // 邮件列表里那半行标题就是人判断「要不要点进去」的依据。
+    const title = `${projectTag}${phaseLabel({ phase, testOutcome: row.testOutcome })}｜${summarize(ticket.description) || ticket.recordId}`
     const body = renderNotifyBody(ticket, row, phase)
 
     /** @type {{ title: string, body: string, link?: string, level: 'info'|'warn'|'error' }} */
@@ -1013,9 +1256,30 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     try {
       const receipt = await push.send(message, sendHandle.signal)
       logInfo('通知已发出', { projectId: ticket.projectId, recordId: ticket.recordId, accepted: receipt.accepted, traceId: receipt.traceId })
+      // 交付维度第三项（#08）：通知是「人知道了没有」的唯一证据。
+      // 只认**真的发出去了**（适配器没抛错）；`accepted` 只代表服务端受理，
+      // 契约里写得很清楚不能当送达，但对我们来说「没抛错 = 这条交付做成了」。
+      await store.setDelivery(row.key ?? ticketKey(ticket.projectId, ticket.recordId), 'notify', {
+        ok: true,
+        attempts: 1,
+        error: undefined,
+        errorKind: undefined,
+        giveUp: undefined,
+      })
     } catch (error) {
       // 通知失败不能反过来把票判失败 —— 活已经干完了，人可以在队列里看到。
-      logInfo('通知失败（不影响票据状态）', { projectId: ticket.projectId, recordId: ticket.recordId, reason: toPipelineError(error).message })
+      const reason = toPipelineError(error)
+      logInfo('通知失败（不影响票据状态）', { projectId: ticket.projectId, recordId: ticket.recordId, reason: reason.message })
+      // 但「人不知道」这件事必须留下来：否则状态页显示一切正常，
+      // 而人根本没收到过任何消息，只能靠自己想起来回来看票。
+      const retryable = retryPolicy(reason.kind) === 'retry'
+      await store.setDelivery(row.key ?? ticketKey(ticket.projectId, ticket.recordId), 'notify', {
+        ok: false,
+        attempts: 1,
+        error: reason.message,
+        errorKind: reason.kind,
+        giveUp: !retryable,
+      })
     } finally {
       clearTimeout(timeoutId)
       sendHandle.dispose()
@@ -1183,23 +1447,56 @@ function rowToTicket (row) {
 }
 
 /**
+ * 带行上下文的阶段标签：**done 要分「验过」和「没验过」**。
+ *
+ * 实现放在 `contracts/types.js` 的 `phaseLabel()` 里 —— 状态工具渲染票行用的是
+ * 同一个函数，两处各写一份就会各说各话。这里 re-export 只是让本文件内的
+ * 调用点（通知标题）读起来短一点。
+ */
+export { phaseLabel } from '../contracts/types.js'
+
+/**
+ * 通知正文第一行的「判定行」：**这封通知需要你做什么**。
+ *
+ * 为什么必须有：通知是这个插件最频繁的界面（一张票一封），但原来它只是一份
+ * 「事实清单」——有项目、序号、sha、改动文件数，唯独没有一句「关我什么事」。
+ * 手机上邮件列表的预览只取前 1–2 行，所以这句话必须在**第一行**，而且要用
+ * 固定的句式，让人扫一眼就知道要不要停下来读。
+ *
+ * 句式只有两种：【不用你做，…】和【要你做：…】。这样「需要我动手吗」是
+ * 一个前两字就能答的问题。
+ *
  * @param {Phase} phase
+ * @param {Partial<TicketRecordRow>} row
  * @returns {string}
  */
-function phaseLabelOf (phase) {
-  switch (phase) {
-    case 'done': return '已完成'
-    case 'skipped': return '已提交但未验证'
-    case 'failed': return '失败'
-    case 'needs-info': return '等你补信息'
-    case 'gone': return '已删除'
-    default: return phase
+function renderNotifyVerdict (phase, row) {
+  if (phase === 'done') {
+    // done 只有一个分支需要人动手：回填写失败了。表格里那行还停在「处理中」，
+    // 除了人没人能改。
+    if (row.writeBack && row.writeBack.written === false) {
+      return '【要你做：去表格里手工回填这一行的「处理结果」】'
+    }
+    // 「没跑过验证」和「验证通过」都是 done —— 前者人必须自己看一眼，
+    // 后者知道一下就行。两者在通知里必须能分开，否则「没有验证命令」的
+    // 场景会被误当成「验过了」。
+    if (normalizeTestOutcome(row.testOutcome) === 'not-run') {
+      return '【要你做：这票没跑过验证，请人工验一遍】'
+    }
+    return '【不用你做，知道一下就行】'
   }
+  if (phase === 'skipped') return '【要你做：改动已交付但验证没过，请人工确认】'
+  if (phase === 'failed') return '【要你做：这票失败了】'
+  if (phase === 'needs-info') return '【要你做：补一张截图】'
+  return '【不用你做，知道一下就行】'
 }
 
 /**
  * 通知正文。用 Markdown —— PushPlus 的 `txt` 模板在微信里也按纯文本显示，
  * 但保留结构对人仍然更可读。
+ *
+ * 结构固定为：判定行 → 工单信息 → 交付事实 → 需要人做的事。
+ * 判定行永远在第一行，因为邮件列表预览只显示开头那一两行。
  *
  * @param {Ticket} ticket
  * @param {Partial<TicketRecordRow>} row
@@ -1208,6 +1505,8 @@ function phaseLabelOf (phase) {
  */
 function renderNotifyBody (ticket, row, phase) {
   const lines = []
+  lines.push(renderNotifyVerdict(phase, row))
+  lines.push('')
   if (ticket.projectId) lines.push(`项目：${ticket.projectId}`)
   if (ticket.seq) lines.push(`工单序号：${ticket.seq}`)
   if (ticket.module) lines.push(`模块：${ticket.module}`)
@@ -1229,20 +1528,43 @@ function renderNotifyBody (ticket, row, phase) {
       for (const f of row.changedFiles.slice(0, 5)) lines.push(`- ${f}`)
       if (row.changedFiles.length > 5) lines.push(`- …还有 ${row.changedFiles.length - 5} 个`)
     }
-    if (row.testOutcome === 'passed') lines.push('验证：通过')
-    else if (row.testOutcome === 'skipped') lines.push(`验证：未跑成 —— ${row.testDetail ?? '原因未记录'}`)
-    else if (row.testOutcome === 'failed') lines.push('验证：未通过')
+    // 验证结论三档：用 normalizeTestOutcome 归一，老数据里的 'skipped'
+    // 与现在的 'not-run' 是同一件事（都是「验证没跑成」）——
+    // 不归一会让升级前收尾的票掉进「三档都不匹配」的黑洞，正文里一句验证结论都没有。
+    const outcome = normalizeTestOutcome(row.testOutcome)
+    if (outcome === 'passed') lines.push('验证：通过')
+    else if (outcome === 'not-run') lines.push(`验证：未跑成 —— ${row.testDetail ?? '原因未记录'}`)
+    else if (outcome === 'failed') lines.push('验证：未通过')
+    // testDetail 是验证命令 stdout/stderr 的完整尾部（末 8 行），**不按本票改动过滤**。
+    // 真机上出现过「别的票的用例挂了、被写进这封通知」的情况，人第一反应是
+    // 「我的票把别人的用例弄挂了」。加一句免责，消掉大半误判。
+    if (row.testDetail && outcome !== 'not-run') {
+      lines.push('', '以下是验证命令的完整尾部输出，可能包含与本工单无关的用例失败：')
+      lines.push(row.testDetail)
+    }
+    // 处理会话：收到邮件想追问「它当时怎么想的」，得能直接找到那个会话。
+    // 说法与 renderWriteBackResult 一致（都是「处理会话：」），不造第二种叫法。
+    if (row.sessionId) lines.push(`处理会话：${row.sessionId}`)
     // 回填失败必须在通知里说：代码改完了，但表格里那一行还是「处理中」——
     // 不说的话人以为流程全绿，回去看表格又发现没回填，只能翻日志猜。
     // 只报失败：成功回填是预期行为，多写一行只是噪音。
     if (row.writeBack && row.writeBack.written === false) {
-      lines.push(`回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}（表格里那一行可能还停在「处理中」，请手工改一下）`)
+      const state = row.delivery?.writeBack
+      // 已放弃的要多说一句：人看到「没写成」会等它自己好，而这一类永远不会好（#08）。
+      const giveUp = state?.giveUp === true
+      const tail = giveUp
+        ? '（表格里那一行可能还停在「处理中」，请手工改一下。这不是再试一次能好的 —— 得你改表格设置。）'
+        : '（表格里那一行可能还停在「处理中」，可以先手工改一下；插件之后也会再自动试一次。）'
+      lines.push(`回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}${tail}`)
     }
-    if (phase === 'skipped') lines.push('', '（改动已提交到工作区，但验证没跑通，请人工确认）')
   } else if (phase === 'failed') {
     lines.push(`失败原因：${row.lastError ?? '未记录'}`)
     if (row.worktreePath) lines.push(`工作区保留在：${row.worktreePath}`)
-    lines.push('', '修好之后把表格里「是否处理」拨走再拨回「处理中」即可重跑。')
+    // 失败的票最需要「能点回去看它当时在干什么」，所以这里的处理会话行不是可选项。
+    // 执行器在跑之前就用 ctx.onSessionId 把 id 交出来了（见 runOne 里的 runSessionId），
+    // 所以哪怕它抛异常、连结果都没返回，这一行照样有。
+    if (row.sessionId) lines.push(`处理会话：${row.sessionId}`)
+    lines.push('', '要重跑就用 pipeline_reset 带上这张票的 recordId；失败不会自动重试，超时也一样。')
   } else if (phase === 'needs-info') {
     lines.push(`需要补充：${row.lastError ?? '截图取不到'}`)
     lines.push('', '把截图重新贴一次（或填可访问的路径/链接），下一轮会自动继续。')
@@ -1279,7 +1601,7 @@ function renderWriteBackResult (ticket, input) {
   const where = input.worktreePath ? `（${input.worktreePath}）` : ''
 
   if (input.phase === 'skipped') {
-    lines.push('已按工单改完并提交，但验证没跑通，需要人工确认。')
+    lines.push('已按工单改完并提交到工作区检出，待人工验证（验证命令没通过）。')
   } else {
     lines.push('已按工单改完并提交。')
   }
@@ -1292,10 +1614,10 @@ function renderWriteBackResult (ticket, input) {
     lines.push('改动文件：无（见下方提交说明）')
   }
 
-  const outcome = input.verification?.outcome
+  const outcome = normalizeTestOutcome(input.verification?.outcome)
   if (outcome === 'passed') lines.push('验证：通过（build/test 退出码 0）')
   else if (outcome === 'failed') lines.push('验证：未通过')
-  else if (outcome === 'skipped') lines.push(`验证：未跑成 —— ${input.verification?.detail ?? '原因未记录'}`)
+  else if (outcome === 'not-run') lines.push(`验证：未跑成 —— ${input.verification?.detail ?? '原因未记录'}`)
 
   if (input.commit?.sha) {
     lines.push(`本地提交：${String(input.commit.sha).slice(0, 12)}${input.commit.branch ? ` @ ${input.commit.branch}` : ''}${where}`)
@@ -1304,7 +1626,8 @@ function renderWriteBackResult (ticket, input) {
   if (input.sessionId) {
     lines.push(`处理会话：${input.sessionId}（保留在项目工作区名下，可在 GUI 里点进去继续追问）`)
   }
-  lines.push('', '要进一步修改，把这个单元格清空、把「是否处理」拨回「处理中」即可重跑。')
+  lines.push('', '要进一步修改，先把这个单元格清空，再用 pipeline_reset 带上这张票的 recordId 重跑。'
+    + '（也可以把「是否处理」拨回「处理中」，但那会整票重做一遍并覆盖这次的回填。）')
 
   return lines.join('\n')
 }

@@ -44,6 +44,22 @@ export const TABLES = Object.freeze({
  */
 
 /**
+ * 一项交付的状态。三项（commit / writeBack / notify）各自独立，互不牵连。
+ *
+ * 「交付」是 #08 引入的概念：`phase` 答「走到哪一站」，`delivery` 答「该交出去的
+ * 东西交齐了没有」。一票到了 `done` 之后才真正开始往外交东西 —— 本地提交、
+ * 回填表格、发通知 —— 每一件都可能单独失败，而且失败之后票面状态照样是 done。
+ *
+ * @typedef {Object} DeliveryState
+ * @property {boolean} ok 这一项交出去了没有
+ * @property {number} [at] 最后一次尝试的时刻（epoch ms）
+ * @property {string} [error] 没交出去的原因（人话，**不带 `kind:` 前缀** —— kind 放 errorKind）
+ * @property {string} [errorKind] 原因的分类，给程序看，不给用户看
+ * @property {number} [attempts] 试了几次
+ * @property {boolean} [giveUp] 已经放弃（不可重试，或重试用尽）—— 人必须自己动手
+ */
+
+/**
  * @typedef {Object} TicketRecordRow
  * @property {string} key 存储主键 = `ticketKey(projectId, recordId)`
  * @property {string} projectId 所属项目（对应配置 `projects[].name`）
@@ -58,14 +74,15 @@ export const TABLES = Object.freeze({
  * @property {string} [workspaceId] 宿主的 WorkspaceId（用于把会话归属到工作区；headless 下为空）
  * @property {import('../contracts/types.js').Plan} [plan]
  * @property {string[]} [changedFiles]
- * @property {'passed'|'failed'|'skipped'} [testOutcome]
+ * @property {'passed'|'failed'|'not-run'} [testOutcome] 验证结论。老数据里的 'skipped' 与 'not-run' 同义，读时用 `normalizeTestOutcome()` 归一。
  * @property {string} [testDetail]
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 工作区检出里的本地提交（本阶段的交付形态）
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
  * @property {string} [sessionId] 这次执行用的会话 id（会话默认保留在项目工作区名下，可在 GUI 里点回去继续问）
- * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果
+ * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果。**只看这一项判断不了「交付没交付」**——它是某一次尝试的回执；整体交付状态看 `delivery`。
+ * @property {{ commit?: DeliveryState, writeBack?: DeliveryState, notify?: DeliveryState }} [delivery] 交付维度：与 `phase` 正交。phase 答「走到哪一站」，delivery 答「该交出去的东西交齐了没有」（#08）。三项各自独立成败，`attempts` 记试了几次。
  * @property {import('../contracts/types.js').TimelineEntry[]} [timeline] 关键节点流程日志：每个节点一条，带完成时刻与成败。**不是**工单原文里那个「流程」列（那是 `flow`，字符串），别搞混。由 `appendTimeline` 追加，只有人工重置才会清空。
- * @property {{ writeBack?: { phase: string, plan?: unknown, commit?: { sha: string, branch: string, files: string[] }, mr?: { iid: number, url: string, draft: boolean }, changedFiles?: string[], worktreePath?: string, sessionId?: string, verification?: { outcome?: string, detail?: string } }, notify?: boolean }} [pendingEffects]
+ * @property {{ writeBack?: { phase: string, plan?: unknown, commit?: { sha: string, branch: string, files: string[] }, mr?: { iid: number, url: string, draft: boolean }, changedFiles?: string[], worktreePath?: string, sessionId?: string, verification?: { outcome?: string, detail?: string }, attempts?: number }, notify?: boolean }} [pendingEffects]
  *   终态票还没做完的「事后动作」。done/skipped 落库时先记上，回填/通知各自成功后再把子项清掉；
  *   进程在两者之间崩掉时，下次启动由 `replayPendingEffects()` 补做（回填幂等，通知会补发）。
  * @property {number} attempt
@@ -371,6 +388,68 @@ export class TicketStore {
   }
 
   /**
+   * 记一项「交付」的结果（改动有没有落盘 / 表格有没有写回 / 人有没有收到通知）。
+   *
+   * 为什么要和 `phase` 分开：`phase` 答的是「走到哪一站了」，一票到了 `done` 之后
+   * 才真正开始往外交东西（本地提交 → 回填表格 → 发通知），这三件事每一件都可能单独失败。
+   * 真机撞过一次：票是 done、改动提交了、通知也发了，**表格没写进去** ——
+   * 但票面上一切正常，人打开表格发现那行还停在「处理中」，只能去翻日志猜。
+   * 用一个正交的维度记，状态页才答得出「这票该交出去的东西交齐了没有」。
+   *
+   * 为什么不用 `setPhase` 写：`setPhase` 每次把 `finishedAt` 重写成「现在」，
+   * 而交付发生在终态**之后**，拿交付时刻当完成时刻会让「这票跑了多久」失真。
+   *
+   * 合并语义（不是覆盖）：调用方只传这次要变的那几个键，其余保留 —— 否则
+   * 「重试回填成功」会把上一次失败时记下的 `error` 与 `attempts` 一起抹掉，
+   * 而人恰恰需要知道「它重试过两次才成」。
+   *
+   * @param {string} key 票据复合主键
+   * @param {'commit'|'writeBack'|'notify'} name 哪一项交付
+   * @param {{ ok?: boolean, error?: string, errorKind?: string, attempts?: number, giveUp?: boolean, at?: number }} patch
+   * @returns {Promise<TicketRecordRow | undefined>} 更新后的行；票不存在时 undefined
+   */
+  async setDelivery (key, name, patch = {}) {
+    const row = this.getTicket(key)
+    if (!row) return undefined
+    const previous = row.delivery?.[name] ?? {}
+    /** @type {any} */
+    const next = { ...row, delivery: { ...(row.delivery ?? {}) } }
+    const merged = { ...previous, ...patch }
+    if (merged.at === undefined) merged.at = this.now()
+    // `error` 被显式写成 undefined 才能清掉上一次的失败原因（成功后不留旧债）。
+    for (const field of Object.keys(merged)) {
+      if (merged[field] === undefined) delete merged[field]
+    }
+    next.delivery[name] = merged
+    await this.repo.put(TABLES.tickets, key, next)
+    return next
+  }
+
+  /**
+   * 记一项「交付」的重试次数并保留待办（回填失败但还值得再试）。
+   *
+   * @param {string} key
+   * @param {'writeBack'} name
+   * @param {{ payload?: object, error: string, errorKind?: string }} input
+   * @returns {Promise<TicketRecordRow | undefined>}
+   */
+  async retryPendingEffect (key, name, input) {
+    const row = this.getTicket(key)
+    if (!row) return undefined
+    const previous = row.pendingEffects?.[name]
+    const previousAttempts = Number(previous?.attempts ?? 0)
+    const attempts = previousAttempts + 1
+    /** @type {any} */
+    const next = { ...row, pendingEffects: { ...(row.pendingEffects ?? {}) } }
+    next.pendingEffects[name] = {
+      ...(previous ?? input.payload ?? {}),
+      attempts,
+    }
+    await this.repo.put(TABLES.tickets, key, next)
+    return next
+  }
+
+  /**
    * 清掉终态票的一个「事后动作」标记（`pendingEffects.writeBack` / `.notify`）。
    *
    * 为什么不用 `setPhase`：`setPhase` 每次都把 `finishedAt` 重写成「现在」，
@@ -412,28 +491,41 @@ export class TicketStore {
    *
    * 封顶 `TIMELINE_LIMIT` 条，超出丢最旧的。`ok` 缺省 true。
    *
+   * **心跳条目**（`options.heartbeat === true`）是「这一站还在跑」的证据，不是新站点：
+   * 长站点（跑验证可能十几分钟）里调度器每 60 秒补一条，`at` 一直往前推，
+   * `pipeline_status` 才能把「已跑 13 分钟」和「3 分钟前还有心跳」分开说。
+   * 合并规则上心跳只和心跳合并（绝不吃掉进站那一条），所以一站最多两条，
+   * 不会把 `TIMELINE_LIMIT` 吃光。
+   *
    * @param {string} key 票据复合主键
    * @param {string} node 节点 id（见 TIMELINE_NODES）
    * @param {string} detail 一句给人看的中文补充
    * @param {boolean} [ok] 这一站做成了没有，缺省 true
    * @param {string} [label] 节点中文名；省略时按 node 查表
+   * @param {{ heartbeat?: boolean }} [options] `heartbeat: true` = 这是心跳，不是新站点
    * @returns {Promise<TicketRecordRow | undefined>} 更新后的行；票不存在时 undefined
    */
-  async appendTimeline (key, node, detail, ok = true, label) {
+  async appendTimeline (key, node, detail, ok = true, label, options) {
     const row = this.getTicket(key)
     if (!row) return undefined
     const meta = TIMELINE_NODES[node]
+    const heartbeat = options?.heartbeat === true
     /** @type {import('../contracts/types.js').TimelineEntry} */
     const entry = {
       node,
       label: label ?? meta?.label ?? node,
       at: this.now(),
       ok: ok !== false,
+      ...(heartbeat ? { heartbeat: true } : {}),
       ...(detail ? { detail: String(detail) } : {}),
     }
     const list = Array.isArray(row.timeline) ? [...row.timeline] : []
     const last = list[list.length - 1]
-    if (last && last.node === entry.node && last.ok === entry.ok) {
+    // 「同类」才合并：心跳不能把进站那条吃掉（否则这一站什么时候开始的就丢了，
+    // 「已跑多久」会永远算成 0），普通记录也不能吃掉心跳。
+    const sameKind = last && last.node === entry.node && last.ok === entry.ok
+      && (last.heartbeat === true) === heartbeat
+    if (sameKind) {
       list[list.length - 1] = entry
     } else {
       list.push(entry)

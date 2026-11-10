@@ -319,17 +319,23 @@ function checkPureFunctions () {
     }
   }])
 
-  tasks.push(['qqmail：qqmailOptionsFromConfig 缺省安全（secure 默认 true）且不缺键', () => {
+  tasks.push(['qqmail：qqmailOptionsFromConfig 缺省安全（默认 tls/465）且不缺键', () => {
     const empty = qqmailOptionsFromConfig(undefined)
     if (empty.host !== 'smtp.qq.com') throw new Error('默认 host 不对：' + empty.host)
     if (empty.port !== 465) throw new Error('默认 port 不对：' + empty.port)
     if (empty.secure !== true) throw new Error('secure 缺省必须是 true，不能静默走明文')
     if (empty.user !== '' || empty.to !== '') throw new Error('缺省 user/to 应为空串')
     if ('authCode' in empty) throw new Error('配置里不能带授权码，那是凭据不是配置')
-    const filled = qqmailOptionsFromConfig({ qqmail: { host: 'smtp.qq.com', port: '587', secure: false, user: ' a@qq.com ', to: 'b@example.com' } })
-    if (filled.port !== 587) throw new Error('端口字符串没转成数字')
-    if (filled.secure !== false) throw new Error('secure=false 没被尊重')
-    if (filled.user !== 'a@qq.com') throw new Error('user 没有 trim：' + JSON.stringify(filled.user))
+    // 端口与 secure 不再单独配：只回答「怎么加密」，两个值由它派生。
+    const starttls = qqmailOptionsFromConfig({ qqmail: { host: 'smtp.qq.com', encryption: 'starttls', user: ' a@qq.com ', to: 'b@example.com' } })
+    if (starttls.port !== 587) throw new Error('starttls 应派生 587，实际 ' + starttls.port)
+    if (starttls.secure !== false) throw new Error('starttls 的 secure 必须是 false')
+    if (starttls.user !== 'a@qq.com') throw new Error('user 没有 trim：' + JSON.stringify(starttls.user))
+    const tls = qqmailOptionsFromConfig({ qqmail: { encryption: 'tls' } })
+    if (tls.port !== 465 || tls.secure !== true) throw new Error('tls 应派生 465/true')
+    // 拼错的加密方式不能静默降级成明文：回落 tls（宁连不上，不要明文）。
+    const typo = qqmailOptionsFromConfig({ qqmail: { encryption: 'STARTTLS' } })
+    if (typo.secure !== true || typo.port !== 465) throw new Error('未知加密方式应回落 tls，实际 ' + JSON.stringify(typo))
   }])
   return tasks
 }

@@ -82,6 +82,8 @@ function makeReact () {
 // 根在 refs[uid]，节点 meta 里已经删掉 volatile，只留 label/description/default/enum。
 
 function makeSchemaEnvelope () {
+  // 树形就照真实的 24 键来（组名 / 默认值 / 先后顺序都一致），只是字段少几个：
+  // 「行为」组要够满，才能验「缺省第一屏就能看见主要旋钮」这条验收。
   const refs = {
     0: {
       type: 'object',
@@ -89,20 +91,29 @@ function makeSchemaEnvelope () {
       dict: {
         enabled: 1,
         pollIntervalMinutes: 2,
-        pushplus: 3,
+        ticketTimeoutMinutes: 14,
+        maxAttempts: 15,
+        workExecutor: 6,
+        provider: 16,
+        isolateWorktree: 17,
+        writeBack: 18,
+        writeBackStatus: 19,
+        pushAdapter: 13,
         qqmail: 4,
+        pushplus: 3,
         notifyOn: 5,
-        logLevel: 6,
+        leaseTtlMinutes: 11,
+        branchPrefix: 20,
       },
     },
-    1: { type: 'boolean', meta: { label: '总开关', description: '装上不会自动开始扫表。', default: false, group: '杂项' } },
-    2: { type: 'number', meta: { label: '轮询间隔（分钟）', description: '飞书只能轮询。', default: 3, min: 1, max: 60, group: '扫描与队列' } },
+    1: { type: 'boolean', meta: { label: '总开关', description: '装上不会自动开始扫表。', default: false, group: '行为' } },
+    2: { type: 'number', meta: { label: '轮询间隔（分钟）', description: '飞书只能轮询。', default: 3, min: 1, max: 60, group: '行为' } },
     3: {
       type: 'object',
       meta: {},
       dict: {
-        token: 7,
-        template: 8,
+        channel: 7,
+        callbackUrl: 8,
       },
     },
     4: {
@@ -110,15 +121,37 @@ function makeSchemaEnvelope () {
       meta: {},
       dict: {
         host: 9,
-        user: 10,
+        encryption: 10,
+        user: 12,
       },
     },
     5: { type: 'array', meta: { label: '发通知的 phase', default: ['done', 'failed'], group: '通知' }, inner: { type: 'string', meta: {} } },
-    6: { type: 'string', meta: { label: '日志级别', enum: ['debug', 'info', 'warn', 'error'], default: 'info', group: '杂项' } },
-    7: { type: 'string', meta: { label: 'PushPlus token', description: '建议走凭据。', role: 'secret', group: '通知' } },
-    8: { type: 'string', meta: { label: 'PushPlus 模板', enum: ['txt'], default: 'txt', group: '通知' } },
+    6: {
+      type: 'string',
+      meta: { label: '执行器', enum: ['agent', 'mock'], default: 'mock', group: '行为' },
+    },
+    7: { type: 'string', meta: { label: 'PushPlus 渠道', default: 'clawbot', group: '通知' } },
+    8: { type: 'string', meta: { label: '送达回执地址', default: '', group: '通知' } },
     9: { type: 'string', meta: { label: 'SMTP 主机', default: 'smtp.qq.com', group: '通知' } },
-    10: { type: 'string', meta: { label: '发件邮箱', default: '', group: '通知' } },
+    10: { type: 'string', meta: { label: 'SMTP 加密方式', enum: ['tls', 'starttls'], default: 'tls', group: '通知' } },
+    11: { type: 'number', meta: { label: '租约存活（分钟）', default: 10, min: 1, max: 60, group: '高级' } },
+    12: { type: 'string', meta: { label: '发件邮箱', default: '', group: '通知' } },
+    13: {
+      type: 'string',
+      meta: {
+        label: '通知适配器',
+        enum: ['mock', 'pushplus', 'qqmail'],
+        default: 'mock',
+        group: '通知',
+      },
+    },
+    14: { type: 'number', meta: { label: '单票超时（分钟）', default: 40, min: 1, max: 600, group: '行为' } },
+    15: { type: 'number', meta: { label: '最大重试次数', default: 2, min: 1, max: 10, group: '行为' } },
+    16: { type: 'string', meta: { label: '模型 provider', default: '', group: '行为' } },
+    17: { type: 'boolean', meta: { label: '隔离工作区', default: false, group: '行为' } },
+    18: { type: 'boolean', meta: { label: '回填表格', default: true, group: '行为' } },
+    19: { type: 'string', meta: { label: '回填的状态值', default: '是', group: '行为' } },
+    20: { type: 'string', meta: { label: '分支前缀', default: 'ticket-', group: '高级' } },
   }
   return { uid: 0, refs }
 }
@@ -185,12 +218,22 @@ function makeSettingsResponse () {
           value: {
             enabled: true,
             pollIntervalMinutes: 3,
-            pushplus: { token: '', template: 'txt' },
-            qqmail: { host: 'smtp.qq.com', user: 'someone@qq.com' },
+            ticketTimeoutMinutes: 40,
+            maxAttempts: 2,
+            workExecutor: 'agent',
+            provider: '',
+            isolateWorktree: false,
+            writeBack: true,
+            writeBackStatus: '是',
+            pushAdapter: 'qqmail',
+            qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'someone@qq.com' },
+            pushplus: { channel: 'clawbot', callbackUrl: '' },
             notifyOn: ['done', 'skipped', 'failed', 'needs-info'],
-            logLevel: 'info',
+            leaseTtlMinutes: 10,
+            branchPrefix: 'ticket-',
           },
-          secrets: [{ path: ['pushplus', 'token'], set: false }],
+          // token 走凭据（PUSHPLUS_TOKEN / QQMAIL_AUTH_CODE），配置面里没有 secret 叶子了。
+          secrets: [],
         },
       ],
     },
@@ -218,7 +261,7 @@ function makeSettingsResponse () {
  * 属性式 `ctx.remote.settings` 反而要**取不到**（取到就说明插件又退回了坏写法）。
  */
 function makeHost () {
-  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0, pickDirectory: [] }
+  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0, pickDirectory: [], setProjectTable: [] }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
   // gateway 服务自己维护的命名空间表（namespace → { service }）。
@@ -244,8 +287,10 @@ function makeHost () {
       // 一次性脚本化的拒绝：用来验证「宿主原话 + 指路 profile」这条文案。
       if (typeof calls.rejectNext === 'string') {
         const message = calls.rejectNext
+        const code = calls.rejectNextCode || 'SETTINGS_REJECTED'
         calls.rejectNext = undefined
-        return { ok: false, error: { code: 'SETTINGS_REJECTED', message } }
+        calls.rejectNextCode = undefined
+        return { ok: false, error: { code, message } }
       }
       return { ok: true, value: undefined }
     },
@@ -268,7 +313,7 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到四个描述符', contribution.descriptors.length === 4, String(contribution.descriptors.length))
+      check('$mount 收到五个描述符', contribution.descriptors.length === 5, String(contribution.descriptors.length))
       check('第三个描述符是 projects',
         contribution.descriptors.some((item) => item.method === 'projects' &&
           item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
@@ -276,6 +321,13 @@ function makeHost () {
       check('第四个描述符是 branches',
         contribution.descriptors.some((item) => item.method === 'branches' &&
           item.result.typeSymbol === 'ticket-pipeline#BranchList'),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      // 第五个是「粘贴工单表链接」（setProjectTable）：两个必填参数，宿主侧解析明文。
+      check('第五个描述符是 setProjectTable（两个必填参数）',
+        contribution.descriptors.some((item) => item.method === 'setProjectTable' &&
+          item.result.typeSymbol === 'ticket-pipeline#ProjectWriteResult' &&
+          item.parameters.length === 2 &&
+          item.parameters.every((param) => param.codec?.mode === 'strict')),
         contribution.descriptors.map((item) => item.method).join(' | '))
       // 真实 gateway：$mount 会按 namespace 建一根兄弟 fiber，把命名空间服务
       // provide 成 'remote.ticketPipeline'，并记进自己的 namespaces 表。
@@ -288,6 +340,13 @@ function makeHost () {
         projects: async () => {
           calls.projects += 1
           return { ok: true, value: { count: 1, projects: [makeProjectRecord(0)] } }
+        },
+        // 「粘贴工单表链接」：宿主解析并落盘。缺省成功，`calls.setProjectTable`
+        // 记下每次的 (index, url) —— 断言要验的是「面板有没有把原样字符串发出去」，
+        // 而不是「面板自己解析对了没有」（解析是宿主的事，见 host.js）。
+        setProjectTable: async (index, url) => {
+          calls.setProjectTable.push({ index, url })
+          return { ok: true, value: { kind: 'bitable', note: '已记下这条多维表格的定位信息。' } }
         },
       }
       namespaces.set('ticketPipeline', { service })
@@ -556,24 +615,24 @@ async function main () {
     tabs.map((node) => node.props['aria-selected']).join(','))
 
   // 一次只渲染一块：停在「项目」时参数区的字段不该在树上。
-  check('非当前页签的内容不渲染', textOf(tree).indexOf('日志级别') < 0, textOf(tree).slice(0, 120))
+  check('非当前页签的内容不渲染', textOf(tree).indexOf('执行器') < 0, textOf(tree).slice(0, 120))
 
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
   check('工具条上的「放弃改动」在', findButton(tree, '放弃改动') !== undefined)
   check('工具条上的「重新载入」在', findButton(tree, '重新载入') !== undefined)
 
-  // ② 参数页：33 个配置项一屏放不下，默认只展开「扫描与队列」，其余收着。
+  // ② 参数页：24 个配置项一屏放不下，默认只展开「行为」，其余收着。
   tree = await switchTab(Panel, '参数')
   const toggles = findToggles(tree)
   check('每个分组都有折叠标题', toggles.length === 3, String(toggles.length))
   const toggleOf = (label) => toggles.find((node) => textOf(node).indexOf(label) >= 0)
-  check('默认展开「扫描与队列」', toggleOf('扫描与队列') !== undefined &&
-    toggleOf('扫描与队列').props['aria-expanded'] === 'true')
+  check('默认展开「行为」', toggleOf('行为') !== undefined &&
+    toggleOf('行为').props['aria-expanded'] === 'true')
   check('默认收起「通知」', toggleOf('通知') !== undefined &&
     toggleOf('通知').props['aria-expanded'] === 'false')
 
   // 收着的分组不该把字段渲染出来（否则折叠只是视觉假象）。
-  check('收起的分组不渲染字段', textOf(tree).indexOf('日志级别') < 0)
+  check('收起的分组不渲染字段', textOf(tree).indexOf('租约存活') < 0)
 
   tree = await openAllGroups(Panel, tree)
   const inputs = findAll(tree, (node) => node.type === 'input' || node.type === 'select')
@@ -583,8 +642,114 @@ async function main () {
   const bodyText = textOf(tree)
   check('显示分组标题「通知」', bodyText.indexOf('通知') >= 0)
   check('显示布尔字段', bodyText.indexOf('总开关') >= 0)
-  check('显示 enum 字段', bodyText.indexOf('日志级别') >= 0)
+  check('显示 enum 字段', bodyText.indexOf('执行器') >= 0)
   check('显示点号键的嵌套叶子', bodyText.indexOf('SMTP 主机') >= 0)
+
+  // ── 总开关置顶 ────────────────────────────────────────────────
+  //
+  // 它原来埋在「杂项」组最底下，而缺省只展开一组 —— 新人装完打开面板找不到
+  // 「怎么开始」。现在它不属于任何组，画在卡片最上面。
+  tree = await switchTab(Panel, '参数')
+  const masterSwitch = findAll(tree, (node) => node.props && node.props.role === 'switch' &&
+    node.props['aria-label'] === '总开关')[0]
+  check('总开关是一个独立的开关（不在任何分组里）', masterSwitch !== undefined)
+  check('总开关带「已开启/已关闭」的人话状态',
+    textOf(tree).indexOf('已开启：会按下面的间隔自动扫表跑票') >= 0, textOf(tree).slice(0, 200))
+  // 「在分组上面」= 文档顺序里它出现在第一个分组标题之前。
+  const firstGroupIdx = textOf(tree).indexOf('行为')
+  const masterIdx = textOf(tree).indexOf('总开关')
+  check('总开关画在第一个分组之前（置顶）', masterIdx >= 0 && firstGroupIdx > masterIdx,
+    'master@' + masterIdx + ' group@' + firstGroupIdx)
+
+  // 缺省第一屏（只展开「行为」）就该有足够多的控件，且包含主要旋钮。
+  const firstScreenInputs = findAll(tree, (node) => node.type === 'input' || node.type === 'select')
+  check('缺省第一屏可见控件 ≥9', firstScreenInputs.length >= 9, '只有 ' + firstScreenInputs.length + ' 个')
+  const firstScreenText = textOf(tree)
+  check('第一屏能看到执行器', firstScreenText.indexOf('执行器') >= 0)
+  check('第一屏能看到轮询间隔', firstScreenText.indexOf('轮询间隔') >= 0)
+  check('第一屏能看到单票超时', firstScreenText.indexOf('单票超时') >= 0)
+  check('第一屏能看到最大重试次数（不再藏在高级里）',
+    firstScreenText.indexOf('最大重试次数') >= 0)
+
+  // ── 枚举字段用中文标签，值仍是原值 ──────────────────────────
+  const executorSelect = findAll(tree, (node) => node.type === 'select').find(
+    (node) => textOf(node).indexOf('agent（真的改代码）') >= 0)
+  check('执行器下拉用中文说法', executorSelect !== undefined)
+  if (executorSelect !== undefined) {
+    const optionValues = executorSelect.children.map((opt) => opt.props.value)
+    check('中文标签不影响写下去的值', optionValues.join(',') === 'agent,mock', optionValues.join(','))
+  }
+
+  // ── 通知组按 pushAdapter 条件显隐 ────────────────────────────
+  //
+  // 假数据里 pushAdapter = qqmail：看得见 SMTP，看不见 PushPlus 的字段。
+  tree = await openAllGroups(Panel, tree)
+  const qqText = textOf(tree)
+  check('选 qqmail 时露出 SMTP 字段', qqText.indexOf('SMTP 主机') >= 0)
+  check('选 qqmail 时不显示 PushPlus 的字段', qqText.indexOf('PushPlus 渠道') < 0, qqText.slice(0, 200))
+  check('通知组顶部有一句当前通道说明',
+    qqText.indexOf('当前走 QQ 邮箱') >= 0, qqText.slice(0, 200))
+
+  // 换成 mock：两个真实通道的字段都收起来，只留一句「不会真发」。
+  const adapterSelect = findAll(tree, (node) => node.type === 'select').find(
+    (node) => textOf(node).indexOf('QQ 邮箱') >= 0)
+  check('找到通知适配器下拉', adapterSelect !== undefined)
+  if (adapterSelect !== undefined) {
+    adapterSelect.props.onChange({ target: { value: 'mock' } })
+    tree = await render(Panel, { view: 'page' })
+    tree = await openAllGroups(Panel, tree)
+    const mockText = textOf(tree)
+    check('换成 mock 后不显示 SMTP 字段', mockText.indexOf('SMTP 主机') < 0)
+    check('换成 mock 后不显示 PushPlus 字段', mockText.indexOf('PushPlus 渠道') < 0)
+    check('换成 mock 后明说「不会真的发通知」',
+      mockText.indexOf('不会真的发通知') >= 0, mockText.slice(0, 200))
+  }
+
+  // 抽屉式的高级区不该被当成配置分组数进 `findToggles` 里。
+  check('「高级设置」不是配置分组',
+    findAll(tree, (node) => node.type === 'button' &&
+      String(node.props.className || '').indexOf('tp-adv-toggle') >= 0).length >= 1)
+
+  // ── 高级键「改过或有错」必须自动露出来 ────────────────────────
+  //
+  // 否则折叠就成了遮蔽：用户改了 `租约存活`（高级键），收起高级区之后
+  // 看不见这一改动，却能在保存时把一项自己都不记得的改动写下去。
+  {
+    const advBefore = textOf(tree)
+    check('高级键缺省收在「高级设置」里（租约存活默认看不见）',
+      advBefore.indexOf('高级设置') >= 0)
+    // 打开所有「高级设置」抽屉（通知组里也有一个：pushplus.callbackUrl）。
+    const advToggles = () => findAll(tree, (node) => node.type === 'button' &&
+      String(node.props.className || '').indexOf('tp-adv-toggle') >= 0)
+    for (const toggle of advToggles()) {
+      toggle.props.onClick()
+      tree = await render(Panel, { view: 'page' })
+    }
+    tree = await openAllGroups(Panel, tree)
+    for (const toggle of advToggles()) {
+      if (toggle.props['aria-expanded'] !== 'true') {
+        toggle.props.onClick()
+        tree = await render(Panel, { view: 'page' })
+      }
+    }
+    const leaseInput = findInput(tree, (node) => node.props.type === 'number' && node.props.value === '10')
+    check('展开高级区后能看到「租约存活」', leaseInput !== undefined)
+    if (leaseInput !== undefined) {
+      leaseInput.props.onChange({ target: { value: '20' } })
+      tree = await render(Panel, { view: 'page' })
+      // 再把所有抽屉收起来 —— 改过的那一项必须还露在外面。
+      for (const toggle of advToggles()) {
+        if (toggle.props['aria-expanded'] === 'true') {
+          toggle.props.onClick()
+          tree = await render(Panel, { view: 'page' })
+        }
+      }
+      const advAfter = textOf(tree)
+      check('改过的高级键收起高级区后仍然露出来',
+        advAfter.indexOf('租约存活') >= 0, advAfter.slice(0, 300))
+      check('改过的高级键带「已改」标记', advAfter.indexOf('已改') >= 0)
+    }
+  }
 
   // 折叠状态记进 localStorage，下次打开还是上次的样子。
   const openRaw = STORAGE.getItem('ticket-pipeline:open-groups')
@@ -669,6 +834,34 @@ async function main () {
   check('appToken 没有明文输入框',
     findAll(tree, (node) => node.type === 'input' &&
       typeof node.props.value === 'string' && node.props.value.indexOf('basc') >= 0).length === 0)
+  // 「粘贴工单表链接」：唯一能把 appToken 写进配置的入口。面板只把原样字符串
+  // 交给宿主（`setProjectTable`），自己不做任何解析 —— 一旦在浏览器里解析出
+  // appToken，明文就进了浏览器内存与请求体，那条安全边界就破了。
+  check('项目卡片里有「工单表链接」输入框',
+    textOf(tree).indexOf('工单表链接') >= 0)
+  const linkInput = findInput(tree, (node) => typeof node.props.placeholder === 'string' &&
+    node.props.placeholder.indexOf('feishu.cn') >= 0)
+  check('工单表链接是一个可以直接贴链接的输入框', linkInput !== undefined)
+  check('工单表链接有「用这条链接」按钮', findButton(tree, '用这条链接') !== undefined)
+  const pastedUrl = 'https://pms.feishu.cn/base/bascnABCDEFGH?table=tblXYZ&view=vew1'
+  if (linkInput !== undefined) {
+    linkInput.props.onChange({ target: { value: pastedUrl } })
+    tree = await render(Panel, { view: 'page' })
+    const submitLink = findButton(tree, '用这条链接')
+    check('贴了链接之后按钮变成可点', submitLink !== undefined && submitLink.props.disabled !== true)
+    if (submitLink !== undefined) submitLink.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('粘链接调的是宿主 setProjectTable(0, 原样 URL)',
+      ctx.calls.setProjectTable.length === 1 &&
+      ctx.calls.setProjectTable[0].index === 0 &&
+      ctx.calls.setProjectTable[0].url === pastedUrl,
+      JSON.stringify(ctx.calls.setProjectTable))
+    check('粘链接不经过 settings.mutate（明文不走浏览器写配置那条路）',
+      ctx.calls.mutate.every((call) => JSON.stringify(call.ops).indexOf('bascnABCDEFGH') < 0),
+      JSON.stringify(ctx.calls.mutate.map((call) => call.ops)))
+    check('宿主回话显示在卡片里', textOf(tree).indexOf('已记下这条多维表格的定位信息') >= 0)
+  }
   check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
   // projects 是结构化数组，必须由 ProjectListCard 画成卡片 —— 要是漏成普通字段，
   // draftValueOf 会把对象数组 join 成 '[object Object], [object Object]'。
@@ -774,6 +967,17 @@ async function main () {
   check('保存被拒时原样显示宿主文案', rejectedText.indexOf('Config field "projects" is not declared') >= 0,
     rejectedText.slice(0, 300))
   check('保存被拒时给一句能照着做的', rejectedText.indexOf('cordis.patch.yml') >= 0)
+
+  // 版本冲突：最关键的不是「请重试」，而是**你刚才改的那几项没存进去**。
+  // 说清条数，人才知道要不要重新一项项改回去。
+  ctx.calls.rejectNext = 'settings revision mismatch'
+  ctx.calls.rejectNextCode = 'SETTINGS_CONFLICT'
+  findButton(tree, '保存', 'tp-primary').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  const conflictText = textOf(tree)
+  check('冲突文案说「已重新载入」', conflictText.indexOf('已重新载入') >= 0, conflictText.slice(0, 300))
+  check('冲突文案报出「没保存的项数」', /你刚才那 \d+ 项改动没有保存/.test(conflictText),
+    conflictText.slice(0, 300))
 
   // 服务端的「字段级」拒绝：挂到具体字段下面，并且把保存锁住；
   // 人重填这个字段之后旧抱怨必须消失，否则改对了也还是存不了。

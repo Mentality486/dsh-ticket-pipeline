@@ -24,7 +24,7 @@
  * `worktrees`（desktop profile bundle 提供）—— 按需 inject。
  */
 
-import { Config } from './core/config.js'
+import { Config, BUILTIN_LIMITS, readConfigWarnings } from './core/config.js'
 import { makeDomainSpec } from './core/domain.js'
 import { TicketStore, makeDomainRepo } from './core/store.js'
 import { createScheduler } from './core/scheduler.js'
@@ -38,13 +38,13 @@ import { PLUGIN_WORKTREE_PATHSPEC_EXCLUDES, PORCELAIN_STATUS_ARGS, parseStatusZ 
 
 import { createMockSource } from './adapters/source-mock/index.js'
 import { createFeishuSource, feishuOptionsFromMatch } from './adapters/source-feishu/index.js'
+import { probeFeishuConnectivity } from './adapters/source-feishu/probe.js'
 import { createWpsSource, wpsOptionsFromMatch } from './adapters/source-wps/index.js'
-import { createWebformSource } from './adapters/source-webform/index.js'
 import { createTableLocator } from './adapters/locator-table/index.js'
 import { createMockExecutor } from './adapters/executor-mock/index.js'
 import { createAgentExecutor } from './adapters/executor-agent/index.js'
 import { createMockPush } from './adapters/push-mock/index.js'
-import { createPushplusPush, pushplusOptionsFromConfig } from './adapters/push-pushplus/index.js'
+import { createPushplusPush, pushplusOptionsFromConfig, PUSHPLUS_SECRET_REF } from './adapters/push-pushplus/index.js'
 import { createQqmailPush, qqmailOptionsFromConfig, QQMAIL_SECRET_REF } from './adapters/push-qqmail/index.js'
 import { createGitlabClient } from './adapters/gitlab-client/index.js'
 
@@ -108,10 +108,10 @@ export const CAPABILITY_ASSEMBLERS = {
   localFile: (deps) => ({
     readLocalFile: deps.readLocalFile,
   }),
-  /** 扫描节流：连续 N 条已知未变就停、连续 N 轮扫不到就退役，两个数都来自全局配置。 */
-  scanTuning: (deps) => ({
-    safePageRun: Number(deps.config.safePageRun) || 20,
-    goneAfterScans: Number(deps.config.goneAfterScans) || 3,
+  /** 扫描节流：连续 N 条已知未变就停、连续 N 轮扫不到就退役。两个数都是内置常量（见 BUILTIN_LIMITS）。 */
+  scanTuning: () => ({
+    safePageRun: BUILTIN_LIMITS.safePageRun,
+    goneAfterScans: BUILTIN_LIMITS.goneAfterScans,
   }),
 }
 
@@ -216,8 +216,9 @@ export const SOURCES = {
     factory: (opts) => createWpsSource(opts),
     match: { build: (match) => wpsOptionsFromMatch(match) },
   },
-  // webform：演示平台（内存表单源），验证「加平台只加目录 + 两行表」。
-  webform: { capabilities: [], factory: (opts) => createWebformSource(opts) },
+  // webform 源已于 2026-11-09 移除（工单 #18）：它的水位只在内存里，重启一次就把
+  // 同一批工单当新票重收一遍；演示/自测的角色由上面零依赖的 mock 源承担。
+  // 实现留档在 scripts/fixtures/source-webform/（不进安装包），ADR-0001 的实证仍在。
 }
 
 /** @type {Record<string, (opts: any) => import('./contracts/work-executor.js').WorkExecutor>} */
@@ -854,6 +855,14 @@ export async function apply (ctx, config) {
   }
   const log = (msg, detail) => logger.info?.(`[ticket-pipeline] ${msg}`, detail)
 
+  // ── 0. 配置里那些「写了但不会生效」的键 ─────────────────
+  // 拼错一个字母（pollInvervalMinutes / pushplus.tokens）在过去是完全静默的：
+  // 插件照常启动、按缺省值跑，人以为自己配过了。启动这一天说一句，比事后查半天强。
+  // 只警告不拦：老配置里留着已删的键是合法的（见 config.js 的 REMOVED_CONFIG_KEYS）。
+  for (const warning of readConfigWarnings(config)) {
+    logger.warn?.(`[ticket-pipeline] 配置提醒：${warning}`)
+  }
+
   // ── 1. 持久化 ─────────────────────────────────────────
   const domain = await ctx.storageDomain.open(makeDomainSpec())
   // 关闭由调用方负责：插件卸载时把 domain 关上（dsh-mcp-connector 的写法）。
@@ -1154,11 +1163,22 @@ export async function apply (ctx, config) {
     worktreeExists: gitRunner ? worktreeExists : undefined,
   })
 
-  // ── 4. 工具 ───────────────────────────────────────────
-  ctx.tools.register(createPipelineScanTool({ tick: (opts) => scheduler.tick(opts), log }))
+  // 工具 ───────────────────────────────────────────────
+  // `isRunning` / `getConfig` 是给 pipeline_scan 做「触发前就能确定」的那两种判断：
+  // tick() 是 fire-and-forget（同步等会让宿主工具通道超时），返回值拿不到，
+  // 所以 already-running / disabled 必须在触发前自己查，否则文案就是在承诺
+  // 一件代码永远不会做的事。
+  ctx.tools.register(createPipelineScanTool({
+    tick: (opts) => scheduler.tick(opts),
+    isRunning: () => scheduler.isRunning,
+    getConfig: () => config,
+    log,
+  }))
   ctx.tools.register(createPipelineStatusTool({
     store,
     getConfig: () => config,
+    // 「这次提交改了什么」要读 git：同一个 runner 也给体检用，不另起一份。
+    gitRunner,
   }))
   // 人工取消：内核的 cancelActive 此前没有调用方，人只能干等超时。
   ctx.tools.register(createPipelineCancelTool({
@@ -1175,6 +1195,11 @@ export async function apply (ctx, config) {
     gitRunner,
     getConfig: () => config,
     credentials: makeCredentialsDescriber(ctx),
+    // 飞书连通性：探针要明文 secret（换 tenant_access_token 必须有），
+    // 所以这里把「真读凭据」的函数也给它 —— 描述器只说配没配，不够用。
+    // `readSecret` 是同一个惰性读取器（每次重取，凭据服务晚挂上也能用）。
+    readSecret,
+    probeFeishu: (input) => probeFeishuConnectivity(input),
     // 「remote 是不是占位符」不能靠域名猜：`gitlab.example.com` 在有些部署里就是真服务器，
     // 猜错会把健康的配置报成问题，也会漏掉真正连不上的地址。这里改成真的去握一次手
     // （`git ls-remote`，只读、不改仓库），连不上才提醒，并把 git 的原话带出来。
@@ -1201,6 +1226,10 @@ export async function apply (ctx, config) {
     const mounted = mountTicketPipelineRemote(ctx, new TicketPipelineRemote({
       getConfig: () => config,
       doctorOptions,
+      // 面板「粘贴工单表链接」要在宿主侧落盘：浏览器只交链接，解析与写配置都在这里。
+      // 用 `ctx.get` 弱取（不声明进 inject）：settings 缺席时这个方法会明确报错，
+      // 而不是把整个 Remote 拖挂不上。
+      getSettings: () => ctx.get('settings'),
     }))
     if (mounted) log('已挂载 ticketPipeline Remote（设置页可用）')
   } catch (error) {
@@ -1252,7 +1281,13 @@ export async function apply (ctx, config) {
  */
 function pushAdapterOptions (config, logger, getSecret) {
   if (config.pushAdapter === 'pushplus') {
-    return { ...pushplusOptionsFromConfig(config), log: logger }
+    // token 不进配置文件（与 qqmail 的授权码同一套）：构造期只给读凭据的函数，
+    // 第一次真要发时才去取。取不到就报 auth，不影响票本身的状态。
+    return {
+      ...pushplusOptionsFromConfig(config),
+      getSecret: (ref) => getSecret(ref ?? PUSHPLUS_SECRET_REF),
+      log: logger,
+    }
   }
   if (config.pushAdapter === 'qqmail') {
     // 授权码不进配置文件：构造期只给读凭据的函数，第一次真要发时才去取。

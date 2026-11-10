@@ -102,7 +102,12 @@ import { parseBitableUrl } from '../contracts/types.js'
  * @type {Record<string, ConfigField>}
  */
 export const CONFIG_FIELDS = Object.freeze({
-  // ── 扫描与队列 ──────────────────────────────────────
+  // ── 行为 ────────────────────────────────────────────
+  enabled: {
+    type: 'boolean',
+    default: false,
+    description: '总开关。默认关：装上不会自动扫表、建工作区、提交。配好之后要手动打开。',
+  },
   pollIntervalMinutes: {
     type: 'number',
     default: 3,
@@ -110,45 +115,12 @@ export const CONFIG_FIELDS = Object.freeze({
     max: 60,
     description: '轮询间隔（分钟）。飞书没有可靠的单元格变更事件，只能轮询',
   },
-  safePageRun: {
-    type: 'integer',
-    default: 20,
+  ticketTimeoutMinutes: {
+    type: 'number',
+    default: 40,
     min: 5,
-    max: 100,
-    description: '连续扫到多少条已知且未变的记录后停止翻页',
-  },
-  goneAfterScans: {
-    type: 'integer',
-    default: 3,
-    min: 1,
-    max: 20,
-    description: '连续几轮扫不到就认定该行已被删除',
-  },
-  concurrency: {
-    type: 'integer',
-    default: 1,
-    min: 1,
-    max: 1,
-    description: '并发数。当前只支持 1：一轮最多跑一票',
-  },
-
-  // ── 租约与重试 ──────────────────────────────────────
-  leaseTtlMinutes: {
-    type: 'number',
-    default: 10,
-    min: 1,
-    max: 60,
-    description: '票级租约的存活时间（分钟），防止多进程抢同一张票',
-  },
-  leaseHeartbeatSeconds: {
-    type: 'number',
-    default: 60,
-    min: 1,
-    max: 1800,
-    description:
-      '租约心跳间隔（秒）：跑票期间每这么多秒续一次租。'
-      + '必须显著小于 leaseTtlMinutes，否则长票会被别的进程抢走，'
-      + '两边在同一个 worktree 上同时改代码。',
+    max: 180,
+    description: '单票墙钟超时（分钟）',
   },
   maxAttempts: {
     type: 'integer',
@@ -157,8 +129,6 @@ export const CONFIG_FIELDS = Object.freeze({
     max: 5,
     description: '可重试错误最多重试几次',
   },
-
-  // ── 执行 ────────────────────────────────────────────
   workExecutor: {
     type: 'string',
     default: 'mock',
@@ -171,29 +141,10 @@ export const CONFIG_FIELDS = Object.freeze({
     enum: Object.freeze(['agent', 'mock']),
     description: '执行器 id（mock / agent）。mock 只跑通链路、不改代码；agent 会真的起一个 agent 改代码并开 draft MR',
   },
-  ticketTimeoutMinutes: {
-    type: 'number',
-    default: 40,
-    min: 5,
-    max: 180,
-    description: '单票墙钟超时（分钟）',
-  },
-  fetchBeforeCreate: {
-    type: 'boolean',
-    default: true,
-    description: '建隔离 worktree 前先 git fetch 一次基准分支（只在 isolateWorktree 打开时用得上；缺省就地改代码时不连远端）',
-  },
-  branchPrefix: {
+  provider: {
     type: 'string',
-    default: 'ticket-',
-    description: '隔离 worktree 的票分支名前缀；后接 <projectId>-<recordId>-r<修订号>（只在 isolateWorktree 打开时用得上）',
-  },
-  worktreeRetentionHours: {
-    type: 'number',
-    default: 24,
-    min: 0,
-    max: 720,
-    description: '终态票的 worktree 保留小时数；0 = 不自动清理（只有开了 isolateWorktree 才有 worktree 可清）',
+    default: '',
+    description: '跑任务书的模型 provider。留空 = 跟随当前会话默认（推荐：钉死一个 provider 换台宿主就跑不起来）',
   },
   isolateWorktree: {
     type: 'boolean',
@@ -210,18 +161,8 @@ export const CONFIG_FIELDS = Object.freeze({
     default: '是',
     description: '回填时「是否处理」列要写的值（有的表用「是」，有的用「已完成」「已处理」）',
   },
-  keepSession: {
-    type: 'boolean',
-    default: true,
-    description: '处理完保留项目工作区里的那次会话（agent 释放，会话留在工作区名下，可以在 GUI 里点进去继续追问）。关掉就处理完把会话一起收掉',
-  },
 
   // ── agent 与模型 ────────────────────────────────────
-  provider: {
-    type: 'string',
-    default: 'workbuddy',
-    description: '跑任务书的模型 provider，留空则跟随当前会话默认',
-  },
   model: {
     type: 'string',
     default: '',
@@ -243,46 +184,38 @@ export const CONFIG_FIELDS = Object.freeze({
   // ── 通知 ────────────────────────────────────────────
   pushAdapter: {
     type: 'string',
-    default: 'pushplus',
+    default: 'mock',
     // 与 `src/index.js` 的 `PUSHES` 键保持一致（理由同上面的 workExecutor）。
     // 以前写错只会静默退回 mock 推送：人一封真通知都收不到，插件日志里也看不出来。
     enum: Object.freeze(['mock', 'pushplus', 'qqmail']),
-    description: '通知适配器 id（mock / pushplus / qqmail）',
-  },
-  'pushplus.token': {
-    type: 'string',
-    default: '',
-    description: 'PushPlus token（建议走 ctx.credentials）',
+    description: '通知适配器 id（mock / pushplus / qqmail）。缺省 mock = 不发真消息，先这么跑通再换',
   },
   'pushplus.channel': {
     type: 'string',
     default: 'clawbot',
     description: 'PushPlus 推送渠道，ClawBot 用 clawbot',
   },
-  'pushplus.template': {
+  'pushplus.callbackUrl': {
     type: 'string',
-    default: 'txt',
-    enum: ['txt'],
-    description: '必须用 txt：富模板在 ClawBot 里只显示前 50 字',
+    default: '',
+    description:
+      '送达回执地址（可选）。PushPlus 把 sendStatus 回吐到这个地址：'
+      + '0=未发 / 1=发送中 / 2=成功 / 3=失败。'
+      + 'HTTP 200 只代表受理，不代表送达 —— 想知道「人真收到了」要配这个。',
   },
   // ── QQ 邮箱（SMTP）──
-  // 密码是「授权码」，不是登录密码；不写进配置，走 ctx.credentials 的 QQMAIL_AUTH_CODE。
+  // 授权码是「授权码」，不是登录密码；不写进配置，走 ctx.credentials 的 QQMAIL_AUTH_CODE。
   'qqmail.host': {
     type: 'string',
     default: 'smtp.qq.com',
     description: 'QQ 邮箱 SMTP 主机（企业邮箱换成自己的）',
   },
-  'qqmail.port': {
-    type: 'number',
-    default: 465,
-    min: 1,
-    max: 65535,
-    description: 'SMTP 端口：465 = TLS 直连（推荐），587 = STARTTLS',
-  },
-  'qqmail.secure': {
-    type: 'boolean',
-    default: true,
-    description: 'true = 连上就是 TLS（465）；false = 先明文 EHLO 再 STARTTLS（587）',
+  'qqmail.encryption': {
+    type: 'string',
+    default: 'tls',
+    enum: Object.freeze(['tls', 'starttls']),
+    description: '连接加密方式：tls = 465 端口直连加密（推荐）；starttls = 587 端口先明文再升级。'
+      + '这两件事必须配套，所以合成一个选择，而不是让你分别填端口和开关',
   },
   'qqmail.user': {
     type: 'string',
@@ -294,33 +227,59 @@ export const CONFIG_FIELDS = Object.freeze({
     default: '',
     description: '收件邮箱；多个用逗号分隔',
   },
-
-  'pushplus.callbackUrl': {
-    type: 'string',
-    default: '',
-    description:
-      '送达回执地址（可选）。PushPlus 把 sendStatus 回吐到这个地址：'
-      + '0=未发 / 1=发送中 / 2=成功 / 3=失败。'
-      + 'HTTP 200 只代表受理，不代表送达 —— 想知道「人真收到了」要配这个。',
-  },
   notifyOn: {
     type: 'string-array',
     default: ['done', 'skipped', 'failed', 'needs-info'],
     description: '哪些 phase 要给发通知',
   },
 
-  // ── 杂项 ────────────────────────────────────────────
-  enabled: {
-    type: 'boolean',
-    default: false,
-    description: '总开关。默认关：插件装上不会自动开始扫表、建工作区、开 MR',
+  // ── 高级（面板里默认收起）───────────────────────────
+  leaseTtlMinutes: {
+    type: 'number',
+    default: 10,
+    min: 1,
+    max: 60,
+    description: '票级租约的存活时间（分钟），防止多进程抢同一张票',
   },
-  logLevel: {
+  branchPrefix: {
     type: 'string',
-    default: 'info',
-    enum: ['debug', 'info', 'warn', 'error'],
-    description: '日志级别',
+    default: 'ticket-',
+    description: '隔离 worktree 的票分支名前缀；后接 <projectId>-<recordId>-r<修订号>（只在 isolateWorktree 打开时用得上）',
   },
+  worktreeRetentionHours: {
+    type: 'number',
+    default: 24,
+    min: 0,
+    max: 720,
+    description: '终态票的 worktree 保留小时数；0 = 不自动清理（只有开了 isolateWorktree 才有 worktree 可清）',
+  },
+  keepSession: {
+    type: 'boolean',
+    default: true,
+    description: '处理完保留项目工作区里的那次会话（agent 释放，会话留在工作区名下，可以在 GUI 里点进去继续追问）。关掉就处理完把会话一起收掉',
+  },
+})
+
+/**
+ * 已经不给用户配的旋钮，只剩内置常量。
+ *
+ * 为什么收走这 4 个（原先是配置项）：它们全都属于「改错会出事、改对没收益」的
+ * 一类 —— 调大 `safePageRun` 只是省请求、调小 `goneAfterScans` 会把还在改的票
+ * 误判成已删除、心跳配错会让两个进程同时改同一个 worktree、`fetchBeforeCreate`
+ * 关掉只会让基线变旧。用户没有判断依据，配了也只能配错。真需要调的人改这里。
+ *
+ * `concurrency` 不在这里：并发 1 是结构性的（`scheduler` 用 `running` 标志单飞，
+ * `store.pickNext` 本来也只取一张），没有一个「数」需要表达。
+ */
+export const BUILTIN_LIMITS = Object.freeze({
+  /** 连续扫到多少条已知且未变的记录后停止翻页。 */
+  safePageRun: 20,
+  /** 连续几轮扫不到就认定该行已被删除。 */
+  goneAfterScans: 3,
+  /** 租约心跳间隔（秒）：跑票期间每这么多秒续一次租。必须显著小于 leaseTtlMinutes。 */
+  leaseHeartbeatSeconds: 60,
+  /** 建隔离 worktree / 打开工作区前先 fetch 一次基准分支。 */
+  fetchBeforeCreate: true,
 })
 
 /**
@@ -334,41 +293,16 @@ export const CONFIG_FIELDS = Object.freeze({
  */
 export const CONFIG_GROUPS = Object.freeze([
   Object.freeze({
-    id: 'scan',
-    label: '扫描与队列',
+    id: 'behavior',
+    label: '行为',
     fields: Object.freeze([
+      Object.freeze(['enabled', '总开关']),
       Object.freeze(['pollIntervalMinutes', '轮询间隔（分钟）']),
-      Object.freeze(['safePageRun', '安全翻页条数']),
-      Object.freeze(['goneAfterScans', '判失联轮数']),
-      Object.freeze(['concurrency', '并发数']),
-    ]),
-  }),
-  Object.freeze({
-    id: 'lease',
-    label: '租约与重试',
-    fields: Object.freeze([
-      Object.freeze(['leaseTtlMinutes', '租约存活（分钟）']),
-      Object.freeze(['leaseHeartbeatSeconds', '租约心跳（秒）']),
-      Object.freeze(['maxAttempts', '最大重试次数']),
-    ]),
-  }),
-  Object.freeze({
-    id: 'work',
-    label: '执行',
-    fields: Object.freeze([
-      Object.freeze(['workExecutor', '执行器']),
       Object.freeze(['ticketTimeoutMinutes', '单票超时（分钟）']),
+      Object.freeze(['maxAttempts', '最大重试次数']),
+      Object.freeze(['workExecutor', '执行器']),
+      Object.freeze(['provider', '模型 provider']),
       Object.freeze(['isolateWorktree', '每票开隔离 worktree']),
-      Object.freeze(['fetchBeforeCreate', '切 worktree 前先 fetch']),
-      Object.freeze(['branchPrefix', '分支名前缀']),
-      Object.freeze(['worktreeRetentionHours', 'worktree 保留（小时）']),
-      Object.freeze(['keepSession', '保留处理完的会话']),
-    ]),
-  }),
-  Object.freeze({
-    id: 'writeback',
-    label: '回填工单表',
-    fields: Object.freeze([
       Object.freeze(['writeBack', '处理完回填表格']),
       Object.freeze(['writeBackStatus', '回填的「是否处理」值']),
     ]),
@@ -377,7 +311,6 @@ export const CONFIG_GROUPS = Object.freeze([
     id: 'model',
     label: 'agent 与模型',
     fields: Object.freeze([
-      Object.freeze(['provider', '模型 provider']),
       Object.freeze(['model', '模型名']),
       Object.freeze(['maxTokens', '最大输出 token']),
       Object.freeze(['agentPreset', 'agent preset']),
@@ -388,24 +321,23 @@ export const CONFIG_GROUPS = Object.freeze([
     label: '通知',
     fields: Object.freeze([
       Object.freeze(['pushAdapter', '通知适配器']),
-      Object.freeze(['pushplus.token', 'PushPlus token']),
+      Object.freeze(['notifyOn', '发通知的 phase']),
       Object.freeze(['pushplus.channel', 'PushPlus 渠道']),
-      Object.freeze(['pushplus.template', 'PushPlus 模板']),
+      Object.freeze(['pushplus.callbackUrl', '送达回执地址']),
       Object.freeze(['qqmail.host', 'SMTP 主机']),
-      Object.freeze(['qqmail.port', 'SMTP 端口']),
-      Object.freeze(['qqmail.secure', 'SMTP 直接 TLS']),
+      Object.freeze(['qqmail.encryption', 'SMTP 加密方式']),
       Object.freeze(['qqmail.user', '发件邮箱']),
       Object.freeze(['qqmail.to', '收件邮箱']),
-      Object.freeze(['pushplus.callbackUrl', '送达回执地址']),
-      Object.freeze(['notifyOn', '发通知的 phase']),
     ]),
   }),
   Object.freeze({
-    id: 'misc',
-    label: '杂项',
+    id: 'advanced',
+    label: '高级',
     fields: Object.freeze([
-      Object.freeze(['enabled', '总开关']),
-      Object.freeze(['logLevel', '日志级别']),
+      Object.freeze(['leaseTtlMinutes', '租约存活（分钟）']),
+      Object.freeze(['branchPrefix', '分支名前缀']),
+      Object.freeze(['worktreeRetentionHours', 'worktree 保留（小时）']),
+      Object.freeze(['keepSession', '保留处理完的会话']),
     ]),
   }),
 ])
@@ -425,6 +357,61 @@ const FIELD_PRESENTATION = (() => {
   }
   return Object.freeze(table)
 })()
+
+/**
+ * 项目字段路径 → 中文 label（`match.appToken` 这种）。
+ *
+ * 为什么不在这里手写一份表：`buildProjectsDescriptor()` 里已经有全部项目字段的
+ * `meta.label`，再抄一份就是两处定义迟早漂移。这里只是把 descriptor 树走一遍
+ * 把 label 收集出来（懒算，且只算一次）。
+ *
+ * @returns {Record<string, string>}
+ */
+let projectLabelTable = null
+function projectFieldLabels () {
+  if (projectLabelTable !== null) return projectLabelTable
+  /** @type {Record<string, string>} */
+  const table = {}
+  /** @param {any} node @param {string} prefix */
+  const walk = (node, prefix) => {
+    if (node === null || node === undefined) return
+    // 先记自己：`string-array` 叶子也有 `inner`（元素节点），不能因为往下走就漏掉它。
+    if (prefix.length > 0 && typeof node.meta?.label === 'string') table[prefix] = node.meta.label
+    // `projects` 是数组节点：字段全挂在 `inner` 上（同一个前缀，不额外加段）。
+    if (node.inner) {
+      walk(node.inner, prefix)
+      return
+    }
+    if (node.dict) {
+      for (const [key, child] of Object.entries(node.dict)) walk(child, prefix.length > 0 ? `${prefix}.${key}` : key)
+    }
+  }
+  walk(buildProjectsDescriptor(), '')
+  projectLabelTable = Object.freeze(table)
+  return projectLabelTable
+}
+
+/**
+ * 给一个配置路径找中文说话方式。
+ *
+ * 三档：`CONFIG_FIELDS` 里的标量键走 `FIELD_PRESENTATION`；项目字段走
+ * `buildProjectsDescriptor()` 的 label；都没有就返回空串（调用方退回裸路径）。
+ *
+ * @param {string} path 形如 `pollIntervalMinutes` / `match.appToken` / `projects[0].repo.path`
+ * @returns {string}
+ */
+export function configFieldLabel (path) {
+  const direct = FIELD_PRESENTATION[path]
+  if (direct !== undefined) return direct.label
+  // projects[i].<rest> 或 projects[].<rest> → 取 <rest> 去项目字段表里查
+  const projectMatch = /^projects(?:\[(?:\d+)?\])?\.(.+)$/.exec(path)
+  if (projectMatch !== null) {
+    const rest = projectMatch[1]
+    const table = projectFieldLabels()
+    if (table[rest] !== undefined) return table[rest]
+  }
+  return ''
+}
 
 /**
  * 自测用：确认 `CONFIG_GROUPS` 与 `CONFIG_FIELDS` 完全对齐。
@@ -477,25 +464,47 @@ function flatten (source, prefix, out) {
  *
  * 这份名单只用来「拒绝错字」：新增平台要同时改这里和 `SOURCES`（各加一行）。
  *
+ * `webform` 已于 2026-11-09 移除（工单 #18）：它的水位只在内存里，重启一次就把同一批
+ * 工单当新票重收一遍，留着等于留一条「看起来能用、实际会重跑」的路。老配置里写着
+ * `webform` 的项目会在 `validateProject` 里拿到一条专门的迁移提示（见 `REMOVED_PLATFORMS`）。
+ *
  * @type {readonly string[]}
  */
-export const PLATFORMS = Object.freeze(['feishu', 'wps', 'mock', 'webform'])
+export const PLATFORMS = Object.freeze(['feishu', 'wps', 'mock'])
+
+/**
+ * 已移除的平台 → 迁移提示。
+ *
+ * 为什么不是简单地从 `PLATFORMS` 里删掉就完事：那样老配置会收到「只能是 feishu / wps / mock」，
+ * 看得懂但不知道该怎么办。这里给一条能直接照做的替换建议。
+ *
+ * @type {Readonly<Record<string, string>>}
+ */
+export const REMOVED_PLATFORMS = Object.freeze({
+  webform: 'webform 源已移除（它的水位只在内存里，重启一次会把同一批工单重收一遍）；'
+    + '请改成 mock（离线演示/自测）或 feishu（真实工单表）',
+})
 
 /** 报错文案用的平台清单（「只能是 a / b / c」），从表里拼出来，免得两处各写一遍。 */
 const PLATFORM_HINT = PLATFORMS.join(' / ')
 
 /**
- * 校验平台，返回规范后的平台名或 undefined。
+ * 校验平台，返回规范后的平台名，或者一条「为什么不认」的说明。
  *
  * 不传时退到 `mock`：老配置里没有 `match.platform`，以前一律按 mock 跑；
  * 现在照样能跑，但不给默认值的话「漏写平台」会被当成「写错平台」而拒绝启动。
  *
  * @param {unknown} platform
- * @returns {string | undefined}
+ * @returns {{ value: string } | { error: string }}
  */
 function normalizePlatform (platform) {
   const value = platform === undefined || platform === null || platform === '' ? 'mock' : platform
-  return PLATFORMS.includes(/** @type {string} */ (value)) ? /** @type {string} */ (value) : undefined
+  const raw = String(value)
+  const removed = REMOVED_PLATFORMS[raw]
+  // 先查「已移除」：这类要给可照做的迁移提示，而不是一句「只能是 …」。
+  if (removed !== undefined) return { error: removed }
+  if (PLATFORMS.includes(raw)) return { value: raw }
+  return { error: `只能是 ${PLATFORM_HINT}（收到 ${JSON.stringify(raw)}）` }
 }
 
 /**
@@ -507,24 +516,34 @@ function normalizePlatform (platform) {
  */
 function validateProject (raw, index) {
   const issues = []
-  const fail = (path, message) => issues.push({ message: `projects[${index}].${path} ${message}`, path: ['projects', String(index), ...path.split('.')] })
+  // 文案用「第 N 个项目 · 中文 label（原始路径）」：项目卡片上看到的是「飞书 appToken」
+  // 这种中文名，而配置文件里能搜到的是 `match.appToken` —— 两个都得给，人才连得上。
+  const fail = (path, message, fix) => {
+    const label = configFieldLabel(`projects[].${path}`)
+    const heading = label.length > 0
+      ? `projects[${index}] ${label}（${path}）`
+      : `projects[${index}].${path}`
+    issues.push({ message: `${heading} ${message}`, path: ['projects', String(index), ...path.split('.')], ...(fix ? { fix } : {}) })
+  }
 
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { issues: [{ message: `projects[${index}] 必须是对象`, path: ['projects', String(index)] }] }
+    return { issues: [{ message: `projects[${index}] 必须是对象`, path: ['projects', String(index)], fix: '每个项目写成一块键值对（name / match / repo 三样都要有）' }] }
   }
   /** @type {any} */
   const p = raw
 
   const name = typeof p.name === 'string' ? p.name.trim() : ''
-  if (name.length === 0) fail('name', '必须是非空字符串')
+  if (name.length === 0) fail('name', '必须是非空字符串', '给项目起个名字（例如 PMS），它同时是 projectId，必须唯一')
 
   const match = p.match && typeof p.match === 'object' && !Array.isArray(p.match) ? p.match : {}
-  const platform = normalizePlatform(match.platform)
-  if (!platform) fail('match.platform', `只能是 ${PLATFORM_HINT}`)
+  const platformResult = normalizePlatform(match.platform)
+  // 已移除平台给迁移提示、未知平台给「只能是 …」：两条都要能照着做。
+  if (platformResult.error !== undefined) fail('match.platform', platformResult.error, '写成 platform: feishu（飞书）/ wps（金山文档）/ mock（离线自测）')
+  const platform = platformResult.value
 
   const repo = p.repo && typeof p.repo === 'object' && !Array.isArray(p.repo) ? p.repo : {}
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''
-  if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）')
+  if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）', '填这个项目对应的仓库在你本机的路径，例如 D:/WorkSpace/pms')
 
   // feishu 能读两种表：多维表格（appToken+tableId）和电子表格（spreadsheetToken+sheetId/sheetName）。
   // 四选一即可 —— 少给一格就在启动时拦住，别等到扫描时才发现定位不到表：
@@ -546,13 +565,15 @@ function validateProject (raw, index) {
     const tableKind = typeof match.tableKind === 'string' ? match.tableKind.trim() : ''
 
     if (tableKind.length > 0 && tableKind !== 'bitable' && tableKind !== 'sheet') {
-      fail('match.tableKind', '只能写 bitable 或 sheet（留空表示让它自己探测）')
+      fail('match.tableKind', '只能写 bitable 或 sheet（留空表示让它自己探测）', '这一格一般不用填：留空，插件会按 token 自动认出表型')
     }
     if (!hasBitable && !hasSheet && !hasPattern) {
-      fail('match', 'feishu 项目必须给①appToken+tableId（或多维表格链接里的 ?table=）②spreadsheetToken + sheetId/sheetName（电子表格）③docNamePattern（按文件名匹配）之一')
+      fail('match', 'feishu 项目必须给①appToken+tableId（或多维表格链接里的 ?table=）②spreadsheetToken + sheetId/sheetName（电子表格）③docNamePattern（按文件名匹配）之一',
+        '最省事的做法：在面板的项目卡片里把工单表链接整条贴进「工单表链接」；不想用链接就填「表名匹配」（例如 PMS项目管理系统工单）')
     }
     if (rawSpreadsheetToken.length > 0 && !hasSheet) {
-      fail('match.spreadsheetToken', '给了电子表格 token 就得同时给 sheetId（工作表 id）或 sheetName（工作表名），否则不知道该读哪一张')
+      fail('match.spreadsheetToken', '给了电子表格 token 就得同时给 sheetId（工作表 id）或 sheetName（工作表名），否则不知道该读哪一张',
+        '补上「工作表名」（给人看的名字，例如 Sheet1）或「工作表 id」（sh 开头那串）')
     }
   }
 
@@ -579,7 +600,7 @@ function validateProject (raw, index) {
       .map((item) => String(item).trim())
       .filter((item) => item.length > 0)
     if (list.length === 0) {
-      fail('match.statusValues', '必须是非空字符串或字符串数组（值是状态列里表示「在处理中」的取值）')
+      fail('match.statusValues', '必须是非空字符串或字符串数组（值是状态列里表示「在处理中」的取值）', '照抄状态列里实际写的字，例如 ["处理中"] 或 ["否", "待处理"]')
     } else {
       value.match.statusValues = Array.from(new Set(list))
     }
@@ -592,7 +613,8 @@ function validateProject (raw, index) {
       const ids = resolveRecordIds(match.recordIds)
       if (Array.isArray(ids) && ids.length > 0) value.match.recordIds = ids
     } catch (error) {
-      fail('match.recordIds', error instanceof Error ? error.message : String(error))
+      fail('match.recordIds', error instanceof Error ? error.message : String(error),
+        '这个键是「只处理这几张票」的收窄开关；不想收窄就整个删掉，不要留空列表（空列表的意思是「一张都不收」）')
     }
   }
 
@@ -608,7 +630,7 @@ function validateProject (raw, index) {
       .map((item) => item.trim().toLowerCase())
       .filter((item) => item.length > 0)
     if (hosts.length === 0) {
-      fail('match.allowedImageHosts', '必须是非空字符串或字符串数组（截图链接允许的主机名，例如 cdn.example.com）')
+      fail('match.allowedImageHosts', '必须是非空字符串或字符串数组（截图链接允许的主机名，例如 cdn.example.com）', '写域名，不带协议和路径（cdn.example.com 可以，https://cdn.example.com/b.png 不行）；不想放行任何外部截图就整个删掉这个键')
     } else {
       value.match.allowedImageHosts = Array.from(new Set(hosts))
     }
@@ -638,7 +660,7 @@ function validateProject (raw, index) {
   if (match.sheetHeaderRow !== undefined && match.sheetHeaderRow !== null && match.sheetHeaderRow !== '') {
     const row = Number(match.sheetHeaderRow)
     if (!Number.isInteger(row) || row < 1) {
-      fail('match.sheetHeaderRow', `必须是 ≥1 的整数（表头在第几行），实际是 ${JSON.stringify(match.sheetHeaderRow)}`)
+      fail('match.sheetHeaderRow', `必须是 ≥1 的整数（表头在第几行），实际是 ${JSON.stringify(match.sheetHeaderRow)}`, '数一下表头在表格里的行号（最上面有标题行就往后数），缺省 1')
     } else {
       value.match.sheetHeaderRow = row
     }
@@ -649,7 +671,7 @@ function validateProject (raw, index) {
   if (typeof match.sheetIdentity === 'string' && match.sheetIdentity.trim().length > 0) {
     const identity = match.sheetIdentity.trim()
     if (identity !== 'seq' && identity !== 'row') {
-      fail('match.sheetIdentity', '只能写 seq（按序号列，缺省）或 row（按物理行号）')
+      fail('match.sheetIdentity', '只能写 seq（按序号列，缺省）或 row（按物理行号）', '一般不用填。填 seq = 按「序号」列认票（推荐，插行不换身份）；填 row = 按物理行号认票（插行会让票换身份）')
     } else {
       value.match.sheetIdentity = identity
     }
@@ -659,7 +681,7 @@ function validateProject (raw, index) {
   // 写错一个就等于「配了但没生效」，所以这里先按白名单校验一遍。
   if (match.sheetColumns !== undefined && match.sheetColumns !== null) {
     if (typeof match.sheetColumns !== 'object' || Array.isArray(match.sheetColumns)) {
-      fail('match.sheetColumns', '必须是对象，形如 { "description": "问题描述", "status": "是否处理" }')
+      fail('match.sheetColumns', '必须是对象，形如 { "description": "问题描述", "status": "是否处理" }', '左边是插件认识的 13 个字段名，右边是表头里实际写的列名；表头叫法本来就对的话删掉这个键')
     } else {
       /** @type {Record<string, string | string[]>} */
       const columns = {}
@@ -670,7 +692,7 @@ function validateProject (raw, index) {
           .map((item) => item.trim())
           .filter((item) => item.length > 0)
         if (cleaned.length === 0) {
-          fail(`match.sheetColumns.${field}`, '必须是非空字符串或字符串数组（表头里实际写的列名）')
+          fail(`match.sheetColumns.${field}`, '必须是非空字符串或字符串数组（表头里实际写的列名）', `填表头里那一格的实际文字，例如 "${field}": "问题描述"`)
           continue
         }
         columns[field] = Array.isArray(actual) ? cleaned : cleaned[0]
@@ -748,22 +770,112 @@ function validateProjects (raw) {
 }
 
 /**
+ * 已从配置里删掉的键 → 「它去哪了」。
+ *
+ * 为什么单独一张表、而且只是**警告**：#03 删了 10 个键（收成内置常量、挪去凭据、
+ * 合并成枚举）。老配置里还留着它们，删键时已经确认过「留下不报错也不生效」
+ * （`flatten()` 收进 map、`validateConfig` 只遍历 `CONFIG_FIELDS`）。
+ * 但「静默忽略」对人不友好 —— 人照着老文档填了 `qqmail.port`，以为生效了。
+ * 所以这里给一条「这个键已经没用了，该换成什么」，而**不是**报成错误（那会让
+ * 老配置拒绝启动，等于给升级加了一道人工卡口）。
+ *
+ * @type {Readonly<Record<string, string>>}
+ */
+export const REMOVED_CONFIG_KEYS = Object.freeze({
+  safePageRun: '已收成内置常量 20，不再给配',
+  goneAfterScans: '已收成内置常量 3，不再给配',
+  concurrency: '并发恒为 1（结构决定），不再给配',
+  leaseHeartbeatSeconds: '已收成内置常量 60 秒，不再给配',
+  fetchBeforeCreate: '已收成内置常量 true，不再给配',
+  logLevel: '这个键从来没被消费过，已删掉',
+  'pushplus.token': 'token 是密钥，改到「凭据」页填 PUSHPLUS_TOKEN',
+  'pushplus.template': '模板恒为 txt（富模板只显示前 50 字），已删掉',
+  'qqmail.port': '改用 qqmail.encryption：tls = 465、starttls = 587',
+  'qqmail.secure': '改用 qqmail.encryption：tls = 465、starttls = 587',
+})
+
+/**
+ * 编辑距离（只用来给「你是不是想写 X」找最近的那个键）。
+ *
+ * 不引依赖：这里只需要一个小函数，为它拉一个库（levenshtein 之类）不值得。
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {number}
+ */
+function editDistance (a, b) {
+  if (a === b) return 0
+  if (a.length === 0) return b.length
+  if (b.length === 0) return a.length
+  let previous = new Array(b.length + 1)
+  for (let j = 0; j <= b.length; j += 1) previous[j] = j
+  for (let i = 1; i <= a.length; i += 1) {
+    /** @type {number[]} */
+    const current = [i]
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+    }
+    previous = current
+  }
+  return previous[b.length]
+}
+
+/**
+ * 给一个不认识的键找最像的合法键。
+ *
+ * 两档判据：①编辑距离 ≤2（`pollInvervalMinutes` 这种拼错）；②一方是另一方的前缀
+ * 或包含（`pollInterval` / `pollintervalminutes` 这类少写/大小写写歪）。
+ * 都对不上就返回空串 —— **不要硬猜**，猜错的建议比没有建议更浪费时间。
+ *
+ * @param {string} key
+ * @returns {string}
+ */
+export function suggestConfigKey (key) {
+  const candidates = Object.keys(CONFIG_FIELDS)
+  let best = ''
+  let bestDistance = Infinity
+  for (const candidate of candidates) {
+    const distance = editDistance(key, candidate)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = candidate
+    }
+  }
+  if (bestDistance <= 2) return best
+  const lower = key.toLowerCase()
+  for (const candidate of candidates) {
+    const lowered = candidate.toLowerCase()
+    if (lowered.startsWith(lower) || lower.startsWith(lowered)) return candidate
+    if (lower.length >= 6 && lowered.includes(lower)) return candidate
+  }
+  return ''
+}
+
+/**
  * 校验并补默认值。
  *
+ * 每条 issue 都带 `fix`（「该怎么改」），因为绝大多数人看到
+ * `pollIntervalMinutes 不能大于 60` 之后还要再查一遍文档才知道该填什么。
+ * `fix` 是给人看的一句话，不是给程序解析的。
+ *
+ * `warnings` 是**不挡启动**的提醒（目前只有「配置里有不认识的键」这一类）。
+ * 它不进 `issues` —— 报成错误等于让老配置拒绝启动（见 `REMOVED_CONFIG_KEYS`）。
+ *
  * @param {unknown} raw
- * @returns {{ value?: Record<string, unknown>, issues?: Array<{ message: string, path?: string[] }> }}
+ * @returns {{ value?: Record<string, unknown>, issues?: Array<{ message: string, path?: string[], fix?: string }>, warnings?: string[] }}
  */
 export function validateConfig (raw) {
   const input = raw === undefined || raw === null ? {} : raw
   if (typeof input !== 'object' || Array.isArray(input)) {
-    return { issues: [{ message: '配置必须是一个对象', path: [] }] }
+    return { issues: [{ message: '配置必须是一个对象', path: [], fix: '整体写成 { ... } 形状（YAML 顶格缩进的键值对）' }] }
   }
 
   /** @type {Record<string, unknown>} */
   const flat = {}
   flatten(input, '', flat)
 
-  /** @type {Array<{ message: string, path?: string[] }>} */
+  /** @type {Array<{ message: string, path?: string[], fix?: string }>} */
   const issues = []
   /** @type {Record<string, unknown>} */
   const nested = {}
@@ -771,39 +883,67 @@ export function validateConfig (raw) {
   for (const [path, field] of Object.entries(CONFIG_FIELDS)) {
     const present = Object.prototype.hasOwnProperty.call(flat, path)
     const value = present ? flat[path] : field.default
-    const fail = (message) => issues.push({ message: `${path} ${message}`, path: path.split('.') })
+    // 报错文案用「中文 label + 原始路径」，两个都留着：
+    // label 让人一眼知道说的是哪个设置，路径让人能在文件里搜到。
+    // label 自己可能带括号（`轮询间隔（分钟）`），所以路径并进同一对括号里，
+    // 不写成 `轮询间隔（分钟）（pollIntervalMinutes）` 这种两层括号。
+    const label = configFieldLabel(path)
+    const heading = label.length > 0 ? `${label.replace(/）$/, `，${path}）`)}` : path
+    const fail = (message, fix) => issues.push({ message: `${heading} ${message}`, path: path.split('.'), ...(fix ? { fix } : {}) })
+    const example = field.default !== undefined ? JSON.stringify(field.default) : ''
 
     switch (field.type) {
       case 'string': {
-        if (typeof value !== 'string') { fail('必须是字符串'); break }
-        if (field.enum && !field.enum.includes(value)) { fail(`只能是 ${field.enum.join(' / ')}`); break }
+        if (typeof value !== 'string') { fail('必须是字符串', `写成文本（不要写成数字或列表）${example ? `，缺省是 ${example}` : ''}`); break }
+        if (field.enum && !field.enum.includes(value)) {
+          fail(`只能是 ${field.enum.join(' / ')}`, `从这几个里挑一个：${field.enum.join(' / ')}${example ? `；不确定就先用缺省 ${example}` : ''}`)
+          break
+        }
         assignPath(nested, path, value)
         break
       }
       case 'number':
       case 'integer': {
-        if (typeof value !== 'number' || Number.isNaN(value)) { fail('必须是数字'); break }
-        if (field.type === 'integer' && !Number.isInteger(value)) { fail('必须是整数'); break }
-        if (field.min !== undefined && value < field.min) { fail(`不能小于 ${field.min}`); break }
-        if (field.max !== undefined && value > field.max) { fail(`不能大于 ${field.max}`); break }
+        const unit = field.type === 'integer' ? '整数' : '数字'
+        const range = field.min !== undefined && field.max !== undefined
+          ? `${field.min}–${field.max}`
+          : field.min !== undefined
+            ? `不小于 ${field.min}`
+            : field.max !== undefined ? `不大于 ${field.max}` : ''
+        if (typeof value !== 'number' || Number.isNaN(value)) {
+          fail('必须是数字', `填阿拉伯数字，不要加引号、不要写单位${range ? `（范围 ${range}）` : ''}${example ? `；缺省是 ${example}` : ''}`)
+          break
+        }
+        if (field.type === 'integer' && !Number.isInteger(value)) {
+          fail('必须是整数', `填整数（不能带小数点）${example ? `；缺省是 ${example}` : ''}`)
+          break
+        }
+        if (field.min !== undefined && value < field.min) {
+          fail(`不能小于 ${field.min}`, `填 ${field.min}–${field.max ?? '不限'} 之间的${unit}${example ? `，常用 ${example}` : ''}`)
+          break
+        }
+        if (field.max !== undefined && value > field.max) {
+          fail(`不能大于 ${field.max}`, `填 ${field.min ?? '不限'}–${field.max} 之间的${unit}${example ? `，常用 ${example}` : ''}`)
+          break
+        }
         assignPath(nested, path, value)
         break
       }
       case 'boolean': {
-        if (typeof value !== 'boolean') { fail('必须是布尔值'); break }
+        if (typeof value !== 'boolean') { fail('必须是布尔值', '只能是 true 或 false（不要写「是 / 否」「开 / 关」）'); break }
         assignPath(nested, path, value)
         break
       }
       case 'string-array': {
         if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
-          fail('必须是字符串数组')
+          fail('必须是字符串数组', '写成列表，例如 ["done", "failed"]；只有一个值时也要写成列表')
           break
         }
         assignPath(nested, path, [...value])
         break
       }
       default:
-        fail(`未知的配置类型 ${field.type}`)
+        fail(`未知的配置类型 ${field.type}`, '这是插件自身的 bug，请把这条报错贴给维护者')
     }
   }
 
@@ -815,8 +955,80 @@ export function validateConfig (raw) {
     nested.projects = projects.value
   }
 
-  if (issues.length > 0) return { issues }
-  return { value: nested }
+  // 不认识的键：只警告，不挡启动。
+  //
+  // 为什么值得做：`pollInvervalMinutes`（少一个字母）在过去是完全静默的 ——
+  // 插件照常启动、照常按 3 分钟轮询，人以为自己配的是 30 分钟，查半天查不出原因。
+  // 而 `flatten()` 早就把这些键收进 map 了，检查一次几乎没有成本。
+  const warnings = collectUnknownKeyWarnings(flat)
+
+  if (issues.length > 0) return { issues, warnings }
+  return { value: attachWarnings(nested, warnings), warnings }
+}
+
+/**
+ * 找出 `flat` 里不属于 `CONFIG_FIELDS` 的键，翻成人话。
+ *
+ * @param {Record<string, unknown>} flat
+ * @returns {string[]}
+ */
+function collectUnknownKeyWarnings (flat) {
+  /** @type {string[]} */
+  const warnings = []
+  for (const key of Object.keys(flat)) {
+    if (CONFIG_FIELDS[key] !== undefined) continue
+    const removed = REMOVED_CONFIG_KEYS[key]
+    if (removed !== undefined) {
+      warnings.push(`配置里还留着 \`${key}\`（${removed}）。留着不影响启动，删掉更清爽。`)
+      continue
+    }
+    const suggestion = suggestConfigKey(key)
+    warnings.push(suggestion.length > 0
+      ? `配置里有 \`${key}\`，这个键不存在；你要找的是 \`${suggestion}\` 吗？（写成 \`${key}\` 完全不会生效，插件会当作没配）`
+      : `配置里有 \`${key}\`，这个键不存在，也不会生效。检查一下拼写，或看看 user-guide 的「配置项速查」。`)
+  }
+  return warnings
+}
+
+/**
+ * 校验结果的警告挂在配置对象上的键。
+ *
+ * 用 `Symbol.for` 而不是模块内私有 Symbol：读的一方在别的模块（`pipeline_doctor`），
+ * 两边必须是同一个键。
+ */
+export const CONFIG_WARNINGS = Symbol.for('ticket-pipeline.configWarnings')
+
+/**
+ * 把警告挂到校验后的配置对象上（**不可枚举**）。
+ *
+ * 为什么挂在这里而不是让 `apply()` 再解析一遍配置：cordis 只把**校验后的值**
+ * 传给 `apply()`，原始（带拼错键的）配置在那一步已经拿不到了。而
+ * `pipeline_doctor` 只拿得到 `getConfig()` 的结果 —— 不挂上去，警告就只有
+ * `validateConfig()` 的直接调用者才看得见，等于没做。
+ *
+ * 不可枚举是硬要求：它不能被 `describeConfig()`、`JSON.stringify()` 或面板的
+ * 值序列化看见（那是用户数据，不该混进内部字段）。
+ *
+ * @param {Record<string, unknown>} value
+ * @param {string[]} warnings
+ * @returns {Record<string, unknown>}
+ */
+function attachWarnings (value, warnings) {
+  if (warnings.length === 0) return value
+  Object.defineProperty(value, CONFIG_WARNINGS, { value: [...warnings], enumerable: false, configurable: true })
+  return value
+}
+
+/**
+ * 读回 `validateConfig()` 留下的警告（没有就是空数组）。
+ *
+ * @param {unknown} config
+ * @returns {string[]}
+ */
+export function readConfigWarnings (config) {
+  const value = /** @type {any} */ (config)
+  const warnings = value?.[CONFIG_WARNINGS]
+  return Array.isArray(warnings) ? warnings : []
 }
 
 // ── 设置面板的 schema 形状（descriptor）────────────────────────
@@ -1026,7 +1238,7 @@ function projectObject (dict, meta = {}) {
 function buildProjectsDescriptor () {
   const matchNode = projectObject({
     platform: projectLeaf('string', '平台', '决定用哪个 ticket-source 适配器收票', { enum: [...PLATFORMS] }),
-    appToken: projectLeaf('string', '飞书 appToken', '飞书多维表格的 app_token（显式绑定）；面板不画它，要改请改 profile'),
+    appToken: projectLeaf('string', '飞书 appToken', '飞书多维表格的 app_token（显式绑定）。面板不显示明文，改用「粘贴工单表链接」写入（宿主解析、明文不回浏览器）'),
     tableId: projectLeaf('string', '工单表 tableId', '飞书多维表格的 table id；与 appToken 一起构成显式绑定'),
     viewId: projectLeaf('string', '视图 viewId', '可选：只扫某个视图'),
     docNamePattern: projectLeaf('string', '表名匹配', '没有显式 appToken/tableId 时，按文件名模糊匹配工单表'),

@@ -45,10 +45,22 @@ import { fingerprintOf } from './types.js'
 /**
  * 回填结果。
  *
+ * `written:false` 有两种完全不同的处境，适配器**必须**用 `retryable` 分开说 ——
+ * 内核据此决定「留着待办下次启动再试」还是「当场放弃、让人去改配置」：
+ * - `retryable: false`（配置/结构问题，例如往飞书同步表里写、表里少一列、
+ *   电子表格首版不支持回填）：再试一百次也是同一个结果，只会让每次启动都撞一遍。
+ * - `retryable: true`（网络、限流、鉴权过期这类临时问题）：值得再试。
+ *
+ * 不标 `retryable` 时内核按「不可重试」处理 —— 宁可少试一次，
+ * 也不要对着同一张结构上写不进去的表反复报错。
+ *
  * @typedef {Object} WriteBackReceipt
  * @property {boolean} written 是否真的写成功了（平台不支持/没开开关时 false）
  * @property {string[]} [fields] 实际写了哪几列（排障时看）
- * @property {string} [note] 没写的原因，或写成功时的补充说明
+ * @property {string} [note] 没写的原因，或写成功时的补充说明。**这段文字会进表格、进通知、
+ *   进状态页，是给人看的**：不要拼 `kind: ` 之类内部前缀，分类放 `errorKind`。
+ * @property {boolean} [retryable] 没写成时：再试一次有没有意义
+ * @property {import('./errors.js').ErrorKind} [errorKind] 没写成时的错误分类（程序用，不给人看）
  */
 
 /**

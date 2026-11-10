@@ -189,6 +189,43 @@ async function readClientProjectFields () {
   return fields
 }
 
+/** 带参方法的每个参数都必须能过 typert 的边界校验，且两端都要写全。 */
+function checkParameters (label, descriptors) {
+  for (const descriptor of descriptors) {
+    const parameters = Array.isArray(descriptor.parameters) ? descriptor.parameters : []
+    const seen = new Set()
+    for (const parameter of parameters) {
+      const where = label + ' 的 ' + descriptor.id + ' 的参数 ' + String(parameter.name)
+      if (typeof parameter.name !== 'string' || parameter.name.length === 0) {
+        fail(where + ' 没有 name')
+        continue
+      }
+      if (parameter.wire !== parameter.name) {
+        fail(where + ' 的 wire 与 name 不同（网关按 wire 精确比对，两端必须一致）')
+      }
+      if (seen.has(parameter.wire)) fail(where + ' 的 wire 重名')
+      seen.add(parameter.wire)
+      if (parameter.source !== 'json') {
+        fail(where + ' 的 source 只能是 json（lookup 留给宿主内部绑定用）')
+      }
+      if (typeof parameter.codec?.create !== 'function') {
+        fail(where + ' 没有 codec.create() —— 网关 decode() 会拒掉这次调用')
+      }
+      if (typeof parameter.strictCodec?.create !== 'function') {
+        fail(where + ' 没有 strictCodec.create() —— 浏览器侧 $mount 只读这一份')
+      }
+      if (typeof parameter.codec?.typeSymbol !== 'string' || parameter.codec.typeSymbol.length === 0) {
+        fail(where + ' 的 codec.typeSymbol 为空')
+      }
+    }
+    // 参数个数另一头是浏览器侧：它按位置传实参，数量对不上就是
+    // `client api: … expected N argument(s), got M`。
+    if (parameters.length > 0) {
+      notes.push(label + ' 的 ' + descriptor.method + ' 带 ' + parameters.length + ' 个参数：' + parameters.map(function (p) { return p.name }).join(', '))
+    }
+  }
+}
+
 /**
  * 把描述符剥成只含「跨端必须一致」的字段。
  *
@@ -211,7 +248,17 @@ function normalizeDescriptor (descriptor) {
         }
       : undefined,
     parameters: (descriptor.parameters ?? []).map(function (parameter) {
-      return { name: parameter.name, wire: parameter.wire, source: parameter.source }
+      return {
+        name: parameter.name,
+        wire: parameter.wire,
+        source: parameter.source,
+        // 参数也是有边界的：网关 `decode()` 会用 `codec.create().parse()` 校验入参，
+        // 缺 create() 或 typeSymbol 让参数直接没法过边界（症状是「点了没反应」）。
+        // 函数没法比相等，只比这两个布尔位 + 类型名。
+        hasCodecCreate: typeof parameter.codec?.create === 'function',
+        hasStrictCodecCreate: typeof parameter.strictCodec?.create === 'function',
+        codecType: parameter.codec?.typeSymbol,
+      }
     }),
   }
 }
@@ -573,7 +620,12 @@ async function checkProjectFields () {
   }
   for (const path of audit.fields) {
     if (panelPaths.indexOf(path) < 0) {
-      notes.push('宿主 projects descriptor 里有 ' + path + '，面板没画（这个字段只能改配置文件）')
+      // `match.appToken` 是特例：面板确实没有它的输入框，但「粘贴工单表链接」
+      // 会经宿主的 `setProjectTable()` 把它写进去（明文不下发浏览器）。
+      // 所以它不是「只能改配置文件」，只是改法不同 —— 别在这里误导人。
+      notes.push(path === 'match.appToken'
+        ? '宿主 projects descriptor 里有 match.appToken，面板没有明文输入框（用「粘贴工单表链接」经宿主写入）'
+        : '宿主 projects descriptor 里有 ' + path + '，面板没画（这个字段只能改配置文件）')
     }
   }
   notes.push('面板项目字段 ' + panelPaths.length + ' 项与宿主 projects descriptor 对得上')
@@ -688,6 +740,8 @@ async function main () {
   if (host !== undefined && client !== undefined) {
     checkResultCodecs('宿主侧 src/remote/descriptors.js', host.raw)
     checkResultCodecs('浏览器侧 lib/client.js', client.raw)
+    checkParameters('宿主侧', host.raw)
+    checkParameters('浏览器侧', client.raw)
     if (host.package !== client.package) {
       fail('包名不一致：宿主 ' + host.package + ' vs 浏览器 ' + client.package)
     }
