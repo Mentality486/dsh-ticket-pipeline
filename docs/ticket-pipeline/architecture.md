@@ -1997,6 +1997,10 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
   profile 目录不硬套三层相对路径，`findProfileDir()` 沿路向上最多 6 层找真的声明了本包的那份 `package.json`。
 - **只进 `warnings` 不进 `problems`**：装旧版插件票照样能跑完，记成 `problems` 会让人以为流水线坏了。
   落后时文案直接给出「把 `<sourceDir>` 同步到 `<installedDir>`，然后重启宿主」。
+  **同步动作本身有脚本**：`node scripts/sync-install.mjs`（`--dry-run` 只看不改、`--dir <path>` 指定目标，
+  缺省遍历 `~/.dsh/profiles/*/node_modules/@local/ticket-pipeline` 并核对 `package.json` 里的 `name`
+  才动 —— 同名不同包不能误伤）。它只写安装副本：多出的旧文件一并删（例如 #18 移除的 webform 源），
+  源码目录一个字节都不动。
 - 比对器**绝不抛**：路径不存在、profile 声明缺失、源码目录里没有可比文件，全部走 `ok: false` + `reason`，
   `runDoctor` 把它渲染成 `ℹ️ 插件版本：无法比对（<原因>）`。
 

@@ -133,9 +133,21 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 三件事，少一件都不生效：
 
 1. **把本目录同步到安装副本**（`dsh.cmd plugin --profile desktop add` 走的是拷进 profile 的副本，不是这个目录）。
-   `pipeline_doctor` 会告诉你「把哪个目录同步到哪个目录」。
+   直接用脚本，别手抄路径：
+
+   ```bash
+   node scripts/sync-install.mjs --dry-run   # 先看会改哪些文件
+   node scripts/sync-install.mjs             # 真同步（自动找 ~/.dsh/profiles/*/node_modules/@local/ticket-pipeline）
+   ```
+
+   它只动安装副本、不动源码；副本里多出来的旧文件会一并删掉（例如 #18 移除的 webform 源）。
+   为什么要这一步（`file:` 依赖跨盘落成复制、`pnpm install` 不刷新、HMR 不监听源码目录）见 `architecture.md` §12.11。
+
 2. **重启宿主**（桌面包由 Electron 独占管理，刷新页面不算）。
 3. **`lib/client.js` 是浏览器 bundle**：改完还要让宿重重发 bundle 才能生效（重启覆盖这一点）。
+
+重启后跑一次 `pipeline_doctor`，第 5 节不再报「安装副本比源码旧」就说明同步到位了
+（它比的是文件内容，不是版本号）。
 
 **Q：在设置页改了配置，为什么行为没立刻变？**
 配置是读一次快照用的，改动落盘后由宿主 `settings` 服务通知插件重读；但**已打开的面板页面**要刷新才重取。

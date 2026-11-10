@@ -1314,7 +1314,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 目标仓库 | `.repos/mgiot-pms`（GitLab project 28，`v2.x`）、`.repos/tp-sandbox`（project 33，main） |
 | 宿主 profile 现状（2026-11-06） | pms 项目 `repo.path` = `D:/WorkSpace/mgiot-pms`（直接指向项目工作区）、`match.statusValues` = `["处理中"]`、`fetchBeforeCreate: false`；**已去掉 `recordIds` 试点收窄**（整张表按状态值收） |
 | 插件依赖 | **零 npm 依赖**；一切宿主能力从 `options` 注入（插件目录解析不到 `@deepseek-ai/*`） |
-| 插件改动生效 | 必须 `cp -r` 到安装副本 `C:/Users/Administrator/.dsh/profiles/desktop/node_modules/@local/ticket-pipeline/` 并重启宿主 |
+| 插件改动生效 | 跑 `node scripts/sync-install.mjs`（自动找 `~/.dsh/profiles/*/node_modules/@local/ticket-pipeline`，可用 `--dry-run` 先看、`--dir` 指定）再**完全重启宿主**；手抄路径不再需要。为什么要这一步见 `architecture.md` §12.11 |
 | 权威票态 | `C:/Users/Administrator/.dsh/storages/ticket_pipeline.json` 的 `tables.tickets`（object，键 = projectId + `\u0000` + recordId） |
 
 ---
