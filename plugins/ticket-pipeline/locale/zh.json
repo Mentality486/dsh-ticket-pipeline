@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "工单流水线",
-    "description": "从工单表检测变化，定位代码、改动验证、开 draft MR 并发送通知（QQ 邮箱 / PushPlus 中继微信）。"
+    "description": "从工单表检测变化，定位代码、改动验证、在检出里做本地提交、回填表格并发送通知（QQ 邮箱 / PushPlus 中继微信）。"
   }
 }

@@ -16,6 +16,10 @@
 
 import { runDoctor } from '../tools/pipeline-doctor.js'
 import { parseFeishuLink } from '../contracts/types.js'
+import { collectStatus } from '../tools/pipeline-status.js'
+import { collectScan } from '../tools/pipeline-scan.js'
+import { collectCancel } from '../tools/pipeline-cancel.js'
+import { collectReset } from '../tools/pipeline-reset.js'
 import { TICKET_PIPELINE_DESCRIPTORS, TICKET_PIPELINE_NAMESPACE } from './descriptors.js'
 
 /**
@@ -27,11 +31,23 @@ export class TicketPipelineRemote {
    * @param {() => unknown} options.getConfig
    * @param {import('../tools/pipeline-doctor.js').DoctorOptions} options.doctorOptions
    * @param {() => any} [options.getSettings] 宿主 `settings` 服务（写 profile 用；缺席时「粘贴链接」不可用）
+   * @param {import('../core/store.js').TicketStore} [options.store] 运行页签读票、重开票要用
+   * @param {{ isRunning: () => boolean, tick: (opts?: any) => Promise<any>, cancelActive: () => boolean }} [options.scheduler]
+   * @param {(args: string[], opts?: any) => Promise<any>} [options.gitRunner] 改动摘要要用
+   * @param {(message: string, detail?: unknown) => void} [options.log] 后台一轮失败留痕
    */
   constructor (options) {
     this.getConfig = options.getConfig
     this.doctorOptions = options.doctorOptions
     this.getSettings = options.getSettings
+    // 运行页签（#16）的四件东西。全部可选：`dev-run.mjs` 里有只测 branches 的用例
+    // 只传 getConfig + doctorOptions，缺依赖时对应方法给一条人话错误，不是崩。
+    this.store = options.store
+    this.scheduler = options.scheduler
+    this.gitRunner = options.gitRunner ?? options.doctorOptions?.gitRunner
+    // 后台一轮失败时的留痕口（与工具那条 `options.log` 同一个）。缺席就静默 ——
+    // 但「点了没反应」正是本票要治的病，所以宿主装配必须把它传进来。
+    this.log = options.log
 
     // 网关的绑定校验读这个字段（见文件头注释）。
     this.typertRemote = Object.freeze({
@@ -189,6 +205,82 @@ export class TicketPipelineRemote {
         '面板只存 token，明文不会回到浏览器。项目改动生效需要插件重载（保存后重启宿主）。',
     }
   }
+
+  // ── 运行页签（工单 #16）──────────────────────────────────────
+  //
+  // 这四个方法是面板上「运行」页的一整屏动作。硬约束：**不许复制工具实现** ——
+  // 它们全部转调 tools/ 里已经抽好的算结果层（collectStatus / collectScan /
+  // collectCancel / collectReset），与对话里的同名工具是同一份代码。
+  // 复制一份的后果不是代码丑，而是两处判定迟早分道扬镳：工具说 already-running、
+  // 按钮说 triggered，人就再也信不过任何一边。
+
+  /**
+   * 运行页签的一屏快照 —— 与 `pipeline_status` 工具同一个 `collectStatus()`。
+   *
+   * 固定取 `view: 'tickets'`：面板要的是「一张票一行、能挂按钮」的明细，
+   * 不是按项目聚合的战报。`includeDone: false` 是缺省口径（见票 #16 B 段：
+   * 进去先看「还要我做什么」，历史用展开的方式看）。
+   */
+  async status () {
+    requireStore(this.store, 'status')
+    return collectStatus({
+      store: this.store,
+      getConfig: this.getConfig,
+      gitRunner: this.gitRunner ?? null,
+    }, { view: 'tickets', includeDone: false })
+  }
+
+  /**
+   * 「跑一轮」按钮 —— 与 `pipeline_scan` 工具同一个 `collectScan()`。
+   *
+   * 同样 fire-and-forget：这里**不等**这一轮跑完（跑一张票可能几十分钟，
+   * 而网关的 direct 调用也有超时）。触发完立刻返回，进度靠 status() 轮询。
+   * `disabled` / `already-running` 这两个「按下那一刻就知道」的结果由
+   * collectScan 的 preflight 直接给出，不会白起一个后台任务。
+   */
+  async scan () {
+    if (!this.scheduler) throw new Error('运行页签没接上调度器（scheduler 缺席），点不了「跑一轮」。')
+    return collectScan({
+      tick: (opts) => this.scheduler.tick(opts),
+      isRunning: () => this.scheduler.isRunning,
+      getConfig: this.getConfig,
+      log: this.log,
+    }, {}, undefined)
+  }
+
+  /** 「取消当前」按钮 —— 与 `pipeline_cancel` 工具同一个 `collectCancel()`。 */
+  async cancel () {
+    if (!this.scheduler) throw new Error('运行页签没接上调度器（scheduler 缺席），点不了「取消」。')
+    return collectCancel({ cancelActive: () => this.scheduler.cancelActive() })
+  }
+
+  /**
+   * 失败票行尾的「重跑」按钮 —— 与 `pipeline_reset` 工具同一个 `collectReset()`。
+   *
+   * 这是本票最大的一块价值：failed 票不会自动重试，以前只能去表格里拨
+   * 「是否处理」，而那条路会整票重做一遍并覆盖旧回填。
+   *
+   * `projectId` 可选：只有多项目撞同一个 record_id 时才需要补。
+   *
+   * @param {string} recordId
+   * @param {string} [projectId]
+   */
+  async reset (recordId, projectId) {
+    requireStore(this.store, 'reset')
+    return collectReset({ store: this.store }, { recordId, projectId })
+  }
+}
+
+/**
+ * 缺依赖时给一条能照着做的错，而不是 `undefined.listTickets is not a function`。
+ *
+ * @param {unknown} store
+ * @param {string} action
+ */
+function requireStore (store, action) {
+  if (!store) {
+    throw new Error(`运行页签没接上存储（store 缺席），${action} 不可用。这通常是宿主装配没把 store 传进来。`)
+  }
 }
 
 /**
@@ -244,6 +336,15 @@ function describeProject (project, index) {
         return `${key}=${text}`
       }).join(', ')
       : '',
+    // 多维表格的列名覆盖（工单 #21）。和上面 `sheetColumns` 完全同形的摊平方式 ——
+    // 面板那一个文本框同时服务两种表型，只是键名不同（见 lib/client.js 的 projectRawValue）。
+    columns: match.columns && typeof match.columns === 'object' && !Array.isArray(match.columns)
+      ? Object.keys(match.columns).map((key) => {
+        const value = match.columns[key]
+        const text = Array.isArray(value) ? value.map(String).join('|') : String(value ?? '')
+        return `${key}=${text}`
+      }).join(', ')
+      : '',
     tableKind: String(match.tableKind ?? ''),
     // 通用收窄
     statusValues: Array.isArray(match.statusValues) ? match.statusValues.map(String) : [],
@@ -254,7 +355,14 @@ function describeProject (project, index) {
     repoRemote: String(repo.remote ?? ''),
     repoBaseBranch: String(repo.baseBranch ?? ''),
     repoTargetBranch: String(repo.targetBranch ?? ''),
+    // GitLab 出口（工单 #19）：这三个不是密钥，可以原样下发 —— 以前它们在面板上
+    // 根本画不出来，导致「想开 draft MR 的人只能去手改 YAML」，这是这个能力最荒谬的地方。
     remoteMrEnabled: repo?.gitlab?.enabled === true,
+    gitlabBaseUrl: String(repo?.gitlab?.baseUrl ?? ''),
+    gitlabRemote: String(repo?.gitlab?.remote ?? ''),
+    gitlabProjectId: repo?.gitlab?.projectId === undefined || repo?.gitlab?.projectId === null
+      ? ''
+      : String(repo.gitlab.projectId),
     // 验证
     verifyBuild: String(verify.build ?? ''),
     verifyTest: String(verify.test ?? ''),

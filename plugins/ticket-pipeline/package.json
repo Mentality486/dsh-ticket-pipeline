@@ -2,7 +2,7 @@
   "name": "@local/ticket-pipeline",
   "version": "0.1.0-test.1",
   "private": true,
-  "description": "工单流水线：从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。",
+  "description": "工单流水线：从工单表检测变化，定位代码、改动验证、在检出里做本地提交、回填表格并推送通知。",
   "type": "module",
   "exports": {
     ".": "./src/index.js",

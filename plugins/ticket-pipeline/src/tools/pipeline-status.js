@@ -17,6 +17,10 @@ import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { describeConfig } from '../core/config.js'
 import { describeCommit, renderCommitSummary } from '../core/commit-summary.js'
 import { foundAtSortKey, summarize, ticketKey } from '../core/store.js'
+// 「能不能重跑」的口径只在 pipeline-reset.js 里定（RESETTABLE_PHASES）。
+// 运行页签（#16）要按它决定给不给按钮，所以这里把它转成一个布尔随票下发 ——
+// 浏览器 bundle 里 import 不到 src 里的常量，面板自己再抄一份判定就会两边不一致。
+import { RESETTABLE_PHASES } from './pipeline-reset.js'
 
 // 9 个主站的编号。补充站的 no 是 '·'，不参与「第 N 站」的说法。
 const MAIN_STATION_NO = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨']
@@ -652,397 +656,437 @@ export function createPipelineStatusTool (options) {
     render: (value) => textBlocks(value.text),
     async execute (args, exec) {
       void exec
-      const config = options.getConfig()
-      const limit = typeof args.limit === 'number' ? args.limit : 20
-      const includeDone = args.includeDone === true
-      // 两个视图回答两个不同的问题：
-      //   overview —— 「我这些项目现在什么情况、有没有要我动手的」（缺省）
-      //   tickets  —— 「这一票走到哪一站、卡了多久」（以前唯一的形态）
-      // 缺省改成 overview 是因为按明细输出时，全在终态的库里默认一条都不显示
-      // （只筛非终态），而人真正想知道的往往正是「全都跑完了没有」。
-      const view = args.view === 'tickets' ? 'tickets' : 'overview'
-      const hasRecordId = typeof args.recordId === 'string' && args.recordId.length > 0
-      // 传了 recordId 一定是看某一张的明细：总览里没有「只看一张」这回事。
-      const overview = view === 'overview' && !hasRecordId
-      // 整次查询用同一个「现在」：否则逐票算时间线时，前一张票与后一张票的
-      // 「已多久没动」会差几毫秒，自测也没法写确定值。
-      const now = nowFn()
+      // 算结果与渲染分层在这里落地：Remote（ticketPipeline.status()）也必须调
+      // 同一个 collectStatus，否则面板上的票列表会和工具输出两套口径。
+      return collectStatus(options, args)
+    },
+  })
+}
 
-      let rows = options.store.listTickets()
-      // 交付口径要按全库算，不受 recordId / includeDone 影响（#08）：
-      // 「交付未完成：2 张」说的是整个流水线，不是这一次筛出来的。
-      const allTicketsInitial = rows
+/**
+ * 算一份状态快照（工单 #16 抽出来的）。
+ *
+ * ## 为什么必须是模块级导出，而不是工具内部的一段
+ *
+ * 设置面板的「运行」页签也要看同一份状态：票有多少张、谁在跑、失败票是哪几条。
+ * 如果面板那条路（TicketPipelineRemote.status()）自己重算一遍，就会出现
+ * 「工具说 3 张要你处理、面板显示 2 张」——两个数字各自都对，人却不知道信谁。
+ * 所以这里把「算」抽出来共用，面板只负责画。
+ *
+ * ## 参数
+ *
+ * @param {Object} options 与 createPipelineStatusTool 同一个 options
+ * @param {Object} [args] 与工具入参同形状（recordId / view / includeDone / limit）
+ */
+export async function collectStatus (options, args) {
+  const safeArgs = args && typeof args === "object" ? args : {}
+  const nowFn = typeof options.now === "function" ? options.now : () => Date.now()
+  const gitRunner = options.gitRunner ?? null
+  const config = options.getConfig()
+  const limit = typeof safeArgs.limit === 'number' ? safeArgs.limit : 20
+  const includeDone = safeArgs.includeDone === true
+  // 两个视图回答两个不同的问题：
+  //   overview —— 「我这些项目现在什么情况、有没有要我动手的」（缺省）
+  //   tickets  —— 「这一票走到哪一站、卡了多久」（以前唯一的形态）
+  // 缺省改成 overview 是因为按明细输出时，全在终态的库里默认一条都不显示
+  // （只筛非终态），而人真正想知道的往往正是「全都跑完了没有」。
+  const view = safeArgs.view === 'tickets' ? 'tickets' : 'overview'
+  const hasRecordId = typeof safeArgs.recordId === 'string' && safeArgs.recordId.length > 0
+  // 传了 recordId 一定是看某一张的明细：总览里没有「只看一张」这回事。
+  const overview = view === 'overview' && !hasRecordId
+  // 整次查询用同一个「现在」：否则逐票算时间线时，前一张票与后一张票的
+  // 「已多久没动」会差几毫秒，自测也没法写确定值。
+  const now = nowFn()
 
-      if (hasRecordId) {
-        rows = rows.filter((row) => row.recordId === args.recordId)
-        if (rows.length === 0) {
-          // 早退分支的口径要和正常分支一致：counts 是全库，filteredCounts 是筛选后（这里是 0）。
-          /** @type {Record<string, number>} */
-          const allCounts = {}
-          for (const row of options.store.listTickets()) {
-            allCounts[row.phase] = (allCounts[row.phase] ?? 0) + 1
-          }
-          return {
-            enabled: config?.enabled === true,
-            counts: allCounts,
-            filteredCounts: {},
-            view,
-            projects: [],
-            tickets: [],
-            config: describeConfig(config),
-            text: `没有这条工单的记录：${args.recordId}\n`
-              + '（插件从没见过它。可能是「是否处理」还不是「处理中」，或者还没扫到。）',
-          }
-        }
-      } else if (!overview && !includeDone) {
-        rows = rows.filter((row) => !TERMINAL.includes(row.phase))
-      }
+  let rows = options.store.listTickets()
+  // 交付口径要按全库算，不受 recordId / includeDone 影响（#08）：
+  // 「交付未完成：2 张」说的是整个流水线，不是这一次筛出来的。
+  const allTicketsInitial = rows
 
-      // 「本次筛选」这个口径只在真的筛过的时候才显示，否则它就等于全库，白占一行。
-      // 总览永远按全库算，所以它不算「筛过」。
-      const filteredScope = hasRecordId || (!overview && !includeDone)
-
-      // 两个口径必须分开算、分开写明，否则会互相冒充：
-      //   total    —— 全库（不受 recordId / includeDone 影响），回答「整个流水线大概什么样」
-      //   filtered —— 这次请求筛完之后、尚未被 limit 截断（回答「我这次问到的这批有多少」）
-      // 以前只有一组 counts 却用全库算，列表却按过滤后显示：传了 recordId 时
-      // 上面写着「失败 7」，下面只有 1 条，人会以为列表漏了。
+  if (hasRecordId) {
+    rows = rows.filter((row) => row.recordId === safeArgs.recordId)
+    if (rows.length === 0) {
+      // 早退分支的口径要和正常分支一致：counts 是全库，filteredCounts 是筛选后（这里是 0）。
       /** @type {Record<string, number>} */
-      const total = {}
+      const allCounts = {}
       for (const row of options.store.listTickets()) {
-        total[row.phase] = (total[row.phase] ?? 0) + 1
+        allCounts[row.phase] = (allCounts[row.phase] ?? 0) + 1
       }
-      /** @type {Record<string, number>} */
-      const filtered = {}
-      for (const row of rows) {
-        filtered[row.phase] = (filtered[row.phase] ?? 0) + 1
+      return {
+        enabled: config?.enabled === true,
+        counts: allCounts,
+        filteredCounts: {},
+        // 档位口径与正常分支一致：运行页签拿到早退结果时也要能画出汇总行。
+        tiers: tierCounts(allCounts),
+        view,
+        projects: [],
+        tickets: [],
+        config: describeConfig(config),
+        text: `没有这条工单的记录：${safeArgs.recordId}\n`
+          + '（插件从没见过它。可能是「是否处理」还不是「处理中」，或者还没扫到。）',
       }
+    }
+  } else if (!overview && !includeDone) {
+    rows = rows.filter((row) => !TERMINAL.includes(row.phase))
+  }
 
-      // 排队顺序 = pickNext 的顺序：优先级降序 → 发现日期升序 → 入队时间升序。
-      // 比较逻辑直接复用 store / types 里的那几个函数，不在这里再写一份：
-      // 写两份就会在「没有发现日期时排哪儿」这种细节上分道扬镳。
-      const priorityText = { high: '高', medium: '中', low: '低' }
-      const compareQueue = (a, b) => {
-        const pa = priorityWeight(a.priority)
-        const pb = priorityWeight(b.priority)
-        if (pa !== pb) return pb - pa
-        const fa = foundAtSortKey(a)
-        const fb = foundAtSortKey(b)
-        if (fa !== fb) return fa < fb ? -1 : 1
-        return (a.enqueuedAt ?? 0) - (b.enqueuedAt ?? 0)
-      }
-      rows = [...rows].sort(compareQueue)
+  // 「本次筛选」这个口径只在真的筛过的时候才显示，否则它就等于全库，白占一行。
+  // 总览永远按全库算，所以它不算「筛过」。
+  const filteredScope = hasRecordId || (!overview && !includeDone)
 
-      const shown = rows.slice(0, limit)
-      const enabled = config?.enabled === true
+  // 两个口径必须分开算、分开写明，否则会互相冒充：
+  //   total    —— 全库（不受 recordId / includeDone 影响），回答「整个流水线大概什么样」
+  //   filtered —— 这次请求筛完之后、尚未被 limit 截断（回答「我这次问到的这批有多少」）
+  // 以前只有一组 counts 却用全库算，列表却按过滤后显示：传了 recordId 时
+  // 上面写着「失败 7」，下面只有 1 条，人会以为列表漏了。
+  /** @type {Record<string, number>} */
+  const total = {}
+  for (const row of options.store.listTickets()) {
+    total[row.phase] = (total[row.phase] ?? 0) + 1
+  }
+  /** @type {Record<string, number>} */
+  const filtered = {}
+  for (const row of rows) {
+    filtered[row.phase] = (filtered[row.phase] ?? 0) + 1
+  }
 
-      const lines = []
-      lines.push(enabled ? '流水线：已开启' : '流水线：总开关是关的（enabled=false），不会自动扫表')
+  // 排队顺序 = pickNext 的顺序：优先级降序 → 发现日期升序 → 入队时间升序。
+  // 比较逻辑直接复用 store / types 里的那几个函数，不在这里再写一份：
+  // 写两份就会在「没有发现日期时排哪儿」这种细节上分道扬镳。
+  const priorityText = { high: '高', medium: '中', low: '低' }
+  const compareQueue = (a, b) => {
+    const pa = priorityWeight(a.priority)
+    const pb = priorityWeight(b.priority)
+    if (pa !== pb) return pb - pa
+    const fa = foundAtSortKey(a)
+    const fb = foundAtSortKey(b)
+    if (fa !== fb) return fa < fb ? -1 : 1
+    return (a.enqueuedAt ?? 0) - (b.enqueuedAt ?? 0)
+  }
+  rows = [...rows].sort(compareQueue)
 
-      /**
-       * 把 `{ phase: count }` 按档位渲染成几行人话。
-       *
-       * 改这里的动机（#01）：原来是按 phase 枚举顺序拼成一行，
-       * 于是「已本地提交，但未跑通验证 2」和「失败 1」并列，读的人分不清
-       * 哪一类要自己动手。现在按干预程度分档，最重的一档永远有行。
-       *
-       * @param {Record<string, number>} source
-       * @param {string} [emptyText] 一条都没有时改说这句话（只给「本次筛选」用；
-       *   全库口径不用它 —— 空库时「需要你处理：0」本身就是有用的答案）
-       * @returns {string[]}
-       */
-      const formatDistribution = (source, emptyText) => {
-        const entries = Object.entries(source).filter(([, count]) => Number(count) > 0)
-        if (entries.length === 0 && emptyText) return [emptyText]
-        const out = []
-        const seen = new Set()
-        for (const tier of PHASE_TIERS) {
-          const parts = []
-          for (const [phase, shortName] of tier.phases) {
-            seen.add(phase)
-            const count = Number(source[phase] ?? 0)
-            if (count <= 0) continue
-            parts.push(shortName ? `${shortName} ${count}` : String(count))
-          }
-          if (parts.length > 0) out.push(`${tier.label}：${parts.join(' / ')}`)
-          else if (tier.keepEmpty) out.push(`${tier.label}：0`)
-        }
-        // 不认识的新 phase 不能被吞掉 —— 吞掉就是「票不见了」。
-        const leftovers = entries.filter(([phase]) => !seen.has(phase))
-        if (leftovers.length > 0) {
-          out.push(`其它：${leftovers.map(([phase, count]) => `${PHASE_LABEL[phase] ?? phase} ${count}`).join(' / ')}`)
-        }
-        return out
+  const shown = rows.slice(0, limit)
+  const enabled = config?.enabled === true
+
+  const lines = []
+  lines.push(enabled ? '流水线：已开启' : '流水线：总开关是关的（enabled=false），不会自动扫表')
+
+  /**
+   * 把 `{ phase: count }` 按档位渲染成几行人话。
+   *
+   * 改这里的动机（#01）：原来是按 phase 枚举顺序拼成一行，
+   * 于是「已本地提交，但未跑通验证 2」和「失败 1」并列，读的人分不清
+   * 哪一类要自己动手。现在按干预程度分档，最重的一档永远有行。
+   *
+   * @param {Record<string, number>} source
+   * @param {string} [emptyText] 一条都没有时改说这句话（只给「本次筛选」用；
+   *   全库口径不用它 —— 空库时「需要你处理：0」本身就是有用的答案）
+   * @returns {string[]}
+   */
+  const formatDistribution = (source, emptyText) => {
+    const entries = Object.entries(source).filter(([, count]) => Number(count) > 0)
+    if (entries.length === 0 && emptyText) return [emptyText]
+    const out = []
+    const seen = new Set()
+    for (const tier of PHASE_TIERS) {
+      const parts = []
+      for (const [phase, shortName] of tier.phases) {
+        seen.add(phase)
+        const count = Number(source[phase] ?? 0)
+        if (count <= 0) continue
+        parts.push(shortName ? `${shortName} ${count}` : String(count))
       }
-      // 先把两个口径都写上，再决定列不列票：这样「筛选结果为空」时，
-      // 人也还能看到全库其实有多少票 —— 否则只剩一句「没有未收尾的票」，看不出是全空了还是筛空了。
-      lines.push(...formatDistribution(total).map((line, i) => `${i === 0 ? '全库分布：' : '        '}${line}`))
-      if (filteredScope) {
-        lines.push(...formatDistribution(filtered, '（无）').map((line, i) => `${i === 0 ? '本次筛选：' : '        '}${line}`))
-      }
-      // 交付未完成单独一行（#08）：这类票 phase 上看是「已完成」，但改动/回填/通知
-      // 有一项没交到你手里 —— 只看「已完成 3」会以为全好了。
-      const deliveryIncomplete = allTicketsInitial.filter((row) => deliveryIssues(row).length > 0).length
-      if (deliveryIncomplete > 0) {
-        lines.push(`交付未完成：${deliveryIncomplete} 张（票态已经是完成，但该交给你的东西没交到 —— 见下面带「（表格未回写）」的票）`)
-      }
+      if (parts.length > 0) out.push(`${tier.label}：${parts.join(' / ')}`)
+      else if (tier.keepEmpty) out.push(`${tier.label}：0`)
+    }
+    // 不认识的新 phase 不能被吞掉 —— 吞掉就是「票不见了」。
+    const leftovers = entries.filter(([phase]) => !seen.has(phase))
+    if (leftovers.length > 0) {
+      out.push(`其它：${leftovers.map(([phase, count]) => `${PHASE_LABEL[phase] ?? phase} ${count}`).join(' / ')}`)
+    }
+    return out
+  }
+  // 先把两个口径都写上，再决定列不列票：这样「筛选结果为空」时，
+  // 人也还能看到全库其实有多少票 —— 否则只剩一句「没有未收尾的票」，看不出是全空了还是筛空了。
+  lines.push(...formatDistribution(total).map((line, i) => `${i === 0 ? '全库分布：' : '        '}${line}`))
+  if (filteredScope) {
+    lines.push(...formatDistribution(filtered, '（无）').map((line, i) => `${i === 0 ? '本次筛选：' : '        '}${line}`))
+  }
+  // 交付未完成单独一行（#08）：这类票 phase 上看是「已完成」，但改动/回填/通知
+  // 有一项没交到你手里 —— 只看「已完成 3」会以为全好了。
+  const deliveryIncomplete = allTicketsInitial.filter((row) => deliveryIssues(row).length > 0).length
+  if (deliveryIncomplete > 0) {
+    lines.push(`交付未完成：${deliveryIncomplete} 张（票态已经是完成，但该交给你的东西没交到 —— 见下面带「（表格未回写）」的票）`)
+  }
+  lines.push('')
+
+  // ── 队列说明（#17）─────────────────────────────────────────
+  // 并发恒 1，所以「排队」是这个插件的常态而不是边界情况。以前这里
+  // 一个字都不说，人看到「排队中 3 张」等十分钟，分不清是「前面那张在跑」
+  // 「我在退避」还是「根本不会跑了」。
+  //
+  // 「下一个」直接问 store.pickNext()，不在这里再排一遍 —— 排序规则写两份
+  // 就会在「没有发现日期时排哪儿」这类细节上分道扬镳（本文件上面的注释同理）。
+  const allRows = options.store.listTickets()
+  const pendingRows = allRows.filter((row) => row.phase === 'pending')
+  const pendingTotal = pendingRows.length
+  // 退避中的票：enqueuedAt 被写成「现在 + 退避」，store.pickNext 会跳过它。
+  // 判定口径必须与 store.js 的 `(row.enqueuedAt ?? 0) > now` 完全一致，
+  // 否则会出现「status 说下一张是它，实际 pickNext 跳过了」这种自相矛盾。
+  const backoffRemainingMs = (row) => {
+    const enqueuedAt = Number(row.enqueuedAt ?? 0)
+    return enqueuedAt > now ? enqueuedAt - now : 0
+  }
+  // 队列顺序按 pickNext 的口径排一遍，用来算「这张前面还有几张」。
+  // 退避中的票不算在前面 —— pickNext 根本不会挑它，说「前面还有 1 张」
+  // 会让人误以为那张跑完就轮到它。
+  const runnablePending = pendingRows
+    .filter((row) => backoffRemainingMs(row) === 0)
+    .sort(compareQueue)
+  // 行的身份：真库有 `key`；自测/老数据可能只有 projectId + recordId。
+  const rowIdentity = (row) => row.key ?? ticketKey(row.projectId ?? '', row.recordId ?? '')
+  const pollIntervalMinutes = Number(config?.pollIntervalMinutes ?? 3)
+  if (pendingTotal > 0) {
+    const nextRow = typeof options.store.pickNext === 'function'
+      ? options.store.pickNext()
+      : runnablePending[0]
+    const queueLines = [`队列：${pendingTotal} 张在等（同一时刻只跑一张）`]
+    if (nextRow) {
+      const nextTitle = nextRow.problemSummary ?? summarize(nextRow.description ?? '')
+      const priorityLabel = priorityText[nextRow.priority ?? ''] ?? nextRow.priority ?? '未标'
+      queueLines.push(`下一个：${nextRow.projectId ? `[${nextRow.projectId}] ` : ''}${nextRow.recordId}（优先级 ${priorityLabel}）｜${nextTitle}`)
+    } else {
+      // 全是退避中的票：这时候「下一个」没有答案，必须说清为什么，
+      // 否则这句话看起来像是工具坏了。
+      queueLines.push('下一个：暂时没有（都在退避中，等退避结束会自动重新排队）')
+    }
+    queueLines.push('排法：优先级高的先跑 → 发现日期早的先跑 → 入队早的先跑')
+    // 这句是顺手回答「为什么这么慢 / 能不能并发」——必然会被问一次。
+    queueLines.push('为什么一次只跑一张：多张票同时改同一个代码检出会互相踩，串行是设计不是缺陷。')
+    lines.push(...queueLines)
+    lines.push('')
+  }
+
+  /**
+   * recordId → 改动摘要。渲染与返回体共用同一份结果，免得为了
+   * `tickets[].commitSummary` 再跑一遍 git（那就是每票两次进程）。
+   * @type {Map<string, Awaited<ReturnType<typeof describeCommit>>>}
+   */
+  const summaries = new Map()
+
+  // 按项目聚合永远按**全库**算：它是「我这几个项目现在什么情况」的答案，
+  // 不该跟着 recordId / includeDone / limit 抖动。
+  const projectSummaries = summarizeProjects(allTicketsInitial)
+
+  if (overview) {
+    if (allTicketsInitial.length === 0) {
+      lines.push('库里还没有任何票。')
+    } else {
+      lines.push(...renderProjectOverview(projectSummaries, allTicketsInitial, now))
       lines.push('')
-
-      // ── 队列说明（#17）─────────────────────────────────────────
-      // 并发恒 1，所以「排队」是这个插件的常态而不是边界情况。以前这里
-      // 一个字都不说，人看到「排队中 3 张」等十分钟，分不清是「前面那张在跑」
-      // 「我在退避」还是「根本不会跑了」。
-      //
-      // 「下一个」直接问 store.pickNext()，不在这里再排一遍 —— 排序规则写两份
-      // 就会在「没有发现日期时排哪儿」这类细节上分道扬镳（本文件上面的注释同理）。
-      const allRows = options.store.listTickets()
-      const pendingRows = allRows.filter((row) => row.phase === 'pending')
-      const pendingTotal = pendingRows.length
-      // 退避中的票：enqueuedAt 被写成「现在 + 退避」，store.pickNext 会跳过它。
-      // 判定口径必须与 store.js 的 `(row.enqueuedAt ?? 0) > now` 完全一致，
-      // 否则会出现「status 说下一张是它，实际 pickNext 跳过了」这种自相矛盾。
-      const backoffRemainingMs = (row) => {
-        const enqueuedAt = Number(row.enqueuedAt ?? 0)
-        return enqueuedAt > now ? enqueuedAt - now : 0
+      lines.push('（这是按项目聚合的总览。看某一票的完整流程日志用 view="tickets"，或直接传 recordId。）')
+    }
+  } else if (rows.length === 0) {
+    lines.push(filteredScope
+      ? '这次筛选一条都没命中（全库分布见上）。'
+      : (includeDone ? '库里还没有任何票。' : '没有未收尾的票。'))
+  } else {
+    for (const row of shown) {
+      const title = row.problemSummary ?? summarize(row.description ?? '')
+      const projectTag = row.projectId ? `[${row.projectId}] ` : ''
+      // 取消与真失败共用 phase=failed（#02）：不区分的话，人分不清「我取消的」
+      // 和「它自己挂了的」—— 前者不用管，后者要修。
+      const cancelledByUser = row.phase === 'failed' && row.lastError === CANCELLED_BY_USER
+      // 退避中的 pending 与普通 pending 的 phase 完全一样（#17）。不把退避
+      // 写进状态行，两行文字就一模一样 —— 人无法判断是在等还是卡住。
+      const backoffMs = row.phase === 'pending' ? backoffRemainingMs(row) : 0
+      const backoffSuffix = backoffMs > 0 ? `（退避中，还要等 ${formatDuration(backoffMs)}）` : ''
+      // 阶段名走 phaseLabel(row)：done 要能分出「已验证 / 未跑验证」，
+      // 混成一个「已完成」会让没配验证命令的项目以为自己全绿。
+      // 交付没做成时再加个后缀（#08）：票面写着「已完成」但回填/通知/提交
+      // 有一项没落地 —— 不加后缀，人只看标题会以为一切正常。
+      const issues = deliveryIssues(row)
+      const deliverySuffix = issues.length === 0
+        ? ''
+        : (issues.length === 1 && issues[0].name === 'writeBack'
+            ? '（表格未回写）'
+            : `（交付未完成：${issues.map((it) => it.label).join('、')}）`)
+      const phaseText = `${phaseLabel(row)}${cancelledByUser ? '（你取消的）' : ''}${backoffSuffix}${deliverySuffix}`
+      lines.push(`· ${projectTag}${row.recordId}｜${phaseText}｜${title}`)
+      // 建议现在**一律**是函数（见 PHASE_ADVICE 的说明）：一条建议对不对取决于
+      // 这一票自己的处境，静态字符串只能照顾最典型的那一种。取消票有自己的话术。
+      const adviceDef = cancelledByUser ? CANCEL_ADVICE : PHASE_ADVICE[row.phase]
+      const advice = typeof adviceDef === 'function'
+        ? adviceDef({
+            now,
+            row,
+            // 「前面还有几张」按 pickNext 的可跑口径算：退避中的不算前面，
+            // 否则会出现「前面还有 1 张」但那张根本没在跑的错觉。
+            pendingAhead: Math.max(0, runnablePending.findIndex((p) => rowIdentity(p) === rowIdentity(row))),
+            pendingTotal,
+            backoffMs,
+            backoffReason: backoffMs > 0 ? row.lastError : undefined,
+            pollIntervalMinutes,
+          })
+        : adviceDef
+      if (advice) lines.push(`  ${advice}`)
+      if (row.module) lines.push(`  模块：${row.module}${row.priority ? `｜优先级：${row.priority}` : ''}`)
+      if (row.worktreePath) lines.push(`  改代码目录：${row.worktreePath}`)
+      if (row.commit?.sha) {
+        lines.push(`  本地提交：${String(row.commit.sha).slice(0, 12)}${row.commit.branch ? ` @ ${row.commit.branch}` : ''}`)
+        // 「改了什么」是这个工具以前最缺的一段：只给 sha，人还得离开 GUI 去敲 git show。
+        // 只读、一次进程调用、读不到就降级，绝不影响这条查询本身。
+        summaries.set(row.recordId, await describeCommit({
+          gitRunner,
+          worktreePath: row.worktreePath,
+          sha: row.commit.sha,
+        }))
+        renderCommitSummary(summaries.get(row.recordId), (line) => lines.push(line))
       }
-      // 队列顺序按 pickNext 的口径排一遍，用来算「这张前面还有几张」。
-      // 退避中的票不算在前面 —— pickNext 根本不会挑它，说「前面还有 1 张」
-      // 会让人误以为那张跑完就轮到它。
-      const runnablePending = pendingRows
-        .filter((row) => backoffRemainingMs(row) === 0)
-        .sort(compareQueue)
-      // 行的身份：真库有 `key`；自测/老数据可能只有 projectId + recordId。
-      const rowIdentity = (row) => row.key ?? ticketKey(row.projectId ?? '', row.recordId ?? '')
-      const pollIntervalMinutes = Number(config?.pollIntervalMinutes ?? 3)
-      if (pendingTotal > 0) {
+      if (row.mr?.url) lines.push(`  MR：${row.mr.url}${row.mr.draft ? '（draft）' : ''}`)
+      if (row.sessionId) lines.push(`  处理会话：${row.sessionId}（保留在工作区名下，可在会话列表里点进去继续问）`)
+      // 回填只在 done/skipped 后发生，写没写成是「表格里那行现在长什么样」的唯一线索。
+      if (row.writeBack) {
+        lines.push(row.writeBack.written
+          ? `  回填表格：成功${Array.isArray(row.writeBack.fields) && row.writeBack.fields.length > 0 ? `（${row.writeBack.fields.join('、')}）` : ''}`
+          : `  回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}`)
+      }
+      // 交付维度逐项（#08）：只写在「没做成」的那几项上，成功的不用重复。
+      // 已放弃（giveUp）的项要多说一句「别再等了」—— 否则人会一直等它自己好。
+      for (const issue of issues) {
+        const state = issue.state
+        const attempts = Number(state.attempts ?? 0)
+        const tried = attempts > 1 ? `（已试过 ${attempts} 次）` : ''
+        const tail = state.giveUp === true
+          ? '这不是再试一次能好的，得你去改配置/表格设置。'
+          : '会再自动试一次（下次启动补做）。'
+        lines.push(`  交付·${issue.label}：没做成${tried} —— ${state.error ?? '原因未记录'}。${tail}`)
+      }
+      if (cancelledByUser) {
+        // 原文是 'cancelled by user' —— 内部标识符，读的人不需要看见它。
+        lines.push('  最近错误：（无。这张票是你取消的，不是报错）')
+      } else if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
+      if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
+      // 待补做的事后动作：票已经是终态，但回填/通知还没做成（进程在中间退出了）。
+      // 不写出来，「表里那行还停在处理中」就永远没人知道该去看一眼。
+      if (row.pendingEffects) {
+        const todo = []
+        if (row.pendingEffects.writeBack) todo.push('回填表格')
+        if (row.pendingEffects.notify) todo.push('发通知')
+        if (todo.length > 0) {
+          lines.push(`  待补做：${todo.join('、')}（进程在到终态之后、动作完成之前退出了；下次启动会自动补做一次）`)
+        }
+      }
+      if (row.revisionCount > 1) lines.push(`  这是第 ${row.revisionCount} 版（工单被改过 ${row.revisionCount - 1} 次）`)
+      // 时间线放在最后：前面的「最近错误 / 待补做」先给结论，这里给完整过程。
+      lines.push(...renderTimeline(row, now))
+    }
+
+    if (rows.length > shown.length) {
+      lines.push('')
+      lines.push(`还有 ${rows.length - shown.length} 条没列出（用 limit 调大）。`)
+    }
+  }
+
+  return {
+    enabled,
+    // 这次给的是哪一屏：overview = 按项目聚合的总览，tickets = 一张票一段的明细。
+    // 调用方要靠它判断下面 `projects` / `tickets` 两份数据哪一份才是主体。
+    view,
+    // 按项目聚合的战报：口径恒为全库，不受 recordId / includeDone / limit 影响。
+    // 「每个项目多少张、几张要你动手」以前只能靠人翻完所有票自己数。
+    projects: projectSummaries,
+    // counts = 全库口径（老字段名不变，避免调用方炸）；filteredCounts = 本次筛选口径。
+    counts: total,
+    filteredCounts: filtered,
+    // 全库按「干预程度」归档后的计数（#16）：设置面板「运行」页签的汇总行直接画
+    // 这一份，不再自己数 phase —— 浏览器里没有 PHASE_TIERS，抄一份必然两处打脸。
+    tiers: tierCounts(total),
+    // 队列快照（#17）：运行页签（#16）与告警要看「谁是下一个」，不该自己再排一遍。
+    // backoff：这一轮拣不出来的票（退避没到期），带还剩多久 —— 它们看着像
+    // 普通 pending，但实际不会跑，只靠 phase 分辨不出来。
+    queue: {
+      pendingCount: pendingTotal,
+      runnableCount: runnablePending.length,
+      nextRecordId: (() => {
         const nextRow = typeof options.store.pickNext === 'function'
           ? options.store.pickNext()
           : runnablePending[0]
-        const queueLines = [`队列：${pendingTotal} 张在等（同一时刻只跑一张）`]
-        if (nextRow) {
-          const nextTitle = nextRow.problemSummary ?? summarize(nextRow.description ?? '')
-          const priorityLabel = priorityText[nextRow.priority ?? ''] ?? nextRow.priority ?? '未标'
-          queueLines.push(`下一个：${nextRow.projectId ? `[${nextRow.projectId}] ` : ''}${nextRow.recordId}（优先级 ${priorityLabel}）｜${nextTitle}`)
-        } else {
-          // 全是退避中的票：这时候「下一个」没有答案，必须说清为什么，
-          // 否则这句话看起来像是工具坏了。
-          queueLines.push('下一个：暂时没有（都在退避中，等退避结束会自动重新排队）')
-        }
-        queueLines.push('排法：优先级高的先跑 → 发现日期早的先跑 → 入队早的先跑')
-        // 这句是顺手回答「为什么这么慢 / 能不能并发」——必然会被问一次。
-        queueLines.push('为什么一次只跑一张：多张票同时改同一个代码检出会互相踩，串行是设计不是缺陷。')
-        lines.push(...queueLines)
-        lines.push('')
-      }
-
-      /**
-       * recordId → 改动摘要。渲染与返回体共用同一份结果，免得为了
-       * `tickets[].commitSummary` 再跑一遍 git（那就是每票两次进程）。
-       * @type {Map<string, Awaited<ReturnType<typeof describeCommit>>>}
-       */
-      const summaries = new Map()
-
-      // 按项目聚合永远按**全库**算：它是「我这几个项目现在什么情况」的答案，
-      // 不该跟着 recordId / includeDone / limit 抖动。
-      const projectSummaries = summarizeProjects(allTicketsInitial)
-
-      if (overview) {
-        if (allTicketsInitial.length === 0) {
-          lines.push('库里还没有任何票。')
-        } else {
-          lines.push(...renderProjectOverview(projectSummaries, allTicketsInitial, now))
-          lines.push('')
-          lines.push('（这是按项目聚合的总览。看某一票的完整流程日志用 view="tickets"，或直接传 recordId。）')
-        }
-      } else if (rows.length === 0) {
-        lines.push(filteredScope
-          ? '这次筛选一条都没命中（全库分布见上）。'
-          : (includeDone ? '库里还没有任何票。' : '没有未收尾的票。'))
-      } else {
-        for (const row of shown) {
-          const title = row.problemSummary ?? summarize(row.description ?? '')
-          const projectTag = row.projectId ? `[${row.projectId}] ` : ''
-          // 取消与真失败共用 phase=failed（#02）：不区分的话，人分不清「我取消的」
-          // 和「它自己挂了的」—— 前者不用管，后者要修。
-          const cancelledByUser = row.phase === 'failed' && row.lastError === CANCELLED_BY_USER
-          // 退避中的 pending 与普通 pending 的 phase 完全一样（#17）。不把退避
-          // 写进状态行，两行文字就一模一样 —— 人无法判断是在等还是卡住。
-          const backoffMs = row.phase === 'pending' ? backoffRemainingMs(row) : 0
-          const backoffSuffix = backoffMs > 0 ? `（退避中，还要等 ${formatDuration(backoffMs)}）` : ''
-          // 阶段名走 phaseLabel(row)：done 要能分出「已验证 / 未跑验证」，
-          // 混成一个「已完成」会让没配验证命令的项目以为自己全绿。
-          // 交付没做成时再加个后缀（#08）：票面写着「已完成」但回填/通知/提交
-          // 有一项没落地 —— 不加后缀，人只看标题会以为一切正常。
-          const issues = deliveryIssues(row)
-          const deliverySuffix = issues.length === 0
-            ? ''
-            : (issues.length === 1 && issues[0].name === 'writeBack'
-                ? '（表格未回写）'
-                : `（交付未完成：${issues.map((it) => it.label).join('、')}）`)
-          const phaseText = `${phaseLabel(row)}${cancelledByUser ? '（你取消的）' : ''}${backoffSuffix}${deliverySuffix}`
-          lines.push(`· ${projectTag}${row.recordId}｜${phaseText}｜${title}`)
-          // 建议现在**一律**是函数（见 PHASE_ADVICE 的说明）：一条建议对不对取决于
-          // 这一票自己的处境，静态字符串只能照顾最典型的那一种。取消票有自己的话术。
-          const adviceDef = cancelledByUser ? CANCEL_ADVICE : PHASE_ADVICE[row.phase]
-          const advice = typeof adviceDef === 'function'
-            ? adviceDef({
-                now,
-                row,
-                // 「前面还有几张」按 pickNext 的可跑口径算：退避中的不算前面，
-                // 否则会出现「前面还有 1 张」但那张根本没在跑的错觉。
-                pendingAhead: Math.max(0, runnablePending.findIndex((p) => rowIdentity(p) === rowIdentity(row))),
-                pendingTotal,
-                backoffMs,
-                backoffReason: backoffMs > 0 ? row.lastError : undefined,
-                pollIntervalMinutes,
-              })
-            : adviceDef
-          if (advice) lines.push(`  ${advice}`)
-          if (row.module) lines.push(`  模块：${row.module}${row.priority ? `｜优先级：${row.priority}` : ''}`)
-          if (row.worktreePath) lines.push(`  改代码目录：${row.worktreePath}`)
-          if (row.commit?.sha) {
-            lines.push(`  本地提交：${String(row.commit.sha).slice(0, 12)}${row.commit.branch ? ` @ ${row.commit.branch}` : ''}`)
-            // 「改了什么」是这个工具以前最缺的一段：只给 sha，人还得离开 GUI 去敲 git show。
-            // 只读、一次进程调用、读不到就降级，绝不影响这条查询本身。
-            summaries.set(row.recordId, await describeCommit({
-              gitRunner,
-              worktreePath: row.worktreePath,
-              sha: row.commit.sha,
-            }))
-            renderCommitSummary(summaries.get(row.recordId), (line) => lines.push(line))
-          }
-          if (row.mr?.url) lines.push(`  MR：${row.mr.url}${row.mr.draft ? '（draft）' : ''}`)
-          if (row.sessionId) lines.push(`  处理会话：${row.sessionId}（保留在工作区名下，可在会话列表里点进去继续问）`)
-          // 回填只在 done/skipped 后发生，写没写成是「表格里那行现在长什么样」的唯一线索。
-          if (row.writeBack) {
-            lines.push(row.writeBack.written
-              ? `  回填表格：成功${Array.isArray(row.writeBack.fields) && row.writeBack.fields.length > 0 ? `（${row.writeBack.fields.join('、')}）` : ''}`
-              : `  回填表格：没写成 —— ${row.writeBack.note ?? '原因未记录'}`)
-          }
-          // 交付维度逐项（#08）：只写在「没做成」的那几项上，成功的不用重复。
-          // 已放弃（giveUp）的项要多说一句「别再等了」—— 否则人会一直等它自己好。
-          for (const issue of issues) {
-            const state = issue.state
-            const attempts = Number(state.attempts ?? 0)
-            const tried = attempts > 1 ? `（已试过 ${attempts} 次）` : ''
-            const tail = state.giveUp === true
-              ? '这不是再试一次能好的，得你去改配置/表格设置。'
-              : '会再自动试一次（下次启动补做）。'
-            lines.push(`  交付·${issue.label}：没做成${tried} —— ${state.error ?? '原因未记录'}。${tail}`)
-          }
-          if (cancelledByUser) {
-            // 原文是 'cancelled by user' —— 内部标识符，读的人不需要看见它。
-            lines.push('  最近错误：（无。这张票是你取消的，不是报错）')
-          } else if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
-          if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
-          // 待补做的事后动作：票已经是终态，但回填/通知还没做成（进程在中间退出了）。
-          // 不写出来，「表里那行还停在处理中」就永远没人知道该去看一眼。
-          if (row.pendingEffects) {
-            const todo = []
-            if (row.pendingEffects.writeBack) todo.push('回填表格')
-            if (row.pendingEffects.notify) todo.push('发通知')
-            if (todo.length > 0) {
-              lines.push(`  待补做：${todo.join('、')}（进程在到终态之后、动作完成之前退出了；下次启动会自动补做一次）`)
-            }
-          }
-          if (row.revisionCount > 1) lines.push(`  这是第 ${row.revisionCount} 版（工单被改过 ${row.revisionCount - 1} 次）`)
-          // 时间线放在最后：前面的「最近错误 / 待补做」先给结论，这里给完整过程。
-          lines.push(...renderTimeline(row, now))
-        }
-
-        if (rows.length > shown.length) {
-          lines.push('')
-          lines.push(`还有 ${rows.length - shown.length} 条没列出（用 limit 调大）。`)
-        }
-      }
-
-      return {
-        enabled,
-        // 这次给的是哪一屏：overview = 按项目聚合的总览，tickets = 一张票一段的明细。
-        // 调用方要靠它判断下面 `projects` / `tickets` 两份数据哪一份才是主体。
-        view,
-        // 按项目聚合的战报：口径恒为全库，不受 recordId / includeDone / limit 影响。
-        // 「每个项目多少张、几张要你动手」以前只能靠人翻完所有票自己数。
-        projects: projectSummaries,
-        // counts = 全库口径（老字段名不变，避免调用方炸）；filteredCounts = 本次筛选口径。
-        counts: total,
-        filteredCounts: filtered,
-        // 队列快照（#17）：运行页签（#16）与告警要看「谁是下一个」，不该自己再排一遍。
-        // backoff：这一轮拣不出来的票（退避没到期），带还剩多久 —— 它们看着像
-        // 普通 pending，但实际不会跑，只靠 phase 分辨不出来。
-        queue: {
-          pendingCount: pendingTotal,
-          runnableCount: runnablePending.length,
-          nextRecordId: (() => {
-            const nextRow = typeof options.store.pickNext === 'function'
-              ? options.store.pickNext()
-              : runnablePending[0]
-            return nextRow ? nextRow.recordId : null
-          })(),
-          orderRule: 'priority-desc → foundAt-asc → enqueuedAt-asc',
-          backoff: pendingRows
-            .filter((row) => backoffRemainingMs(row) > 0)
-            .map((row) => ({
-              recordId: row.recordId,
-              remainingMs: backoffRemainingMs(row),
-              reason: row.lastError ?? null,
-            })),
-        },
-        tickets: shown.map((row) => {
-          // 机器可读的时间线在这里给全量（node/label/at/ok/detail 原样），
-          // 不截断成布尔：调用方拿它自己画图或做告警都要原始条目。
-          const flow = describeFlow(row, now)
-          // 交付没做成的项（#08）：渲染循环里也算一次，这里重新算而不是捕获 ——
-          // 两个循环的 row 不是同一个作用域，捕获会拿到最后一张票的。
-          const ticketsIssues = deliveryIssues(row)
-          return {
-            projectId: row.projectId,
-            recordId: row.recordId,
-            phase: row.phase,
-            problemSummary: row.problemSummary,
-            module: row.module,
-            priority: row.priority,
-            worktreePath: row.worktreePath,
-            branch: row.branch,
-            commitSha: row.commit?.sha,
-            // 机器可读的改动摘要：调用方（运行页签/告警）不必自己再跑一次 git。
-            // 取不到时是 `{ ok:false, reason }`；这票压根没有提交时是 null ——
-            // 绝不漏成 undefined（工具通道要求 lossless JSON，undefined 会直接报错）。
-            commitSummary: summaries.get(row.recordId) ?? null,
-            mrUrl: row.mr?.url,
-            sessionId: row.sessionId,
-            writeBack: row.writeBack,
-            // 交付维度（#08）：`commit`/`writeBack`/`notify` 各自成没成。
-            // 与 phase 正交 —— phase 是「走到哪」，这是「该交的交给去了没有」。
-            // 没记录时是 null（绝不留 undefined，工具通道要求 lossless JSON）。
-            delivery: row.delivery ?? null,
-            deliveryIssues: ticketsIssues.map((it) => ({ name: it.name, label: it.label, error: it.state.error ?? null, attempts: it.state.attempts ?? null, giveUp: it.state.giveUp === true })),
-            // 只暴露「还有没有待补做」，不把整份 writeBack 输入摊给调用方：
-            // 那是内部载荷，对调用方没有意义，还会把工具输出撑大。
-            pendingEffects: row.pendingEffects
-              ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
-              : undefined,
-            lastError: row.lastError,
-            testDetail: row.testDetail,
-            revisionCount: row.revisionCount,
-            attempt: row.attempt,
-            timeline: flow.timeline,
-            // 只留真正的站点（心跳条目是「还在跑」的证据，不算站点）——
-            // 调用方按站点数做判断时不该被每 60 秒一条的心跳带偏。
-            stations: flow.stations,
-            stalledForMs: flow.stalledForMs,
-            station: flow.station,
-            // 这一站已经跑了多久 + 经验区间（分钟，只有长站点有）。
-            // 与 stalledForMs 是两个数：有站点心跳之后，后者永远只有几十秒。
-            stationElapsedMs: flow.stationElapsedMs,
-            stationRange: flow.stationRange,
-            heartbeatCount: flow.heartbeatCount,
-            lastNodeOk: flow.lastNodeOk,
-          }
-        }),
-        config: describeConfig(config),
-        text: lines.join('\n'),
-      }
+        return nextRow ? nextRow.recordId : null
+      })(),
+      orderRule: 'priority-desc → foundAt-asc → enqueuedAt-asc',
+      backoff: pendingRows
+        .filter((row) => backoffRemainingMs(row) > 0)
+        .map((row) => ({
+          recordId: row.recordId,
+          remainingMs: backoffRemainingMs(row),
+          reason: row.lastError ?? null,
+        })),
     },
-  })
+    tickets: shown.map((row) => {
+      // 机器可读的时间线在这里给全量（node/label/at/ok/detail 原样），
+      // 不截断成布尔：调用方拿它自己画图或做告警都要原始条目。
+      const flow = describeFlow(row, now)
+      // 交付没做成的项（#08）：渲染循环里也算一次，这里重新算而不是捕获 ——
+      // 两个循环的 row 不是同一个作用域，捕获会拿到最后一张票的。
+      const ticketsIssues = deliveryIssues(row)
+      return {
+        projectId: row.projectId,
+        recordId: row.recordId,
+        phase: row.phase,
+        // 人话阶段名（#16）：设置面板的「运行」页签要用它画票列表。
+        // 浏览器 bundle 里没有 PHASE_LABEL / phaseLabel，若让面板自己拼一份，
+        // 「已完成（未跑验证）」这种判定就会两处各写一遍、迟早说法不一致。
+        phaseLabel: phaseLabel(row),
+        // 是不是人自己按的取消（#16）：面板要决定给不给「重跑」按钮，
+        // 而「取消」与「真失败」共用 phase=failed，只能靠这个布尔区分。
+        // 判定口径只有 CANCELLED_BY_USER 一处，面板不该自己比对那个字面量。
+        cancelledByUser: row.phase === 'failed' && row.lastError === CANCELLED_BY_USER,
+        // 能不能用 pipeline_reset 重开（#16）：口径来自 RESETTABLE_PHASES，
+        // 面板只读这个布尔，不自己判断 phase 名单（名单在 src 里，浏览器取不到）。
+        canReset: RESETTABLE_PHASES.includes(row.phase),
+        problemSummary: row.problemSummary,
+        module: row.module,
+        priority: row.priority,
+        worktreePath: row.worktreePath,
+        branch: row.branch,
+        commitSha: row.commit?.sha,
+        // 机器可读的改动摘要：调用方（运行页签/告警）不必自己再跑一次 git。
+        // 取不到时是 `{ ok:false, reason }`；这票压根没有提交时是 null ——
+        // 绝不漏成 undefined（工具通道要求 lossless JSON，undefined 会直接报错）。
+        commitSummary: summaries.get(row.recordId) ?? null,
+        mrUrl: row.mr?.url,
+        sessionId: row.sessionId,
+        writeBack: row.writeBack,
+        // 交付维度（#08）：`commit`/`writeBack`/`notify` 各自成没成。
+        // 与 phase 正交 —— phase 是「走到哪」，这是「该交的交给去了没有」。
+        // 没记录时是 null（绝不留 undefined，工具通道要求 lossless JSON）。
+        delivery: row.delivery ?? null,
+        deliveryIssues: ticketsIssues.map((it) => ({ name: it.name, label: it.label, error: it.state.error ?? null, attempts: it.state.attempts ?? null, giveUp: it.state.giveUp === true })),
+        // 只暴露「还有没有待补做」，不把整份 writeBack 输入摊给调用方：
+        // 那是内部载荷，对调用方没有意义，还会把工具输出撑大。
+        pendingEffects: row.pendingEffects
+          ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
+          : undefined,
+        lastError: row.lastError,
+        testDetail: row.testDetail,
+        revisionCount: row.revisionCount,
+        attempt: row.attempt,
+        timeline: flow.timeline,
+        // 只留真正的站点（心跳条目是「还在跑」的证据，不算站点）——
+        // 调用方按站点数做判断时不该被每 60 秒一条的心跳带偏。
+        stations: flow.stations,
+        stalledForMs: flow.stalledForMs,
+        station: flow.station,
+        // 这一站已经跑了多久 + 经验区间（分钟，只有长站点有）。
+        // 与 stalledForMs 是两个数：有站点心跳之后，后者永远只有几十秒。
+        stationElapsedMs: flow.stationElapsedMs,
+        stationRange: flow.stationRange,
+        heartbeatCount: flow.heartbeatCount,
+        lastNodeOk: flow.lastNodeOk,
+      }
+    }),
+    config: describeConfig(config),
+    text: lines.join('\n'),
+  }
 }

@@ -178,6 +178,23 @@ function createFakeServer (options = {}) {
      * @type {any[][]}
      */
     sheetValues: options.sheetValues ? options.sheetValues.map((row) => [...row]) : [],
+    /**
+     * 多维表格的字段名清单（工单 #21）。`null` = 回规范名那 13 个；
+     * 要测「列名叫法不一样」就传一串别的名字。
+     * @type {string[] | null}
+     */
+    fields: Array.isArray(options.fields) ? [...options.fields] : null,
+    /**
+     * 电子表格回填写值（`values_batch_update`）收到的请求体，一条一条攒下来。
+     * 测「写到了哪一格、写的是什么」全靠它 —— 断言得看真发出去的东西，
+     * 不能只看适配器返回的那句 `written: true`。
+     * @type {any[]}
+     */
+    sheetWrites: [],
+    /** 让 `values_batch_update` 回一个业务错误码（测「列少一列」之外的失败）。 */
+    sheetWriteFailCode: options.sheetWriteFailCode ?? null,
+    /** 让 `values_batch_update` 回一个 HTTP 错误状态（401/403 走鉴权分档）。 */
+    sheetWriteHttpStatus: options.sheetWriteHttpStatus ?? null,
   }
 
   const fetchImpl = async (url, init = {}) => {
@@ -235,6 +252,22 @@ function createFakeServer (options = {}) {
       return jsonResponse({ code: 0, data: { items: state.tables } })
     }
 
+    // —— 多维表格：字段列表（工单 #21）——
+    // 适配器现在每轮扫描先问一次「这张表里的字段到底叫什么」，再按别名表映射。
+    // 不 stub 这条路由的话会掉进末尾的 `{ code: 0, data: {} }` ⇒ items 为空
+    // ⇒ 必需列（描述 / 状态）映射不上 ⇒ **所有老用例一起红**。
+    // 缺省回规范名 13 个（`state.fields === null` 时），测「列名不一样」的用例
+    // 自己把 `state.fields` 设成一串别的名字。
+    if (/\/fields$/.test(path)) {
+      const names = Array.isArray(state.fields)
+        ? state.fields
+        : Object.values(FEISHU_COLUMNS)
+      return jsonResponse({
+        code: 0,
+        data: { items: names.map((field_name) => ({ field_name })), has_more: false },
+      })
+    }
+
     if (path.includes('/wiki/v2/spaces/get_node')) {
       const token = new URL(url, 'http://x').searchParams.get('token') ?? ''
       const objToken = state.wikiNodeToken ? state.wikiNodeToken(token) : `btplNormal-${token}`
@@ -251,9 +284,23 @@ function createFakeServer (options = {}) {
       return jsonResponse({ code: 0, data: { sheets: state.sheets } })
     }
 
-    // —— 电子表格：读值（v2、camelCase）——
+    // —— 电子表格：读值（v2、camelCase）与回填写值（工单 #22）——
     // path 形如 `/sheets/v2/spreadsheets/{token}/values/{sheetId}!A1:M500`，
     // `!` 与 `:` 是**不编码**的（飞书要求原样），所以这里直接截 `values/` 之后那一段。
+    //
+    // 回填走的是 `values_batch_update`（POST），必须和读值分开分支：混在一个分支里
+    // 写请求会被当成读、回一份「成功读到数据」，于是「回填失败」这个场景永远测不出来。
+    if (path.includes('/values_batch_update')) {
+      if (state.sheetWriteFailCode !== null) {
+        return jsonResponse({ code: state.sheetWriteFailCode, msg: 'injected sheet write failure' })
+      }
+      if (state.sheetWriteHttpStatus !== null) {
+        return jsonResponse({ code: 0, msg: 'forbidden' }, state.sheetWriteHttpStatus)
+      }
+      state.sheetWrites.push(body)
+      return jsonResponse({ code: 0, data: { responses: [] } })
+    }
+
     if (path.includes('/sheets/v2/spreadsheets/') && path.includes('/values/')) {
       return jsonResponse({
         code: 0,
@@ -349,6 +396,8 @@ function makeSource (server, options = {}) {
     sheetIdentity: options.sheetIdentity,
     sheetIdColumn: options.sheetIdColumn,
     sheetColumns: options.sheetColumns,
+    // 多维表格的列名覆盖（工单 #21）。和 sheetColumns 分开透传，两种表型各用各的键。
+    columns: options.columns,
     sheetRange: options.sheetRange,
     tableKind: options.tableKind,
     // —— task-9 新增：这些参数不透传，离线打桩就测不到超时 / 字节上限 / 日志 ——
@@ -1448,6 +1497,203 @@ export async function runFeishuChecks (check) {
     assert.equal(source.writes.length, 1, '失败的这次不该记进 writes')
   })
 
+  // ——————————————————————————————————————————————————————————————
+  // 多维表格的列名别名（工单 #21）。
+  //
+  // 病根：以前多维表格走的是硬编码的 13 个中文列名。表里的人把「问题描述」写成
+  // 「缺陷描述」时，`fields['问题描述']` 取到 undefined ⇒ 描述为空 ⇒ **静默扫出 0 张票**，
+  // 既不报错也不提示。这比直接报错难查得多，所以这里既测「别名能认」，
+  // 也测「实在认不出时必须报错并列出实际字段名」。
+  // ——————————————————————————————————————————————————————————————
+
+  /** 造一行，字段名完全由调用方给（测别名映射用）。 */
+  const makeRowWithColumns = (recordId, names, values) => ({
+    record_id: recordId,
+    last_modified_time: values.mtime ?? 1_700_000_000_000,
+    fields: {
+      [names.seq]: '1',
+      [names.department]: '工程部',
+      [names.description]: values.description,
+      [names.foundAt]: values.mtime ?? 1_700_000_000_000,
+      [names.module]: '登录',
+      [names.flow]: '打开首页 → 点登录',
+      [names.screenshot]: undefined,
+      [names.priority]: '高',
+      [names.status]: values.status,
+      [names.handler]: '',
+      [names.result]: '',
+      [names.handledAt]: '',
+    },
+  })
+
+  await check('多维表格：字段叫「缺陷描述」「处理状态」也能扫出票（别名映射）', async () => {
+    // 一张被人改成自家叫法的表 —— 这正是搬表进多维表格后最常见的形状。
+    const altNames = {
+      ...FEISHU_COLUMNS,
+      description: '缺陷描述',
+      status: '处理状态',
+      priority: '严重程度',
+      module: '所属模块',
+    }
+    const server = createFakeServer({
+      fields: Object.values(altNames),
+      rows: [makeRowWithColumns('rec-alt', altNames, { description: '登录页报 500', status: IN_PROGRESS_VALUE })],
+    })
+    const { source } = makeSource(server)
+
+    const result = await source.scan()
+    assert.equal(result.created.length, 1, `列名换成别名后必须照样能收票，实际收了 ${result.created.length} 张（0 张就是那个静默 bug 回来了）`)
+    assert.equal(result.created[0].recordId, 'rec-alt')
+    assert.equal(result.created[0].description, '登录页报 500', '描述要真的读到，不能是空串')
+    assert.equal(result.created[0].priority, 'high', '别名字段（严重程度）也要能读出优先级')
+
+    // 字段列表只该问一次：一轮扫描无论翻几页，都复用同一份映射。
+    const fieldCalls = server.requests.filter((request) => /\/fields$/.test(new URL(request.url).pathname))
+    assert.equal(fieldCalls.length, 1, `字段列表一轮只该问一次，实际问了 ${fieldCalls.length} 次`)
+  })
+
+  await check('多维表格：实在找不到描述列时当场报错，并列出表里实际的字段名', async () => {
+    // 为什么必须报错而不是「扫出 0 张票」：0 张票有太多合理解释
+    //（开关没开、表里真没数据、状态值配错），人会把时间全花在别处。
+    const server = createFakeServer({
+      fields: ['标题', '严重程度', '处理状态'],
+      rows: [],
+    })
+    const { source } = makeSource(server)
+
+    await assert.rejects(
+      () => source.scan(),
+      (error) => {
+        assert.equal(error.kind, 'invalid-input', `列名对不上是配置问题，实际 kind=${error.kind}`)
+        const message = String(error.message)
+        assert.match(message, /收不了票/, `要明说收不了票，实际：${message}`)
+        assert.match(message, /标题 \/ 严重程度 \/ 处理状态/, `要列出表里实际的字段名，实际：${message}`)
+        assert.match(message, /match\.columns/, `要给出「用 match.columns 覆盖」这条路，实际：${message}`)
+        return true
+      },
+    )
+  })
+
+  await check('多维表格：match.columns 能覆盖插件不认识的字段叫法', async () => {
+    // 表里那列叫「现象」，别名表里没有 —— 只能靠人显式写 match.columns。
+    const names = { ...FEISHU_COLUMNS, description: '现象' }
+    const server = createFakeServer({
+      fields: Object.values(names),
+      rows: [makeRowWithColumns('rec-override', names, { description: '列表翻页丢数据', status: IN_PROGRESS_VALUE })],
+    })
+    const { source } = makeSource(server, { columns: { description: '现象' } })
+
+    const result = await source.scan()
+    assert.equal(result.created.length, 1, 'match.columns 覆盖之后必须能收票')
+    assert.equal(result.created[0].description, '列表翻页丢数据')
+  })
+
+  await check('多维表格：回填用映射后的列名，读哪列就写哪列', async () => {
+    // 最容易漏的一处：扫描读了「缺陷描述」，回填却按规范名写「处理结果」「是否处理」，
+    // 两边都对不上，看起来请求成功、实际全错位。
+    const altNames = {
+      ...FEISHU_COLUMNS,
+      status: '处理状态',
+      result: '修复说明',
+      handledAt: '闭环时间',
+    }
+    const server = createFakeServer({ fields: Object.values(altNames), rows: [] })
+    // 「修复说明」「闭环时间」不在内置别名表里 —— 这类完全自造的叫法只能靠
+    // `match.columns` 显式说明（别名表只覆盖常见同义写法，不能瞎猜）。
+    const { source } = makeSource(server, {
+      columns: { status: '处理状态', result: '修复说明', handledAt: '闭环时间' },
+    })
+
+    const receipt = await source.writeResult('rec-w', { result: '已修好' })
+    assert.equal(receipt.written, true)
+    assert.deepEqual(
+      [...receipt.fields].sort(),
+      ['处理状态', '修复说明', '闭环时间'].sort(),
+      `回执要报表里真实的列名（人对着表能直接找到），实际 ${JSON.stringify(receipt.fields)}`,
+    )
+
+    const put = server.requests.find((request) => request.method === 'PUT')
+    assert.ok(put, '回填要真的发出 PUT')
+    assert.deepEqual(
+      Object.keys(put.body.fields).sort(),
+      ['处理状态', '修复说明', '闭环时间'].sort(),
+      `PUT 的字段名必须是表里真实列名，实际写了：${Object.keys(put.body.fields).join('、')}`,
+    )
+    assert.equal(put.body.fields['修复说明'], '已修好')
+    assert.equal(put.body.fields['处理状态'], '是')
+  })
+
+  await check('两套表型喂同一组列名时，扫出来的票长得一样', async () => {
+    // 工单 #21 把「认列名」抽成一套共用逻辑（mapColumns）就是为了这个：
+    // 同一张表换个表型不该换一套认法，否则「多维表格能收、电子表格收不到」这种
+    // 只在某一种表型上出现的 bug 会一直长回来。
+    const header = ['序号', '缺陷描述', '处理状态', '优先级']
+    const sheetServer = createFakeServer({
+      sheets: [{ sheet_id: 'sh1', title: '工单', index: 0 }],
+      sheetValues: [header, ['S-1', '列表翻页丢数据', IN_PROGRESS_VALUE, '高']],
+    })
+    const sheetSource = makeSource(sheetServer, { spreadsheetToken: 'sht-test', sheetId: 'sh1' }).source
+    const sheetResult = await sheetSource.scan()
+
+    const altNames = { ...FEISHU_COLUMNS, description: '缺陷描述', status: '处理状态' }
+    const bitableServer = createFakeServer({
+      fields: Object.values(altNames),
+      rows: [makeRowWithColumns('rec-same', altNames, { description: '列表翻页丢数据', status: IN_PROGRESS_VALUE })],
+    })
+    const bitableResult = await makeSource(bitableServer).source.scan()
+
+    assert.equal(sheetResult.created.length, 1, '电子表格侧应该收到 1 张')
+    assert.equal(bitableResult.created.length, 1, '多维表格侧应该收到 1 张')
+    assert.equal(
+      sheetResult.created[0].description,
+      bitableResult.created[0].description,
+      '同一组列名在两种表型下要读出同一段描述',
+    )
+    assert.equal(sheetResult.created[0].priority, bitableResult.created[0].priority, '优先级也要一致')
+  })
+
+
+  await check('多维表格：单选 / 附件 / 数字这些字段类型也能读（记下验证过的类型）', async () => {
+    // 工单 #21 的风险提示要求「记录验证过的字段类型」：列名能映射上只是第一步，
+    // 字段的**类型**决定 `normalizeCellText` 拿到的形状。真实多维表格里
+    // 「是否处理」多半是单选、「优先级」是单选、「截图」是附件、「发现日期」是日期(数字)。
+    const names = { ...FEISHU_COLUMNS }
+    const server = createFakeServer({
+      fields: Object.values(names),
+      rows: [{
+        record_id: 'rec-types',
+        last_modified_time: 1_700_000_000_000,
+        fields: {
+          [names.seq]: '7',                                  // 文本
+          [names.department]: ['工程部', '平台组'],            // 多选 → 空格连接
+          [names.description]: '导出报表时缺最后一行',          // 文本
+          [names.foundAt]: 1_735_689_600_000,                // 日期 → 毫秒时间戳
+          [names.module]: '报表',                             // 单选
+          [names.flow]: '',                                   // 空字符串
+          [names.screenshot]: [                               // 附件
+            { file_token: 'boxcnTypeShot', name: 'shot.png', size: 2048, type: 'image/png' },
+          ],
+          [names.priority]: '高',                             // 单选
+          [names.status]: IN_PROGRESS_VALUE,                  // 单选
+          [names.handler]: [{ id: 'ou_1', name: '张三' }],     // 人员 → 取 name
+          [names.result]: '',
+          [names.handledAt]: '',
+        },
+      }],
+    })
+
+    const result = await makeSource(server).source.scan()
+    assert.equal(result.created.length, 1, '字段类型不同不该影响收票')
+    const ticket = result.created[0]
+    assert.equal(ticket.description, '导出报表时缺最后一行')
+    assert.equal(ticket.department, '工程部 平台组', '多选要用空格连起来')
+    assert.equal(ticket.priority, 'high', '单选「高」也要归一到 high')
+    assert.equal(ticket.foundAt, '2025-01-01', '日期字段是毫秒时间戳，要归成 YYYY-MM-DD')
+    assert.equal(ticket.screenshots.length, 1, '附件形态的截图要抽出来')
+    assert.equal(ticket.screenshots[0].kind, 'attachment')
+    assert.equal(ticket.screenshots[0].fileToken, 'boxcnTypeShot')
+  })
+
   await check('配置：appToken 贴整条表格 URL 时，table / view 要从链接里啃出来', async () => {
     // 为什么测这个：文档一直写着「appToken 可以直接贴整条链接」，但代码先前只从
     // `/base/<token>` 里抠 app_token，`?table=tblXXX` 被白白扔掉 —— 用户还得另外
@@ -1630,28 +1876,185 @@ export async function runFeishuChecks (check) {
     )
   })
 
-  await check('电子表格：回填退化成只读回执，不去拼一个必然 404 的 bitable 地址', async () => {
-    // 电子表格分支上 `table` 里没有 appToken / tableId。若 writeResult 继续往下走，
-    // 拼出来的是 `/bitable/v1/apps/undefined/tables/undefined/records/sh-seq-1`
-    // —— 必然 404，还得被当成可重试故障。所以这里必须是「written:false + 说清原因」，
-    // 而且**一个写请求都不许发**。
-    const server = makeSheetServer()
-    const { source } = makeSource(server, {
-      appToken: '',
-      tableId: '',
-      spreadsheetToken: 'shtcnABCDEF',
-      sheetId: 'sh1',
+  // ── 电子表格回填（工单 #22）─────────────────────────────────────
+  // 这一组测的是「写回三格」这件事本身：写到了哪一格、写的内容对不对、
+  // 行号漂移之后还找不找得到、以及失败了能不能说清为什么。
+  // 断言必须看 `server.state.sheetWrites`（真发出去的请求体），
+  // 不能只看适配器返回的 `written:true` —— 回执说成功但写到别人格子里，
+  // 正是这一块最容易犯的错。
+
+  /** 带「处理结果 / 处理日期」两列的表，回填才有地方可写。 */
+  const makeWriteBackSheetValues = () => [
+    ['序号', '问题描述', '是否处理', '处理结果', '处理日期'],
+    ['A-1', '列表翻页丢数据', '处理中', '', ''],
+    ['A-2', '导出少一行', '处理中', '', ''],
+  ]
+
+  const makeWriteBackSheetServer = (overrides = {}) => createFakeServer({
+    sheets: makeSheets(),
+    sheetValues: makeWriteBackSheetValues(),
+    ...overrides,
+  })
+
+  const makeWriteBackSource = (server, options = {}) => makeSource(server, {
+    appToken: '',
+    tableId: '',
+    spreadsheetToken: 'shtcnABCDEF',
+    sheetId: 'sh1',
+    ...options,
+  })
+
+  await check('电子表格：回填写到「那一行的三格」上，不是别的格子', async () => {
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+
+    const receipt = await source.writeResult('sh-seq-A-1', {
+      status: '是',
+      result: '已修复，加了空值保护',
+      handledAt: Date.UTC(2026, 10, 9),
     })
-    await source.scan(new AbortController().signal)
-    const before = server.requests.length
-    const receipt = await source.writeResult('sh-seq-1', { result: '已修复' })
-    assert.equal(receipt.written, false, '电子表格不回填，必须回 written:false')
-    assert.ok(
-      String(receipt.note || '').includes('电子表格'),
-      `回执要说清是「电子表格不支持回填」，实际 ${JSON.stringify(receipt)}`,
+
+    assert.equal(receipt.written, true, `要真写成，实际 ${JSON.stringify(receipt)}`)
+    assert.equal(server.state.sheetWrites.length, 1, '一次批量写，不是三次单格写')
+    const ranges = server.state.sheetWrites[0].valueRanges
+    // A-1 是数据第一行，表头在第 1 行 ⇒ 序号在第 2 行；四列分别是 C/D/E（1-based 列号）。
+    assert.deepEqual(
+      ranges.map((item) => item.range),
+      ['sh1!C2:C2', 'sh1!D2:D2', 'sh1!E2:E2'],
+      `要写 C/D/E 三列的第 2 行，实际 ${JSON.stringify(ranges.map((item) => item.range))}`,
     )
-    const writes = server.requests.slice(before).filter((r) => r.method !== 'GET')
-    assert.equal(writes.length, 0, `不许发任何写请求，实际发了 ${writes.map((r) => r.url).join(' | ')}`)
+    assert.deepEqual(
+      ranges.map((item) => item.values[0][0]),
+      ['是', '已修复，加了空值保护', '2026-11-09'],
+      '三格内容：状态 / 结果 / 日期文本',
+    )
+    // 回执里报的是「表里真实列名」，排障时人对着表能一眼对上。
+    assert.deepEqual(receipt.fields, ['是否处理', '处理结果', '处理日期'])
+  })
+
+  await check('电子表格：行被插过之后按序号重新定位，写到的还是那一行', async () => {
+    // 这张票能跑几十分钟，期间人在中间插一行是常事。缓存行号 = 写到别人格子里，
+    // 所以回填必须自己重读一遍表、按身份列定位。
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+    await source.scan(new AbortController().signal)
+
+    // 模拟「A-1 上面被插了一行」：A-1 从第 2 行挪到第 3 行。
+    server.state.sheetValues = [
+      ['序号', '问题描述', '是否处理', '处理结果', '处理日期'],
+      ['A-0', '新插进来的一行', '否', '', ''],
+      ['A-1', '列表翻页丢数据', '处理中', '', ''],
+      ['A-2', '导出少一行', '处理中', '', ''],
+    ]
+
+    await source.writeResult('sh-seq-A-1', { result: '已修好' })
+    const ranges = server.state.sheetWrites[0].valueRanges
+    assert.ok(
+      ranges.every((item) => /[A-Z]3:[A-Z]3$/.test(item.range)),
+      `插行之后 A-1 在第 3 行，实际写到 ${JSON.stringify(ranges.map((item) => item.range))}`,
+    )
+    assert.ok(
+      ranges.every((item) => !item.range.includes('2:2')),
+      '绝不能还按旧行号写到第 2 行（那是别人）',
+    )
+  })
+
+  await check('电子表格：那一行被删了就直说「找不到」，不发写请求', async () => {
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+    await source.scan(new AbortController().signal)
+
+    server.state.sheetValues = [
+      ['序号', '问题描述', '是否处理', '处理结果', '处理日期'],
+      ['A-2', '导出少一行', '处理中', '', ''],
+    ]
+    const receipt = await source.writeResult('sh-seq-A-1', { result: '已修好' })
+
+    assert.equal(receipt.written, false)
+    assert.equal(receipt.retryable, false, '行都没了，再试一万次也一样')
+    assert.equal(receipt.errorKind, 'not-found')
+    assert.ok(String(receipt.note).includes('找不到'), `note 要说清「找不到那一行」，实际 ${receipt.note}`)
+    assert.equal(server.state.sheetWrites.length, 0, '定位不到就不许瞎写')
+  })
+
+  await check('电子表格：表里没有「处理结果」列时退回只读回执，并列出现有列名', async () => {
+    const server = createFakeServer({
+      sheets: makeSheets(),
+      sheetValues: makeSheetValues(),
+    })
+    const { source } = makeWriteBackSource(server)
+    await source.scan(new AbortController().signal)
+
+    const receipt = await source.writeResult('sh-seq-A-1', { result: '已修好' })
+    assert.equal(receipt.written, false)
+    assert.equal(receipt.errorKind, 'unsupported')
+    assert.ok(String(receipt.note).includes('处理结果'), '要指名缺哪一列')
+    assert.ok(String(receipt.note).includes('问题描述'), '要列出表里实际的列名，人才能对照')
+    assert.equal(server.state.sheetWrites.length, 0)
+  })
+
+  await check('电子表格：只有读权限时把「改成读写并重新发布版本」写进 note', async () => {
+    // 读票只要 readonly，写值要读写 —— 少这一档时读得好好的、一到回填就 403，
+    // 报错码和「表没加协作者」混在一起，不说清楚没人能想到是权限档位。
+    const server = makeWriteBackSheetServer({ sheetWriteHttpStatus: 403 })
+    const { source } = makeWriteBackSource(server)
+
+    const receipt = await source.writeResult('sh-seq-A-1', { result: '已修好' })
+    assert.equal(receipt.written, false)
+    assert.equal(receipt.errorKind, 'auth')
+    assert.equal(receipt.retryable, false)
+    assert.ok(String(receipt.note).includes('sheets:spreadsheet'), `note 要点名权限名，实际 ${receipt.note}`)
+    assert.ok(String(receipt.note).includes('发布'), '不发布版本权限不生效，这一步必须写出来')
+    assert.ok(String(receipt.note).includes('可编辑'), '还要确认表里把应用加成可编辑协作者')
+  })
+
+  await check('电子表格：失败票回填只写「处理结果」那一格', async () => {
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+
+    await source.writeResult('sh-seq-A-2', {
+      result: '[流水线] 失败：模型说它不想干',
+      onlyResult: true,
+    })
+    const ranges = server.state.sheetWrites[0].valueRanges
+    assert.equal(ranges.length, 1, '失败票只写一格')
+    assert.equal(ranges[0].range, 'sh1!D3:D3', `只写「处理结果」那一列，实际 ${ranges[0].range}`)
+    assert.deepEqual(ranges[0].values, [['[流水线] 失败：模型说它不想干']])
+  })
+
+  await check('电子表格：回填过的那一行下一轮不会被重复收票', async () => {
+    // 这是本票最重要的一条：回填写「是否处理 = 是」→ 下一轮扫描看到「是」不再算处理中。
+    // 如果回填写错了列（比如把结果写进状态列），这一行会永远停在「处理中」，
+    // 每一轮都重收一遍 —— 票会无限循环。
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+    const first = await source.scan(new AbortController().signal)
+    assert.equal(first.created.length, 2, '一开始两行都在处理中')
+
+    await source.writeResult('sh-seq-A-1', { status: '是', result: '已修好' })
+    // 按回填的请求体把假表改掉 —— 这一步必须用**适配器真发出去的 range 与值**，
+    // 否则测的是「我们以为它写了什么」。
+    for (const item of server.state.sheetWrites[0].valueRanges) {
+      const m = item.range.match(/^([^!]+)!([A-Z]+)(\d+):/)
+      const columnIndex = m[2].charCodeAt(0) - 'A'.charCodeAt(0)
+      const rowIndex = Number(m[3]) - 1
+      server.state.sheetValues[rowIndex][columnIndex] = item.values[0][0]
+    }
+    assert.equal(server.state.sheetValues[1][2], '是', '状态列的格子要被改成「是」')
+
+    const second = await source.scan(new AbortController().signal)
+    assert.equal(second.created.length, 0, '已回填的那行不许被再收一遍')
+    assert.equal(second.updated.length, 0, '内容没改，也不该算修订')
+  })
+
+  await check('电子表格：回填要打对 spreadsheetToken 与工作表 id', async () => {
+    const server = makeWriteBackSheetServer()
+    const { source } = makeWriteBackSource(server)
+    await source.writeResult('sh-seq-A-1', { result: '已修好' })
+    const write = server.requests.find((r) => r.url.includes('/values_batch_update'))
+    assert.ok(write, '要走 values_batch_update')
+    assert.ok(write.url.includes('shtcnABCDEF'), `要打对 token，实际 ${write.url}`)
+    assert.ok(write.url.includes('/sheets/v2/spreadsheets/'), 'v2 接口')
   })
 
   await check('电子表格：sheetId 不在清单里就报错并列出所有工作表', async () => {

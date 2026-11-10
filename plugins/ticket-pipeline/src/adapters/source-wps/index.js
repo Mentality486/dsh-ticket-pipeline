@@ -70,9 +70,24 @@ export const capabilities = Object.freeze(['watermark', 'scanTuning'])
 /** 收票只看这一列的这一值。与飞书源同一句话，方便人从两边对照。 */
 export const IN_PROGRESS_VALUE = '处理中'
 
-const MISSING_FETCH_SHEET =
-  '金山文档源没有配置取数通道：请给 createWpsSource 传 fetchSheet()，让它返回当前表格导出的 xlsx 字节。' +
-  '没有这一步就无法拿到单元格截图（开放接口只给 is_cell_pic 标记，不给图片字节）。'
+/**
+ * 没配取数通道时的报错。**分两层**（工单 #20）：
+ *
+ * 第一层给用户 —— 他选了 `platform: 'wps'`，然后是「一张票都拿不到」。他不需要知道
+ * 什么是 `fetchSheet`，需要知道的是「这个选项现在不能用，该改用什么」。
+ * 第二层给要真正接它的人（缩进一行）—— 函数名、注入点、看哪个文件。
+ *
+ * 以前只有第二层，于是用户在 `pipeline_scan` 的报错里读到一句让他去给某个函数传参数的
+ * 话 —— 那不是他能做的事，等于把内部实现细节当成了故障排除建议。
+ */
+const MISSING_FETCH_SHEET = [
+  '金山文档源在当前版本没有可用的取数通道，选它会拿不到任何工单（一张都拿不到）。请改用飞书多维表格或飞书电子表格。',
+  '改法：打开设置页「项目」，把这个项目的「平台」从 wps 改成 feishu，再把工单表链接贴进卡片里的「工单表链接」。',
+  '',
+  '  给要自行接入的人：金山源的取数通道是注入式的，需要给 createWpsSource 传 fetchSheet()，',
+  '  让它返回当前表格导出的 xlsx 字节。见 plugins/ticket-pipeline/src/adapters/source-wps/index.js 模块注释。',
+  '  （为什么不内置：开放平台只给 is_cell_pic 标记、不给图片字节，必须整表导出后自己解 OOXML。）',
+].join('\n')
 
 /**
  * @typedef {Object} WpsSourceOptions

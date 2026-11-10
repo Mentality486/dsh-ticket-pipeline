@@ -540,10 +540,26 @@ export async function runWpsChecks (check) {
   await check('没配取数通道：报 invalid-input 并说清该配什么', async () => {
     const source = createWpsSource({ sourceId: 'wps-1' })
     assert.equal(source.capabilities.includes('watermark'), true, '水位是适配器自己算的，这条能力必须声明')
+    let caught = null
     await assert.rejects(
       () => source.scan({}),
-      (error) => error.kind === 'invalid-input' && /取数通道/.test(error.message),
+      (error) => {
+        caught = error
+        return error.kind === 'invalid-input' && /取数通道/.test(error.message)
+      },
       '缺 fetchSheet 时不能返回空列表 —— 那会被上层当成「这一轮没有新工单」，问题全被捂住'
+    )
+    // 工单 #20：这段报错是**用户**在 pipeline_scan 里看到的那一段，不是给开发者的。
+    // 所以第一行必须是「拿不到票 + 该改用飞书」，而不是「请给 createWpsSource 传 fetchSheet()」。
+    const firstLine = String(caught.message).split('\n')[0]
+    assert.ok(firstLine.includes('拿不到'), `第一行要说清后果：${firstLine}`)
+    assert.ok(firstLine.includes('飞书'), `第一行要给出出路：${firstLine}`)
+    assert.ok(!firstLine.includes('createWpsSource'), `第一层不能出现内部函数名：${firstLine}`)
+    // 开发者那层还得留着（不然真要接的人没有线索），但必须在后面。
+    assert.ok(String(caught.message).includes('fetchSheet'), '第二层要留开发者线索')
+    assert.ok(
+      String(caught.message).indexOf('createWpsSource') > String(caught.message).indexOf('飞书'),
+      '开发者说明必须排在第一层之后'
     )
   })
 

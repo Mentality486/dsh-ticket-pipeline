@@ -26,6 +26,7 @@
  */
 
 import { PipelineError } from '../../contracts/errors.js'
+import { FEISHU_SEMANTIC_FIELDS } from '../../contracts/feishu-columns.js'
 
 /**
  * 表头认这些列名。
@@ -54,6 +55,51 @@ export const SHEET_COLUMN_ALIASES = Object.freeze({
 
 /** 必需列：缺任一就报配置错误，而不是静默扫出 0 张票。 */
 export const REQUIRED_SHEET_FIELDS = Object.freeze(['description', 'status'])
+
+/**
+ * 多维表格那 13 列的**规范名**（工单 #21）。
+ *
+ * 这张表的结构来自用户贴出的《PMS系统问题Bug记录表》使用说明（12 列，
+ * 外加一个自动字段「最后更新时间」）。规范名同时充当「缺省映射」：
+ * 表里就叫这些名字时，一次映射都不用做。
+ *
+ * **定义已经搬到 `contracts/feishu-columns.js`**：`core/config.js` 校验
+ * `match.columns` 时也要这份字段白名单，而 `core` 反向 import `adapters`
+ * 是倒着的依赖方向。这里只做转出，保证「适配器认识的那 13 个」与
+ * 「配置校验放行的那 13 个」永远是同一份。
+ *
+ * 注意它**不再是唯一的认定口径** —— 名字对不上时先查 `BITABLE_COLUMN_ALIASES`。
+ */
+export const BITABLE_CANONICAL_COLUMNS = FEISHU_SEMANTIC_FIELDS
+
+/**
+ * 多维表格的列名别名表（工单 #21）。
+ *
+ * 为什么必须和电子表格共用一套：同一张工单表被人从多维表格导出、再导入回来，
+ * 或者干脆被人重建成多维表格时，字段名会变成「缺陷描述」「处理状态」这些
+ * 电子表格侧本来就认的写法。以前多维表格走的是硬编码常量，名字一换就
+ * **静默扫出 0 张票**（`fields['问题描述']` 取不到 ⇒ 描述为空 ⇒ 全被过滤掉），
+ * 既不报错也不提示，最难查。
+ *
+ * 构造规则：字段 = 规范名的 13 个 ∪ 电子表格别名表的字段；
+ * 每个字段的候选名 = **规范名排第一**，其后接电子表格那套别名（去重）。
+ * 顺序即优先级 —— 表里同时存在「问题描述」和「缺陷描述」两列时，认规范名那列。
+ */
+export const BITABLE_COLUMN_ALIASES = Object.freeze(buildBitableAliases())
+
+/**
+ * @returns {Record<string, string[]>}
+ */
+function buildBitableAliases () {
+  /** @type {Record<string, string[]>} */
+  const out = {}
+  for (const [field, canonical] of Object.entries(BITABLE_CANONICAL_COLUMNS)) {
+    const extra = SHEET_COLUMN_ALIASES[field] ?? []
+    // 规范名必须排第一：别名表里也有一堆同义写法，但「问题描述」是这张表的正名。
+    out[field] = Object.freeze([canonical, ...extra.filter((name) => name !== canonical)])
+  }
+  return out
+}
 
 /** 优先级字面量 → 内部档位。含金山那个表多出来的「严重 / 轻微」。 */
 const SHEET_PRIORITY_MAP = new Map([
@@ -94,17 +140,96 @@ export function normalizeHeaderKey (text) {
  * 配置里只想把「是否处理」改成「处理情况」时，其余列不该因此全都不认识。
  *
  * @param {Record<string, string[]>} [overrides]
+ * @param {Record<string, string[]>} [base]
  * @returns {Record<string, string[]>}
  */
-export function mergeSheetAliases (overrides) {
-  if (!overrides || Object.keys(overrides).length === 0) return SHEET_COLUMN_ALIASES
+export function mergeSheetAliases (overrides, base = SHEET_COLUMN_ALIASES) {
+  if (!overrides || Object.keys(overrides).length === 0) return base
   /** @type {Record<string, string[]>} */
-  const merged = { ...SHEET_COLUMN_ALIASES }
+  const merged = { ...base }
   for (const [field, names] of Object.entries(overrides)) {
     if (!Array.isArray(names) || names.length === 0) continue
-    merged[field] = [...names.map(String), ...(SHEET_COLUMN_ALIASES[field] ?? [])]
+    // 覆盖值排在最前面 = 优先级最高。人显式写下来的名字必须赢过内置别名。
+    merged[field] = [...names.map(String), ...(base[field] ?? [])]
   }
   return merged
+}
+
+/**
+ * **两种表型共用的列名解析**（工单 #21）。
+ *
+ * 电子表格靠「表头行的一组文字」认列，多维表格靠「表的字段名列表」认列 ——
+ * 输入形态不同，但要做的事是同一件：把「语义字段」对上「表里那个真实名字」。
+ * 以前这段逻辑只活在 `locateSheetHeader` 里，多维表格那边则是一个 `FEISHU_COLUMNS`
+ * 硬编码常量，结果同一个插件对同一件事有两套标准：用户把现成的表搬进多维表格，
+ * 列名一换就**静默扫出 0 张票**。
+ *
+ * 这里只做纯函数映射，不抛错也不猜：`required` 交给调用方，因为两种表型
+ * 报错的措辞不一样（一个说「表头里找不到」，一个说「表里没有这个字段」）。
+ *
+ * @param {Object} input
+ * @param {unknown[]} input.actualNames 表里真实存在的名字，**顺序即列顺序**
+ * @param {Record<string, string[]>} [input.overrides] `match.sheetColumns` / `match.columns` 归一后的形状
+ * @param {Record<string, string[]>} [input.aliases] 别名表（缺省电子表格那张）
+ * @returns {{
+ *   entries: Array<{ index: number, name: string, field: string | null }>,
+ *   columns: Record<string, number>,
+ *   names: Record<string, string>,
+ *   missing: string[],
+ * }}
+ */
+export function mapColumns ({ actualNames, overrides, aliases }) {
+  const names = Array.isArray(actualNames) ? actualNames : []
+  const merged = mergeSheetAliases(overrides, aliases ?? SHEET_COLUMN_ALIASES)
+
+  // 归一后的名字 → 语义字段。同一个归一名字被两个字段抢时，先到先得（别名表顺序即优先级）。
+  /** @type {Map<string, string>} */
+  const lookup = new Map()
+  for (const [field, list] of Object.entries(merged)) {
+    for (const candidate of list) {
+      const key = normalizeHeaderKey(candidate)
+      if (key.length === 0 || lookup.has(key)) continue
+      lookup.set(key, field)
+    }
+  }
+
+  /** @type {Array<{ index: number, name: string, field: string | null }>} */
+  const entries = []
+  /** @type {Record<string, number>} */
+  const columns = {}
+  /** @type {Record<string, string>} */
+  const found = {}
+  for (let index = 0; index < names.length; index += 1) {
+    const name = String(names[index] ?? '').trim()
+    if (name.length === 0) continue
+    const field = lookup.get(normalizeHeaderKey(name)) ?? null
+    entries.push({ index, name, field })
+    // 同一字段只认**第一列**：表里真有两列都叫「问题描述」时（导入常见空格差异），
+    // 取靠左那列，并且不因此报错 —— 宽进严出，别让人为了这种小事改表。
+    if (field !== null && columns[field] === undefined) {
+      columns[field] = index
+      found[field] = name
+    }
+  }
+
+  const missing = REQUIRED_SHEET_FIELDS.filter((field) => columns[field] === undefined)
+  return { entries, columns, names: found, missing }
+}
+
+/**
+ * 把「插件认识的别名」摊成一句人话，用于「表头对不上」的报错。
+ *
+ * 报错里必须同时给**表里实际有什么**和**插件认识什么** —— 只给其中一半，
+ * 人都得再去翻文档。
+ *
+ * @param {Record<string, string[]>} [aliases]
+ * @returns {string}
+ */
+export function describeColumnAliases (aliases = SHEET_COLUMN_ALIASES) {
+  return Object.entries(aliases)
+    .filter(([, list]) => Array.isArray(list) && list.length > 0)
+    .map(([field, list]) => `${field}（${list.slice(0, 3).join(' / ')}${list.length > 3 ? ' …' : ''}）`)
+    .join('、')
 }
 
 /**
@@ -116,20 +241,23 @@ export function mergeSheetAliases (overrides) {
  * 实际上一个都没生效。
  *
  * @param {unknown} raw
+ * @param {{ aliases?: Record<string, string[]>, optionName?: string }} [config]
  * @returns {Record<string, string[]> | undefined}
  */
-export function resolveSheetColumns (raw) {
+export function resolveSheetColumns (raw, config = {}) {
+  const aliases = config.aliases ?? SHEET_COLUMN_ALIASES
+  const optionName = config.optionName ?? 'match.sheetColumns'
   if (raw === undefined || raw === null) return undefined
   if (typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new PipelineError('invalid-input', 'match.sheetColumns 必须是对象：{ 字段: "实际表头文字" }')
+    throw new PipelineError('invalid-input', `${optionName} 必须是对象：{ 字段: "实际表头文字" }`)
   }
   /** @type {Record<string, string[]>} */
   const out = {}
   for (const [field, value] of Object.entries(/** @type {Record<string, unknown>} */ (raw))) {
-    if (!(field in SHEET_COLUMN_ALIASES)) {
+    if (!(field in aliases)) {
       throw new PipelineError(
         'invalid-input',
-        `match.sheetColumns 里的 "${field}" 不是认识的字段名。可用：${Object.keys(SHEET_COLUMN_ALIASES).join(' / ')}`,
+        `${optionName} 里的 "${field}" 不是认识的字段名。可用：${Object.keys(aliases).join(' / ')}`,
       )
     }
     const list = Array.isArray(value) ? value : [value]
@@ -138,7 +266,7 @@ export function resolveSheetColumns (raw) {
       .map((item) => String(item).trim())
       .filter((item) => item.length > 0)
     if (names.length === 0) {
-      throw new PipelineError('invalid-input', `match.sheetColumns.${field} 必须是非空字符串或字符串数组`)
+      throw new PipelineError('invalid-input', `${optionName}.${field} 必须是非空字符串或字符串数组`)
     }
     out[field] = names
   }
@@ -328,23 +456,10 @@ export function locateSheetHeader (values, options = {}) {
     )
   }
 
-  const aliases = mergeSheetAliases(options.columns)
-  /** @type {Map<string, string>} */
-  const normalized = new Map()
-  for (const [field, names] of Object.entries(aliases)) {
-    for (const name of names) normalized.set(normalizeHeaderKey(name), field)
-  }
-
-  /** @type {Record<string, number>} */
-  const columns = {}
-  for (let i = 0; i < row.length; i += 1) {
-    const field = normalized.get(normalizeHeaderKey(row[i]))
-    if (!field || columns[field] !== undefined) continue
-    columns[field] = i
-  }
+  // 认列这件事本身收敛进 `mapColumns()`：多维表格那边走的是同一个函数（工单 #21）。
+  const { columns, missing } = mapColumns({ actualNames: row, overrides: options.columns })
 
   const headers = row.map((cell) => String(cell ?? '').trim()).filter((text) => text.length > 0)
-  const missing = REQUIRED_SHEET_FIELDS.filter((field) => columns[field] === undefined)
   if (missing.length > 0) {
     const names = missing.map((field) => `${field === 'description' ? '“问题描述”' : '“是否处理”'}`).join(' 和 ')
     throw new PipelineError(

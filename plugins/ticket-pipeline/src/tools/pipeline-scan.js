@@ -27,31 +27,6 @@ import { defineTool, textBlocks } from './define.js'
  * @returns {Record<string, unknown>}
  */
 export function createPipelineScanTool (options) {
-  /**
-   * 触发前能确定的结果。返回 null 表示「可以真的跑一轮」。
-   *
-   * @returns {{ status: string, text: string } | null}
-   */
-  function preflight () {
-    // 总开关关着时连后台都不用起：`tick()` 会立刻返回 disabled，白起一个 Promise。
-    const enabled = options.getConfig?.()?.enabled
-    if (enabled === false) {
-      return {
-        status: 'disabled',
-        text: '总开关 enabled 是关的，这一轮什么都没干，也不会替你把开关打开。\n'
-          + '要开始跑，把配置里的 enabled 改成 true（在设置面板「行为」组最上面，或改配置文件后重启宿主）。',
-      }
-    }
-    if (options.isRunning?.() === true) {
-      return {
-        status: 'already-running',
-        text: '上一轮还没跑完，这次不叠加。\n'
-          + '一轮最多跑一票，连点不会加速；等它结束后再触发，或用 pipeline_status 看它现在停在第几站。',
-      }
-    }
-    return null
-  }
-
   return defineTool({
     name: 'pipeline_scan',
     description:
@@ -72,41 +47,88 @@ export function createPipelineScanTool (options) {
     outputSchema: { type: 'object' },
     render: (value) => textBlocks(value.text),
     async execute (args, exec) {
-      // 先查「已经能确定的那两种结果」：不发后台任务、如实回报。
-      const blocked = preflight()
-      if (blocked !== null) {
-        return {
-          status: blocked.status,
-          scan: null,
-          ran: null,
-          cleaned: false,
-          text: blocked.text,
-        }
-      }
-
-      // 把工具的取消信号一路递进内核：取消 = 「别再扫了、别再动票了」，
-      // 而不是「只让调用方收不到结果」。内核在扫描阶段把它转给每个 source.scan。
-      //
-      // fire-and-forget：tick 里「跑一张票」可能要几十秒到 40 分钟（超时上限），
-      // 同步等它会让宿主工具通道超时、报 not lossless JSON（生产实锤过）。
-      // 所以这里只触发一轮、立刻返回；跑完的结果用 pipeline_status 查。
-      void options.tick({ skipScan: args.skipScan === true, signal: exec?.signal }).catch((error) => {
-        // 后台失败没人接：只静默吞掉等于「点了没反应」，人永远查不出为什么。
-        // 工具通道已经返回了，所以这里只能靠日志留痕（不打断调用方）。
-        options.log?.('后台一轮流水线失败', { reason: error instanceof Error ? error.message : String(error) })
-      })
-
-      return {
-        status: 'triggered',
-        scan: null,
-        ran: null,
-        cleaned: false,
-        text: '已触发一轮流水线，后台执行中。\n'
-          + '扫描工单源几秒，跑一张票可能几十秒到几十分钟。\n'
-          + '稍等片刻用 pipeline_status 查看进度与结果；正在跑时再触发会返回 already-running。',
-      }
+      // 算结果与渲染分层：面板「运行」页签的「跑一轮」走 ticketPipeline.scan()
+      // → 同一个 collectScan，两处不会出现「工具说 disabled、按钮说 triggered」。
+      return collectScan(options, args, exec?.signal)
     },
   })
+}
+
+/**
+ * 触发前能确定的结果。返回 null 表示「可以真的跑一轮」。
+ *
+ * @param {{ isRunning?: () => boolean, getConfig?: () => { enabled?: boolean } }} options
+ * @returns {{ status: string, text: string } | null}
+ */
+function preflight (options) {
+  // 总开关关着时连后台都不用起：`tick()` 会立刻返回 disabled，白起一个 Promise。
+  const enabled = options.getConfig?.()?.enabled
+  if (enabled === false) {
+    return {
+      status: 'disabled',
+      text: '总开关 enabled 是关的，这一轮什么都没干，也不会替你把开关打开。\n'
+        + '要开始跑，把配置里的 enabled 改成 true（在设置面板「行为」组最上面，或改配置文件后重启宿主）。',
+    }
+  }
+  if (options.isRunning?.() === true) {
+    return {
+      status: 'already-running',
+      text: '上一轮还没跑完，这次不叠加。\n'
+        + '一轮最多跑一票，连点不会加速；等它结束后再触发，或用 pipeline_status 看它现在停在第几站。',
+    }
+  }
+  return null
+}
+
+/**
+ * `pipeline_scan` 的算结果层：触发一轮并立刻返回（fire-and-forget）。
+ *
+ * 面板的「跑一轮」按钮与工具调用走同一条实现（工单 #16 的硬约束：绝不复制）。
+ * `signal` 由调用方给：工具拿 `exec.signal`，面板没有取消信号就传 undefined。
+ *
+ * @param {Object} options
+ * @param {(opts?: { skipScan?: boolean, signal?: AbortSignal }) => Promise<any>} options.tick
+ * @param {(message: string, detail?: unknown) => void} [options.log]
+ * @param {{ skipScan?: unknown }} [args]
+ * @param {AbortSignal} [signal]
+ * @returns {Record<string, unknown>}
+ */
+export function collectScan (options, args, signal) {
+  const safeArgs = args && typeof args === 'object' ? args : {}
+
+  // 先查「已经能确定的那两种结果」：不发后台任务、如实回报。
+  const blocked = preflight(options)
+  if (blocked !== null) {
+    return {
+      status: blocked.status,
+      scan: null,
+      ran: null,
+      cleaned: false,
+      text: blocked.text,
+    }
+  }
+
+  // 把取消信号一路递进内核：取消 = 「别再扫了、别再动票了」，
+  // 而不是「只让调用方收不到结果」。内核在扫描阶段把它转给每个 source.scan。
+  //
+  // fire-and-forget：tick 里「跑一张票」可能要几十秒到 40 分钟（超时上限），
+  // 同步等它会让宿主工具通道超时、报 not lossless JSON（生产实锤过）。
+  // 所以这里只触发一轮、立刻返回；跑完的结果用 pipeline_status 查。
+  void options.tick({ skipScan: safeArgs.skipScan === true, signal }).catch((error) => {
+    // 后台失败没人接：只静默吞掉等于「点了没反应」，人永远查不出为什么。
+    // 工具通道已经返回了，所以这里只能靠日志留痕（不打断调用方）。
+    options.log?.('后台一轮流水线失败', { reason: error instanceof Error ? error.message : String(error) })
+  })
+
+  return {
+    status: 'triggered',
+    scan: null,
+    ran: null,
+    cleaned: false,
+    text: '已触发一轮流水线，后台执行中。\n'
+      + '扫描工单源几秒，跑一张票可能几十秒到几十分钟。\n'
+      + '稍等片刻用 pipeline_status 查看进度与结果；正在跑时再触发会返回 already-running。',
+  }
 }
 
 // ── 原同步等待实现保留为注释备查 ──

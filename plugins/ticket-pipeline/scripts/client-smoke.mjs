@@ -98,6 +98,7 @@ function makeSchemaEnvelope () {
         isolateWorktree: 17,
         writeBack: 18,
         writeBackStatus: 19,
+        writeBackOnFailure: 21,
         pushAdapter: 13,
         qqmail: 4,
         pushplus: 3,
@@ -152,6 +153,7 @@ function makeSchemaEnvelope () {
     18: { type: 'boolean', meta: { label: '回填表格', default: true, group: '行为' } },
     19: { type: 'string', meta: { label: '回填的状态值', default: '是', group: '行为' } },
     20: { type: 'string', meta: { label: '分支前缀', default: 'ticket-', group: '高级' } },
+    21: { type: 'boolean', meta: { label: '失败也写「处理结果」', default: false, group: '行为' } },
   }
   return { uid: 0, refs }
 }
@@ -197,6 +199,10 @@ function makeProjectRecord (index) {
     repoBaseBranch: 'v2.x',
     repoTargetBranch: 'v2.x',
     remoteMrEnabled: true,
+    // 工单 #19：GitLab 出口的三个定位字段现在也是可填字段（不是密钥，原样下发）。
+    gitlabBaseUrl: 'https://gitlab.example.com',
+    gitlabRemote: 'https://gitlab.example.com/platform/pms.git',
+    gitlabProjectId: 'platform/pms',
     verifyBuild: 'pnpm build',
     verifyTest: 'pnpm test',
   }
@@ -225,6 +231,7 @@ function makeSettingsResponse () {
             isolateWorktree: false,
             writeBack: true,
             writeBackStatus: '是',
+            writeBackOnFailure: false,
             pushAdapter: 'qqmail',
             qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'someone@qq.com' },
             pushplus: { channel: 'clawbot', callbackUrl: '' },
@@ -260,8 +267,63 @@ function makeSettingsResponse () {
  * 所以这里的假宿主必须用 `ctx.get(name)` 能按 'remote.<ns>' 取到服务，
  * 属性式 `ctx.remote.settings` 反而要**取不到**（取到就说明插件又退回了坏写法）。
  */
+/**
+ * 运行页签（#16）要用的队列快照夹具。
+ *
+ * 刻意放一张「要人处理的失败票」+ 一张「正在跑的票」：
+ * 前者验「重跑」按钮挂没挂对地方，后者验「取消当前」可不可点。
+ * tiers 由宿主算，这里照真实形状给 —— 面板不该自己数 phase。
+ */
+function makeRunSnapshot () {
+  return {
+    enabled: true,
+    view: 'tickets',
+    projects: [],
+    counts: { failed: 1, pending: 1 },
+    filteredCounts: { failed: 1, pending: 1 },
+    tiers: [
+      { label: '需要你处理', count: 1 },
+      { label: '待人工验证', count: 0 },
+      { label: '正在跑', count: 1 },
+      { label: '已交付', count: 0 },
+      { label: '已退役', count: 0 },
+    ],
+    queue: { pendingCount: 1, runnableCount: 1, nextRecordId: 'recRunning001', orderRule: 'priority-desc', backoff: [] },
+    tickets: [
+      {
+        projectId: 'pms',
+        recordId: 'recFailed001',
+        phase: 'failed',
+        phaseLabel: '失败',
+        problemSummary: '登录页报 500',
+        canReset: true,
+        cancelledByUser: false,
+        lastError: '模型说它不想干',
+        deliveryIssues: [],
+      },
+      {
+        projectId: 'pms',
+        recordId: 'recRunning001',
+        phase: 'editing',
+        phaseLabel: '改代码',
+        problemSummary: '列表翻页丢数据',
+        canReset: false,
+        cancelledByUser: false,
+        deliveryIssues: [],
+      },
+    ],
+    config: {},
+    text: '【流水线状态】',
+  }
+}
+
 function makeHost () {
-  const calls = { mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0, pickDirectory: [], setProjectTable: [] }
+  const calls = {
+    mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0,
+    pickDirectory: [], setProjectTable: [],
+    // 运行页签（#16）四个新方法各记一份，断言要验「点了按钮有没有真的发出去」。
+    status: 0, scan: 0, cancel: 0, reset: [],
+  }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
   // gateway 服务自己维护的命名空间表（namespace → { service }）。
@@ -313,7 +375,7 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到五个描述符', contribution.descriptors.length === 5, String(contribution.descriptors.length))
+      check('$mount 收到九个描述符', contribution.descriptors.length === 9, String(contribution.descriptors.length))
       check('第三个描述符是 projects',
         contribution.descriptors.some((item) => item.method === 'projects' &&
           item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
@@ -328,6 +390,23 @@ function makeHost () {
           item.result.typeSymbol === 'ticket-pipeline#ProjectWriteResult' &&
           item.parameters.length === 2 &&
           item.parameters.every((param) => param.codec?.mode === 'strict')),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      // 运行页签（#16）依赖的四个方法：三个无参 + reset 一个必填一个可选。
+      // 这里按 method 名字查，不按位置 —— 位置一挪，按位置写的断言会静默失效。
+      check('描述符里有 status / scan / cancel 三个无参方法',
+        ['status', 'scan', 'cancel'].every((name) => contribution.descriptors.some((item) =>
+          item.method === name && item.parameters.length === 0 && item.invocation.kind === 'direct')),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      check('描述符里有 reset：recordId 必填、projectId 可选',
+        contribution.descriptors.some((item) => {
+          if (item.method !== 'reset') return false
+          if (item.parameters.length !== 2) return false
+          const [recordId, projectId] = item.parameters
+          return recordId.wire === 'recordId' &&
+            recordId.acceptsUndefined !== true &&
+            projectId.wire === 'projectId' &&
+            projectId.acceptsUndefined === true
+        }),
         contribution.descriptors.map((item) => item.method).join(' | '))
       // 真实 gateway：$mount 会按 namespace 建一根兄弟 fiber，把命名空间服务
       // provide 成 'remote.ticketPipeline'，并记进自己的 namespaces 表。
@@ -347,6 +426,26 @@ function makeHost () {
         setProjectTable: async (index, url) => {
           calls.setProjectTable.push({ index, url })
           return { ok: true, value: { kind: 'bitable', note: '已记下这条多维表格的定位信息。' } }
+        },
+        // ── 运行页签（#16）─────────────────────────────────────────
+        // status：缺省回一份「有一张要人处理的失败票」的队列快照 ——
+        // 断言要验的是「票列表画出来没有、重跑按钮挂在哪一行」，
+        // 所以夹具里必须有一张 canReset 为真的票。
+        status: async () => {
+          calls.status += 1
+          return { ok: true, value: makeRunSnapshot() }
+        },
+        scan: async () => {
+          calls.scan += 1
+          return { ok: true, value: { status: 'triggered', scan: null, ran: null, cleaned: false, text: '已触发这一轮（不等它跑完）。' } }
+        },
+        cancel: async () => {
+          calls.cancel += 1
+          return { ok: true, value: { cancelled: true, text: '已让当前这张票停下。' } }
+        },
+        reset: async (recordId) => {
+          calls.reset.push(recordId)
+          return { ok: true, value: { reset: true, reason: 'ok', recordId, projectId: 'pms', phase: 'pending', text: '已重开：下一轮轮询会把它当成一张新票重新跑。' } }
         },
       }
       namespaces.set('ticketPipeline', { service })
@@ -603,19 +702,100 @@ async function main () {
   resetRender()
   let tree = await render(Panel, { view: 'page' })
 
-  // 整页拆成四个页签 —— 这是「太复杂」的解法：一次只摊开一块，其余收在标题里。
+  // 整页拆成五个页签 —— 这是「太复杂」的解法：一次只摊开一块，其余收在标题里。
+  // 「运行」排第一且是缺省页签（#16）：人打开设置页时的第一个问题几乎总是
+  // 「现在跑得怎么样、要我做什么」。
   const tabs = findTabs(tree)
-  check('顶部有四个页签', tabs.length === 4, tabs.map(textOf).join(' | '))
-  check('页签是 项目 / 参数 / 凭据 / 体检',
-    tabs.map(textOf).join('|') === '项目|参数|凭据|体检', tabs.map(textOf).join('|'))
+  check('顶部有五个页签', tabs.length === 5, tabs.map(textOf).join(' | '))
+  // 页签文字可能带角标数字（运行页有「需要你处理」时挂 1），所以比对时
+  // 只看标签本身：把 aria 与 badge 拆开，别让角标把文案断言带崩。
+  const tabLabels = tabs.map((node) => String(node.props.children[0] ?? ''))
+  check('页签是 运行 / 项目 / 参数 / 凭据 / 体检',
+    tabLabels.join('|') === '运行|项目|参数|凭据|体检', tabLabels.join('|'))
   check('页签带 tablist 语义',
     findAll(tree, (node) => node.props && node.props.role === 'tablist').length === 1)
-  check('缺省停在「项目」页签',
+  check('缺省停在「运行」页签',
     tabs[0].props['aria-selected'] === 'true' && tabs.filter((node) => node.props['aria-selected'] === 'true').length === 1,
     tabs.map((node) => node.props['aria-selected']).join(','))
 
-  // 一次只渲染一块：停在「项目」时参数区的字段不该在树上。
+  // 一次只渲染一块：停在「运行」时参数区的字段不该在树上。
   check('非当前页签的内容不渲染', textOf(tree).indexOf('执行器') < 0, textOf(tree).slice(0, 120))
+
+  // ── 运行页签（#16）─────────────────────────────────────────────
+  //
+  // 这一页的存在理由：人打开设置面板时的第一个问题是「现在跑得怎么样、
+  // 要我做点什么」，以前这个答案只存在于对话里的 pipeline_status。
+  // 断言只验「面板有没有把宿主给的东西画出来、按钮有没有真的发出去」——
+  // 票列表、档位汇总、canReset 全是宿主办的，面板不重算。
+  const runText = textOf(tree)
+  check('运行页签画出流水线开关状态', runText.indexOf('流水线：已开启') >= 0, runText.slice(0, 240))
+  check('运行页签画出档位汇总', runText.indexOf('需要你处理 1') >= 0, runText.slice(0, 240))
+  check('运行页签按宿主的 tiers 画汇总（不自己数 phase）',
+    runText.indexOf('汇总：需要你处理 1 · 待人工验证 0') >= 0, runText.slice(0, 240))
+  check('运行页签列出票（recordId + 标题）',
+    runText.indexOf('recFailed001') >= 0 && runText.indexOf('登录页报 500') >= 0, runText.slice(0, 400))
+  check('运行页签显示队列里的下一个',
+    runText.indexOf('下一个：recRunning001') >= 0, runText.slice(0, 400))
+  check('运行页签的页签角标只数「需要你处理」', (() => {
+    const badge = tabs[0].props.children[1]
+    // 原生标签的 children 留在 props 里、不进 node.children（textOf 读不到），
+    // 所以这里直接读 props.children —— 和「平台下拉里 wps 标了实验性」同一个坑。
+    if (!badge || !badge.props) return false
+    const label = Array.isArray(badge.props.children) ? badge.props.children.join('') : badge.props.children
+    return String(label) === '1'
+  })(), JSON.stringify(String(textOf(tabs[0]))))
+
+  // 「重跑」只挂在 canReset 的票上：这张失败票有，那张正在跑的不该有。
+  const rerunButton = findButton(tree, '重跑')
+  check('失败票行尾有「重跑」按钮', rerunButton !== undefined)
+  check('只有 canReset 的票才有「重跑」（正在跑的那张没有）',
+    findAll(tree, (node) => node.type === 'button' && textOf(node).indexOf('重跑') >= 0).length === 1,
+    String(findAll(tree, (node) => node.type === 'button' && textOf(node).indexOf('重跑') >= 0).length))
+
+  // 展开详情：详情里的字段全部来自宿主返回体，面板只负责排版。
+  const toggleRow = findAll(tree, (node) => node.type === 'button' &&
+    String(node.props.className || '').indexOf('tp-run-toggle') >= 0)[0]
+  check('找到票行（可展开的按钮）', toggleRow !== undefined)
+  if (toggleRow !== undefined) {
+    toggleRow.props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    check('展开后能看到最近错误', textOf(tree).indexOf('模型说它不想干') >= 0, textOf(tree).slice(0, 400))
+  }
+
+  // 三个动作：跑一轮 / 取消当前 / 重跑。
+  const scanButton = findButton(tree, '跑一轮')
+  check('运行页签有「跑一轮」按钮', scanButton !== undefined)
+  check('「跑一轮」按钮可用', scanButton !== undefined && scanButton.props.disabled === false,
+    scanButton === undefined ? '没找到' : String(scanButton.props.disabled))
+  if (scanButton !== undefined) {
+    scanButton.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('点「跑一轮」调的是宿主 scan()', ctx.calls.scan === 1, String(ctx.calls.scan))
+  }
+
+  const cancelButton = findButton(tree, '取消当前')
+  check('运行页签有「取消当前」按钮', cancelButton !== undefined)
+  // 有票正在 editing，所以这时候该是能点的。
+  check('有票在跑时「取消当前」可点',
+    cancelButton !== undefined && cancelButton.props.disabled === false,
+    cancelButton === undefined ? '没找到' : String(cancelButton.props.disabled))
+  if (cancelButton !== undefined) {
+    cancelButton.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('点「取消当前」调的是宿主 cancel()', ctx.calls.cancel === 1, String(ctx.calls.cancel))
+  }
+
+  const rerunAfter = findButton(tree, '重跑')
+  if (rerunAfter !== undefined) {
+    rerunAfter.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('点「重跑」调的是宿主 reset(recordId)，只传一个参数',
+      ctx.calls.reset.length === 1 && ctx.calls.reset[0] === 'recFailed001',
+      JSON.stringify(ctx.calls.reset))
+  }
 
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
   check('工具条上的「放弃改动」在', findButton(tree, '放弃改动') !== undefined)
@@ -829,7 +1009,8 @@ async function main () {
   tree = await switchTab(Panel, '项目')
   check('渲染出「项目清单」', textOf(tree).indexOf('项目清单') >= 0)
   check('项目卡片显示项目名', textOf(tree).indexOf('pms') >= 0)
-  check('项目卡片标注了 MR 开关', textOf(tree).indexOf('开 MR') >= 0)
+  // 工单 #19：MR 是实验性能力，徽标必须带「实验性」三个字，不能让人以为这是主推的交付形态。
+  check('项目卡片标注了 MR 开关（且明说是实验性）', textOf(tree).indexOf('MR（实验性）') >= 0)
   check('appToken 只显示打码预览', textOf(tree).indexOf('basc…Cnhh') >= 0)
   check('appToken 没有明文输入框',
     findAll(tree, (node) => node.type === 'input' &&
@@ -878,6 +1059,11 @@ async function main () {
   check('项目卡片有「删除」按钮', findButton(tree, '删除') !== undefined)
   check('项目卡片分了「仓库」一节', textOf(tree).indexOf('仓库') >= 0)
   check('缺省不显示高级组「验证命令」', textOf(tree).indexOf('验证命令') < 0)
+  // 工单 #19：GitLab 出口整组是实验性能力，缺省一个字都不出现 ——
+  // 99% 的人只用本地提交，把这个能力摆到第一屏就是把错的东西当主角。
+  check('缺省不显示「远程 MR（实验性）」整组', textOf(tree).indexOf('远程 MR') < 0)
+  check('缺省不出现 GitLab 站点 / projectId 的输入框',
+    textOf(tree).indexOf('GitLab 站点') < 0 && textOf(tree).indexOf('GitLab projectId') < 0)
   const advLabel = findAll(tree, (node) => node.type === 'label' &&
     textOf(node).indexOf('显示全部字段') >= 0)[0]
   const advToggle = advLabel === undefined
@@ -888,6 +1074,44 @@ async function main () {
     advToggle.props.onChange({ target: { checked: true } })
     tree = await render(Panel, { view: 'page' })
     check('勾上后显示高级组「验证命令」', textOf(tree).indexOf('验证命令') >= 0)
+    // 三个定位字段必须真能填：以前只有 enabled 画得出来，另外三个只能手改 YAML，
+    // 结果就是「这个能力开得起来但配不出来」——那才叫荒谬。
+    check('勾上后显示「远程 MR（实验性）」整组', textOf(tree).indexOf('远程 MR') >= 0)
+    check('勾上后能填 GitLab 站点', textOf(tree).indexOf('GitLab 站点') >= 0)
+    check('勾上后能填 GitLab projectId', textOf(tree).indexOf('GitLab projectId') >= 0)
+    const glBase = findAll(tree, (node) => node.type === 'input' &&
+      node.props.value === 'https://gitlab.example.com')[0]
+    check('GitLab 站点能带出宿主下发的当前值（不是空框）', glBase !== undefined)
+  }
+
+  // 工单 #20：金山源是实验性的。下拉里就得写出来，切过去还要在卡片顶部给一条醒目提示 ——
+  // 这条提示的后果是「配完了什么都没发生」，不在这里说，人只会以为插件坏了。
+  const platformSelect = findAll(tree, (node) => node.type === 'select').find(
+    (node) => Array.isArray(node.props.children) &&
+      node.props.children.some((option) => option.props && option.props.value === 'wps'))
+  check('找到平台下拉', platformSelect !== undefined)
+  if (platformSelect !== undefined) {
+    const wpsOption = platformSelect.props.children.find(
+      (option) => option.props && option.props.value === 'wps')
+    // ⚠️ 这里读的是 `props.children` 而不是 `textOf()`：`props` 保留的是 createElement
+    // 收到的原始 element，`option` 的文本挂在它自己的 props.children 上，顶层没有 `children`。
+    const wpsLabel = String((wpsOption.props.children || []).join(''))
+    check('平台下拉里 wps 标了「实验性」（值仍是裸 wps）',
+      wpsOption !== undefined && wpsOption.props.value === 'wps' && wpsLabel.indexOf('实验性') >= 0,
+      wpsOption === undefined ? 'no option' : wpsLabel)
+    platformSelect.props.onChange({ target: { value: 'wps' } })
+    tree = await render(Panel, { view: 'page' })
+    const wpsText = textOf(tree)
+    check('切到 wps 后卡片顶部有「没有内置取数通道」的醒目提示',
+      wpsText.indexOf('没有内置取数通道') >= 0, wpsText.slice(0, 300))
+    check('提示里明说「拿不到票」+ 该改用飞书',
+      wpsText.indexOf('拿不到') >= 0 && wpsText.indexOf('feishu') >= 0)
+    // 切回 feishu：提示必须消失（它不是常驻噪音）。
+    // 注意不能拿「没有内置取数通道」当判据 —— 平台字段的 hint 里也有这半句，永远命中。
+    platformSelect.props.onChange({ target: { value: 'feishu' } })
+    tree = await render(Panel, { view: 'page' })
+    check('切回 feishu 后那条实验性提示消失',
+      textOf(tree).indexOf('直接用它收不到任何工单') < 0)
   }
 
   // 布尔字段统一换成 role="switch" 的开关（宿主 practices.md 要求保留 aria-checked 语义）。
@@ -991,6 +1215,9 @@ async function main () {
   const fieldRejected = textOf(tree)
   check('字段级拒绝挂到字段下方', fieldRejected.indexOf('必须是非空字符串（本地 git 检出根目录）') >= 0,
     fieldRejected.slice(0, 300))
+  // 光说「保存失败」不够：下面几十个字段里哪一个是红的、有几项，得先说出来。
+  check('保存被拒时先说有几项没通过校验', /有 \d+ 项没通过校验，已在下方标红/.test(fieldRejected),
+    fieldRejected.slice(0, 300))
   check('被服务端拒绝后保存被锁住',
     findButton(tree, '保存', 'tp-primary').props.disabled === true)
   findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms4')
@@ -1020,9 +1247,9 @@ async function main () {
     JSON.stringify(listOp && listOp.value))
 
   // 平台是固定集合，界面上必须给下拉而不是自由文本 —— 手打错一个字母就要等宿主拒。
-  const platformSelect = findAll(tree, (node) => node.type === 'select' &&
+  const selectSizes = findAll(tree, (node) => node.type === 'select' &&
     Array.isArray(node.props.children)).map((node) => node.props.children.length)
-  check('平台字段渲染成下拉框', platformSelect.length >= 1, JSON.stringify(platformSelect))
+  check('平台字段渲染成下拉框', selectSizes.length >= 1, JSON.stringify(selectSizes))
 
   // 项目卡片可收起：收起后字段不该还渲染在树上（否则折叠只是视觉假象），
   // 而头部的徽标（已改 / 待修）必须还在 —— 收起不能顺手把「有错」也藏了。

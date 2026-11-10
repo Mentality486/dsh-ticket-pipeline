@@ -28,7 +28,7 @@ import { makeExecResult, normalizeTestOutcome } from '../src/contracts/work-exec
 import { PipelineError, ERROR_KINDS, RETRYABLE_KINDS, FATAL_KINDS, CANCELLED_KINDS, retryPolicy } from '../src/contracts/errors.js'
 import { canTransition, PHASE_LABEL, TIMELINE_NODES, phaseLabel, parseFeishuLink } from '../src/contracts/types.js'
 import { fingerprintOf } from '../src/contracts/types.js'
-import { validateConfig, describeConfig, CONFIG_FIELDS, CONFIG_GROUPS, BUILTIN_LIMITS, assertGroupCoverage } from '../src/core/config.js'
+import { validateConfig, describeConfig, CONFIG_FIELDS, CONFIG_GROUPS, BUILTIN_LIMITS, assertGroupCoverage, configFieldLabel, suggestConfigKey, readConfigWarnings, REMOVED_CONFIG_KEYS } from '../src/core/config.js'
 import { createPipelineCancelTool } from '../src/tools/pipeline-cancel.js'
 import { createPipelineScanTool } from '../src/tools/pipeline-scan.js'
 import { createPipelineResetTool } from '../src/tools/pipeline-reset.js'
@@ -987,11 +987,12 @@ async function main () {
     assert.equal('logLevel' in described, false)
   })
 
-  await check('配置面收敛到 24 个键 / 4 个分组，且每个键都归到了组里', async () => {
+  await check('配置面收敛到 25 个键 / 4 个分组，且每个键都归到了组里', async () => {
     // 涨键是有代价的：每多一个键，面板就多一格要人判断的东西，文档就多一行。
     // 这条断言把当前数字钉住 —— 想加键必须先回答「为什么这个人必须懂这件事」。
+    // 24 → 25 是 #14 加的 `writeBackOnFailure`（失败也写「处理结果」列，缺省关）。
     const keys = Object.keys(CONFIG_FIELDS)
-    assert.equal(keys.length, 24, '顶层配置字段应当是 24 个，实际：' + keys.join(', '))
+    assert.equal(keys.length, 25, '顶层配置字段应当是 25 个，实际：' + keys.join(', '))
     assert.equal(CONFIG_GROUPS.length, 4, '分组应当是 4 组')
     assertGroupCoverage() // 漏写分组会在这里抛
     // 死键必须真的死了：这两个键曾经在面板上可编辑、改了什么也不发生。
@@ -1027,6 +1028,82 @@ async function main () {
       assert.equal(key in result.value, false, key + ' 已删除，不该出现在归一后的配置里')
     }
     assert.equal(result.value.qqmail.encryption, 'tls', '老的 qqmail.port 不该顶掉新键的默认值')
+  })
+
+  await check('配置拼错一个字母：只警告不挡启动，且说出最像的那个键', async () => {
+    // 真实痛点：`pollInvervalMinutes`（少一个字母）过去完全静默 —— 插件照常启动、
+    // 按缺省 3 分钟跑，人以为自己配了 30 分钟，查半天查不出来。宁可多一句提醒。
+    const result = validateConfig({ pollInvervalMinutes: 30 })
+    assert.ok(result.value, '拼错的键不能挡住启动：' + JSON.stringify(result.issues ?? []))
+    assert.equal(result.issues ?? undefined, undefined, '拼错的键是警告，不是错误')
+    assert.equal('pollInvervalMinutes' in result.value, false, '拼错的键不该进归一后的配置')
+    assert.equal(result.value.pollIntervalMinutes, 3, '拼错就当没配，回落缺省值')
+    const warnings = result.warnings ?? []
+    assert.equal(warnings.length, 1, '应当正好一条警告，实际：' + JSON.stringify(warnings))
+    assert.match(warnings[0], /pollInvervalMinutes/, '警告要点名那个键')
+    assert.match(warnings[0], /pollIntervalMinutes/, '警告要说「你要找的是哪个」')
+    // 挂在配置对象上（不可枚举），pipeline_doctor 只拿得到配置对象，读不到就白做。
+    assert.deepEqual(readConfigWarnings(result.value), warnings, '警告必须能随配置对象带出去')
+    assert.equal(Object.keys(result.value).includes('pollInvervalMinutes'), false, '符号挂载不能污染普通键')
+  })
+
+  await check('配置里留着已删的键：给成因，不是一句「不存在」', async () => {
+    // 老配置里躺着 `concurrency: 4` 的人，最想知道的是「它去哪了」而不是「它不存在」。
+    const result = validateConfig({ concurrency: 4, logLevel: 'debug' })
+    assert.ok(result.value)
+    const warnings = result.warnings ?? []
+    assert.equal(warnings.length, 2, '两个已删键各一条，实际：' + JSON.stringify(warnings))
+    assert.match(warnings[0], /concurrency/)
+    assert.match(warnings[0], /留着不影响启动/, '已删键的说辞要和「拼错」区分开：留着是合法的')
+    assert.match(warnings[0], /恒 1|并发/, '要说清为什么没有再给配')
+    assert.ok(Object.keys(REMOVED_CONFIG_KEYS).length >= 8, '已删键的成因表不该只剩几个')
+    for (const key of ['concurrency', 'logLevel', 'safePageRun', 'pushplus.token', 'qqmail.port']) {
+      assert.ok(key in REMOVED_CONFIG_KEYS, key + ' 应当在已删键成因表里')
+    }
+  })
+
+  await check('完全不认识的键：不硬猜，但仍然说清楚「写了也不生效」', async () => {
+    const result = validateConfig({ totallyMadeUpKey: 1 })
+    assert.ok(result.value)
+    const warnings = result.warnings ?? []
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /totallyMadeUpKey/)
+    assert.match(warnings[0], /不会生效/)
+    assert.equal(suggestConfigKey('totallyMadeUpKey'), '', '离得远就不该硬猜一个键出来')
+    assert.equal(suggestConfigKey('pollInvervalMinutes'), 'pollIntervalMinutes', '差一个字母要猜得出来')
+  })
+
+  await check('校验报错带中文名与修法，不再只给一句「值不对」', async () => {
+    const bad = validateConfig({ pollIntervalMinutes: 999 })
+    assert.ok(bad.issues && bad.issues.length === 1)
+    const issue = bad.issues[0]
+    // 中文名 + 原始路径都要有：前者让人知道说的是哪一格，后者让人能在文件里搜到。
+    assert.match(issue.message, /轮询间隔/, '要用中文 label，不能只甩 pollIntervalMinutes')
+    assert.match(issue.message, /pollIntervalMinutes/, '原始路径要保留，方便 grep')
+    assert.match(issue.message, /不能大于 60/)
+    assert.ok(typeof issue.fix === 'string' && issue.fix.length > 0, '每条报错都要带修法')
+    assert.match(issue.fix, /1–60|1-60/, '修法要给可用范围')
+    assert.match(issue.fix, /3/, '修法要给常用值')
+
+    const enumBad = validateConfig({ workExecutor: 'agentt' })
+    const enumIssue = (enumBad.issues ?? [])[0]
+    assert.match(enumIssue.message, /执行器/, '枚举字段也要中文名')
+    assert.match(enumIssue.message, /agent/)
+    assert.match(enumIssue.fix, /mock/, '枚举报错的修法要提缺省推荐值')
+
+    // 项目侧字段同样要有中文名（不说人话的 `repo.path` 最容易让人卡住）。
+    const projBad = validateConfig({ projects: [{ name: 'p', match: { platform: 'feishu' }, repo: {} }] })
+    const pathIssue = (projBad.issues ?? []).find((one) => one.path.join('.').includes('repo.path'))
+    assert.ok(pathIssue, 'repo.path 应当报错')
+    assert.match(pathIssue.message, /仓库路径/, '项目字段也要中文名')
+    assert.match(pathIssue.fix, /本机的路径|D:\//, '修法要给一个能照抄的例子')
+
+    // label 查表本身也要能对得上几种形态（面板与校验共用同一套中文名）。
+    assert.equal(configFieldLabel('pollIntervalMinutes'), '轮询间隔（分钟）')
+    assert.equal(configFieldLabel('qqmail.host'), 'SMTP 主机')
+    assert.equal(configFieldLabel('projects[0].repo.path'), '仓库路径')
+    assert.equal(configFieldLabel('projects[].match.appToken'), '飞书 appToken')
+    assert.equal(configFieldLabel('nope'), '')
   })
 
   await check('pushplus 的 token 只走凭据，不从配置里读', async () => {
@@ -2282,6 +2359,74 @@ async function main () {
     assert.ok(stepsStart >= 0, '要能找到清单起点')
     const steps = out.text.slice(stepsStart)
     assert.ok(steps.indexOf('「凭据」页签') < steps.indexOf('总开关'), `顺序不能反：${steps}`)
+  })
+
+  await check('体检：没开远程 MR 的项目，一个字都不提 GITLAB_TOKEN', async () => {
+    // 真实现象：缺省安装里没有任何项目开 MR，体检每次却都念一句
+    // 「ℹ️ 凭据 GITLAB_TOKEN：未配置」——念多了人就会学会整段忽略体检输出。
+    const out = await createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'mock' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    }).execute({}, {})
+    assert.equal(out.ok, true, `缺省该项目全绿：${out.text}`)
+    assert.ok(!out.text.includes('GITLAB_TOKEN'), `不该提 GITLAB_TOKEN：${out.text}`)
+    assert.ok(!out.text.includes('远程 MR'), '没开的时候连这一节都不该出现')
+  })
+
+  await check('体检：开了远程 MR 却缺定位字段 → 进阻断，并说清「跑到最后一步才失败」', async () => {
+    const out = await createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'mock' }, repo: { path: 'D:/repo/pms', gitlab: { enabled: true } } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async (ref) => ({ configured: ref !== 'GITLAB_TOKEN' }) },
+    }).execute({}, {})
+    assert.equal(out.ok, false, `缺字段要拦：${out.text}`)
+    assert.ok(
+      out.blockers.some((b) => b.includes('远程 MR') || b.includes('repo.gitlab.enabled')),
+      `要进 blockers：${JSON.stringify(out.blockers)}`,
+    )
+    assert.ok(out.text.includes('跑到最后一步才失败'), '要说清失败时机（改动都做完了才炸）')
+    assert.ok(out.text.includes('GitLab Commits API'), '要说明为什么只能走 API')
+    // 打开了才查 token：这条路径下缺 GITLAB_TOKEN 也是阻断。
+    assert.ok(
+      out.blockers.some((b) => b.includes('GITLAB_TOKEN')),
+      `开了 MR 才该要 token：${JSON.stringify(out.blockers)}`,
+    )
+  })
+
+  await check('体检：选了金山文档源就报阻断，并说清「一张票都拿不到」', async () => {
+    // 工单 #20：wps 源的取数通道是注入式的，主装配没注入 ⇒ 选了它票永远是 0。
+    // 这种「配完了什么都没发生」必须在这里拦，否则人只会以为插件坏了。
+    const out = await createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'wps1', match: { platform: 'wps' }, repo: { path: 'D:/repo/wps1' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    }).execute({}, {})
+    assert.equal(out.ok, false, `选了 wps 要拦：${out.text}`)
+    assert.ok(
+      out.blockers.some((b) => b.includes('金山')),
+      `要进 blockers：${JSON.stringify(out.blockers)}`,
+    )
+    assert.ok(out.text.includes('拿不到票'), '要说清后果（一张票都拿不到）')
+    assert.ok(out.text.includes('feishu'), '要给出出路（改成 feishu）')
   })
 
   await check('体检：飞书连接失败都被归一成人话（码表 / 未知码 / 网络错 / 超时）', async () => {
@@ -3817,6 +3962,119 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(out.tickets[0].deliveryIssues[0].giveUp, false)
   })
 
+  // ── #14：失败票回填「处理结果」列 ─────────────────────────────
+  // 表格里那一行永久停在「处理中」，在飞书 UI 里看跟「还没开始」完全一样。
+  // 但把「是否处理」也写上会变成另一种谎 —— 所以只写「处理结果」一列，且缺省关。
+  section('16c-2. 失败票回填：只写「处理结果」，绝不碰「是否处理」')
+
+  await check('writeBackOnFailure 缺省关：失败票仍然完全不回填（回归）', async () => {
+    const source = createMockSource()
+    const { scheduler, store } = harness({
+      source,
+      executor: createMockExecutor({ outcome: 'failed' }),
+    })
+    await scheduler.tick()
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed')
+    assert.equal(source.writes.length, 0, '缺省关时一次都不该写表格')
+    assert.equal(row.writeBack, undefined, '连回执都不该有')
+    assert.equal(row.delivery?.writeBack, undefined, '交付维度里也不该出现回填')
+  })
+
+  await check('打开 writeBackOnFailure：失败票只写「处理结果」，不写是否处理/处理日期', async () => {
+    const source = createMockSource()
+    const { scheduler, store, push } = harness({
+      source,
+      executor: createMockExecutor({ outcome: 'failed' }),
+      config: { writeBackOnFailure: true },
+    })
+    await scheduler.tick()
+
+    assert.equal(source.writes.length, 1, '失败票要写一次回填')
+    const write = source.writes[0]
+    assert.equal(write.onlyResult, true, '必须标成「只写结果列」')
+    assert.equal(write.status, undefined, '「是否处理」不能写 —— 写了就等于说处理完了')
+    assert.equal(write.handledAt, undefined, '「处理日期」是人的字段，不能写')
+    assert.match(write.result, /\[流水线\] 失败：/, `结果列要说清这是失败：${write.result}`)
+    assert.match(write.result, /pipeline_reset/, '要告诉人怎么重跑')
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed', '回填不改票态')
+    assert.equal(row.writeBack?.written, true, '回执要落库')
+    assert.equal(row.delivery?.writeBack?.ok, true, '交付维度记成写成了')
+    assert.equal(push.messages.length, 1, '通知照发（回填不抢通知的位置）')
+  })
+
+  await check('打开 writeBackOnFailure 后超时票也回填，但人工取消不回填', async () => {
+    // 超时：人不在电脑前，表格里那行停「处理中」正是他最需要看到的东西。
+    {
+      const source = createMockSource()
+      const { scheduler } = harness({
+        source,
+        executor: createMockExecutor({ hang: true }),
+        config: { writeBackOnFailure: true, ticketTimeoutMinutes: 0.001 },
+      })
+      await scheduler.tick()
+      assert.equal(source.writes.length, 1, '超时票要回填一句原因')
+      assert.match(source.writes[0].result, /超时/, `要写清是超时：${source.writes[0].result}`)
+      assert.equal(source.writes[0].status, undefined, '仍然不碰「是否处理」')
+    }
+    // 取消：人主动喊停，说明他不想让这条链路再动任何远端状态。
+    {
+      const source = createMockSource()
+      const { scheduler } = harness({
+        source,
+        executor: createMockExecutor({ hang: true }),
+        config: { writeBackOnFailure: true },
+      })
+      const pending = scheduler.tick()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      scheduler.cancelActive()
+      await pending
+      assert.equal(source.writes.length, 0, '人工取消不该回填')
+    }
+  })
+
+  await check('失败票回填也会失败：进 delivery 分档，不做死循环', async () => {
+    const source = createMockSource()
+    source.setFailWrite(true) // network ⇒ 可重试
+    const { scheduler, store } = harness({
+      source,
+      executor: createMockExecutor({ outcome: 'failed' }),
+      config: { writeBackOnFailure: true },
+    })
+    await scheduler.tick()
+
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'failed', '回填失败不能说成票的问题')
+    assert.equal(row.delivery?.writeBack?.ok, false, '要如实记下没写成')
+    assert.equal(row.delivery.writeBack.giveUp, false, 'network 是可重试的')
+    assert.equal(row.pendingEffects?.writeBack?.attempts, 1, '待办要记「试过几次」')
+    // 失败票本来就不回填「是否处理」，所以即使开了开关也不写 —— 这条同时钉住了
+    // 「打开开关不能让表格状态变成处理完」这个产品承诺。
+    assert.equal(row.writeBack?.written, false)
+  })
+
+  await check('失败票被 revivals 重跑后再失败：覆盖同一格，不追加', async () => {
+    const source = createMockSource()
+    const { scheduler, store } = harness({
+      source,
+      executor: createMockExecutor({ outcome: 'failed' }),
+      config: { writeBackOnFailure: true },
+    })
+    await scheduler.tick()
+    assert.equal(source.writes.length, 1)
+    const first = source.writes[0].result
+
+    // 人工重置回 pending，再跑一遍还是失败。飞书单元格是整格覆盖，
+    // 所以只该多一次写、内容还是同一种格式，而不是两段拼在一起。
+    await store.resetByHuman(k('rec-mock-001'))
+    await scheduler.tick()
+    assert.equal(source.writes.length, 2, '应该再写一次')
+    assert.equal(source.writes[1].result.split('[流水线]').length, 2, '第二次的内容不能是两段拼起来')
+    assert.match(first, /失败/)
+  })
+
   // #06：通知是用户接触这个插件最频繁的界面（一张票一封），但原来只是一份
   // 「事实清单」——有项目、序号、sha、改动文件数，唯独没有一句「关我什么事」。
   // 判定行固定在第一行，因为手机邮件列表预览只取前 1–2 行。
@@ -4698,6 +4956,91 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(result.branches[1].ok, false, 'bad 项目要失败但不抛')
     assert.equal(result.branches[2].ok, false, '没配路径的项目也要有记录')
     assert.match(result.branches[2].reason, /repo\.path/, `要说清是没配路径：${result.branches[2].reason}`)
+  })
+
+  section('18. 设置面板「运行」页签：宿主 remote 的四个新方法（#16）')
+  await check('remote.status()：面板拿到的就是工具那份结果，不另算一套', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const scan = await env.source.scan(new AbortController().signal)
+    await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    const remote = new TicketPipelineRemote({
+      getConfig: () => env.config,
+      doctorOptions: {},
+      store: env.store,
+    })
+    const out = await remote.status()
+    // 必须和工具口径一致：面板上看到的票列表不能是第二套算法。
+    // 面板看明细，所以 remote 固定传 view:'tickets'；工具缺省是 overview。
+    assert.equal(out.view, 'tickets', '运行页签要明细行，不要按项目聚合')
+    assert.equal(out.tickets.length, 1, `要点到具体那一票：${JSON.stringify(out.tickets)}`)
+    assert.equal(out.tickets[0].phaseLabel, '工作区已就绪', `票面阶段要有中文：${out.tickets[0].phaseLabel}`)
+    assert.ok(Array.isArray(out.tiers) && out.tiers.length > 0, '汇总行要能直接画')
+    assert.equal(typeof out.text, 'string', 'text 也要带着（工具与面板同源）')
+  })
+
+  await check('remote.status()：没有 store 时给人话，不抛 TypeError', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const remote = new TicketPipelineRemote({ getConfig: () => ({ enabled: false }), doctorOptions: {} })
+    await assert.rejects(() => remote.status(), (error) => {
+      assert.match(error.message, /没接上存储/, `要说清是装配问题：${error.message}`)
+      assert.match(error.message, /store/, `要点名缺的是 store：${error.message}`)
+      return true
+    })
+  })
+
+  await check('remote.scan()：总开关关着时直接说 disabled，不起后台', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    let tickCalls = 0
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({ enabled: false }),
+      doctorOptions: {},
+      scheduler: { tick: async () => { tickCalls += 1 }, get isRunning () { return false } },
+    })
+    const out = await remote.scan()
+    assert.equal(out.status, 'disabled', `关着就该说关着：${JSON.stringify(out)}`)
+    assert.equal(tickCalls, 0, '关着不能偷偷跑一轮')
+    assert.match(out.text, /enabled/, '要告诉人开关在哪')
+  })
+
+  await check('remote.cancel()：没票在跑时说清楚，不报错', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({ enabled: true }),
+      doctorOptions: {},
+      scheduler: { cancelActive: () => false },
+    })
+    const out = await remote.cancel()
+    assert.equal(out.cancelled, false)
+    assert.match(out.text, /没有票在跑/, `要说清为什么什么都没取消：${out.text}`)
+  })
+
+  await check('remote.reset()：失败票能重开回 pending', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const scan = await env.source.scan(new AbortController().signal)
+    const row = await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await env.store.setPhase(row.key, 'failed', { lastError: '模型说它不想干' })
+    const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
+    // 只传 recordId：projectId 是 acceptsUndefined 的可选参数，
+    // 显式传 undefined 会让浏览器侧「参数个数」校验对不上（票 #16 验收项）。
+    const out = await remote.reset(scan.created[0].recordId)
+    assert.equal(out.reset, true, `要重开成功：${JSON.stringify(out)}`)
+    assert.equal(out.reason, 'ok', out.text)
+    assert.equal(out.phase, 'pending', '重开后回 pending')
+    assert.equal(env.store.getTicket(row.key).phase, 'pending', '存储里的票态也要真的回去')
+  })
+
+  await check('remote.reset()：不是终态的票不给重开（别把正在跑的打断）', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const scan = await env.source.scan(new AbortController().signal)
+    await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
+    const out = await remote.reset(scan.created[0].recordId)
+    assert.equal(out.reset, false)
+    assert.equal(out.reason, 'not-resettable', `只有 failed / needs-info / gone 能重开：${JSON.stringify(out)}`)
+    assert.match(out.text, /是否处理/, '要教人去表格里拨，而不是让人以为按钮坏了')
   })
 
   // ── 收尾 ────────────────────────────────────────────────

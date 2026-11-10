@@ -30,10 +30,14 @@ import { createRecordFilter, resolveRecordIds } from '../../contracts/record-fil
 import { assertTicketSource, makeTicket } from '../../contracts/ticket-source.js'
 import { IMAGE_MEDIA_TYPES, parseBitableUrl } from '../../contracts/types.js'
 import {
+  BITABLE_CANONICAL_COLUMNS,
+  BITABLE_COLUMN_ALIASES,
   DEFAULT_SHEET_HEADER_ROW,
   DEFAULT_SHEET_ID_COLUMN,
   buildValueRange,
+  columnLetter,
   locateSheetHeader,
+  mapColumns,
   normalizeSheetDate,
   parseSheetRange,
   parseSheetRows,
@@ -53,27 +57,17 @@ const DEFAULT_APP_ID_REF = 'FEISHU_APP_ID'
 const DEFAULT_APP_SECRET_REF = 'FEISHU_APP_SECRET'
 
 /**
- * 工单表的列名。
+ * 工单表的列名（**规范名**）。
  *
- * 为什么要显式写死：多维表格的字段名是**表级**的约定，不是飞书的通用概念。
- * 换一张表如果列名不同，改这里的常量即可 —— 不用动内核。
+ * 为什么要显式写死一份：多维表格的字段名是**表级**的约定，不是飞书的通用概念。
  * 这张表的结构来自用户贴出的《PMS系统问题Bug记录表》使用说明（12 列）。
+ *
+ * 但它已经**不再是唯一的认定口径**（工单 #21）：真实扫描前会先读一遍表的字段列表，
+ * 用 `BITABLE_COLUMN_ALIASES`（规范名 + 电子表格那套别名）把语义字段映到表里的真实名字。
+ * 名字一模一样时这份常量就是映射结果，所以它同时充当「缺省映射」。
+ * 保留这个导出是因为自测与外部脚本仍在按规范名造数据 —— 别在业务代码里新引它。
  */
-export const FEISHU_COLUMNS = Object.freeze({
-  seq: '序号',
-  department: '发现部门',
-  description: '问题描述',
-  foundAt: '发现日期',
-  module: '模块',
-  flow: '操作流程',
-  screenshot: '截图',
-  priority: '优先级',
-  status: '是否处理',
-  handler: '处理人',
-  result: '处理结果',
-  handledAt: '处理日期',
-  lastModified: '最后更新时间',
-})
+export const FEISHU_COLUMNS = BITABLE_CANONICAL_COLUMNS
 
 /** 收票只看这一列的这一值（缺省值，可被 options.statusValues 覆盖）。 */
 export const IN_PROGRESS_VALUE = '处理中'
@@ -369,6 +363,13 @@ export function createFeishuSource (options = {}) {
   // 写法是否合法，写错了现在就该告诉人，而不是等到半夜轮询才报错。
   const sheetRange = parseSheetRange(options.sheetRange)
   const sheetColumns = resolveSheetColumns(options.sheetColumns)
+  // 多维表格的列名覆盖（工单 #21）：与 `sheetColumns` **同一个键、同一套校验**，
+  // 只是字段白名单换成多维表格那份（规范名 + 电子表格别名，两边都收）。
+  // 人只有一张表要配，不该为了「这张是哪种表型」去改键名。
+  const bitableColumns = resolveSheetColumns(options.columns, {
+    aliases: BITABLE_COLUMN_ALIASES,
+    optionName: 'match.columns',
+  })
   // 「这一行算不算待处理的工单」由状态列的取值决定，而这个取值**每张表不一样**：
   // 常见有「处理中」「否」「待处理」「未处理」……写死一个值，配置写得再对也一张票都收不到。
   // 这里接受一组值（命中任意一个即算「在处理中」），缺省仍是老的那一个，保持既有行为。
@@ -459,6 +460,19 @@ export function createFeishuSource (options = {}) {
   let tokenCache = null
   /** @type {{ appToken: string, tableId: string } | null} */
   let tableCache = null
+  /**
+   * 多维表格的列名映射缓存（工单 #21）。
+   *
+   * 为什么按 `appToken/tableId` 缓存而不是一次算死：`resolveTable()` 的结果本身是缓存的，
+   * 但 `writeResult()` 也会独立走一遍（回填时要拼字段名），两处必须拿到**同一份**映射，
+   * 否则扫描按「缺陷描述」读、回填按「问题描述」写，看起来都对，实际错位。
+   *
+   * `null` = 还没读过字段列表；`{ columns, names }` = 已解析（可能带 warning）。
+   * @type {{ columns: Record<string, string>, names: Record<string, string>, missing: string[] } | null}
+   */
+  let columnCache = null
+  /** @type {Promise<any> | null} */
+  let columnInflight = null
   /**
    * 正在进行的 token 获取（single-flight，B4）。
    *
@@ -1220,6 +1234,106 @@ export function createFeishuSource (options = {}) {
   const resolveTableWithAppToken = resolveBitableTableByIdentity
 
   /**
+   * 读这张多维表格的**真实字段名**，把语义字段映到表里那个名字上（工单 #21）。
+   *
+   * 为什么非要多打一次 `fields` 接口：
+   * 以前列名是硬编码常量，表里叫「缺陷描述」「处理状态」时 `fields['问题描述']`
+   * 取不到值 ⇒ 描述为空 ⇒ 整张表**静默扫出 0 张票**，既不报错也不提示。
+   * 猜名字是不可能的（字段名是表级的、用户随便起），所以只能问一次平台。
+   *
+   * 一次扫描打一次，缓存整轮复用；回填走同一份缓存，保证「读哪列」与「写哪列」一致。
+   *
+   * @param {{ kind: string, appToken: string, tableId: string }} table
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ columns: Record<string, string>, names: Record<string, string>, missing: string[] }>}
+   */
+  async function resolveBitableColumns (table, signal) {
+    if (columnCache) return columnCache
+    if (columnInflight) return columnInflight
+
+    columnInflight = (async () => {
+      /** @type {string[]} */
+      const names = []
+      let pageToken = ''
+      // 翻页上限 50 页（每页 100 个字段 = 5000 列）。防坏数据把循环拖死，
+      // 也和 `records/search` 那个 200 页的守卫保持同一种写法。
+      for (let guard = 0; guard < 50; guard += 1) {
+        if (signal?.aborted) throw new PipelineError('aborted', '扫描被取消')
+        const payload = await apiCall(
+          `/open-apis/bitable/v1/apps/${table.appToken}/tables/${table.tableId}/fields`,
+          { query: { page_size: 100, page_token: pageToken || undefined }, signal },
+        )
+        const data = payload?.data ?? {}
+        for (const item of Array.isArray(data.items) ? data.items : []) {
+          const name = String(item?.field_name ?? '').trim()
+          if (name.length > 0) names.push(name)
+        }
+        if (data.has_more !== true) break
+        pageToken = String(data.page_token ?? '')
+        if (pageToken === '') break
+      }
+
+      const mapped = mapColumns({ actualNames: names, overrides: bitableColumns, aliases: BITABLE_COLUMN_ALIASES })
+
+      if (mapped.missing.length > 0) {
+        // 必需列对不上**必须当场报错**：继续扫下去只会得到「0 张票」，而人会以为
+        // 是没配置好开关或者表里没数据 —— 最费时间的一种失败（工单 #21）。
+        const wanted = mapped.missing
+          .map((field) => `${field === 'description' ? '描述' : '状态'}（${(BITABLE_COLUMN_ALIASES[field] ?? []).slice(0, 3).join(' / ')}）`)
+          .join('、')
+        throw new PipelineError(
+          'invalid-input',
+          `这张多维表格里找不到 ${wanted} 这两列中的某一列，收不了票。`
+            + `表里实际的字段名：${names.join(' / ') || '（一个都没有）'}。`
+            + '两种改法：① 把字段名改成上面括号里的任一种；'
+            + '② 在配置 match.columns 里写明实际叫法，例如 {"description":"我的描述列"}（不用改表）。',
+        )
+      }
+
+      // 非必需列缺失只记一条日志：少了「优先级」「截图」不该让整轮扫描失败，
+      // 那些字段本来就有缺省处理（优先级空 = 不排优先级）。
+      const optionalMissing = Object.keys(BITABLE_COLUMN_ALIASES)
+        .filter((field) => mapped.columns[field] === undefined && field !== 'description' && field !== 'status')
+      if (optionalMissing.length > 0 && typeof options.log === 'function') {
+        options.log('多维表格列名映射：这些列没找到，按空值处理', {
+          sourceId,
+          missing: optionalMissing,
+          actual: names,
+        })
+      }
+
+      const mappedNames = mapped.names
+      // `columns` 对外用**表里的真实名字**：所有拼 `fields[...]` 的地方都读它。
+      // 没映射上的字段退回规范名 —— 让「读不到」表现为空值，而不是 `undefined` 键名。
+      /** @type {Record<string, string>} */
+      const columns = { ...BITABLE_CANONICAL_COLUMNS }
+      for (const [field, name] of Object.entries(mappedNames)) columns[field] = name
+
+      columnCache = { columns, names: mappedNames, missing: mapped.missing }
+      return columnCache
+    })()
+
+    try {
+      return await columnInflight
+    } finally {
+      columnInflight = null
+    }
+  }
+
+  /**
+   * 当前生效的列名：还没解析过时就是规范名。
+   *
+   * 为什么要有这个函数而不是直接用 `columnCache`：`pickMtime` 这类工具在
+   * 「拿到字段列表之前」也可能被调用（比如自测直接调 buildTicket），
+   * 那时候用规范名是唯一安全的猜测，且与缺省表结构完全一致。
+   *
+   * @returns {Record<string, string>}
+   */
+  function activeColumns () {
+    return columnCache?.columns ?? BITABLE_CANONICAL_COLUMNS
+  }
+
+  /**
    * 把一行记录组装成内部 Ticket。
    * @param {any} item
    * @param {string} recordId
@@ -1227,20 +1341,23 @@ export function createFeishuSource (options = {}) {
    */
   function buildTicket (item, recordId) {
     const fields = item?.fields ?? {}
-    const priorityText = normalizeCellText(fields[FEISHU_COLUMNS.priority]).toLowerCase()
+    // 一律走 `cols`（= 映射后的真实字段名），不要再直接读 `FEISHU_COLUMNS`：
+    // 那是**规范名**，只在表结构完全按文档建的时候才对得上（工单 #21）。
+    const cols = activeColumns()
+    const priorityText = normalizeCellText(fields[cols.priority]).toLowerCase()
     const priority = PRIORITY_MAP.get(priorityText)
     return makeTicket({
       recordId,
       projectId,
-      description: normalizeCellText(fields[FEISHU_COLUMNS.description]),
-      module: normalizeCellText(fields[FEISHU_COLUMNS.module]),
-      flow: normalizeCellText(fields[FEISHU_COLUMNS.flow]),
+      description: normalizeCellText(fields[cols.description]),
+      module: normalizeCellText(fields[cols.module]),
+      flow: normalizeCellText(fields[cols.flow]),
       priority: priority === 'high' || priority === 'medium' || priority === 'low' ? priority : undefined,
-      department: normalizeCellText(fields[FEISHU_COLUMNS.department]),
-      foundAt: normalizeDateCell(fields[FEISHU_COLUMNS.foundAt]),
-      seq: normalizeCellText(fields[FEISHU_COLUMNS.seq]),
-      status: normalizeCellText(fields[FEISHU_COLUMNS.status]),
-      screenshots: extractScreenshots(fields[FEISHU_COLUMNS.screenshot]),
+      department: normalizeCellText(fields[cols.department]),
+      foundAt: normalizeDateCell(fields[cols.foundAt]),
+      seq: normalizeCellText(fields[cols.seq]),
+      status: normalizeCellText(fields[cols.status]),
+      screenshots: extractScreenshots(fields[cols.screenshot]),
       raw: { recordId, mtime: pickMtime(item) },
     })
   }
@@ -1253,7 +1370,7 @@ export function createFeishuSource (options = {}) {
   function pickMtime (item) {
     const fields = item?.fields ?? {}
     const candidates = [
-      fields[FEISHU_COLUMNS.lastModified],
+      fields[activeColumns().lastModified],
       item?.last_modified_time,
       item?.lastModifiedTime,
     ]
@@ -1347,6 +1464,11 @@ export function createFeishuSource (options = {}) {
     let pageToken = ''
     let stopped = false
 
+    // 先问一次平台「这张表里的字段到底叫什么」（工单 #21）。
+    // 放在循环外：一整轮只打一次；放在这里而不是 resolveTable：只有多维表格才需要，
+    // 电子表格走的是表头行探测（`locateSheetHeader`），不该被这条多打一次。
+    await resolveBitableColumns(table, signal)
+
     for (let guard = 0; guard < 200 && !stopped; guard += 1) {
       if (signal?.aborted) throw new PipelineError('aborted', '扫描被取消')
 
@@ -1354,7 +1476,7 @@ export function createFeishuSource (options = {}) {
       const body = {
         page_size: RECORD_PAGE_SIZE,
         automatic_fields: true,
-        sort: [{ field_name: FEISHU_COLUMNS.lastModified, desc: true }],
+        sort: [{ field_name: activeColumns().lastModified, desc: true }],
       }
       if (viewId) body.view_id = viewId
       if (pageToken) body.page_token = pageToken
@@ -1391,7 +1513,7 @@ export function createFeishuSource (options = {}) {
         live.add(recordId)
 
         const fields = item?.fields ?? {}
-        const status = normalizeCellText(fields[FEISHU_COLUMNS.status])
+        const status = normalizeCellText(fields[activeColumns().status])
         const inProgress = statusValues.includes(status)
         const mtime = pickMtime(item)
         const ticket = buildTicket(item, recordId)
@@ -1471,9 +1593,17 @@ export function createFeishuSource (options = {}) {
    * @param {{ seen: any, live: Set<string>, created: any[], updated: any[] }} book
    * @param {AbortSignal} [signal]
    */
-  async function scanSheet (table, book, signal) {
-    const { seen, live, created, updated, disappeared } = book
-
+  /**
+   * 读一遍电子表格的裸值 + 表头 + 行。
+   *
+   * 扫描（`scanSheet`）和回填（`writeSheetResult`，工单 #22）都必须走这一个函数：
+   * 两处各读一份、各认一次列，就会出现「按 A 列认、往 B 列写」这种对不上却看起来
+   * 都对的错位 —— 而电子表格回填正是靠「列位置」写值的，错一列就是写到别人格子里。
+   *
+   * @param {{ kind: 'sheet', spreadsheetToken: string, sheetId: string }} table
+   * @param {AbortSignal} [signal]
+   */
+  async function readSheetValues (table, signal) {
     // 读值接口的 range 是 **URL path 的一段**，形状 `{sheetId}!A1:M500`。
     // `!` 与 `:` 必须保持原样（整段编码了飞书不认），只有 sheetId 自身需要编码 ——
     // sheetId 里绝不会出现 `!` 或 `:`，所以分开拼是安全的。
@@ -1486,10 +1616,6 @@ export function createFeishuSource (options = {}) {
     )
 
     const values = Array.isArray(payload?.data?.valueRange?.values) ? payload.data.valueRange.values : []
-    if (values.length === 0 && typeof options.log === 'function') {
-      options.log('feishu 电子表格读回空表', { sourceId, sheetId: table.sheetId })
-    }
-
     const header = locateSheetHeader(values, { headerRow: sheetHeaderRow, columns: sheetColumns })
     const rows = parseSheetRows({
       values,
@@ -1498,6 +1624,117 @@ export function createFeishuSource (options = {}) {
       idColumn: sheetIdColumn,
       extractScreenshots,
     })
+    return { values, header, rows }
+  }
+
+  /**
+   * 电子表格回填（工单 #22）：把「是否处理 / 处理结果 / 处理日期」写回那一行。
+   *
+   * 与多维表格的差别只有一条，但它决定了整个写法：电子表格**没有 record_id**，
+   * 只有「第几行」。而行号会漂移 —— 人在上面插一行，所有票都往下挪一格。
+   * 所以：
+   *
+   * 1. **每次都重新读表定位，缓存任何行号都是错的**（这一票能花几十分钟，
+   *    期间人插一行的概率不低）。
+   * 2. 定位靠**身份列的值**（`sh-seq-<序号>` / `sh-row-<行号>`），
+   *    和扫描用的是同一套 `parseSheetRows`，不会算两遍。
+   * 3. 认列靠 `locateSheetHeader`，和扫描共用同一份别名映射（工单 #21 收口的那份）。
+   *
+   * 写值用 `values_batch_update` 一次提交三格：三列在表里未必相邻，
+   * 逐格 PUT 会变成三个请求、且中间失败会留下「写了一半」的表。
+   *
+   * @param {{ kind: 'sheet', spreadsheetToken: string, sheetId: string }} table
+   * @param {string} recordId
+   * @param {{ onlyResult: boolean, status: string, handledAt: number, result: object }} input
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<import('../../contracts/ticket-source.js').WriteBackReceipt>}
+   */
+  async function writeSheetResult (table, recordId, input, signal) {
+    const { onlyResult, status, handledAt, result } = input
+
+    const { header, rows } = await readSheetValues(table, signal)
+    const target = rows.find((row) => row.recordId === recordId)
+    if (!target) {
+      // 行被删了 / 序号被改了。这不是「再试一次就好」：not-found 在 errors.js 里
+      // 属于不可重试，标对分档，免得调度器每次启动都对着同一张表再撞一遍（#08）。
+      return {
+        written: false,
+        retryable: false,
+        errorKind: 'not-found',
+        note: `这张电子表格里已经找不到「${recordId}」那一行了（可能被删掉，或序号列被改过）。`
+          + '本次不回填，票本身已处理完。要留痕就手工在表里补一行，或者把这张票 recordId 记下来另存。',
+      }
+    }
+
+    // 要写哪几列：失败票只写「处理结果」（工单 #14），成功票写三列。
+    const fields = onlyResult ? ['result'] : ['status', 'result', 'handledAt']
+    const missing = fields.filter((field) => header.columns[field] === undefined)
+    if (missing.length > 0) {
+      const names = missing
+        .map((field) => (field === 'status' ? '“是否处理”' : field === 'result' ? '“处理结果”' : '“处理日期”'))
+        .join('、')
+      return {
+        written: false,
+        retryable: false,
+        errorKind: 'unsupported',
+        note: `这张电子表格的表头里没有${names}列，本次不回填（票本身已处理完）。`
+          + `表里实际的列名：${header.headers.join(' / ') || '（空）'}。请把列名改成上面这些，`
+          + '或用 match.sheetColumns 指明实际叫法，或把 writeBack 关掉退化成只读。',
+      }
+    }
+
+    // 处理日期写成人能读的日期文本，而不是毫秒时间戳：
+    // 日期格式的单元格，飞书两种都收；文本格式的单元格只会把 1735689600000
+    // 原样显示成一串数字。写文本在任何一种情况下都不难看。
+    const cellOf = {
+      status,
+      result: result.result,
+      handledAt: normalizeSheetDate(handledAt),
+    }
+
+    const valueRanges = fields.map((field) => {
+      const letter = columnLetter(header.columns[field])
+      const rowNumber = target.rowNumber
+      return {
+        range: `${table.sheetId}!${letter}${rowNumber}:${letter}${rowNumber}`,
+        values: [[cellOf[field]]],
+      }
+    })
+
+    try {
+      await apiCall(
+        `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(table.spreadsheetToken)}/values_batch_update`,
+        { method: 'POST', body: { valueRanges }, signal },
+      )
+    } catch (error) {
+      // 只读权限是最容易踩的一脚：读票只要 `sheets:spreadsheet:readonly`，
+      // 写值要 `sheets:spreadsheet`（读写）。少这一档时读得好好的、一到回填就报错，
+      // 而且报错码跟「没权限」混在一起，不说清楚没人能想到是权限档位的问题。
+      if (error instanceof PipelineError && error.kind === 'auth') {
+        return {
+          written: false,
+          retryable: false,
+          errorKind: 'auth',
+          note: '写入被飞书拒绝了：应用对这张电子表格只有读权限。'
+            + '去开放平台 →「权限管理」→ 把「电子表格」的权限从只读（sheets:spreadsheet:readonly）'
+            + '改成读写（sheets:spreadsheet）→ **创建版本并发布**（不发布版本，权限不生效）→ '
+            + '再确认表里把应用加成了「可编辑」协作者。'
+            + `飞书原话：${error.message}`,
+        }
+      }
+      throw error
+    }
+
+    return { written: true, fields: fields.map((field) => header.headers[header.columns[field]] ?? field) }
+  }
+
+  async function scanSheet (table, book, signal) {
+    const { seen, live, created, updated, disappeared } = book
+
+    const { values, header, rows } = await readSheetValues(table, signal)
+    if (values.length === 0 && typeof options.log === 'function') {
+      options.log('feishu 电子表格读回空表', { sourceId, sheetId: table.sheetId })
+    }
 
     for (const row of rows) {
       const recordId = row.recordId
@@ -1755,39 +1992,43 @@ export function createFeishuSource (options = {}) {
     }
 
     // 缺省值在这里落一次，别让调用方各自拼：契约说「status 缺省 是、handledAt 缺省当前时间」。
+    const onlyResult = result.onlyResult === true
     const status = typeof result.status === 'string' && result.status.trim().length > 0
       ? result.status.trim()
       : '是'
     // 处理日期：飞书日期字段接受毫秒时间戳数字，直接传数字，传格式化字符串反而要按表时区猜。
     const handledAt = result.handledAt === undefined ? now() : Number(result.handledAt)
-    if (!Number.isFinite(handledAt) || handledAt <= 0) {
+    // onlyResult 时**不校验日期**：失败票本来就不写日期那一列，调用方也不必给。
+    if (!onlyResult && (!Number.isFinite(handledAt) || handledAt <= 0)) {
       throw new PipelineError('invalid-input', `回填的处理日期不是合法毫秒时间戳：${String(result.handledAt)}`)
     }
 
     const table = await resolveTable(signal)
 
-    // 电子表格分支不做回填（首版范围见 feishu-sheet-source.md §1.2、ADR-0005 决策）。
-    // 必须在这里显式挡住：`table.appToken` / `table.tableId` 在 sheet 分支上根本不存在，
-    // 继续往下拼会得到 `/bitable/v1/apps/undefined/tables/undefined/records/sh-seq-3`
-    // —— 一个必然 404 的请求，还会被当成可重试故障反复重试。
+    // 电子表格回填（工单 #22）：走自己的那一套。
+    // 多维表格是按 `record_id` PUT 一条记录，电子表格没有 record_id 这层概念 ——
+    // 它只有「第几行第几列」，而**行号会漂移**（人在上面插一行，所有票都往下挪一格）。
+    // 所以这里不复用多维表格那段代码，而是重新读一遍表、按身份列重新定位目标行。
     if (table.kind === 'sheet') {
-      return {
-        written: false,
-        // 结构上不支持，不是「再试一次就好了」：标成不可重试，
-        // 调度器才不会在每次启动补偿时对着同一张表再撞一遍（#08）。
-        retryable: false,
-        errorKind: 'unsupported',
-        note: '这张工单表是飞书「电子表格」，首版只支持从电子表格读票、不支持回填'
-          + '（多维表格才回填「是否处理 / 处理结果 / 处理日期」三列）。票本身已处理完；'
-          + '要回填就把工单表换成多维表格，或把 writeBack 关掉。',
-      }
+      return writeSheetResult(table, id, { onlyResult, status, handledAt, result }, signal)
     }
 
-    const fields = {
-      [FEISHU_COLUMNS.status]: status,
-      [FEISHU_COLUMNS.result]: result.result,
-      [FEISHU_COLUMNS.handledAt]: handledAt,
-    }
+    // 失败票回填（工单 #14）：只写「处理结果」这一列。
+    // 为什么不写另外两列：「是否处理」写成「是」会让人以为处理完了，可这票根本没成；
+    // 「处理日期」在飞书里叫「处理日期」，语义是「处理完的那天」，没完就不该有值。
+    //
+    // 列名走 `activeColumns()`（工单 #21）：**必须与扫描时那份映射是同一份**，
+    // 否则读「缺陷描述」、写「问题描述」，看起来都对，实际错位。
+    // 这里不依赖 scan 先跑过 —— 直接 `resolveBitableColumns` 拿缓存（同一轮只会打一次接口）。
+    await resolveBitableColumns(table, signal)
+    const cols = activeColumns()
+    const fields = onlyResult
+      ? { [cols.result]: result.result }
+      : {
+          [cols.status]: status,
+          [cols.result]: result.result,
+          [cols.handledAt]: handledAt,
+        }
     const written = Object.keys(fields)
 
     try {
@@ -1798,11 +2039,14 @@ export function createFeishuSource (options = {}) {
     } catch (error) {
       // 只有「表里没这几列」退化成只读回执；其余（网络 / 鉴权 / 限流 / 参数）照样抛。
       if (isFieldMissingError(error)) {
+        const wanted = onlyResult
+          ? `「${cols.result}」这一列`
+          : `「${cols.status} / ${cols.result} / ${cols.handledAt}」这几列`
         return {
           written: false,
           retryable: false,
           errorKind: 'unsupported',
-          note: `工单表里没有「${FEISHU_COLUMNS.status} / ${FEISHU_COLUMNS.result} / ${FEISHU_COLUMNS.handledAt}」这几列，本次不回填（票本身已处理完）。`
+          note: `工单表里没有${wanted}，本次不回填（票本身已处理完）。`
             + `请确认表结构，或关掉 writeBack 退化成只读：${error instanceof Error ? error.message : String(error)}`,
         }
       }
@@ -1907,6 +2151,11 @@ export function feishuOptionsFromMatch (match) {
   }
   if (m.sheetColumns && typeof m.sheetColumns === 'object' && !Array.isArray(m.sheetColumns)) {
     options.sheetColumns = m.sheetColumns
+  }
+  // 多维表格的列名覆盖（工单 #21）。和 `sheetColumns` 分成两个键只是为了让校验能给出
+  // 不同的字段白名单提示，实际用法一模一样：写「语义字段 → 表里那个名字」。
+  if (m.columns && typeof m.columns === 'object' && !Array.isArray(m.columns)) {
+    options.columns = m.columns
   }
 
   return /** @type {any} */ (options)

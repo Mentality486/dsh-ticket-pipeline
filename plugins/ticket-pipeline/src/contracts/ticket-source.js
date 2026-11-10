@@ -40,6 +40,9 @@ import { fingerprintOf } from './types.js'
  * @property {string} [status] `是否处理` 列要写的值，缺省 `是`
  * @property {string} result `处理结果` 列要写的内容
  * @property {number} [handledAt] `处理日期` 的时间戳（毫秒），缺省取当前时间
+ * @property {boolean} [onlyResult] 只写 `处理结果` 列，**不碰 `是否处理` 与 `处理日期`**
+ *   （工单 #14：失败的票也要能在表里留一句「卡在哪」，但不能把「是否处理」改成「是」
+ *   —— 那会让人以为处理完了。日期是「处理完成日」，没完成就不该有。）
  */
 
 /**
@@ -48,7 +51,8 @@ import { fingerprintOf } from './types.js'
  * `written:false` 有两种完全不同的处境，适配器**必须**用 `retryable` 分开说 ——
  * 内核据此决定「留着待办下次启动再试」还是「当场放弃、让人去改配置」：
  * - `retryable: false`（配置/结构问题，例如往飞书同步表里写、表里少一列、
- *   电子表格首版不支持回填）：再试一百次也是同一个结果，只会让每次启动都撞一遍。
+ *   电子表格只有读权限、要回填的那一行已经被删）：再试一百次也是同一个结果，
+ *   只会让每次启动都撞一遍。
  * - `retryable: true`（网络、限流、鉴权过期这类临时问题）：值得再试。
  *
  * 不标 `retryable` 时内核按「不可重试」处理 —— 宁可少试一次，

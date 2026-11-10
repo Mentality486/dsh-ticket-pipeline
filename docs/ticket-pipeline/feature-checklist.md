@@ -15,9 +15,9 @@
 > 链接贴进 `match.appToken` 会被 `get_node` 里硬写的 `obj_type: 'bitable'` 判成「不是多维表格」，
 > 一张票都扫不出来，报错还指向「权限」这个错误方向。现在适配器按表型分派（`sheet` 走电子表格
 > 分支、`bitable` 走原来的路、老服务端不返回类型时按多维表格兜底），新增 9 个 `match.*` 配置键、
-> 面板多一组「飞书电子表格」，`validateProject` 从「二选一」改成「四选一」放行。**首版只读不写**：
-> 电子表格的 `writeResult` 退化成只读回执（不去拼一个必然 404 的 bitable 地址），红字会说明
-> 「要回填就把工单表换成多维表格，或把 writeBack 关掉」。同轮还补齐了「不知道怎么填」的字段说明、
+> 面板多一组「飞书电子表格」，`validateProject` 从「二选一」改成「四选一」放行。首版只读不写，
+> **已于 2026-11-10 补齐回填（工单 #22，见 §1.23）**：`values_batch_update` 写三格、按序号列重新定位行、
+> 四类失败各有说法。同轮还补齐了「不知道怎么填」的字段说明、
 > 并给 `repo.path` 加了「选择目录」按钮（接宿主 `uiWorkspace.pickDirectory()`），见 §1.21。
 > `dev-run` 384 → **451/451**、`feishu-checks` 60 → **80** 条、`client-smoke` 113 → **175 条**、
 > `client-check` 面板项目字段 29 项与宿主 descriptor 对得上。此前同日**设置面板「添加项目」失败修好**（原来点「+ 添加项目」会立刻发一笔
@@ -28,14 +28,14 @@
 > 此前同日**`appToken` 贴整条表格链接真的够了**（`parseBitableUrl` 挪进 `src/contracts/types.js`，
 > 配置校验与飞书适配器共用：从 `?table=` 啃出 `table_id`、`?view=` 啃出 `view_id`，显式 `tableId` 仍优先；
 > 此前只有适配器认得这个写法，用户在配置里只贴一条链接会被 `validateConfig` 拦在启动前），
-> `dev-run` **384/384**、`feishu-checks` 58 → **60** 条（都是那一轮的值；电子表格支持后现为 **451/451** 与 **80** 条）；此前同日「配置页改成页签式、视觉对齐宿主设置页」
+> `dev-run` **384/384**、`feishu-checks` 58 → **60** 条（都是那一轮的值；电子表格支持后现为 **482/482** 与 **93** 条）；此前同日「配置页改成页签式、视觉对齐宿主设置页」
 > （项目 / 参数 / 凭据 / 体检四个页签、一次只画一页、下划线式页签、卡片改用宿主 `settings-card-*` token 并去掉阴影、拆掉三层套娃、
 > 面板不再铺灰底，见 §1.17），`client-smoke` 105 → **113 条**，`dev-run` **376/376** 全绿；
 > 此前 2026-11-06 新增**关键节点流程日志（时间线）**（票据 `timeline` 17 节点表、9 主站 ①–⑨、
 > `pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」，见 §1.16），自测 **376/376** 全绿；
 > 此前同日新增**配置页 UI/UX 大改造**（Label 置顶、高级参数折叠、凭据统一走顶部保存、
 > 项目清单可增删、卡片化 + Switch 开关，顺手修掉 `[object Object]` 渲染 bug，见 §1.15），
-> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组，现为 24 键 / 4 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），该轮自测 **363/363** 全绿（后补时间线，现为 451/451）；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**2026-11-09 已实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`；当时估的 5 人日最终没按这个口径走，一天内做完，见 §1.21）
+> `client-smoke` 94 → **105 条**；此前同日新增四项改造 —— **处理完回填工单表**（`TicketSource.writeResult` 唯一写入口 + `writeBack` / `writeBackStatus`）、**处理完保留会话**（`ExecResult.sessionId` + `keepSession`）、**只提交 agent 真正改过的文件**（`createBaseline` 用 `git stash create` 拍基线，脏工作区也能跑，`assertCleanCheckout` 删除）、**设置面板补齐**（`projects` 子树可编辑 + 第 3 个 Remote 方法 `ticketPipeline.projects()`，配置变 33 键 / 7 组，现为 24 键 / 4 组）、**选择分支**（`repo.baseBranch` / `repo.targetBranch` 从手打改成带候选的输入框，第 4 个 Remote 方法 `ticketPipeline.branches()`，见 §1.12）、**设置面板瘦身**（项目卡片可收起、缺省只留 8 个常改字段、「显示全部字段」开关收高级项，见 §1.13），**上线加固**（5 条阻断项 + 4 条重要项：适配器名强校验、验证命令超时与取消、敏感名单 8 类 41 条、`.git`/profile 篡改自检、`pendingEffects` 事后动作补偿、回填失败进通知、租约诚实化，见 §1.14），该轮自测 **363/363** 全绿（后补时间线，现为 482/482）；此前同日新增「插件版本自检」（`src/core/plugin-version.js` + `pipeline_doctor` 第 5 节：比 profile 里声明的源码目录与安装副本的**文件内容**，不落后才静默，落后就给出同步命令），自测 294/294；此前同日新增「本地提交」改造（交付形态改为在项目工作区的检出里做一次真实本地提交，远程 GitLab draft MR 降级为 `repo.gitlab.enabled: true` 才走的可选出口）+ 当晚的「改代码落点」改造（`isolateWorktree` 缺省 `false`：直接在项目工作区的检出里改，检出脏也能跑；`true` 才每票开隔离 worktree）+ 改动收集改走 `git -z`（未跟踪新文件、重命名、中文名/空格名、`.agents/worktrees` 污染四个坑一并修掉），自测 285/285；2026-11-05 深夜的「项目工作区」改造（票 → 项目 → 宿主 Workspace 登记，会话 cwd = 工作区根）自测 262/262；再此前 `26f0391` 把收窄开关推广到三个源、「待修改项目」列不再丢、飞书截图白名单可配，连同 `5b94a17` 的 agent 侧四项，自测 242/242。同日另出「飞书电子表格支持」设计（**2026-11-09 已实施**，见 `docs/ticket-pipeline/feishu-sheet-source.md` 与 `docs/adr/0005-飞书电子表格源按表型分派.md`；当时估的 5 人日最终没按这个口径走，一天内做完，见 §1.21）
 > 口径声明：**本文只写代码里真实存在且已验证的东西**。凡是「打算做」「应该做」的一律进第 9 章「未完成与缺陷清单」，不混进完成项。所有行号取自本文生成时的源码。
 
 ---
@@ -66,7 +66,7 @@
 | --- | --- | --- | --- | --- |
 | ① | AI 同时监控多个平台（金山共享 Excel、飞书）上的工单表，检测内容变化 | **✅ 可用** | 飞书源 2 470 行（`index.js` 1 891 + `sheets.js` 579），已接真实表（appToken `RZZQbY4SkaY6z0shZaBcVpQCnhh` / table `tblWhRSGf0osJqrE`，79 条记录实测），**多维表格与电子表格都认**（按表型分派，见 §1.21）；金山源 1 660 行（xlsx/zip 自解 OOXML）；webform/mock 演示源 | 金山缺开放平台取数通道，只能用注入的 `fetchSheet`；飞书「收票状态值」与真实表语义不一致，已做成可配（`statusValues`）；电子表格首版**只读不回填** |
 | ② | 可以在插件中配置对应工单的项目本地仓库地址 | **✅ 可用** | `projects[].repo.path` / `remote` / `baseBranch` / `targetBranch` / `gitlab`（enabled / baseUrl / projectId / remote），由 `locator-table`（187 行）把工单 projectId 映射到仓库；`repo.gitlab` 已能在配置校验层存活（`5b94a17`），`gitlab.enabled` 是远程 MR 出口总开关、缺省 `false` | 无（这项已补齐） |
-| ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `FEISHU_COLUMNS`（描述/操作流程/截图/模块/优先级/发现日期等）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② ~~金山表该列的值被丢弃~~ → **已修（`26f0391`）**：金山表该列的值现在进 `ticket.targetProject` 并写进任务书（不顶 `projectId` —— 那是存储主键的一半，而这一列是人手填的自由文本）；③ ~~URL 形态截图默认全拒、无配置键~~ → **已修（`26f0391`）**：新增 `match.allowedImageHosts` 白名单配置键（缺省仍为空 = 一律拒绝，安全闸门只有人能打开） |
+| ③ | 解析每张工单中的待修改项目、问题描述、操作流程及截图 | **⚠️ 部分** | 飞书列映射 `contracts/feishu-columns.js` 的 13 个语义字段 + 两套表型共用 `mapColumns()` 别名解析（描述/操作流程/截图/模块/优先级/发现日期等；多维表格每轮先读 `/fields` 的真实字段名，见工单 #21）；金山列别名表 `xlsx.js:34-42`（含「待修改项目」）；截图三形态（附件 / 路径 / URL）都已建模并作为 `ImageBlock` 进消息 | ① 飞书表**没有「待修改项目」列**（实测列名只有：序号/发现部门/问题描述/发现日期/模块/操作流程/截图/优先级/是否处理/处理人/处理结果/处理日期）；② ~~金山表该列的值被丢弃~~ → **已修（`26f0391`）**：金山表该列的值现在进 `ticket.targetProject` 并写进任务书（不顶 `projectId` —— 那是存储主键的一半，而这一列是人手填的自由文本）；③ ~~URL 形态截图默认全拒、无配置键~~ → **已修（`26f0391`）**：新增 `match.allowedImageHosts` 白名单配置键（缺省仍为空 = 一律拒绝，安全闸门只有人能打开） |
 | ④ | 自主规划并执行修复 | **⚠️ 部分** | `executor-agent` 真实现：先确保**项目工作区**（`repo.path` 目录在宿主 `workspaceRegistry` 里登记，一个项目一条，多票共用）→ `agents.create({meta:{cwd: workspacePath}})` + 挂 preset + （仅 `isolateWorktree: true` 时）`workingDirectory.set(worktreePath)` + `attachSession` 归属工作区 + followup + `git diff --name-status` 收集改动 + 敏感文件过滤；沙盒票 `sandbox\|rec-mock-001` 已由 agent 真改出 `src/pagination.js`，当轮开成 MR !1（**本轮改成在工作区检出里做本地提交**，见 §1.2） | 真实业务票（pms）只在配额上卡过一次；两处宿主侧雷已修（`5b94a17`：`{{model}}` 补齐、preset 缺服务硬失败），但**尚未在真实 pms 票上完整跑绿一次**（上游 workbuddy 429 配额限制，非插件缺陷） |
 | ⑤ | 完成后对问题功能进行测试，自动提交 PR | **✅ 基本可用** | 真跑出 GitLab draft MR `http://gitlab.example.com/mk/end/ticket-pipeline-sandbox/-/merge_requests/1`（sha `634777aa…`，changes_count=1，源分支 `ticket-sandbox-rec-mock-001-r1`）；验证命令从 `projects[].verify.build/test` 注入，`verify.test` 真跑出 exit 0。**本轮起默认交付形态改成工作区检出里的本地提交**（`commitLocally` → `ExecResult.commit = {sha, branch, files}`），远程 draft MR 变成 `repo.gitlab.enabled: true` 才走的可选出口 | 没配验证命令时 `phase` 仍是 `done`（契约里 `skipped` 是合法成功路径），现在把验证结论写进提交说明以免误读（`5b94a17`）；要彻底区分得新增 phase，属契约变更 |
 | ⑥ | 通过微信 Clawbot 推送或 QQ 邮箱推送（先实现）完成通知，收到后看 PR 详情，人工验证后手动合并 | **✅ QQ 邮箱可用；微信走中继** | QQ 邮箱零依赖 SMTP 适配器（574 行）已真实发信成功（traceId `<mw319ltk.47861f8c479221d3@qq.com>`）；PushPlus 适配器 171 行 | 插件**不直连微信**：微信消息经 PushPlus 的 `clawbot` 渠道中继，需配 `pushplus.token`；PushPlus 回执未消费 |
@@ -409,7 +409,7 @@ skipped 的首句要说「待人工验证」（不要用否定式收尾）。`fe
 `branches()` 与 `projects()` 用的是同一次 `config.projects` 遍历，index 一定对得上。
 
 **验收**：`dev-run` 新增 6 条断言（解析 / 排序去重 / 真跑通 / 四种失败不抛 / 游离 HEAD / 宿主 remote 按项目隔离），
-自测 **325/325** 全绿（当轮；上线加固 + 时间线后现为 **451/451**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
+自测 **325/325** 全绿（当轮；上线加固 + 时间线后现为 **482/482**）；`client-check` 的 `kind` 白名单加了 `branch`，Remote 描述符 4 个方法一致；
 真机验证 `listBranches` 在 `D:/WorkSpace/mgiot-pms`（当前 `v2.x`，候选 `v2.x`/`master`/`workbuddy/v2-x-8ef29a33`/`main`）、
 本仓库（`v0.0.1`/`main`）、`.repos/tp-sandbox`（`main` + 3 个 worktree 分支）上都返回正确清单，
 不存在的路径返回 `fatal: cannot change to ...`。
@@ -436,7 +436,7 @@ skipped 的首句要说「待人工验证」（不要用否定式收尾）。`fe
 `.tp-toggle` 一把捞、断言「配置分组有 3 个折叠标题」；项目卡片与卡内分组加进来后变成 7 条，
 断言就红了，而且红得看不出是哪儿错。各认自己的类名，断言才能稳定表达「配置分组有 3 个」。
 
-**验收**：`dev-run` 363/363（当轮；时间线后现为 451/451）、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
+**验收**：`dev-run` 363/363（当轮；时间线后现为 482/482）、`client-check` 全绿（21 项仍对得上、Remote 4 个方法一致）、
 `client-smoke` **85 → 94 条**（新增「卡片有折叠开关 / 默认展开 / 收起后不再渲染字段 / 收起后仍显示项目名 /
 aria-expanded 变 false / 再点一次展开回来 / 卡内有可折叠分组」7 条）。
 
@@ -467,7 +467,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 `ask` 在无头场景 fail-closed，会让 agent 的每一步工具调用都失败。所以只能退回 `never` 并打一条 warn
 （`executor-agent/index.js:1152`）。兜底只有 git 白名单 + 提交前篡改自检，**不是硬隔离**。
 
-**新增断言**：`dev-run` 325 → **363/363**（当轮；第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条；时间线后现为 451/451）；
+**新增断言**：`dev-run` 325 → **363/363**（当轮；第 16b 节「事后动作补偿（`pendingEffects`）与租约诚实化」14 条；时间线后现为 482/482）；
 `gitlab-checks` 78 → **86**（敏感名单覆盖与不误伤、`.git/hooks` 与 `cordis.patch.yml` 篡改判失败、无 `readFile` 跳过、
 白名单放行自检要用的 `rev-parse` 形态、`blockedFiles` 可见、受保护路径边界）；
 `wps-checks` 25 → **34**（下载通道超时/取消/字节上限/逐跳重定向校验、`scan` 传 signal）；
@@ -496,7 +496,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 **自测**：`client-smoke` 94 → **105 条**（新增：凭据每行不再有「保存」按钮、清单无 `[object Object]`、
 「+ 添加项目」/「删除」按钮、`role="switch"` 语义、布尔不落回原生 checkbox、全页只一颗主按钮）；
-`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**（当轮；时间线后现为 451）、`chain-smoke` **11** 全绿。
+`client-check` ✅（descriptor 33 叶子 / 7 组、Remote 4 方法、面板 21 项对得上）、`dev-run` **363**（当轮；时间线后现为 482）、`chain-smoke` **11** 全绿。
 
 ---
 
@@ -526,9 +526,10 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 **验收**：`dev-run` 第 **16c** 节 13 条断言全绿（主站顺序 / `at`/`ok`/`label` 合法性 / 相邻 `at` 单调 /
 `onFlow` 报的 ④ 进时间线 / 失败站记 ✗ / 连续合并 / 80 条封顶 / 重新入队继承 / 人工重置不清空 /
 `pipeline_status` 渲染「已 1 分 35 秒没动」/ 终态与 needs-info 文案 / 返回体四字段 / 老票无 undefined）；
-累计 **376/376**（当轮；补 appToken 链接解析 2 条后现为 **451/451**），26 小节。真实链路探针跑一轮 mock tick 得 11 条时间线（④ 因 mock 不上报而缺席，合法），
-渲染探针给出「现在停在第 ⑥ 站」与 `station/stalledForMs` 返回值。详见 `README.md` §5.2.1、
-`user-guide.md` §5.2.1、`architecture.md` §11.4、`operation-flow.md` §1/§7。
+累计 **376/376**（当轮；补 appToken 链接解析 2 条后现为 **482/482**），26 小节。真实链路探针跑一轮 mock tick 得 11 条时间线（④ 因 mock 不上报而缺席，合法），
+渲染探针给出「现在停在第 ⑥ 站」与 `station/stalledForMs` 返回值。详见 `user-guide.md` 的「日常循环 →
+为什么这么慢、卡在哪一站」、`architecture.md` §11.4、`operation-flow.md` §1/§7。
+（2026-11-10 起 `README.md` 已瘦成 42 行的入口页，不再有 §5.2.1 这类章节号。）
 
 ---
 
@@ -548,7 +549,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 
 | 环 | 落点 |
 | --- | --- |
-| 页签导航 | 新增 `TABS = [项目 / 参数 / 凭据 / 体检]`、`TAB_KEY = 'ticket-pipeline:open-tab'`、`readTab()` / `writeTab(key)`；`aria-selected` + `role="tablist"`。**缺省停在「项目」** —— 它是主线（一张工单表绑一个仓库），参数与凭据是一次性调好的配角 |
+| 页签导航 | 新增 `TABS = [项目 / 参数 / 凭据 / 体检]`、`TAB_KEY = 'ticket-pipeline:open-tab'`、`readTab()` / `writeTab(key)`；`aria-selected` + `role="tablist"`。**缺省停在「项目」** —— 它是主线（一张工单表绑一个仓库），参数与凭据是一次性调好的配角。**（工单 #16 之后变成五个页签、缺省改「运行」，见本文 §1.22）** |
 | 一次只画一页 | 主渲染改成 `panels = { projects, params, creds, doctor }` + `panels[activeTab]`，非当前页签的子树**根本不渲染**（不是藏起来），一屏字数从 1320 降到 601 / 148 / 467 / 128 |
 | 页签角标 | `tabBadge(key)` 只在真有未保存/待修时才挂数字：参数页 = 未保存的配置项数（有校验错则显示错误数并转红），凭据页 = 待提交的凭据条数，项目页 = 未保存的项目改动数，体检页 = `problems.length` |
 | 顶部工具条 | `TABS` 在左、`tp-bar-actions`（待修 / 未保存 / 放弃改动 / 重新载入 / 保存）在右，**吸顶**。「体检」从按钮变页签后工具条不再放重复入口 |
@@ -569,7 +570,7 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 非当前页签不渲染内容；原有依赖「四块同屏」的断言按页签重校准 —— 参数页输入控件门槛 7 → 6，
 因为凭据的 5 个密码框不再同屏；「项目卡内可折叠分组」改用 `tp-sec-toggle` 计数）。
 `client-check` ✅（descriptor 33 叶子 / 7 组、schema 信封 71 节点 33 叶子、Remote 4 方法、面板 21 项对得上）、
-`dev-run` **451**（当轮 384；电子表格支持后为 404）、`chain-smoke` **11** 全绿。
+`dev-run` **451**（当轮 384；22 张工单落地后为 **482**）、`chain-smoke` **11** 全绿。
 
 ---
 
@@ -638,7 +639,8 @@ agent 能改 `.git/hooks` 与插件 profile、终态与「事后动作」（回�
 **配置页核对结论（全新用户视角）**：
 
 - `CONFIG_FIELDS` **24 个叶子 / 4 组**（行为 / agent 与模型 / 通知 / 高级；当轮是 33 个 / 7 组，后来把 `safePageRun`、`goneAfterScans`、`concurrency`、`leaseHeartbeatSeconds`、`fetchBeforeCreate` 收成内置常量，删掉 `pushplus.token`、`pushplus.template`、`qqmail.port`、`qqmail.secure`、`logLevel`）；`getConfigDescriptor()` 与面板三方一致（`client-check` 守）。
-- 项目字段 descriptor 里 **25 个**，面板只画 **21 个**。缺的 4 个：`match.appToken`（含明文密钥，宿主不下发，面板只显示「已配置（前 4…后 4）」）、`repo.gitlab.baseUrl` / `repo.gitlab.remote` / `repo.gitlab.projectId`（只能改配置文件）。**这是设计而非缺陷，但新用户不知道**，已在 `docs/ticket-pipeline/user-guide.md` §3.0.1 写明。
+- 项目字段 descriptor 里 **25 个**，面板只画 **21 个**。缺的 4 个：`match.appToken`（含明文密钥，宿主不下发，面板只显示「已配置（前 4…后 4）」）、`repo.gitlab.baseUrl` / `repo.gitlab.remote` / `repo.gitlab.projectId`（只能改配置文件）。**这是设计而非缺陷，但新用户不知道**。
+  **（2026-11-10 已改）：**现在 descriptor 是 **34 个深层路径**、面板画 **33 个**，缺的那一个只有 `match.appToken` —— 而且它不再是「只能手改」：项目卡片里有「工单表链接」，贴整条 URL、宿主解析后落盘，明文不进浏览器（工单 #11）。`repo.gitlab.*` 三个字段也补上了可填输入框，收进「远程 MR（实验性）」组（工单 #19）。三处数字的口径差异见 [`reference/config.md`](reference/config.md) 开头那张表。
 - 空清单文案原来写「如果当前宿主还不支持通过设置通道写 `projects`，保存时会把宿主原话显示出来 —— 那就改 profile 的 `cordis.patch.yml`」，**对现在的面板已经过时**，改成「点上面的「+ 添加项目」加一个：先在面板上垫一张空卡片，填完右边这些必填项，再点顶部「保存」。」+「一个项目 = 一张工单表 + 一个本地 git 检出。最少要填 `name`（唯一）、`match.platform`、`repo.path`；飞书来源还要手填 `match.appToken`」。
 
 **自测**：`dev-run` 378 → **382**（+4：凭据描述器「服务晚于 apply() 挂上也能用」、doctor 区分「服务没挂上 / 这个 ref 没配」、doctor 必须说出总开关、「恢复完必须能被 pickNext 捡起来」并反向断言「工作区有效时不得清坐标」）；`feishu-checks` 59 → **60**（同步表回执）。
@@ -689,7 +691,7 @@ bitable / sheet 是**同一平台上两种文档类型**，硬拆成两个 platf
 **代码落点**：
 - 新增 `plugins/ticket-pipeline/src/adapters/source-feishu/sheets.js`（**579 行纯函数**）：列名别名表
   `SHEET_COLUMN_ALIASES`（飞书 12 列 + 金山别名，另加处理人/处理结果/处理日期）、`REQUIRED_SHEET_FIELDS`
-  （`description` + `status` 缺一不可）、`resolveSheetColumns` / `mergeSheetAliases`（`match.sheetColumns` 只覆盖不替换）、
+  （`description` + `status` 缺一不可）、`resolveSheetColumns` / `mergeSheetAliases` / `mapColumns`（`match.sheetColumns` 与 `match.columns` 都只覆盖不替换；两套表型共用同一份解析器）、
   `columnLetter` / `columnIndex` / `parseSheetRange` / `buildValueRange`、`resolveWorksheet`（按 id / 名字 / 第一张可见）、
   `locateSheetHeader`（**不往下扫表头**）、`cellReader`、`buildRowIdentity`、`sheetPriorityOf`、
   `normalizeSheetDate`（回 `YYYY-MM-DD` 字符串）、`parseSheetRows`（**同轮序号重复直接报错**）。
@@ -711,16 +713,18 @@ bitable / sheet 是**同一平台上两种文档类型**，硬拆成两个 platf
 3. **`docNamePattern` 只用来挑云文档，不再用来过滤数据表名** —— 第四步已经用它挑出唯一那张表，若再拿它过滤
    `tables` 清单会 0 命中（`resolveBitableTableByIdentity(token, signal, false)`）。
 
-**首版范围：只读不回填**。电子表格分支的 `writeResult` 在 `resolveTable` 之后立刻挡掉，返回
+**首版范围：只读不回填**（**2026-11-10 已改，见 §1.23**）。当时电子表格分支的 `writeResult` 在 `resolveTable` 之后立刻挡掉，返回
 `{ written: false, note: '这张工单表是飞书「电子表格」，首版只支持从电子表格读票、不支持回填…' }`。
 不能让它往下拼 —— sheet 分支上 `table.appToken` / `table.tableId` 根本不存在，拼出来是
 `/bitable/v1/apps/undefined/tables/undefined/records/sh-seq-3`，一个必然 404 的请求，还会被当成可重试故障反复重试。
-断言里专门验证了「一个非 GET 请求都不发」。
+当时断言里专门验证了「一个非 GET 请求都不发」。
+**后来发现这个「只读」不只是缺个功能，它会自我放大**：「是否处理」永远停在「处理中」⇒ 下一轮扫描
+把同一张票再收一次。工单 #22 因此把它补上了（`values_batch_update` 三格 + 每次重新定位行）。
 
 **面板与配置说明**（同轮一起做的，见用户第 ②③ 条诉求）：
 - 项目卡片多一组「飞书电子表格」（`PROJECT_SECTIONS` 第 6 组，`onlyFor: 'feishu'`）8 个字段，
   每个都写了「这一格该填什么」；`sheetIdentity`（`seq` / `row`）与 `tableKind`（空 / `bitable` / `sheet`）是下拉。
-- `sheetColumns` 用**一行文本** `description=我的列名, status=我的状态`（对应控件的 `kind: 'columns'`），
+- `sheetColumns`（电子表格）/ `columns`（多维表格）都用**一行文本** `description=我的列名, status=我的状态`（对应控件的 `kind: 'columns'`），
   保存时由 `parseColumnsDraft()` 解析回对象，值里带 `|` 会拆成数组（`seq=序号|编号`）。
 - `sheetName` **只在「工单表」组画一次** —— 金山组和飞书组各画一次会变成两个输入框绑同一个草稿键，
   `client-check` 直接报「重复字段：match.sheetName」。
@@ -733,16 +737,116 @@ bitable / sheet 是**同一平台上两种文档类型**，硬拆成两个 platf
 `client-check` 通过（面板项目字段 29 项与宿主 descriptor 对得上）。
 
 **仍未验证**（别当成已完成）：`docs/ticket-pipeline/feishu-sheet-source.md` §8.2 的四条**人工前置**一条都没做 ——
-①飞书开放平台开 `sheets:spreadsheet:readonly` scope（与多维表格的 `bitable:app:readonly` 是**两套独立**权限）；
-②表格所有者「…」→「添加文档应用」把应用加为协作者（`tenant_access_token` 无法自举，这步只能人做）；
+①飞书开放平台开 `sheets:spreadsheet` scope（**读写**；只读够扫票、回填会被拒，见 §1.23；与多维表格的
+`bitable:app:readonly` 是**两套独立**权限）；
+②表格所有者「…」→「添加文档应用」把应用加为**可编辑**协作者（`tenant_access_token` 无法自举，这步只能人做）；
 ③一张带表头行 + 序号列 + 问题描述列 + 是否处理列的真表；④应用至少有一个云文档 API 权限已开通。
 **真表还没读过一张** —— 在这四条做完之前，不要对外说「电子表格已经在真表上跑过」。
+（回填那条同理：`values_batch_update` 只在假服务端验过，真表上还没写过一格。）
+
+---
+
+### 1.22 设置页第五个页签「运行」：把队列从对话里搬进面板（2026-11-10，工单 #16）
+
+**要解决什么**：面板以前**只能改配置**。想知道「现在跑到哪了、哪张卡住了、失败的那张怎么重来」，
+唯一入口是回对话里敲 `pipeline_status` / `pipeline_scan` / `pipeline_reset` —— 而不知道有这些工具的人
+**根本无从查起**。配置页是「一劳永逸」的地方，人打开它时的第一个问题却往往是运营状态。
+
+**做法（顺序即代码顺序）**：
+1. **工具侧先把「算结果」抽成模块级函数**，这是整票的地基 —— 不抽就只能复制一份，两种口径迟早不一致。
+   `pipeline-status.js` 的 `execute` 主体变成 `export async function collectStatus (options, args)`；
+   同款抽出 `collectReset`（`pipeline-reset.js`）、`collectCancel`（`pipeline-cancel.js`）、
+   `collectScan`（`pipeline-scan.js`，`preflight()` 同时提到模块级）。工具 `execute` 与 Remote 方法**调同一个函数**。
+2. **四个新 Remote 方法**（`descriptors.js` 9 个方法，每参数 `codec` + `strictCodec` 两份）：
+   `status()` / `scan()` / `cancel()` / `reset(recordId, projectId?)`。`reset` 是第二个带参方法。
+   `method()` 的 result 分派表必须补三行，否则 `status`/`scan`/`cancel` 会全落到 `configSnapshot` 的 typeSymbol 上。
+3. **`host.js` 多收四个依赖** `store` / `scheduler` / `gitRunner` / `log`（全可选）；缺了给**人话**
+   （`requireStore()` → 「运行页签没接上存储（store 缺席），status 不可用。这通常是宿主装配没把 store 传进来。」），
+   不是 `TypeError`。`dev-run` 里有只传 `getConfig` + `doctorOptions` 的老用例，不能崩。
+4. **返回体补三个「面板要用、但浏览器里算不出来」的字段**（口径只许在 src 里有一处）：
+   每票 `phaseLabel`（浏览器 bundle 里没有 `PHASE_LABEL`）、每票 `canReset`（`RESETTABLE_PHASES`
+   已 `export`）、整体 `tiers`（`tierCounts()` 的结果，早退分支也要给）。
+   面板**不重算**任何档位或名单，只读这三个字段。
+5. **面板**：`TABS` 加 `{key:'run',label:'运行'}` **放最前**，三处 `readTab()` 缺省值全改 `'run'`，
+   `panels.run` + 兜底 `|| panels.run`（漏了会静默显示项目页）。`RunCard` 只做「看 + 三个动作」：
+   状态行（`已开启` / `关着（enabled=false）` + 圆点）、汇总行、下一个、票列表（`.tp-run-row` 一行一张，
+   点开 `.tp-run-detail` 看最近错误/验证/提交/交付缺项/卡在哪站/工作区/会话）、失败票行尾「重跑」。
+   轮询是**自递归 `setTimeout` 3 秒 × 最多 200 轮**，不用 `setInterval`（自测沙箱没有它）。
+
+**四个只在这一票里踩到的坑**：
+1. **轮询把自测进程吊死**：假 React（`client-smoke.mjs` 的 `makeReact()`）**只执行 effect、从不执行它的
+   cleanup 返回值**，于是 `setTimeout` 永远续期、Node 事件循环不空，`client-smoke` 挂 120 秒像卡死。
+   修法 `timer.unref?.()`（浏览器里 `setTimeout` 返回数字，没有 `unref`，问号调用安全）。
+2. **`useEffect` deps 不能放 `useCallback` 的函数**（`loadRun` 每次渲染都是新引用）⇒ 每渲染一次重读一次队列
+   ⇒ 自测渲染循环停不下来。deps 只放 `[isPage, mounted, activeTab]` / `[runPolling]`。
+3. **页签文案断言不能用 `textOf(node)`**：角标数字会粘进文字（实测 `运行1|项目|…`），
+   要比标签就读 `props.children[0]`；原生标签的 children 也不进 `node.children`（这是
+   「`textOf(option)` 读不到 option 文字」的同一个坑，第 3 次踩）。
+4. **`ns.reset(recordId)` 只传 1 个实参**：`projectId` 是 `acceptsUndefined`，显式传 `undefined`
+   仍会让浏览器侧的「参数个数」校验抛 `expected 2 argument(s), got 1`。
+
+**自测**：`dev-run` 469 → **475**（新增一节 6 条：status 与工具同源、无 store 给人话、
+scan 关着时 `disabled` 且 `tickCalls === 0`、cancel 没票在跑说清楚、reset 把失败票放回 pending、
+reset 不给非终态票重开）；`client-smoke` 175 → 全绿（新增 9 描述符、四方法形状、五页签、
+缺省「运行」、状态行/汇总/票行/角标/展开/三个按钮的点击断言）。`client-check` ✅（9 个方法）。
+
+**没做（票里明确不做）**：监控大盘（图表/趋势）、diff 视图（#05 的文本摘要已够）、实时日志流
+（`host.js` 只有 direct，没有 stream）。
+
+---
+
+### 1.23 电子表格也能回填了：只读不是缺功能，是自我放大的 bug（2026-11-10，工单 #22）
+
+**要解决什么**：电子表格分支的 `writeResult` 从 §1.21 起是**挡板**（返回只读回执）。当时的理由是「多写多错、
+首版先只读」，但这个口子留错了 —— 电子表格的行身份是**「是否处理=处理中」**，而回填正是把那一格改成「是」。
+不写 ⇒ 那一行永远停在「处理中」⇒ **下一轮扫描把同一张票再收一次**，无限重跑。所以「不支持回填」不是少个功能，
+是一个会自己长大的 bug。
+
+**为什么不能照抄多维表格那段**：多维表格按 `record_id` PUT 一条记录，`record_id` 是稳定的。电子表格**没有
+record_id**，只有「第几行第几列」，而**行号会漂移** —— 人在中间插一行，后面所有票都往下挪一格，
+按上次记下的行号写就写到隔壁票上去了。所以回填必须**每次重新读表、按身份列重新定位目标行**。
+
+**做法（顺序即代码顺序）**：
+1. **把读表那一段从 `scanSheet` 里抽成 `readSheetValues(table, signal)`**，返回 `{ values, header, rows }`。
+   扫描与回填**必须走同一个函数** —— 两处各认一次列，迟早变成「按 A 列认、往 B 列写」。
+   它复用 `locateSheetHeader()` + `parseSheetRows()`，于是 `rows[i].rowNumber` 天然就是**人看到的行号**（1-based），
+   定位不需要另写一套。
+2. **`writeSheetResult(table, recordId, input, signal)`**：`rows.find(r => r.recordId === recordId)` 拿到目标行
+   → 按 `header.columns[field]` 反查列字母 → 拼 `valueRanges` → **一次 `values_batch_update` 写三格**
+   （逐格 PUT 是三个请求，中间失败会在表里留下「写了一半」，那比全没写更难查）。
+3. **四种失败各有专属 `errorKind` + `note`**（不共用一个笼统的「回填失败」）：
+   行没了 → `not-found`「找不到那一行（可能被删掉，或序号列被改过）」；
+   缺列 → `unsupported` + 列出**表里实际有哪些列名** + 两条改法（`match.sheetColumns` / 关 `writeBack`）；
+   只有读权限（403/`auth`）→ `auth` + 点名 `sheets:spreadsheet`（**不是** `:readonly`）+「创建版本并发布」+「可编辑协作者」；
+   限流 → 交给 #08 的分档，`retryable` 由 `retryPolicy()` 决定，不在这里自造第二套。
+4. **日期写文本不写时间戳**：`normalizeSheetDate(handledAt)` 给 `YYYY-MM-DD`。直接写毫秒数字，文本格式的
+   单元格会显示一串 `1762…`，看起来像坏了。
+5. **`pipeline_doctor` 加一条「看不见的前置」警告**：读票只要只读权限、写回那三列要读写权限。缺这一档时
+   **读得好好的，票跑完了才在回填那一步失败**，而那时票已经是「完成」，人只会看到表格没更新 ——
+   体检是唯一能在跑之前提醒的地方。只提醒不写表（写一次就能验权限，但体检的硬约束是不写任何表格）。
+
+**坑**：
+1. **假服务端的 `/values/` 路由不分 GET/PUT**（`feishu-checks.mjs`）—— 写请求会被当成读、悄悄返回读的数据，
+   于是「回填失败」这个场景永远测不出来。必须单开 `values_batch_update` 分支，并记住 `state.sheetWrites`。
+2. **「回填过的那一行下一轮不会被重复收票」是最该断言的一条**（这是本票的真正价值）。测法：把适配器**真发出去**
+   的 range 与值回写进假表（列字母转列号、行号减一），再 `scan` 一次，断言 `created.length === 0`
+   **且 `updated.length === 0`**。少断言后半个，就等于允许它「再收一次但没改」—— 那还是重跑一遍。
+3. **测「行漂移」要在 scan 之后改假表数据**，不能一开始就把目标行放在第 3 行：那样第 2 行和第 3 行都在、
+   断言分不清是「定位对了」还是「碰巧」。先 scan（行在第 2 行）→ 再插一行把目标挪到第 3 行 → 回填 → 断言
+   `every(r => /[A-Z]3:[A-Z]3$/.test(r.range))` 且**不含 `2:2`**。
+
+**自测**：`dev-run` 475 → **482**（`feishu-checks` 里的 8 条：写对三格、插行后重新定位、行被删不发写请求、
+缺列退回只读回执并列实际列名、只有读权限的 note、失败票只写一格、回填后不重复收票、打对 token 与 sheet id）。
+`feishu-checks` 86 → **93** 条（+8 新、−1 条老的「回填退化成只读回执」）。
+
+**没做（票里明确不做）**：不新增行（只在既有行上写）、不动三列之外的语义（`status` 仍写 `writeBackStatus`
+缺省「是」）、不在读票路径上顺手回填。
 
 ---
 
 ## 2. 代码清单
 
-`src/` 共 **44 个 .js / 17 577 行**；`scripts/` 共 9 个 .mjs / **11 390 行**（`dev-run.mjs` **3 473 行**）；`lib/client.js` **3 390 行**（浏览器端设置面板）。
+`src/` 共 **46 个 .js / 21 026 行**；`scripts/` 共 9 个 .mjs / **13 736 行**（`dev-run.mjs` **5 061 行**）；`lib/client.js` **4 395 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
@@ -750,14 +854,14 @@ bitable / sheet 是**同一平台上两种文档类型**，硬拆成两个 platf
 | `src/core/` | 4 680 | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书电子表格 9 键校验/透传**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
 | `src/adapters/` | 8 696（15 个 .js） | 见下表 |
 | `src/tools/` | 1 333 | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（关键节点时间线渲染 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 476 | `descriptors.js`（**5 个 Remote 方法**，含带参的 `setProjectTable(index, url)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘） |
+| `src/remote/` | 476 | `descriptors.js`（**9 个 Remote 方法**，含两个带参的 `setProjectTable(index, url)` 与 `reset(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset` 复用工具的 collect\* 层**） |
 | 根 | 1 266 | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `source-feishu/` | 2 470（`index.js` 1 891 + `sheets.js` 579） | **真实可用（含电子表格）** | 飞书多维表格 API + **电子表格 API**；`resolveTable` 是表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`），`get_node` 不再硬写 `obj_type`；`scan` 拆 `scanBitable`（翻页 + 早停）/ `scanSheet`（读全表 + 逐行指纹、mtime 恒 0、不早停）；水位、状态值可配、recordIds 收窄、截图三形态（电子表格只支持 path/url，内嵌图当没有）、`allowedImageHosts` 白名单；**`appToken` 可写整条表格 URL**（`parseBitableUrl` 啃 `?table=` / `?view=`）；**`writeResult` 回填三列**（只对多维表格；电子表格分支不实现回填） |
-| `source-wps/` | 1 660 | **解析可用，取数待接** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet`；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
-| `source-webform/` | 106 | 演示 | 内存表单源，验证「加平台 = 加目录 + 两行表」；也接 recordIds |
+| `source-feishu/` | 2 470（`index.js` 1 891 + `sheets.js` 579 + `probe.js` 428） | **真实可用（含电子表格）** | 飞书多维表格 API + **电子表格 API**；`resolveTable` 是表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`），`get_node` 不再硬写 `obj_type`；`scan` 拆 `scanBitable`（翻页 + 早停）/ `scanSheet`（读全表 + 逐行指纹、mtime 恒 0、不早停）；水位、状态值可配、recordIds 收窄、截图三形态（电子表格只支持 path/url，内嵌图当没有）、`allowedImageHosts` 白名单；**`appToken` 可写整条表格 URL**（`parseBitableUrl` 啃 `?table=` / `?view=`）；**`writeResult` 回填三列**（多维表格按 `record_id` PUT；**电子表格按序号列重新定位行 + `values_batch_update` 写三格，工单 #22**） |
+| `source-wps/` | 1 660 | **experimental（解析可用，取数通道未接）** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet`（**主装配不注入 ⇒ 选 wps 的项目一张票都拿不到**，工单 #20）；`recordId` 用行号 ⇒ 插行会让票换身份（已知限制）；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
+| ~~`source-webform/`~~ | ~~106~~ | **已移除（工单 #18）** | 演示用内存表单源，水位只在内存里 `memoryWatermark = new Map()`，重启就把同一批工单重收一遍。实现已移到 `plugins/ticket-pipeline/scripts/fixtures/source-webform/index.js` 留档（`scripts/` 不进安装包），`PLATFORMS` 只剩 `feishu / wps / mock`，老配置会拿到「改用 mock 或 feishu」的迁移提示 |
 | `source-mock/` | 329 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
 | `executor-agent/` | 2 496 | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 143 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
@@ -882,7 +986,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | `match.sheetHeaderRow` | 表头在第几行（默认 `1`）；行号身份下表头行一变身份就变，所以不自动往下扫 |
 | `match.sheetIdentity` | 行身份来源：`seq`（默认，序号列值）/ `row`（物理行号）。电子表格没有 `record_id`，身份只能自造 |
 | `match.sheetIdColumn` | 身份取自哪一列（默认「序号」），仅 `sheetIdentity: 'seq'` 时生效 |
-| `match.sheetColumns` | 列名覆盖 `{语义: 实际表头文字}`，如 `{"description":"缺陷描述"}` |
+| `match.sheetColumns` / `match.columns` | 列名覆盖 `{语义: 实际表头文字}`，如 `{"description":"缺陷描述"}`。前者管电子表格，后者管多维表格（工单 #21），形状与校验完全一致 |
 | `match.sheetRange` | 限定读取范围（如 `A1:M500`）；读值接口无分页、单次上限 10 MB，大表靠这个收窄 |
 | `match.tableKind` | **逃生阀**：`bitable` / `sheet`。默认空 = 插件自己探测表型；显式写就跳过探测 |
 | `match.statusValues` | 收票状态值集合（**可配**：真实表用「否」，缺省「处理中」） |
@@ -1014,10 +1118,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **451** | 通过 451，失败 0（2026-11-09 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**，319 那批 25 条是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（凭据描述器惰性重取 2 条、总开关必须被体检说出来 1 条、启动恢复终态必须是 pending 1 条，见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，最后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（19 条电子表格断言 + 1 条回填只读回执照，见 §1.21） |
+| `node scripts/dev-run.mjs` | **482** | 通过 482，失败 0（2026-11-10 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）。这 482 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 93 条（见 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
-`dev-run.mjs` 分 29 个小节：
+`dev-run.mjs` 分 31 个小节：
 
 | # | 小节 | 覆盖 |
 | --- | --- | --- |
@@ -1034,19 +1138,24 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 10 | P0 修复 | 租约心跳、注入时钟、送达回执配置、人工取消 |
 | 11 | §5.1 A 组链路断点 | 截图进 prompt、真实工作区、失败原因、人工重开；**陈旧工作区坐标不复用**（目录已删要重建且不把死坐标传下去 / 换了仓库要重建 / 探测抛错时不重建） |
 | 11.6 | `onPhase` 的第二参 | 字符串是「说明」，不能被当字段补丁写进票据 |
-| 11.5 | `pipeline_doctor` | 环境体检；**插件版本自检**：落后时给出同步命令与两个指纹，一致/链接安装/比不出来三态各有断言，既有 7 个用例注入 `NO_VERSION_CHECK` 桩避免读真实磁盘 |
+| 11.5 | `pipeline_doctor` | 环境体检；**插件版本自检**：落后时给出同步命令与两个指纹，一致/链接安装/比不出来三态各有断言，既有 7 个用例注入 `NO_VERSION_CHECK` 桩避免读真实磁盘；**三档结论 `blockers/problems/warnings`**、「通知通道完整性」、「飞书连通性」（真探针 + 假 fetch，码表命中 / 未知码 / 网络错 / 超时四种归一）、「接下来四步」清单、`GITLAB_TOKEN` 只在真开了远程 MR 时才查（见 #10、#19） |
 | 12 | 组合根接线 | 工具真注册进 ctx、真拿到 store |
 | 12b | 注册表真的接上了适配器 | qqmail 推送、agent 执行器 |
 | 12c | 走宿主 shell 必须显式带 sandboxPolicy | 写授权 |
 | 12d | 工具输出必须是 lossless JSON | `undefined` 会让宿主判整次调用失败 |
-| 12e | 平台可插拔 | 状态值可配 + 金山文档接进组合根 |
+| 12e | 平台可插拔 | 状态值可配 + 金山文档接进组合根；`PLATFORMS` 只剩 `feishu/wps/mock`，`webform` 拿到迁移提示（见 #18） |
 | 13 | 新适配器 | gitlab 客户端 **86 项**（新增 7 条本地提交断言 + 10 条 `-z` 收集/暂存断言 + 10 条基线/keepSession 断言 + **8 条敏感名单与篡改自检断言**，原 51）/ qqmail 推送 18 项 / wps 工单源 **34 项** |
 | 14 | 项目工作区 | **19 项**：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用、attachSession 归属；**验证命令的 signal 语义与超时 124**、**适配器名写错要抛并列出可选值** |
 | 15 | 改代码落点 | `inspectCheckout` 干净/脏/拿不到状态三种情况（`-z -uall` + 排除插件自有目录）；`describeDirtyCheckout` 脏工作区只提醒不拒跑、文案能照着理解；`isIsolatedWorktreePath` 只认 `.agents/worktrees/<name>`；真实 `apply()` 缺省不建隔离 worktree、票据落在工作区根上（`branch` = 检出当前分支、`baseCommit` = 检出 HEAD） |
 | 16 | 处理完回填工单表 + 保留工作区会话 | done → 三列都写；`writeBackStatus` 可配、空白回落「是」；`writeBack=false` 完全不写（退化成只读）；failed 不回填；回填失败只记票据、票态不回退、不影响通知；老适配器没有 `writeResult` 时静默跳过；执行器返回 `sessionId` 落到票据、状态里能看到去哪找会话；`pipeline_status` 成功/失败都能一眼看到；skipped 的回填首句要说「待人工验证」 |
+| 16a | 改动摘要 | `pipeline_status` 每票多渲「改动摘要：N 个文件，+X / −Y」；`commitSummary` 无提交时是 `null` 不是 `undefined`；一次 `git show --raw --numstat -z` 拿全（两种 `-z` 互斥） |
 | 16b | 事后动作补偿（`pendingEffects`）与租约诚实化 | **14 项**：回填失败要在通知里说、回填成功时不写回填行、一场跑完 `pendingEffects` 必须清干净、`clearPendingEffect` 只清报上来的那一项（两项清完就把字段整个删掉）、启动补偿：残留终态票把回填和通知补做完并清标记、`enqueue` / `resetByHuman` / `revise` 都不继承上一轮 `pendingEffects`、租约：别的 owner 连试两次都拿不到且续租按 token 判定、就地重跑起点与票面记录不一致时日志要说明「被判没有改动是预期」、`failed` 也是终态（通知发完同样清 `pendingEffects`）、启动补偿只捞终态票、`pipeline_status` 待补动作要能看见 |
+| 16c | 交付维度 | done ≠ 东西交到手上：`delivery` 三项（commit / writeBack / notify）各自记账；回填失败/不可重试分别落 `giveUp`；票标题加「（表格未回写）」「（交付未完成：…）」；全库分布多一行「交付未完成：N 张」；返回体带 `delivery` / `deliveryIssues`（见 #08） |
+| 16c-2 | 失败票回填 | `writeBackOnFailure` 缺省关；打开后只写「处理结果」一列、绝不碰「是否处理」/「处理日期」；**超时也写、人工取消不写**；失败票被重跑后再失败是覆盖同一格不追加（见 #14） |
 | 16c | 关键节点流程日志（时间线） | **13 项**：主站顺序（①–⑨ + 补充站）、每条 `at` 是时间 / `ok` 是布尔 / `label` 非空、相邻 `at` 单调不减、执行器 `onFlow` 报的 ④ 会话进时间线、失败票 `failed` 站记 ✗、连续同节点同成败合并、90 条触发 80 条封顶、重新入队继承时间线、人工重置不清空只补「排队中」分隔、`pipeline_status` 渲染「现在停在第 ⑤ 站…已 1 分 35 秒没动」、终态写「已经收尾」/ needs-info 写「不是插件卡死」、返回体带 `timeline`/`station`/`stalledForMs`、老票无时间线不引入 `undefined` |
+| 16d | 长站点心跳 | `planning` / `editing` / `testing` 每分钟追加一条 `heartbeat` 时间线条目（同类才合并，别吃掉进站那条）；只渲「最近一次心跳 HH:MM:SS」，不单独占行；`testing` 额外给「通常 3–15 分钟」的区间（见 #07） |
 | 17 | 选择分支 | `parseBranchRefs` 解析 `for-each-ref`（`refs/remotes/` 后只切第一个 `/`、丢掉 `origin/HEAD` 这类符号引用）；`mergeBranchChoices` 排序（当前分支 → 远端默认 → 本地 → 其余远端）；`listBranches` 真跑通；四种拿不到分支的情况（无 `repo.path` / 无 git 执行链路 / 不是 git 检出 / git 抛错）**只返回 `ok:false` + 原因、绝不抛**；游离 HEAD 不算分支名；宿主 remote 暴露 `branches()` 且某个项目配错不影响别的项目 |
+| 18 | 运行页签的四个 Remote 方法 | `status` 与工具同源（`collectStatus`）、无 store 给人话、`scan` 关着时 `disabled` 且不起后台、`cancel` 没票在跑说清楚、`reset` 把失败票放回 pending、不给非终态票重开（见 #16） |
 
 ### 8.2 真实链路验证记录
 
@@ -1056,10 +1165,10 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
-| 设置面板（新） | ✅ `client-check.mjs`：descriptor 24 叶子 / 4 组、schema 信封 70 节点 24 叶子、**Remote 5 个方法**（含带参 `setProjectTable`）、`projects` 可写 33 字段；`client-smoke.mjs` 全过（页签式布局见 §1.17，「添加项目」见 §1.18） |
-| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 451/451）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 25 叶子 / 4 组、schema 信封 72 节点 25 叶子、**Remote 9 个方法**（含带参 `setProjectTable` 与 `reset`）、`projects` 可写 34 字段；`client-smoke.mjs` 全过（页签式布局见 §1.17，「添加项目」见 §1.18，运行页签见 §1.22） |
+| 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 482/482）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
-| appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **60** 条、`dev-run` 加 2 条配置校验断言（那是当轮的值；现为 **451/451** 与 **80** 条） |
+| appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **60** 条、`dev-run` 加 2 条配置校验断言（那是当轮的值；现为 **482/482** 与 **93** 条） |
 | 面板「添加项目」修好（新，2026-11-09） | ✅ 加项目改成「垫空卡片 + 一次保存提交」：不再拿空 `repo.path` 撞宿主整份校验（见 §1.18）；顺手修「出错吃掉整个清单」与「有未保存改动就锁死加项目」；`repo.remote` 面板标签改「GitLab 仓库地址」；`client-smoke` 113 → **123** 条断言全过 |
 | 真实 GitLab draft MR 创建（可选出口） | ✅ MR !1（sandbox project 33）；现在只有 `repo.gitlab.enabled: true` 才走这条 |
 | GitLab 凭据权限 | Owner 级（`/repository/branches`、`/merge_requests` 均 200） |
@@ -1097,7 +1206,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- | --- | --- | --- |
 | 1 | **模型默认留空 → 宿主 persona 模板崩**：`agentOptionsFromConfig` 在 `model` 为空串时不带 model，宿主给 agent 会话装 personaPrefix 时含 `{{model}}` 变量 → 装配阶段直接报 `prompt variable "{{model}}" has no value for this assembly` | `src/adapters/executor-agent/index.js`（新增 `resolveAgentOptions`） | 沙盒 002/003 两张票就是这么挂的（attempt=2） | **已修（`5b94a17`）**：新增 `resolveAgentOptions`，配置优先、缺的读宿主 `agentDefaultModel.currentSelection()` 补齐，两项必须成对下发；宿主也给不出就报 `internal` 并说清该配什么。（早期那条「空串不下传即跟随会话默认」的判断是错的 —— 空串就是真的不下发，才会在模板上崩） |
 | 2 | **找不到 agentPresets 服务只记日志继续跑**：agent 起来了但是零工具，改不出任何文件，最后报「没有产生任何文件改动」，真因被埋 | `src/adapters/executor-agent/index.js`（`setupAgent`） | headless profile 必现；桌面 profile 也可能缺 | **已修（`5b94a17`）**：改为抛 `invalid-input` 硬失败并列出该配什么（重试没用，是环境问题） |
-| 3 | **金山文档无开放平台取数通道**：`wpsOptionsFromMatch` 只支持 `sheetUrl` 全局 fetch 下载，缺登录态大概率失败；无开放平台网关接入 | `src/adapters/source-wps/index.js:371-399` | 需求①的「金山」只有解析能力，没有取数能力 | **待修**（需金山账号 + 管理员审批建应用，或注入 `fetchSheet`） |
+| 3 | **金山文档无开放平台取数通道**：`wpsOptionsFromMatch` 只支持 `sheetUrl` 全局 fetch 下载，缺登录态大概率失败；无开放平台网关接入 | `src/adapters/source-wps/index.js:371-399` | 需求①的「金山」只有解析能力，没有取数能力 | **已降级为 experimental（工单 #20，2026-11-10）**：不再声称「已支持」——面板下拉标「实验性，需自行注入取数通道」，选中时卡片亮橙框，`pipeline_doctor` 对 wps 项目报**阻断**，`MISSING_FETCH_SHEET` 改成「用户层先说拿不到票 + 改用飞书，开发者层再给 `fetchSheet()`」。真接通道仍需金山账号 + 管理员审批 |
 | 4 | **`repo.gitlab` 配置被校验层吞掉**：`validateProject` 只复制 `repo.remote/baseBranch/targetBranch`，而 `resolveGitlab` 优先读 `repo.gitlab.baseUrl/projectId` | `src/core/config.js`（`validateProject`） | 自建 GitLab / 子组路径配了也不生效 | **已修（`5b94a17`）**：透传 `baseUrl` / `remote` / `projectId` |
 | 5 | ~~**金山表「待修改项目」列的值被丢弃**~~：`toTickets` 用的 `projectId` 是源实例项目名，`makeTicket` 不接收该列的值，表格里那列只留在 `raw.cells` | `src/adapters/source-wps/index.js`（`toTickets` → `targetProject`）、`src/contracts/ticket-source.js` | 需求③「待修改项目」在金山侧拿不到 | **已修（`26f0391`）**：新增 `Ticket.targetProject`，金山该列原值进 `targetProject` 并渲染进任务书；**刻意不顶 `projectId`**（存储主键一半，且该列是人手填的自由文本），任务书里也明确写「不要拿它当目录名直接去改」 |
 | 6 | ~~**飞书 / 金山截图白名单没有配置键**~~：适配器读 `options.allowedImageHosts`（`source-feishu/index.js:306`），但 `CONFIG_FIELDS` 无此键、`feishuOptionsFromMatch` 都不透传 | `src/core/config.js`（`validateProject` / `describeConfig`）、`src/adapters/source-feishu/index.js`（`feishuOptionsFromMatch`） | 真实表的截图是文本链接形态 → 取不到图 → 整票转 needs-info（缺省一律拒，且无法从配置放开） | **已修（`26f0391`）**：新增 `match.allowedImageHosts`，校验层归一化（trim + 小写 + 去重、空集合报错）并透传到适配器；**不给缺省值** —— 安全闸门只有人能打开 |
@@ -1115,7 +1224,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 13 | **`pushplus.token` 走明文配置**，与 config 层描述「建议走 ctx.credentials」矛盾 | `src/adapters/push-pushplus/index.js:163-171` | 令牌落在 cordis.patch.yml | 待修 |
 | 14 | **死配置**：`logLevel` 与 `concurrency` 只出现在配置定义里，代码无任何消费点 | `src/core/config.js:126`（`concurrency` 定义）/`:317`（`logLevel` 定义）/`:342`、`:407`（分组标签） | 改它们不生效 | 待修 |
 | 15 | **`PipelineError.retryAfterMs` 有写入但无读取方**（退避从未按上游建议时间算） | `src/contracts/errors.js:43-47` | 上游说「17:09 重置」，实际只按 30 秒基数退避 | **已修（`dbfa21f` 前）**：`src/core/scheduler.js:53` `backoffDelayMs(attempt, retryAfterMs, random)` 收了服务端建议值（`:54` `const serverHint = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : undefined`），`:571-573` 传 `normalized.retryAfterMs` 进退避并仍受封顶夹住 |
-| 16 | **飞书工单源只支持多维表格，电子表格进不来** —— ① `normalizeAppToken` 的 wiki 节点查询把 `obj_type: 'bitable'` 硬写进 query（`src/adapters/source-feishu/index.js:763-766`），`:770-775` 把 `sheet` 判成「不是多维表格」并抛错，错误文案里还写着「sheet=电子表格」不支持；② `searchBitableDocs` 只认 `type === 'bitable'`（`:713`）；③ 配置校验只认「`appToken`+`tableId`」或「`docNamePattern`」二选一（`src/core/config.js:494-501`），只给 `spreadsheetToken` 的配置在启动时就被拒 | `src/adapters/source-feishu/index.js`（`normalizeAppToken` / `searchBitableDocs` / `resolveTable`）、`src/core/config.js`（`validateProject`） | 用户的飞书工单表如果是电子表格，插件**完全扫不出票**，且报错文案指向错误方向（像权限问题，实际是代码路径问题） | **已修（2026-11-09）**：新增 `src/adapters/source-feishu/sheets.js`（579 行），`get_node` 不再带 `obj_type`、改读 `node.obj_type` 分派；`searchBitableDocs` → `searchCloudDocs` 认 `type ∈ {bitable, sheet}`；`resolveTable` 成为表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`）；`scan` 拆 `scanBitable` / `scanSheet`；`validateProject` 改成四选一放行。自测 `dev-run` 384 → **451**、`feishu-checks` 60 → **80**（19 条电子表格断言含只读断言 + 1 条回填只读回执照）。**仍待**：真表验证（要开 `sheets:spreadsheet:readonly` scope + 文档级「添加文档应用」） |
+| 16 | **飞书工单源只支持多维表格，电子表格进不来** —— ① `normalizeAppToken` 的 wiki 节点查询把 `obj_type: 'bitable'` 硬写进 query（`src/adapters/source-feishu/index.js:763-766`），`:770-775` 把 `sheet` 判成「不是多维表格」并抛错，错误文案里还写着「sheet=电子表格」不支持；② `searchBitableDocs` 只认 `type === 'bitable'`（`:713`）；③ 配置校验只认「`appToken`+`tableId`」或「`docNamePattern`」二选一（`src/core/config.js:494-501`），只给 `spreadsheetToken` 的配置在启动时就被拒 | `src/adapters/source-feishu/index.js`（`normalizeAppToken` / `searchBitableDocs` / `resolveTable`）、`src/core/config.js`（`validateProject`） | 用户的飞书工单表如果是电子表格，插件**完全扫不出票**，且报错文案指向错误方向（像权限问题，实际是代码路径问题） | **已修（2026-11-09）**：新增 `src/adapters/source-feishu/sheets.js`（579 行），`get_node` 不再带 `obj_type`、改读 `node.obj_type` 分派；`searchBitableDocs` → `searchCloudDocs` 认 `type ∈ {bitable, sheet}`；`resolveTable` 成为表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`）；`scan` 拆 `scanBitable` / `scanSheet`；`validateProject` 改成四选一放行。自测 `dev-run` 384 → **451**、`feishu-checks` 60 → **80**（19 条电子表格断言）。**回填也已补上（2026-11-10，工单 #22，见 §1.23）**：`values_batch_update` 写三格、按序号列重新定位行、四类失败各有 `errorKind`+`note`；`dev-run` 475 → **482**、`feishu-checks` 86 → **93**（86 是 #21 列名别名之后的值）。**仍待**：真表验证（要开 `sheets:spreadsheet` **读写** scope + 文档级「添加文档应用」加成可编辑） |
 
 ### 9.3 P2 —— 健壮性与体验
 
@@ -1148,7 +1257,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **451** 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **482** 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -1174,11 +1283,12 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 「插件版本自检」（**已完成**，2026-11-06） | 宿主加载的是 profile 下的目录副本（跨盘 `file:` 落成复制），HMR `root: []` 不监听源码 ⇒ 改完不同步就静默跑旧代码；新增 `src/core/plugin-version.js`，`pipeline_doctor` 比对安装副本与源码的**文件内容**，落后时给出同步命令，只进「提醒」 | ✅ 自测 288 → 293（新增 5 组断言）；见 §1.6 与 `architecture.md` §12.11 |
 | 「`setPhase` 清不掉字段」缺陷修复（**已完成**，2026-11-06） | `setPhase` 把补丁里所有 `undefined` 一概过滤，于是调用方写的每一种「清掉」都静默失效：成功票上挂着上一轮 `lastError`（真实事故：`pms\|reczz28VWNWVbpgL` 跑成 done 却显示 `provider "workbuddy" has no configured model`），启动恢复以为清了死坐标其实没清。改为「键不存在 = 不动 / 键在值为 undefined = 删掉」 | ✅ 自测 293 → 294（新增 1 条走真实重试路径 —— 旧的那条是 `resetByHuman` 兜的假绿）；见 §1.7 |
 | 「回填 / 保留会话 / 基线 / 面板」四项改造（**已完成**，2026-11-06） | ①处理完回填工单表（`TicketSource.writeResult` 唯一写入口 + `writeBack`/`writeBackStatus`，见 §1.8）②处理完保留会话（`ExecResult.sessionId` + `keepSession`，见 §1.9）③脏工作区只提交 agent 改过的文件（`createBaseline` + `describeDirtyCheckout`，`assertCleanCheckout` 删除，见 §1.10）④设置面板补齐（`projects` 子树可编辑 + 第 3 个 Remote 方法，配置 33 键 / 7 组，现为 24 键 / 4 组，见 §1.11） | ✅ 自测 319/319（新增 25 条，`dev-run.mjs` 第 16 节 + 第 15 节改写）；`feishu-checks` 52 → 58、`gitlab-checks` 68 → 78；`client-check` / `client-smoke` 全绿 |
-| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固 + 时间线后现为 451/451）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
+| 「选择分支」改造（**已完成**，2026-11-06） | `repo.baseBranch` / `repo.targetBranch` 带候选下拉：`src/core/branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches` 绝不抛）+ 第 4 个 Remote 方法 `ticketPipeline.branches()`（一次返回全部项目）+ 面板字段 `kind` 从 `text` 改 `branch`（`<input list>` + `<datalist>`，不做纯 `<select>`），见 §1.12 | ✅ 自测 319 → **325/325**（新增 6 条，`dev-run.mjs` 第 17 节；上线加固 + 时间线后现为 482/482）；`client-check` 的 `kind` 白名单加 `branch`，Remote 描述符 4 个方法一致 |
 | **上线加固**（**已完成**，2026-11-06） | 5 条阻断项 + 4 条重要项：适配器名强校验（`workExecutor` / `pushAdapter` 的 `enum`，写错抛 `invalid-input` 不静默退 mock）、验证命令超时与取消（30 分钟缺省、退出码 124、取消真 kill）、敏感名单 9 → **8 大类 41 条正则**、`.git`/profile 篡改自检（28 + 10 + 4）、终态与事后动作同一次落库（`pendingEffects` + `replayPendingEffects`）、回填失败进通知、就地重跑起点、租约诚实化（best-effort，不是原子 CAS），见 §1.14 | ✅ 自测 325 → **363/363**（当轮；新增 38 条，`dev-run.mjs` 第 16b 节 14 条 + 各 checks）；`gitlab-checks` 78 → 86、`wps-checks` 25 → 34、`workspace-checks` 11 → 19 |
 | **关键节点流程日志（时间线）**（**已完成**，2026-11-06） | 票据 `timeline` 17 节点表（9 主站 ①–⑨ + 8 补充站）、`markNode` / `markExtra` / `onFlow` 全链路打点、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、历史不清空 + 80 条封顶，见 §1.16 | ✅ 自测 363 → **376/376**（新增 13 条，`dev-run.mjs` 第 16c 节）；26 小节；真实链路探针 11 条时间线、渲染探针给出 `station`/`stalledForMs` |
-| **飞书电子表格支持**（**已完成**，2026-11-09） | 新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数：列名别名、工作表定位、range、读值、行身份、日期/优先级）；`get_node` 不再硬写 `obj_type`；`resolveTable` 成表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`）；`scan` 拆 `scanBitable` / `scanSheet`；`validateProject` 四选一；9 个配置键透传；面板加「飞书电子表格」一组（含 `kind:'columns'` 一行写法）。见 §1.21 | ✅ 自测 384 → **451/451**；`feishu-checks` 60 → **80**（19 条电子表格断言含只读断言 + 1 条回填只读回执照）；`client-smoke` **175** 条；`client-check` 面板字段 29 项与 descriptor 对得上 |
+| **飞书电子表格支持**（**已完成**，2026-11-09） | 新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数：列名别名、工作表定位、range、读值、行身份、日期/优先级）；`get_node` 不再硬写 `obj_type`；`resolveTable` 成表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`）；`scan` 拆 `scanBitable` / `scanSheet`；`validateProject` 四选一；9 个配置键透传；面板加「飞书电子表格」一组（含 `kind:'columns'` 一行写法）。见 §1.21 | ✅ 自测 384 → **451/451**；`feishu-checks` 60 → **80**（19 条电子表格断言）；`client-smoke` **175** 条；`client-check` 面板字段 29 项与 descriptor 对得上 |
+| **22 张产品工单落地批次**（**已完成**，2026-11-10） | 产品评审出的 22 张票全部实施完（见 `.scratch/ticket-pipeline-product/spec.md` 索引）：配置 33 → **25 键 4 组**、`skipped` 终态文案四档、面板加「运行」第五页签、`delivery` 交付维度、`appToken` 面板贴链接、多维表格列名别名、电子表格回填、WPS 与 GitLab 降级为 experimental、doctor 三档体检、校验带修复建议与拼错键检测 | ✅ `dev-run` 451 → **482/482**；`feishu-checks` **93** 条；`client-check` **9 个 Remote 方法** / 25 叶子 / 72 节点 / `projects` 可写 34 字段；`client-smoke`、`chain-smoke`（11）、`wps-checks` 全绿 |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
-| 第二步半（**代码已完成**，2026-11-09） | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`） | ✅ `dev-run` 384 → **451**；真表读数据待 §8.2 人工前置（开 `sheets:spreadsheet:readonly` + 「添加文档应用」） |
+| 第二步半（**代码已完成**，2026-11-09） | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`；回填见 §1.23） | ✅ `dev-run` 384 → **451** → **482**（#22 回填）；真表读数据与回填待 §8.2 人工前置（开 `sheets:spreadsheet` **读写** + 「添加文档应用」加成可编辑） |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |
 | 第四步 | 9.2 / 9.3 剩余项按需修 | —— |

@@ -297,16 +297,24 @@ export function createMockSource (options = {}) {
         throw new PipelineError('network', 'mock：模拟回填失败')
       }
 
+      const onlyResult = payload.onlyResult === true
       const status = typeof payload.status === 'string' && payload.status.trim().length > 0
         ? payload.status.trim()
         : '是'
       const handledAt = payload.handledAt === undefined ? Date.now() : Number(payload.handledAt)
-      if (!Number.isFinite(handledAt) || handledAt <= 0) {
+      // onlyResult 时不校验日期：失败票不写「处理日期」那一列（工单 #14）。
+      if (!onlyResult && (!Number.isFinite(handledAt) || handledAt <= 0)) {
         throw new PipelineError('invalid-input', `回填的处理日期不是合法毫秒时间戳：${String(payload.handledAt)}`)
       }
 
-      writes.push({ recordId: id, status, result: payload.result, handledAt })
-      return { written: true, fields: [...WRITE_BACK_FIELDS] }
+      writes.push({
+        recordId: id,
+        status: onlyResult ? undefined : status,
+        result: payload.result,
+        handledAt: onlyResult ? undefined : handledAt,
+        onlyResult,
+      })
+      return { written: true, fields: onlyResult ? ['处理结果'] : [...WRITE_BACK_FIELDS] }
     },
 
     setFailScan (value) {

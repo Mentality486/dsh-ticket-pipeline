@@ -30,7 +30,7 @@ import { defineTool, textBlocks } from './define.js'
 import { PHASE_LABEL } from '../contracts/types.js'
 
 /** 可以被人工重开的阶段。与 `store.resetByHuman` 的判定必须保持一致。 */
-const RESETTABLE_PHASES = ['failed', 'needs-info', 'gone']
+export const RESETTABLE_PHASES = ['failed', 'needs-info', 'gone']
 
 /**
  * @param {import('../core/store.js').TicketStore} store
@@ -72,90 +72,106 @@ export function createPipelineResetTool (options) {
     render: (value) => textBlocks(value.text),
     async execute (args, exec) {
       void exec
-
-      const recordId = typeof args.recordId === 'string' ? args.recordId.trim() : ''
-      const projectId = typeof args.projectId === 'string' ? args.projectId.trim() : ''
-
-      if (recordId.length === 0) {
-        return {
-          reset: false,
-          reason: 'missing-recordId',
-          text: '请告诉我 recordId（飞书工单的 record_id），我才知道要重开哪一张。\n'
-            + '不知道是哪一张的话，先用 pipeline_status 看看队列里都有什么。',
-        }
-      }
-
-      let rows = options.store.listTickets().filter((row) => row.recordId === recordId)
-      if (projectId.length > 0) rows = rows.filter((row) => row.projectId === projectId)
-
-      if (rows.length === 0) {
-        const where = projectId.length > 0 ? `项目 ${projectId} 下` : ''
-        return {
-          reset: false,
-          reason: 'not-found',
-          recordId,
-          text: `${where}没有 recordId 为 ${recordId} 的工单记录。\n`
-            + '（插件从没见过它：可能「是否处理」还不是「处理中」，或者还没扫到。'
-            + '用 pipeline_status 确认一下。想马上扫一轮就用 pipeline_scan。）',
-        }
-      }
-
-      if (rows.length > 1) {
-        // 多项目撞了同一个 record_id。猜一个就可能把 A 项目的票当成 B 项目的重开，
-        // 所以这里只摆事实，让人补 projectId。
-        const candidates = rows.map((row) => `· 项目 ${row.projectId ?? '(空)'}｜${phaseName(row.phase)}`)
-        return {
-          reset: false,
-          reason: 'ambiguous',
-          recordId,
-          candidates: rows.map((row) => ({ projectId: row.projectId, phase: row.phase })),
-          text: `recordId ${recordId} 在多个项目里都存在，我不猜是哪一个：\n`
-            + candidates.join('\n') + '\n'
-            + '请带上 projectId（项目名）再调一次。',
-        }
-      }
-
-      const row = rows[0]
-      if (!RESETTABLE_PHASES.includes(row.phase)) {
-        return {
-          reset: false,
-          reason: 'not-resettable',
-          recordId,
-          projectId: row.projectId,
-          phase: row.phase,
-          text: `这张工单现在是「${phaseName(row.phase)}」，不在可重开的范围内。\n`
-            + '这个工具只对 failed（失败）、needs-info（等人补信息）、gone（表格行已删）三种生效：'
-            + '它们是「跑不下去、等人接手」的收尾态。\n'
-            + '排队中或正在跑的票本来就会接着走；done / skipped 是已经验收过的结果，重开等于重做一遍。\n'
-            + '真要重做（连内容一起）：直接改表格里这一行，把「是否处理」拨回「处理中」——那条路会覆盖旧的回填结果。\n'
-            + '想确认它到底停在哪、为什么停，用 pipeline_status。',
-        }
-      }
-
-      const ok = await options.store.resetByHuman(row.key)
-      if (!ok) {
-        // resetByHuman 只有「记录不见了」或「状态在读到与写入之间变了」才会返回 false。
-        return {
-          reset: false,
-          reason: 'rejected',
-          recordId,
-          projectId: row.projectId,
-          phase: row.phase,
-          text: `存储拒绝了这次重置（recordId ${recordId}，当前「${phaseName(row.phase)}」）。\n`
-            + '可能是这一行刚好被别处改动或删掉了。用 pipeline_status 再看一眼现在的状态。',
-        }
-      }
-
-      return {
-        reset: true,
-        reason: 'ok',
-        recordId,
-        projectId: row.projectId,
-        phase: 'pending',
-        text: `已重开：${row.projectId ? `[${row.projectId}] ` : ''}${recordId} 回到队列（阶段改回排队中，重试次数与最近错误已清空）。\n`
-          + '下一轮轮询会把它当成一张新票重新跑。\n'
-          + '想立刻推进一轮，用 pipeline_scan。',
-      }
+      // 算结果的部分抽到 collectReset，Remote（ticketPipeline.reset()）必须调同一份，
+      // 否则面板上的「重跑」和对话里 / 工具里的 pipeline_reset 会出现两套判定。
+      return collectReset(options, args)
     },
   })
+}
+
+/**
+ * `pipeline_reset` 的算结果层：不碰 defineTool、不碰渲染，纯逻辑 + 返回对象。
+ *
+ * 面板「运行」页签的「重跑」按钮走 `ticketPipeline.reset()` → 这里，
+ * 与工具调用是同一条实现（工单 #16 的硬约束：绝不复制工具实现）。
+ *
+ * @param {{ store: import('../core/store.js').TicketStore }} options
+ * @param {{ recordId?: unknown, projectId?: unknown }} args
+ * @returns {Promise<Record<string, unknown>>}
+ */
+export async function collectReset (options, args) {
+  const safeArgs = args && typeof args === 'object' ? args : {}
+  const recordId = typeof safeArgs.recordId === 'string' ? safeArgs.recordId.trim() : ''
+  const projectId = typeof safeArgs.projectId === 'string' ? safeArgs.projectId.trim() : ''
+
+  if (recordId.length === 0) {
+    return {
+      reset: false,
+      reason: 'missing-recordId',
+      text: '请告诉我 recordId（飞书工单的 record_id），我才知道要重开哪一张。\n'
+        + '不知道是哪一张的话，先用 pipeline_status 看看队列里都有什么。',
+    }
+  }
+
+  let rows = options.store.listTickets().filter((row) => row.recordId === recordId)
+  if (projectId.length > 0) rows = rows.filter((row) => row.projectId === projectId)
+
+  if (rows.length === 0) {
+    const where = projectId.length > 0 ? `项目 ${projectId} 下` : ''
+    return {
+      reset: false,
+      reason: 'not-found',
+      recordId,
+      text: `${where}没有 recordId 为 ${recordId} 的工单记录。\n`
+        + '（插件从没见过它：可能「是否处理」还不是「处理中」，或者还没扫到。'
+        + '用 pipeline_status 确认一下。想马上扫一轮就用 pipeline_scan。）',
+    }
+  }
+
+  if (rows.length > 1) {
+    // 多项目撞了同一个 record_id。猜一个就可能把 A 项目的票当成 B 项目的重开，
+    // 所以这里只摆事实，让人补 projectId。
+    const candidates = rows.map((row) => `· 项目 ${row.projectId ?? '(空)'}｜${phaseName(row.phase)}`)
+    return {
+      reset: false,
+      reason: 'ambiguous',
+      recordId,
+      candidates: rows.map((row) => ({ projectId: row.projectId, phase: row.phase })),
+      text: `recordId ${recordId} 在多个项目里都存在，我不猜是哪一个：\n`
+        + candidates.join('\n') + '\n'
+        + '请带上 projectId（项目名）再调一次。',
+    }
+  }
+
+  const row = rows[0]
+  if (!RESETTABLE_PHASES.includes(row.phase)) {
+    return {
+      reset: false,
+      reason: 'not-resettable',
+      recordId,
+      projectId: row.projectId,
+      phase: row.phase,
+      text: `这张工单现在是「${phaseName(row.phase)}」，不在可重开的范围内。\n`
+        + '这个工具只对 failed（失败）、needs-info（等人补信息）、gone（表格行已删）三种生效：'
+        + '它们是「跑不下去、等人接手」的收尾态。\n'
+        + '排队中或正在跑的票本来就会接着走；done / skipped 是已经验收过的结果，重开等于重做一遍。\n'
+        + '真要重做（连内容一起）：直接改表格里这一行，把「是否处理」拨回「处理中」——那条路会覆盖旧的回填结果。\n'
+        + '想确认它到底停在哪、为什么停，用 pipeline_status。',
+    }
+  }
+
+  const ok = await options.store.resetByHuman(row.key)
+  if (!ok) {
+    // resetByHuman 只有「记录不见了」或「状态在读到与写入之间变了」才会返回 false。
+    return {
+      reset: false,
+      reason: 'rejected',
+      recordId,
+      projectId: row.projectId,
+      phase: row.phase,
+      text: `存储拒绝了这次重置（recordId ${recordId}，当前「${phaseName(row.phase)}」）。\n`
+        + '可能是这一行刚好被别处改动或删掉了。用 pipeline_status 再看一眼现在的状态。',
+    }
+  }
+
+  return {
+    reset: true,
+    reason: 'ok',
+    recordId,
+    projectId: row.projectId,
+    phase: 'pending',
+    text: `已重开：${row.projectId ? `[${row.projectId}] ` : ''}${recordId} 回到队列（阶段改回排队中，重试次数与最近错误已清空）。\n`
+      + '下一轮轮询会把它当成一张新票重新跑。\n'
+      + '想立刻推进一轮，用 pipeline_scan。',
+  }
 }

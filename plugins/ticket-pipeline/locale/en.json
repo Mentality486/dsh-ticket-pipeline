@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Ticket Pipeline",
-    "description": "Work-order pipeline: detect ticket changes, locate code, verify fixes, open draft MRs, and push WeChat notifications."
+    "description": "Work-order pipeline: detect ticket changes, locate code, verify fixes, commit locally in the checkout, write results back to the ticket table, and push WeChat notifications."
   }
 }

@@ -25,7 +25,7 @@
 
 ### 1.2 不在范围内
 
-- 不做**写回**（电子表格同样只读，用户 2026-11-03 已拍板的硬约束）。
+- ~~不做**写回**（电子表格同样只读，用户 2026-11-03 已拍板的硬约束）~~ —— **已改：2026-11-10 起电子表格支持回填**（工单 #22，见 §11；只写「是否处理 / 处理结果 / 处理日期」三列，需要**读写**权限）。
 - 不支持电子表格里的**内嵌图片**（单元格内粘贴的图片没有稳定可下载的 token 形态）——首版只支持人填的链接 / 本地路径两种截图形态。
 - 不做「一张配置同时盯多张飞书表」。一个 `projects[]` 条目 = 一张工单表 + 一个仓库（现状不变，见 `feature-checklist.md` §4.1）。要看两张表就写两个条目、起两个名字。
 - 不改 `TicketSource` 契约（`src/contracts/ticket-source.js:41-46`）。电子表格是**飞书平台内部**的另一种文档类型，不是新平台 —— 契约一个字都不用动。
@@ -197,11 +197,18 @@ if (platform === 'feishu') {
 
 | 来源 | 位置 | 内容 |
 | --- | --- | --- |
-| 飞书 12 列常量 | `source-feishu/index.js:47-61` `FEISHU_COLUMNS` | 序号 / 发现部门 / 问题描述 / 发现日期 / 模块 / 操作流程 / 截图 / 优先级 / 是否处理 / 处理人 / 处理结果 / 处理日期 |
+| 飞书 13 列常量 | `contracts/feishu-columns.js` `FEISHU_SEMANTIC_FIELDS`（`source-feishu/index.js` 里 `FEISHU_COLUMNS` 是它的别名） | 序号 / 发现部门 / 问题描述 / 发现日期 / 模块 / 操作流程 / 截图 / 优先级 / 是否处理 / 处理人 / 处理结果 / 处理日期 / 最后更新时间 |
 | 金山列别名表 | `source-wps/xlsx.js:32-43` `DEFAULT_COLUMN_ALIASES` | 同义列名（「缺陷描述」「复现步骤」「问题截图」…） |
 | 金山优先级表 | `source-wps/xlsx.js:46-50` | 比飞书多「严重 / 轻微」两档 |
 
-**做法**：电子表格分支用「飞书 12 列名 + 金山别名表」合成一张默认别名表，首行（或 `sheetHeaderRow` 指的那行）做表头，逐列反查语义；`match.sheetColumns` 覆盖个别列名。**必需列**：`description`（问题描述）与 `status`（是否处理）—— 缺任一列就报 `invalid-input` 并说清「表头里没有『问题描述』这一列，现有列名：…」，因为缺了描述列 = 收出来的票全是空的。
+**做法**：**两种表型共用同一份解析器** —— `source-feishu/sheets.js` 的 `mapColumns({ actualNames, overrides, aliases })`
+返回 `{ entries, columns, names, missing }`，`mergeSheetAliases` 把用户覆盖值排在最前。
+- 电子表格：表头行做 `actualNames`，别名表 `SHEET_COLUMN_ALIASES`，覆盖键 `match.sheetColumns`。
+- 多维表格：每轮先 `GET /bitable/v1/apps/:app_token/tables/:table_id/fields` 读**真实字段名**做 `actualNames`，
+  别名表 `BITABLE_COLUMN_ALIASES`（规范名排第一，再接同一批同义词），覆盖键 `match.columns`。
+  结果缓存在 `columnCache`，`activeColumns()` 在没解析过时回落规范名。
+- **必需列**：`description`（问题描述）与 `status`（是否处理）—— 缺任一列就报 `invalid-input` 并列出
+  「表里实际的字段名」，多维表格的文案还会提示用 `match.columns` 覆盖（工单 #21 之前这里会静默扫出 0 张票）。
 
 金山已有的 `HEADER_SCAN_ROWS = 10`（`xlsx.js:53`）思路可以借用，但电子表格**不做**「往下扫 10 行找表头」——行号是身份的一部分，表头行一变身份就变，必须显式配 `sheetHeaderRow`。
 
@@ -461,6 +468,7 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 ### 8.2 人工前置（不在人日内，但会卡住 G）
 
 1. 开放平台应用开通权限：`sheets:spreadsheet:readonly`（或 `drive:drive:readonly`）—— 与现有多维表格的 `bitable:app:readonly` 是**两套独立 scope**，要单独开。
+   **要回填就必须开读写版 `sheets:spreadsheet`**（工单 #22）：只读权限下读票一切正常，跑完回填才报错，而那时票已经是「完成」—— 人只会看到表格没更新。改完权限**必须创建版本并发布**，不发布不生效。
 2. **文档级授权**：电子表格所有者 → 「…」→「…更多」→「添加文档应用」把应用加为协作者。`POST /drive/v1/permissions/:token/members` 只对 `user_access_token` 有效，插件用的 `tenant_access_token` 无法自举（同 `architecture.md` §12.8 记的多维表格那条）。
 3. 一张真实的飞书电子表格（带表头行 + 序号列 + 问题描述列 + 是否处理列）。
 4. 应用需要至少一个云文档 API 权限**已开通**，否则授权按钮不可用。
@@ -489,7 +497,7 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 | R7 | **内嵌图片不支持** | 中（体验） | 文档明说；表里有内嵌图时按「没有截图」处理，票里描述照常进模型 |
 | R8 | **探测误判**：一个 token 两个接口都认 | 低 | bitable 优先（保持现状兼容）；仍不确定时让 `match.tableKind` 逃生 |
 | R9 | **探测请求翻倍**（裸 token 场景多一次失败请求） | 低 | 一轮只探测一次并缓存 |
-| R10 | **scope 要单独开**（`sheets:spreadsheet:readonly`） | 中（人工前置） | 写进 §8.2 与 `user-guide.md` §1.2.1 |
+| R10 | **scope 要单独开**（`sheets:spreadsheet:readonly`；回填要 `sheets:spreadsheet` 读写） | 中（人工前置） | 写进 §8.2 与 `user-guide.md` §1.2.1；`pipeline_doctor` 对电子表格项目专门提醒一次 |
 
 ---
 
@@ -525,7 +533,8 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 | `plugins/ticket-pipeline/src/adapters/source-feishu/sheets.js` | 579（新建） | 列名别名、工作表定位、range 拼装、读值解析、行身份、日期/优先级归一 —— 全部**纯函数**，可单测 |
 | `plugins/ticket-pipeline/src/adapters/source-feishu/index.js` | 1452 → 1891 | `get_node` 不再硬写 `obj_type`；新增 `probeWikiNode` / `extractSheetToken` / `isWikiToken` / `extractWikiToken` / `resolveSheetTarget` / `shouldTrySheet` / `resolveBitableFromCandidates` / `resolveBitableTableByIdentity`；`resolveTable` 改成表型分派总闸；`scan` 拆 `scanBitable` / `scanSheet` |
 | `plugins/ticket-pipeline/src/core/config.js` | 1225 | `validateProject` 电子表格分支四选一；9 个键的校验与透传；`buildProjectsDescriptor()` 的 match 组新增 8 个叶子 |
-| `plugins/ticket-pipeline/src/remote/host.js` | 202 | `describeProject()` 摊平 8 个电子表格字段（`sheetColumns` 从对象摊成 `k=v, k=v` 一行文本） |
+| `plugins/ticket-pipeline/src/remote/host.js` | 202 → 258 | `describeProject()` 摊平 8 个电子表格字段（`sheetColumns` 从对象摊成 `k=v, k=v` 一行文本）；工单 #21 又多摊平一个同形的 `columns`（多维表格列名覆盖），面板上那两个文本框共用一个控件类型 |
+| `plugins/ticket-pipeline/src/contracts/feishu-columns.js` | 33（新建，#21） | 13 个语义字段常量下沉到 `contracts/`：`core/config.js` 校验 `match.columns` 的白名单与 `adapters/source-feishu/` 的映射都要用它，放这里才不会出现 `core → adapters` 的倒向依赖 |
 | `plugins/ticket-pipeline/lib/client.js` | 3390 | `PROJECT_SECTIONS` 新增第 6 组「飞书电子表格」；`kind:'columns'` 与 `parseColumnsDraft()`；`sheetName` 只画一次（挪进 `match` 组） |
 | `plugins/ticket-pipeline/scripts/feishu-checks.mjs` | 1404 → 1995 | 60 → **80** 条断言（19 条电子表格 + 1 条回填只读回执） |
 | `plugins/ticket-pipeline/scripts/client-smoke.mjs` | → 1061 | 新增第 ⑦ 组断言（电子表格字段渲染 / 列名覆盖往返 / 选择目录） |
@@ -549,3 +558,46 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 ### 12.4 仍未验证（需要人工前置）
 
 §8.2 的四条前置一条都还没做，所以**真实电子表格还没读过一张**：`sheets:spreadsheet:readonly` scope 未开、文档级「添加文档应用」未做。当前状态是：代码路径全部走通（假服务端），真表一接就能验；接上之前不要向用户承诺「已经在真表上跑过」。
+
+---
+
+## 13. 电子表格回填（2026-11-10，工单 #22）
+
+### 13.1 为什么改口径
+
+首版把电子表格定成只读（§1.2 原第一行），代价比预想的大：票跑完不回填，「是否处理」那一格就永远停在「处理中」，**下一轮扫描会把同一张票再收一遍** —— 这不是「少个功能」，是个会自我放大的 bug：票越跑越多，每轮都重跑同一批。
+
+### 13.2 做法
+
+| 环节 | 落点 |
+| --- | --- |
+| 读表 | 抽出 `readSheetValues(table, signal)`：扫描与回填**共用同一个函数**读值 + 认表头 + 解析行。两处各读一份就会出现「按 A 列认、往 B 列写」的错位 |
+| 定位目标行 | 回填时**重新读一遍表**，用身份列值找 `recordId`（`sh-seq-<序号>`），拿 `rowNumber` —— **绝不缓存行号**：这一票能跑几十分钟，期间人插一行是常事 |
+| 认列 | `locateSheetHeader()`，与扫描同一份别名表（工单 #21 收口的那份），不另写常量 |
+| 写值 | `POST /open-apis/sheets/v2/spreadsheets/{token}/values_batch_update`，`valueRanges` 一次提交三格。逐格 PUT 会变三个请求，中间失败会留下「写了一半」的表 |
+| 写什么 | 成功票三列（状态 / 结果 / 日期文本）；失败票只写「处理结果」一格（工单 #14 的既有口径，`onlyResult`） |
+| 日期格式 | 写 `2026-11-09` 这样的**文本**而不是毫秒时间戳 —— 文本格式的单元格会把 `1735689600000` 原样显示成一串数字 |
+
+### 13.3 四种失败各自怎么报
+
+| 情形 | `errorKind` | `retryable` | note 说什么 |
+| --- | --- | --- | --- |
+| 那一行被删了 / 序号被改过 | `not-found` | false | 「找不到那一行，可能被删除或序号被改过」，并提示可以手工补一行 |
+| 表里缺「是否处理 / 处理结果 / 处理日期」某一列 | `unsupported` | false | 指名缺哪列 + **列出表里实际的列名** + 给出 `match.sheetColumns` 这条改法 |
+| 只有读权限（403 / 鉴权错误） | `auth` | false | 点名 `sheets:spreadsheet`（不是 `:readonly`）+ **创建版本并发布** + 表里加「可编辑」协作者 |
+| 限流 / 网络 | 由 `apiCall` 抛出 | —— | 走 #08 的 delivery 分档自动重试，不进 note |
+
+### 13.4 权限是新增的隐形前置
+
+读票只要 `sheets:spreadsheet:readonly`，**写值要 `sheets:spreadsheet`（读写）**。缺这一档时读票一切正常、票跑完回填才 403 —— 而那时票已经是「完成」，人只会看到表格没更新。
+
+三处提示已经补上：`pipeline_doctor` 对电子表格项目报一条 warning（只在 `writeBack !== false` 时）、写入失败的 note 里写全改法、本文档 §8.2 与 `README.md` 的凭据表。
+
+### 13.5 自测
+
+`feishu-checks.mjs` 新增 8 条（原「回填退化成只读回执」那一条换成 8 条真回填断言）：写到哪三格、插行后还按序号定位、行删了直说找不到且不发写请求、缺列时列出现有列名、只读权限的 note 写全改法、失败票只写一格、**回填过的那一行下一轮不再被收票**（本票最重要的一条）、打对 token 与工作表 id。
+
+假服务端新增 `values_batch_update` 路由与 `state.sheetWrites` —— 它必须和读值分成两个分支，混在一起时写请求会被当成读、回一份「成功读到数据」，于是「回填失败」这个场景永远测不出来。
+
+`node scripts/dev-run.mjs` → **通过 482 项，失败 0 项**；`feishu-checks` 的电子表格断言全过。
+

@@ -299,6 +299,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         counters.disappeared += 1
         logInfo('表格里这行消失了，退役', { projectId, recordId })
         await markNode(key, 'gone', '表格里这一行被删掉了，静默退役')
+        // 工单 #14：`gone` 也在「没跑成」之列。但这一行的记录已经被删了，
+        // 再往里写必然 404 —— 所以打开 writeBackOnFailure 时这里**故意不写**，
+        // 写一次只会留下一条「记录不存在」的交付失败，对谁都没用。
+        // 保留 willWriteBack('gone') 为真的判断是为了让调用方一眼看出这是刻意的（不是漏掉）。
       }
     }
 
@@ -711,49 +715,7 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       // 表格里那一行就永远停在「处理中」，而没有任何地方会说这件事。
       // 不清也有代价：每次启动都会再试一次。所以只有「值得再试」的才留着，
       // 不可重试的（同步表、缺列、没权限）当场放弃并记成人话。
-      if (writeBackPlanned) {
-        if (writeBackReceipt === undefined) {
-          await clearPendingEffect(key, 'writeBack')
-        } else if (writeBackReceipt.written) {
-          await clearPendingEffect(key, 'writeBack')
-          await store.setDelivery(key, 'writeBack', {
-            ok: true,
-            attempts: 1,
-            error: undefined,
-            errorKind: undefined,
-            giveUp: undefined,
-          })
-        } else {
-          const retryable = writeBackReceipt.retryable === true
-          const pendingBefore = store.getTicket(key)?.pendingEffects?.writeBack
-          const attempts = Number(pendingBefore?.attempts ?? 0) + 1
-          if (retryable && attempts < maxAttempts) {
-            // 留着待办，下次启动（或人工重开）再试。attempts 记在待办里，
-            // 因为「试过几次」是待办自己的属性，票面下一次可能就成功了。
-            await store.retryPendingEffect(key, 'writeBack', {
-              error: writeBackReceipt.note ?? '回填失败',
-              errorKind: writeBackReceipt.errorKind,
-            })
-            await store.setDelivery(key, 'writeBack', {
-              ok: false,
-              attempts,
-              error: writeBackReceipt.note ?? '回填失败',
-              errorKind: writeBackReceipt.errorKind,
-              giveUp: false,
-            })
-          } else {
-            await clearPendingEffect(key, 'writeBack')
-            await store.setDelivery(key, 'writeBack', {
-              ok: false,
-              attempts,
-              error: writeBackReceipt.note ?? '回填失败',
-              errorKind: writeBackReceipt.errorKind,
-              // 不可重试，或重试用尽：人必须自己去改表格，别再让它一遍遍撞。
-              giveUp: true,
-            })
-          }
-        }
-      }
+      await settleWriteBack(key, writeBackReceipt, writeBackPlanned)
       if (writeBackReceipt === undefined) {
         await markNode(key, 'writeback', '按配置跳过（writeBack=false、源没有 writeResult，或这一站不是 done/skipped）')
       } else if (writeBackReceipt.written) {
@@ -823,14 +785,38 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       if (isAbortError(normalized) || timedOut) {
         // 人工取消不通知；超时要通知（人不在电脑前，得知道卡住了）。
         // 超时同样是「落库了但通知没发」的窗口，登记待办（取消路径不通知，不登记）。
+        // 超时也算 failed，所以 writeBackOnFailure 打开时也要回填失败原因（#14）；
+        // 人工取消不回填 —— 人按了取消就是不想让这条链路再动任何远端状态。
+        const writeBackTimeout = timedOut && willWriteBack(source, 'failed')
+        /** @type {Record<string, any>} */
+        const timeoutEffects = {}
+        if (writeBackTimeout) {
+          timeoutEffects.writeBack = {
+            phase: 'failed',
+            lastError: `超时 ${timeoutMinutes} 分钟`,
+            worktreePath: ws.worktreePath,
+            sessionId: runSessionId,
+          }
+        }
+        if (timedOut && willNotify('failed')) timeoutEffects.notify = true
         await store.setPhase(key, 'failed', {
           // 失败也要把会话 id 落下：人看到「失败了」之后第一件想做的事就是
           // 「它当时在干什么」，没有 id 就只能去会话列表里翻。
           sessionId: runSessionId.length > 0 ? runSessionId : undefined,
           lastError: timedOut ? `超时 ${timeoutMinutes} 分钟` : 'cancelled by user',
-          pendingEffects: timedOut && willNotify('failed') ? { notify: true } : undefined,
+          pendingEffects: Object.keys(timeoutEffects).length > 0 ? timeoutEffects : undefined,
         })
         await markExtra(key, 'failed', timedOut ? `整票超时 ${timeoutMinutes} 分钟，已标 failed` : '被人工取消，已标 failed', false)
+        if (writeBackTimeout) {
+          // 和通知一样**故意不传 handle.signal**：走到这里它必然已 aborted，
+          // 传下去回填适配器第一行就会抛 aborted，等于永远写不进去。
+          const timeoutReceipt = await writeBackFor(source, ticket, timeoutEffects.writeBack, undefined)
+          if (timeoutReceipt !== undefined) {
+            await store.setPhase(key, 'failed', { writeBack: timeoutReceipt })
+          }
+          await settleWriteBack(key, timeoutReceipt, true)
+          await markNode(key, 'writeback', timeoutReceipt?.written === false ? '超时后回填没写成（见交付·回填表格）' : '已把超时原因写回「处理结果」列', timeoutReceipt?.written !== false)
+        }
         if (timedOut) {
           // 这里**故意不传 handle.signal**：走到这一行时它必然已经 aborted，
           // 而推送适配器（push-mock 第一行就是这么写的）见 aborted 会把消息原样推回 ——
@@ -879,16 +865,30 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       } else {
         // 失败也是终态，同样有「落库了但通知没发」的窗口：DSH 重启一次，
         // 人就永远不知道这票失败了。所以和 done/skipped 一样先登记待办。
-        // 失败不回填（表里那行留在「处理中」是刻意留的信号），所以只有 notify。
+        // 「失败不回填」现在是可配的（工单 #14）：writeBackOnFailure 打开时，
+        // 只往「处理结果」列写一段说明，不碰「是否处理」—— 那列填上就等于说「处理完了」。
+        const writeBackFailure = willWriteBack(source, 'failed')
+        /** @type {Record<string, any>} */
+        const failedEffects = {}
+        if (writeBackFailure) failedEffects.writeBack = { phase: 'failed', lastError: normalized.message, worktreePath: ws.worktreePath, sessionId: runSessionId, attempt }
+        if (willNotify('failed')) failedEffects.notify = true
         await store.setPhase(key, 'failed', {
           attempt,
           // 同上：失败终态也要留住会话 id，否则通知与状态里都没有可追问的入口。
           sessionId: runSessionId.length > 0 ? runSessionId : undefined,
           lastError: normalized.message,
           lastErrorKind: normalized.kind,
-          pendingEffects: willNotify('failed') ? { notify: true } : undefined,
+          pendingEffects: Object.keys(failedEffects).length > 0 ? failedEffects : undefined,
         })
         await markExtra(key, 'failed', `第 ${attempt} 次没跑成，已用尽重试：${normalized.message}`, false)
+        if (writeBackFailure) {
+          const failedReceipt = await writeBackFor(source, ticket, failedEffects.writeBack, handle.signal)
+          if (failedReceipt !== undefined) {
+            await store.setPhase(key, 'failed', { writeBack: failedReceipt })
+          }
+          await settleWriteBack(key, failedReceipt, true)
+          await markNode(key, 'writeback', failedReceipt?.written === false ? '失败的回填没写成（见交付·回填表格）' : '已把失败原因写回「处理结果」列', failedReceipt?.written !== false)
+        }
         // 工作区坐标要带 ws 的值，不能用 ...row：row 是进 runOne 时的快照，
         // 首次运行时里面根本没有 worktreePath，失败的票明明留着工作区，
         // 通知正文却会缺掉「工作区保留在」那一行 —— 人照着去修时找不到目录。
@@ -977,6 +977,19 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         await store.setPhase(key, 'needs-info', {
           lastError: '截图取不到，需要人补图',
         })
+        // 工单 #14：needs-info 也是「没跑成」，writeBackOnFailure 打开时同样只写「处理结果」一列。
+        // 这一步在取图阶段就走完了，所以拿不到提交/会话上下文，只有一句原因 —— 够用：
+        // 人打开表格看到的就是「等你补图」，下一步动作唯一。
+        if (willWriteBack(source, 'needs-info')) {
+          const infoReceipt = await writeBackFor(source, ticket, {
+            phase: 'needs-info',
+            lastError: '截图取不到，需要人补图',
+          }, signal)
+          if (infoReceipt !== undefined) {
+            await store.setPhase(key, 'needs-info', { writeBack: infoReceipt })
+          }
+          await settleWriteBack(key, infoReceipt, true)
+        }
         await notifyFor(ticket, {
           ...(store.getTicket(key) ?? {}),
           phase: 'needs-info',
@@ -1003,8 +1016,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
   function willWriteBack (source, phase) {
     if (config.writeBack === false) return false
     if (typeof source?.writeResult !== 'function') return false
-    if (phase !== 'done' && phase !== 'skipped') return false
-    return true
+    if (phase === 'done' || phase === 'skipped') return true
+    // 失败三种终态：只有显式打开 writeBackOnFailure 才回填，而且只写「处理结果」一列（工单 #14）。
+    // 缺省关的原因是「是否处理」这三列在飞书里是给人看进度的，把一张失败的票写进去
+    // 会让看板显示成「处理完了」，比不写更糟。
+    if (config.writeBackOnFailure !== true) return false
+    return phase === 'failed' || phase === 'needs-info' || phase === 'gone'
   }
 
   /**
@@ -1025,6 +1042,60 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
    */
   async function clearPendingEffect (key, name) {
     await store.clearPendingEffect(key, name)
+  }
+
+  /**
+   * 回填之后收尾：决定待办留不留、交付状态怎么写（工单 #08 / #14）。
+   *
+   * 三条规则（每条都对应一个真出现过的错）：
+   * 1. **回执为空**（这次压根不该回填，比如 writeBack=false）⇒ 清待办。
+   * 2. **写成了** ⇒ 清待办 + 交付记成功，并把上一次的失败原因清掉
+   *    （`setDelivery` 合并写，`error: undefined` 是「明确清掉」不是「没提到」）。
+   * 3. **没写成** ⇒ 分两档：还能救的留着待办等下次补做，救不了的当场放弃并置 `giveUp`,
+   *    让界面能说「这不是再试一次能好的，得你改表格设置」。
+   *    「救不了」的判断权在适配器（`retryable`），这里只负责尊重它。
+   *
+   * @param {string} key
+   * @param {{ written?: boolean, note?: string, retryable?: boolean, errorKind?: string } | undefined} receipt
+   * @param {boolean} planned 这一次是否本来就打算回填（决定「没回执」该不该清待办）
+   */
+  async function settleWriteBack (key, receipt, planned) {
+    if (!planned) return
+    // 这里必须自己算一次：`maxAttempts` 是 runOne 的局部量（它对单票重试口径负责），
+    // 而这里是补做路径也要用的收尾逻辑 —— 借用局部量会 ReferenceError。
+    const attemptLimit = Math.max(1, Number(config.maxAttempts ?? 2))
+    if (receipt === undefined || receipt.written !== false) {
+      await clearPendingEffect(key, 'writeBack')
+      await store.setDelivery(key, 'writeBack', {
+        ok: true,
+        attempts: 1,
+        error: undefined,
+        errorKind: undefined,
+        giveUp: undefined,
+      })
+      return
+    }
+
+    const pendingBefore = store.getTicket(key)?.pendingEffects?.writeBack
+    const attempts = Number(pendingBefore?.attempts ?? 0) + 1
+    const retryable = receipt.retryable === true
+    const willRetry = retryable && attempts < attemptLimit
+    const error = receipt.note ?? '回填失败'
+
+    if (willRetry) {
+      // 留着待办，下次启动（或人工重开）再试。attempts 记在待办里，
+      // 因为「试过几次」是待办自己的属性，票面下一次可能就成功了。
+      await store.retryPendingEffect(key, 'writeBack', { error, errorKind: receipt.errorKind })
+    } else {
+      await clearPendingEffect(key, 'writeBack')
+    }
+    await store.setDelivery(key, 'writeBack', {
+      ok: false,
+      attempts,
+      error,
+      errorKind: receipt.errorKind,
+      giveUp: !willRetry,
+    })
   }
 
   /**
@@ -1065,36 +1136,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         if (receipt !== undefined) {
           await store.setPhase(row.key, row.phase, { writeBack: receipt })
         }
-        // 补做也失败了怎么办（#08）：这是补做，不是第一次 —— 第一次失败留下的待办
-        // 要按「还能不能救」再决定一次，不能像以前那样无论成败都清掉。
-        if (receipt === undefined || receipt.written) {
-          await clearPendingEffect(row.key, 'writeBack')
-          await store.setDelivery(row.key, 'writeBack', {
-            ok: true,
-            attempts: Number(effects.writeBack.attempts ?? 0) + 1,
-            error: undefined,
-            errorKind: undefined,
-            giveUp: undefined,
-          })
-        } else {
-          const attempts = Number(effects.writeBack.attempts ?? 0) + 1
-          const retryable = receipt.retryable === true
-          if (retryable && attempts < maxAttempts) {
-            await store.retryPendingEffect(row.key, 'writeBack', {
-              error: receipt.note ?? '回填失败',
-              errorKind: receipt.errorKind,
-            })
-          } else {
-            await clearPendingEffect(row.key, 'writeBack')
-          }
-          await store.setDelivery(row.key, 'writeBack', {
-            ok: false,
-            attempts,
-            error: receipt.note ?? '回填失败',
-            errorKind: receipt.errorKind,
-            giveUp: !(retryable && attempts < maxAttempts),
-          })
-        }
+        // 补做也失败了怎么办（#08）：和第一次走同一条分档规则 ——
+        // 分成两处写会漂移（曾经一处清了待办、另一处没清），所以收敛到 settleWriteBack。
+        await settleWriteBack(row.key, receipt, true)
         await markNode(row.key, 'writeback', '启动补偿：上次进程在回填前退出了，这一站是补做', receipt?.written !== false)
         replayed += 1
       }
@@ -1156,7 +1200,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     // 关掉就完全不碰表格 —— 有人就是要「表格只读」，这个开关是他们唯一的出口。
     if (config.writeBack === false) return undefined
     if (typeof source?.writeResult !== 'function') return undefined
-    if (input.phase !== 'done' && input.phase !== 'skipped') return undefined
+    const successPhase = input.phase === 'done' || input.phase === 'skipped'
+    // 失败终态回填（工单 #14）：只有 writeBackOnFailure 打开时才写，而且**只写「处理结果」一列**。
+    // 不写「是否处理」是因为它在这张表里的语义是「处理完了」：把一张失败的票写进去，
+    // 看板上那一行立刻变成「已处理」，比什么都不写更误导人。
+    const failurePhase = input.phase === 'failed' || input.phase === 'needs-info' || input.phase === 'gone'
+    const onlyResult = !successPhase
+    if (!successPhase && !(failurePhase && config.writeBackOnFailure === true)) return undefined
     if (signal?.aborted) {
       return { written: false, note: '这张票被取消了，按约定不回填表格' }
     }
@@ -1164,11 +1214,17 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     const status = typeof config.writeBackStatus === 'string' && config.writeBackStatus.trim().length > 0
       ? config.writeBackStatus.trim()
       : '是'
-    const result = renderWriteBackResult(ticket, { ...input, status })
+    const result = onlyResult
+      ? renderFailureWriteBack(ticket, input)
+      : renderWriteBackResult(ticket, { ...input, status })
     const handledAt = nowFn()
 
     try {
-      const receipt = await source.writeResult(ticket.recordId, { status, result, handledAt }, signal)
+      const receipt = await source.writeResult(
+        ticket.recordId,
+        onlyResult ? { result, onlyResult: true } : { status, result, handledAt },
+        signal,
+      )
       const written = receipt?.written === true
       const normalized = {
         written,
@@ -1628,6 +1684,38 @@ function renderWriteBackResult (ticket, input) {
   }
   lines.push('', '要进一步修改，先把这个单元格清空，再用 pipeline_reset 带上这张票的 recordId 重跑。'
     + '（也可以把「是否处理」拨回「处理中」，但那会整票重做一遍并覆盖这次的回填。）')
+
+  return lines.join('\n')
+}
+
+/**
+ * 失败票回填进「处理结果」列的那段话（工单 #14，需 writeBackOnFailure=true）。
+ *
+ * 和成功回填的区别不是措辞，是**信息缺口**：成功的票人看重「改了什么」，
+ * 失败的票人看重「为什么没成、还能不能救、下一步做什么」。所以这里只写这几件事，
+ * 多一句都是噪音。
+ *
+ * 不写「是否处理」与「处理日期」：那两列在飞书表里是「处理完了」的信号，
+ * 一张没成的票填上它们，看板会说谎。
+ *
+ * @param {Ticket} ticket
+ * @param {{
+ *   phase: Phase,
+ *   lastError?: string,
+ *   worktreePath?: string,
+ *   sessionId?: string,
+ *   attempt?: number,
+ * }} input
+ * @returns {string}
+ */
+function renderFailureWriteBack (ticket, input) {
+  const lines = []
+  const label = phaseLabel({ phase: input.phase })
+  lines.push(`[流水线] ${label}：${input.lastError ?? '原因未记录'}`)
+  if (input.attempt && input.attempt > 1) lines.push(`已尝试 ${input.attempt} 次。`)
+  if (input.worktreePath) lines.push(`改代码目录：${input.worktreePath}（工作区还留着，可以去看看改到哪了）`)
+  if (input.sessionId) lines.push(`处理会话：${input.sessionId}（点进去能看它那一轮到底做了什么）`)
+  lines.push('', `要重来：用 pipeline_reset 带上这张票的 recordId（${ticket.recordId}）。`)
 
   return lines.join('\n')
 }

@@ -99,6 +99,21 @@ const branchList = codec('BranchList', (value) => value)
 /** 「粘贴链接」的结果：写完之后的那条项目记录（已打码）+ 一句人话。 */
 const projectWriteResult = codec('ProjectWriteResult', (value) => value)
 
+/**
+ * 运行页签读的状态快照（工单 #16）：与 `pipeline_status` 的返回体**同一份**，
+ * 因为宿主那边调的就是 `collectStatus()`，不是另写一遍。
+ */
+const pipelineStatusSnapshot = codec('PipelineStatus', (value) => value)
+
+/** 跑一轮的结果：与 `pipeline_scan` 返回体同形（`status` 只有 triggered / disabled / already-running）。 */
+const scanResult = codec('ScanResult', (value) => value)
+
+/** 取消的结果：`{ cancelled, text }`，空闲时 `cancelled:false` 不是错误。 */
+const cancelResult = codec('CancelResult', (value) => value)
+
+/** 重开的结果：与 `pipeline_reset` 同形（`reset` + `reason` + `text`）。 */
+const resetResult = codec('ResetResult', (value) => value)
+
 /** 一个非空字符串参数。 */
 function requiredString (method, name, description) {
   return parameter(method, name, description, (value) => {
@@ -135,6 +150,11 @@ function method (method) {
   if (method === 'doctor') result = doctorReport
   if (method === 'projects') result = projectList
   if (method === 'branches') result = branchList
+  // 运行页签（#16）的三个动作。result 必须按名字分派，否则它们会全部拿到
+  // ConfigSnapshot 的 typeSymbol —— 网关按 codec 校验返回值，类型名不对就白挂。
+  if (method === 'status') result = pipelineStatusSnapshot
+  if (method === 'scan') result = scanResult
+  if (method === 'cancel') result = cancelResult
   return {
     id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/${method}`,
     service: TICKET_PIPELINE_NAMESPACE,
@@ -167,6 +187,32 @@ function setProjectTable () {
   }
 }
 
+/**
+ * 面板「运行」页签的「重跑」按钮：`reset(recordId, projectId?)`。
+ *
+ * 与工具 `pipeline_reset` 的参数表一字不差 —— 少一个可选参数，
+ * 「同名 recordId 撞车」时面板就没法从两条里挑一条（工具里那条 `ambiguous` 分支会永远触发）。
+ * `projectId` 是可选的：只有多项目撞同一个 record_id 时才需要补。
+ */
+function reset () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/reset`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'reset',
+    invocation: { kind: 'direct' },
+    result: resetResult,
+    parameters: [
+      requiredString('reset', 'recordId', '要重开的工单标识（飞书 record_id）'),
+      parameter('reset', 'projectId', '工单所属项目名；只有同名 recordId 会冲突时才需要传', (value) => {
+        if (value === undefined) return undefined
+        if (typeof value !== 'string') throw new TypeError('reset: projectId 必须是字符串')
+        return value
+      }, true),
+    ],
+  }
+}
+
 /** 宿主与浏览器共用的方法表。 */
 export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('doctor'),
@@ -174,6 +220,11 @@ export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('projects'),
   method('branches'),
   setProjectTable(),
+  // 运行页签（#16）：先 status 拉一屏，再 scan / cancel / reset 三个动作。
+  method('status'),
+  method('scan'),
+  method('cancel'),
+  reset(),
 ])
 
 /**

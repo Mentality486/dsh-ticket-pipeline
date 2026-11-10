@@ -31,6 +31,16 @@
 
 import { resolveRecordIds } from '../contracts/record-filter.js'
 import { parseBitableUrl } from '../contracts/types.js'
+import { FEISHU_SEMANTIC_FIELD_NAMES } from '../contracts/feishu-columns.js'
+
+/**
+ * `match.columns` 的键白名单（工单 #21）。
+ *
+ * 必须是**适配器真正认识的那 13 个**：写错一个字段名就意味着「配了但没生效」，
+ * 而这是静默的（那一列读不到 → 空值 → 票被过滤掉）。所以白名单必须与
+ * `source-feishu` 用的是同一份常量，不能在这里另抄一遍。
+ */
+const BITABLE_COLUMN_FIELDS = FEISHU_SEMANTIC_FIELD_NAMES
 
 /**
  * 一项配置的声明。
@@ -160,6 +170,13 @@ export const CONFIG_FIELDS = Object.freeze({
     type: 'string',
     default: '是',
     description: '回填时「是否处理」列要写的值（有的表用「是」，有的用「已完成」「已处理」）',
+  },
+  writeBackOnFailure: {
+    type: 'boolean',
+    default: false,
+    description: '失败的票也往「处理结果」列写一段说明（写它卡在哪、工作区在哪、怎么重跑）。'
+      + '**不动「是否处理」列** —— 那一行继续停在「处理中」，让人一眼看出这票没成。'
+      + '缺省关：老用户升级后表格不会突然多出内容。表格里那行不再「躺三天没人知道」时才值得打开',
   },
 
   // ── agent 与模型 ────────────────────────────────────
@@ -305,6 +322,7 @@ export const CONFIG_GROUPS = Object.freeze([
       Object.freeze(['isolateWorktree', '每票开隔离 worktree']),
       Object.freeze(['writeBack', '处理完回填表格']),
       Object.freeze(['writeBackStatus', '回填的「是否处理」值']),
+      Object.freeze(['writeBackOnFailure', '失败也写「处理结果」']),
     ]),
   }),
   Object.freeze({
@@ -701,6 +719,38 @@ function validateProject (raw, index) {
     }
   }
 
+  // 多维表格的列名覆盖（工单 #21）：与 `match.sheetColumns` **同形、同一套校验**，
+  // 只是字段白名单来自多维表格那份别名表。
+  // 为什么要两个键而不是复用 sheetColumns：两种表型的「认识哪些字段名」不完全一样
+  // （多维表格额外认规范名本身），而且报错时要说清「你配的是哪种表」。
+  if (match.columns !== undefined && match.columns !== null) {
+    if (typeof match.columns !== 'object' || Array.isArray(match.columns)) {
+      fail('match.columns', '必须是对象，形如 { "description": "缺陷描述", "status": "处理状态" }', '左边是插件认识的字段名（与 match.sheetColumns 相同），右边是这张多维表格里字段实际叫的名字；字段名本来就对的话删掉这个键')
+    } else {
+      /** @type {Record<string, string | string[]>} */
+      const columns = {}
+      for (const [field, actual] of Object.entries(match.columns)) {
+        if (!BITABLE_COLUMN_FIELDS.includes(field)) {
+          // 白名单外的键**必须报错**：它会静默不生效，而人以为自己已经配好了
+          // —— 那正是这个键要解决的病（列名对不上导致扫出 0 张票）。
+          fail(`match.columns.${field}`, `不认识的字段名（只认 ${BITABLE_COLUMN_FIELDS.join(' / ')}）`, '左边必须用插件认识的字段名，不是表里的中文列名：想表达「描述列叫缺陷描述」要写成 { "description": "缺陷描述" }')
+          continue
+        }
+        const names = Array.isArray(actual) ? actual : [actual]
+        const cleaned = names
+          .filter((item) => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+        if (cleaned.length === 0) {
+          fail(`match.columns.${field}`, '必须是非空字符串或字符串数组（字段在表里的实际名字）', `填这张表里那个字段的真实文字，例如 "${field}": "问题描述"`)
+          continue
+        }
+        columns[field] = Array.isArray(actual) ? cleaned : cleaned[0]
+      }
+      if (Object.keys(columns).length > 0) value.match.columns = columns
+    }
+  }
+
   if (typeof repo.remote === 'string' && repo.remote.length > 0) value.repo.remote = repo.remote
   if (typeof repo.baseBranch === 'string' && repo.baseBranch.length > 0) value.repo.baseBranch = repo.baseBranch
   if (typeof repo.targetBranch === 'string' && repo.targetBranch.length > 0) value.repo.targetBranch = repo.targetBranch
@@ -792,6 +842,22 @@ export const REMOVED_CONFIG_KEYS = Object.freeze({
   'pushplus.template': '模板恒为 txt（富模板只显示前 50 字），已删掉',
   'qqmail.port': '改用 qqmail.encryption：tls = 465、starttls = 587',
   'qqmail.secure': '改用 qqmail.encryption：tls = 465、starttls = 587',
+})
+
+/**
+ * 几个「通用的修法句式说不清」的键，单独给一句能照着做的。
+ *
+ * 为什么需要单独一张表：`从这几个里挑一个：mock / pushplus / qqmail` 只是复述了选项，
+ * 人真正想知道的是「我这次该挑哪个」。这类建议必须结合这个键的用途，从 descriptor
+ * 推不出来。表里没有的键继续走通用句式（默认值 + 范围），不硬写。
+ */
+const FIELD_FIX_HINTS = Object.freeze({
+  pushAdapter: '第一次配先填 mock（只记日志、不发真消息），等整条链路跑通了再换 pushplus / qqmail。'
+    + '选 qqmail 还要在「通知」组填 qqmail.user 与 qqmail.to；选 pushplus 要去「凭据」页填 PUSHPLUS_TOKEN。',
+  workExecutor: '第一次先填 mock（只走流程、不改代码），确认工单表与仓库都配对了再换 agent。',
+  'qqmail.encryption': '不确定就填 tls（465 端口直连加密）。只有服务器不接受 465 时才用 starttls（587，先明文再升级）。',
+  provider: '留空（写 ""）表示跟随当前会话默认 —— 推荐留空。钉死某个 provider 换台机器就跑不起来。',
+  model: '留空（写 ""）表示跟随会话默认模型。钉死模型会在它被限流时让整条流水线全灭。',
 })
 
 /**
@@ -891,12 +957,15 @@ export function validateConfig (raw) {
     const heading = label.length > 0 ? `${label.replace(/）$/, `，${path}）`)}` : path
     const fail = (message, fix) => issues.push({ message: `${heading} ${message}`, path: path.split('.'), ...(fix ? { fix } : {}) })
     const example = field.default !== undefined ? JSON.stringify(field.default) : ''
+    // 几个键的修法没法从 descriptor 推出来（要结合上下文），在这里写死。
+    // 只要「怎么改」比「带默认值的通用句式」更具体，就值得单独写一句。
+    const customFix = FIELD_FIX_HINTS[path]
 
     switch (field.type) {
       case 'string': {
-        if (typeof value !== 'string') { fail('必须是字符串', `写成文本（不要写成数字或列表）${example ? `，缺省是 ${example}` : ''}`); break }
+        if (typeof value !== 'string') { fail('必须是字符串', customFix ?? `写成文本（不要写成数字或列表）${example ? `，缺省是 ${example}` : ''}`); break }
         if (field.enum && !field.enum.includes(value)) {
-          fail(`只能是 ${field.enum.join(' / ')}`, `从这几个里挑一个：${field.enum.join(' / ')}${example ? `；不确定就先用缺省 ${example}` : ''}`)
+          fail(`只能是 ${field.enum.join(' / ')}`, customFix ?? `从这几个里挑一个：${field.enum.join(' / ')}${example ? `；不确定就先用缺省 ${example}` : ''}`)
           break
         }
         assignPath(nested, path, value)
@@ -1259,15 +1328,16 @@ function buildProjectsDescriptor () {
     sheetIdColumn: projectLeaf('string', '序号列名', '缺省「序号」。取这一列的值当工单身份，空值退回行号'),
     sheetRange: projectLeaf('string', '读取范围', '可选，如 A1:M500；不填则从表头读到 Z 列末尾'),
     sheetColumns: projectLeaf('string', '列名覆盖', '可选，JSON 形态 {"description":"你的列名"}；表头叫法不一样时用它'),
+    columns: projectLeaf('string', '列名覆盖（多维表格）', '可选，JSON 形态 {"description":"你的字段名"}；多维表格字段叫法不一样时用它（电子表格用上面那个键）'),
     tableKind: projectLeaf('string', '强制表型', '可选，bitable/sheet；不填则按 token 自动探测', { enum: ['', 'bitable', 'sheet'] }),
-  })
+  }, { label: '工单表绑定' })
 
   const gitlabNode = projectObject({
     enabled: projectLeaf('boolean', '开 draft MR', '关掉只做本地提交，不需要 GITLAB_TOKEN'),
     baseUrl: projectLeaf('string', 'GitLab 站点', '自建站点或子组路径时用它'),
     remote: projectLeaf('string', 'GitLab remote', '仓库 remote 的 URL，用于推导 projectId'),
     projectId: projectLeaf('string', 'GitLab projectId', '数字 id 或 group/project 路径'),
-  })
+  }, { label: 'GitLab 出口' })
 
   const repoNode = projectObject({
     path: projectLeaf('string', '仓库路径', '本地 git 检出根目录，绝对路径或相对 DSH 工作目录'),
@@ -1275,12 +1345,12 @@ function buildProjectsDescriptor () {
     baseBranch: projectLeaf('string', '基准分支', '从哪条分支切出工作分支'),
     targetBranch: projectLeaf('string', '目标分支', 'MR 的目标分支'),
     gitlab: gitlabNode,
-  })
+  }, { label: '仓库' })
 
   const verifyNode = projectObject({
     build: projectLeaf('string', '构建命令', '留空跳过构建'),
     test: projectLeaf('string', '验证命令', '留空跳过验证'),
-  })
+  }, { label: '验证命令' })
 
   const entry = projectObject({
     name: projectLeaf('string', '项目名', 'projectId，必须唯一；工单里的项目要靠它对上仓库'),

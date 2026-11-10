@@ -185,6 +185,120 @@ window.__ModuleLoader__.load({
             },
           ],
         },
+        // ── 运行页签（工单 #16）──────────────────────────────────
+        // 这四个方法的实现全在宿主侧，且**转调工具已经抽好的算结果层**
+        // （collectStatus / collectScan / collectCancel / collectReset），
+        // 面板与对话里的 pipeline_status / scan / cancel / reset 是同一份代码。
+        // 结果 codec 的类型名必须与 src/remote/descriptors.js 逐一对应，
+        // 否则 client-check 的「两端描述符一致」会红。
+        {
+          id: 'ticket-pipeline#ticketPipeline/status',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'status',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#PipelineStatus', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
+        {
+          id: 'ticket-pipeline#ticketPipeline/scan',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'scan',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ScanResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
+        {
+          id: 'ticket-pipeline#ticketPipeline/cancel',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'cancel',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#CancelResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
+        {
+          // 失败票行尾的「重跑」。这是唯一允许带「可选参数」的方法：
+          // projectId 只有在多项目撞同一个 record_id 时才需要补，不传时
+          // 浏览器的 prepareInvocation 不会把该 wire 写进 args（undefined 不写），
+          // 宿主侧 acceptsUndefined:true 正好接住。
+          id: 'ticket-pipeline#ticketPipeline/reset',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'reset',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ResetResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [
+            {
+              name: 'recordId',
+              wire: 'recordId',
+              description: '要重开的工单标识（飞书 record_id）',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/reset:recordId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('reset: recordId 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/reset:recordId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('reset: recordId 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+            {
+              name: 'projectId',
+              wire: 'projectId',
+              description: '工单所属项目名；只有同名 recordId 会冲突时才需要传',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/reset:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('reset: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/reset:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('reset: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
+        },
       ],
     }
 
@@ -208,7 +322,7 @@ window.__ModuleLoader__.load({
       { ref: 'FEISHU_APP_ID', label: '飞书 App ID', hint: '飞书开放平台 → 开发者后台 → 应用详情 → 凭证与基础信息。' },
       { ref: 'FEISHU_APP_SECRET', label: '飞书 App Secret', hint: '同上，App Secret。只读工单表需要 bitable:app:readonly 权限。' },
       { ref: 'QQMAIL_AUTH_CODE', label: 'QQ 邮箱授权码', hint: 'QQ 邮箱 → 设置 → 账户 → 开启 SMTP 服务后拿到的授权码，不是登录密码。' },
-      { ref: 'GITLAB_TOKEN', label: 'GitLab Token', hint: '真实执行器开 MR 时才需要；mock 模式不影响。' },
+      { ref: 'GITLAB_TOKEN', label: 'GitLab Token', hint: '只在项目打开了「远程 MR（实验性）」时才需要；缺省交付形态是本地提交，你多半不用填。' },
       { ref: 'PUSHPLUS_TOKEN', label: 'PushPlus token', hint: '填这里就行。通知适配器选 PushPlus 时用它，不写进配置文件。' },
     ]
 
@@ -559,7 +673,11 @@ window.__ModuleLoader__.load({
         fields: [
           { path: ['name'], from: 'name', label: '项目名', kind: 'text', required: true, hint: 'projectId，必须唯一；工单里的项目要靠它对上仓库。' },
           { path: ['description'], from: 'description', label: '说明', kind: 'text', advanced: true, hint: '随便写给人看的备注，不参与任何判断；留空也行。' },
-          { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true, hint: '决定用哪个 ticket-source 适配器收票。' },
+          { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true,
+            // 金山源没有内置取数通道（工单 #20）：下拉里必须先把这件事写出来，
+            // 否则人选了它、配完、开开关，然后永远等不到票 —— 而且不知道该怪谁。
+            optionLabels: { wps: 'wps 金山文档（实验性，需自行注入取数通道）' },
+            hint: '决定用哪个 ticket-source 适配器收票。wps 是实验性的：当前版本没有内置取数通道，选它会拿不到票。' },
         ],
       },
       {
@@ -640,10 +758,18 @@ window.__ModuleLoader__.load({
           {
             path: ['match', 'sheetColumns'],
             from: 'sheetColumns',
-            label: '列名覆盖',
+            label: '列名覆盖（电子表格）',
             kind: 'columns',
             advanced: true,
             hint: '表头叫法跟插件不一样时用，写成 description=我的列名, status=我的状态列。左边只能是 description / status / seq / module / priority 等固定语义名。',
+          },
+          {
+            path: ['match', 'columns'],
+            from: 'columns',
+            label: '列名覆盖（多维表格）',
+            kind: 'columns',
+            advanced: true,
+            hint: '多维表格的字段叫法跟插件不一样时用（例如字段叫「缺陷描述」「处理状态」）。写法同上；多维表格本来就会自动认一批常见别名，这一格只用来兜底。',
           },
           {
             path: ['match', 'tableKind'],
@@ -664,7 +790,23 @@ window.__ModuleLoader__.load({
           { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'remote'], from: 'repoRemote', label: 'GitLab 仓库地址', kind: 'text', advanced: true, hint: '只有要开 draft MR 时才需要。填仓库地址（https://gitlab.x/group/repo.git 或 git@gitlab.x:group/repo.git），不是 git 远端名，别填 origin。' },
-          { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', advanced: true, hint: '关掉只做本地提交，不需要 GITLAB_TOKEN。' },
+        ],
+      },
+      {
+        // GitLab 出口整组是**实验性**能力（工单 #19）：本机 git push 被封死，只能走 Commits API，
+        // 而且要自己申请 GITLAB_TOKEN。所以整组收进「高级设置」，缺省视图里一个字都不出现 ——
+        // 99% 的人只用本地提交，把 MR 当主角介绍他们是错的。
+        //
+        // 但一旦打开 `enabled`，**四个字段都要能在面板上填全**：以前只有 enabled 画得出来，
+        // 另外三个只能手改 YAML，等于「开得起来但配不出来」。
+        key: 'gitlab',
+        label: '远程 MR（实验性）',
+        advanced: true,
+        fields: [
+          { path: ['repo', 'gitlab', 'enabled'], from: 'remoteMrEnabled', label: '开 draft MR', kind: 'bool', hint: '关掉只做本地提交，不需要 GITLAB_TOKEN（这也是缺省行为）。打开之后要在「凭据」页填 GITLAB_TOKEN，并填下面三项。' },
+          { path: ['repo', 'gitlab', 'baseUrl'], from: 'gitlabBaseUrl', label: 'GitLab 站点', kind: 'text', hint: '站点根地址，如 https://gitlab.example.com。自建站点或子组路径必须填；不填时从上面的「GitLab 仓库地址」推。' },
+          { path: ['repo', 'gitlab', 'remote'], from: 'gitlabRemote', label: 'GitLab remote', kind: 'text', hint: '仓库 remote 的 URL，用于推导 projectId。不填时同样从「GitLab 仓库地址」推。' },
+          { path: ['repo', 'gitlab', 'projectId'], from: 'gitlabProjectId', label: 'GitLab projectId', kind: 'text', hint: '数字 id 或 group/project 路径，如 1234 或 platform/pms。这一项填不上，开 MR 会报「项目没有配置 GitLab」。' },
         ],
       },
       {
@@ -990,15 +1132,18 @@ window.__ModuleLoader__.load({
     }
 
     // ── 页签 ────────────────────────────────────────────────────
-    // 整页有四个互不相干的大块（项目 / 参数 / 凭据 / 体检）。上一版把它们竖着
-    // 排成一列，一屏 1300 多字、四个卡片首尾相接，谁也说不清该从哪儿看起 ——
+    // 整页有五个互不相干的大块（运行 / 项目 / 参数 / 凭据 / 体检）。上一版把它们
+    // 竖着排成一列，一屏 1300 多字、四个卡片首尾相接，谁也说不清该从哪儿看起 ——
     // 这就是「太复杂」。改成页签之后每次只摊开一块，其余收在标题里。
     //
-    // 缺省停在「项目」：它是这张配置页真正的主线（一张工单表绑一个仓库），
-    // 参数与凭据是一次性调好的配角。
+    // 缺省停在「运行」（#16）：人打开设置页时的第一个问题几乎总是「现在跑得怎么样、
+    // 有没有卡住 / 要我做点什么」。这个问题以前只能去对话里敲 pipeline_status，
+    // 而不知情的人根本不知道有这个工具 —— 于是「插件跑没跑」变成了一个谜。
+    // 配置类页签（项目/参数/凭据）与体检都是**一劳永逸**的事，排在后面不碍事。
     var TAB_KEY = 'ticket-pipeline:open-tab'
 
     var TABS = [
+      { key: 'run', label: '运行' },
       { key: 'projects', label: '项目' },
       { key: 'params', label: '参数' },
       { key: 'creds', label: '凭据' },
@@ -1007,14 +1152,14 @@ window.__ModuleLoader__.load({
 
     function readTab () {
       try {
-        if (typeof localStorage === 'undefined') return 'projects'
+        if (typeof localStorage === 'undefined') return 'run'
         var raw = localStorage.getItem(TAB_KEY)
         for (var i = 0; i < TABS.length; i += 1) {
           if (TABS[i].key === raw) return raw
         }
-        return 'projects'
+        return 'run'
       } catch (error) {
-        return 'projects'
+        return 'run'
       }
     }
 
@@ -1259,6 +1404,15 @@ window.__ModuleLoader__.load({
       var gitlabEnabled = Boolean(draft[projectKey(index, ['repo', 'gitlab', 'enabled'])])
       if (gitlabEnabled) {
         add(['repo', 'gitlab', 'enabled'], 'soft', '开 MR 需要 GITLAB_TOKEN 凭据，并且仓库要有可访问的远端。')
+        // 打开了却三个定位字段全空 —— 这不是「软提示」，是「跑到最后一步才失败」，
+        // 所以要在开 MR 那一格上直接说清楚，别让人白等一整票。
+        var repoRemote = read(['repo', 'remote']).trim()
+        var glBaseUrl = read(['repo', 'gitlab', 'baseUrl']).trim()
+        var glProjectId = read(['repo', 'gitlab', 'projectId']).trim()
+        if (repoRemote.length === 0 && (glBaseUrl.length === 0 || glProjectId.length === 0)) {
+          add(['repo', 'gitlab', 'projectId'], 'error',
+            '打开了「开 draft MR」但既没填上面的「GitLab 仓库地址」，这里的站点 / projectId 也没填全 —— 票会跑到最后一步才失败。要么把这三格填上，要么把「开 draft MR」关掉只做本地提交。')
+        }
       }
 
       // verify 那两条填的是「命令」，只做软提示：真起进程去跑才知道对不对，
@@ -1550,6 +1704,37 @@ window.__ModuleLoader__.load({
       '.tp-link-input{display:flex;gap:6px;align-items:center}',
       '.tp-link-input .tp-input{flex:1 1 auto;min-width:0}',
       '.tp-link-input .tp-btn{flex:0 0 auto;white-space:nowrap}',
+      // 实验性平台的醒目提示（工单 #20）：背景色 + 左边框，和普通说明文字区分开 ——
+      // 这条提示的后果是「配完了什么都没发生」，混在灰字里没人会读。
+      '.tp-wps-notice{margin:0 0 10px;padding:8px 10px;border-left:3px solid #d98600;',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);border-radius:0 6px 6px 0;line-height:1.6}',
+      '.tp-wps-notice code{font-size:11px;padding:1px 4px;border-radius:3px;',
+      '  background:var(--dsw-alias-bg-layer-3,#eef0f3)}',
+
+      // 「运行」页（#16）：状态行 + 票列表。刻意不用表格 —— 票是「一件件事」，
+      // 一行一张、可展开，比表格更像清单。
+      '.tp-run-line{font-size:13px;line-height:1.6;margin:0 0 6px;display:flex;',
+      '  align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tp-run-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:#9ca3af}',
+      '.tp-run-dot.tp-on{background:#22c55e}',
+      '.tp-run-dot.tp-off{background:#9ca3af}',
+      '.tp-run-tiers{font-size:12px;color:var(--dsw-alias-label-secondary,#61666b);',
+      '  margin:0 0 6px;line-height:1.6}',
+      '.tp-run-row{border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04));padding:8px 0}',
+      '.tp-run-row:first-child{border-top:0}',
+      '.tp-run-row-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.tp-run-toggle{display:flex;align-items:baseline;gap:8px;flex:1 1 auto;min-width:0;',
+      '  font:inherit;font-size:13px;text-align:left;cursor:pointer;border:0;background:none;',
+      '  padding:0;color:inherit}',
+      '.tp-run-toggle:hover .tp-run-id{text-decoration:underline}',
+      '.tp-run-id{font-family:var(--dsw-font-family,ui-monospace,monospace);font-size:12px;',
+      '  color:var(--dsw-alias-label-secondary,#61666b);flex:0 0 auto}',
+      '.tp-run-phase{font-size:12px;flex:0 0 auto;color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.tp-run-title{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-run-detail{margin:6px 0 0 16px;font-size:12px;line-height:1.7;',
+      '  color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.tp-run-detail div{white-space:pre-wrap;word-break:break-word}',
 
       '.tp-empty{padding:16px 0;font-size:13px;line-height:1.6;',
       '  color:var(--dsw-alias-label-tertiary,#81858c)}',
@@ -1807,6 +1992,154 @@ window.__ModuleLoader__.load({
                 + (report.problems.length > 0 ? report.problems.length + ' 个必须修复' : '')),
             h('pre', { className: 'tp-pre' }, report.text))
           : null,
+        props.error ? h('p', { className: 'tp-err' }, props.error) : null)
+    }
+
+    // 正在跑的那几个站点。用来判断「现在能不能取消」——
+    // pending 不算：它只是排着队，取消它等于把票拨走，那是另一件事。
+    var ACTIVE_PHASES = ['worktree-ready', 'planning', 'editing', 'testing', 'mr-opening']
+
+    /**
+     * 「运行」页签（工单 #16）。
+     *
+     * 为什么要把这个页签放在第一位：人打开设置面板时的第一个问题几乎总是
+     * 「现在跑得怎么样、有没有卡住、要我做点什么」。以前这个答案只能靠
+     * 去对话里敲 pipeline_status —— 而不知道有这个工具的人，永远看不到。
+     * 于是「插件到底跑没跑」变成了一个谜，失败票也躺在那里没人知道要重开。
+     *
+     * 这一块**不重复算任何东西**：票列表、档位汇总、能不能重跑，全部来自
+     * 宿主 `ticketPipeline.status()`（它内部调的是 pipeline_status 同一个
+     * collectStatus）。面板只做渲染与三个动作（跑一轮 / 取消 / 重跑）。
+     */
+    function RunCard (props) {
+      var data = props.data
+      var tiers = data && Array.isArray(data.tiers) ? data.tiers : []
+      var tickets = data && Array.isArray(data.tickets) ? data.tickets : []
+      var enabled = data ? data.enabled === true : false
+      var needYou = 0
+      for (var i = 0; i < tiers.length; i += 1) {
+        if (tiers[i].label === '需要你处理') needYou = tiers[i].count
+      }
+      var running = false
+      for (var j = 0; j < tickets.length; j += 1) {
+        if (ACTIVE_PHASES.indexOf(tickets[j].phase) >= 0) running = true
+      }
+      var tierText = tiers.map(function (t) { return t.label + ' ' + t.count }).join(' · ')
+      var queue = data && data.queue ? data.queue : null
+      var busyScan = props.busy && props.action === 'scan'
+      var busyCancel = props.busy && props.action === 'cancel'
+
+      var statusLine = data
+        ? h('p', { className: 'tp-run-line' },
+          h('span', { className: 'tp-run-dot ' + (enabled ? 'tp-on' : 'tp-off') }),
+          enabled ? '流水线：已开启' : '流水线：关着（enabled=false），不会自动扫表')
+        : null
+
+      var rows = tickets.map(function (t) {
+        var open = props.openOf(t.recordId)
+        var rerunBusy = props.busy && props.action === t.recordId
+        var detail = []
+        if (t.lastError) detail.push('最近错误：' + t.lastError)
+        if (t.testDetail) detail.push('验证：' + t.testDetail)
+        if (t.commitSha) detail.push('提交：' + String(t.commitSha).slice(0, 8))
+        if (t.commitSummary) detail.push('改动：' + t.commitSummary)
+        if (t.mrUrl) detail.push('MR：' + t.mrUrl)
+        if (t.writeBack && t.writeBack.written === false) {
+          detail.push('回填表格：没写成 —— ' + (t.writeBack.note || '原因未记录'))
+        }
+        if (Array.isArray(t.deliveryIssues)) {
+          for (var d = 0; d < t.deliveryIssues.length; d += 1) {
+            var issue = t.deliveryIssues[d]
+            detail.push('交付·' + issue.label + '：没做成 —— ' + (issue.error || '原因未记录'))
+          }
+        }
+        if (t.stationElapsedMs && t.station) {
+          detail.push('这一站已经待了 ' + Math.round(t.stationElapsedMs / 60000) + ' 分钟')
+        }
+        if (t.worktreePath) detail.push('改代码目录：' + t.worktreePath)
+        if (t.sessionId) detail.push('处理会话：' + t.sessionId)
+        if (detail.length === 0) detail.push('（这一票没有更多细节）')
+
+        return h('div', { key: t.projectId + '/' + t.recordId, className: 'tp-run-row' },
+          h('div', { className: 'tp-run-row-head' },
+            h('button', {
+              type: 'button',
+              className: 'tp-run-toggle',
+              title: open ? '收起详情' : '展开详情',
+              onClick: function () { props.onToggle(t.recordId) },
+            },
+            h('span', { className: 'tp-run-id' }, t.recordId),
+            h('span', { className: 'tp-run-phase' }, t.phaseLabel || t.phase),
+            h('span', { className: 'tp-run-title' }, t.problemSummary || '（没有标题）')),
+            // 「重跑」是本页签最大的价值：失败票以前只能回对话里敲 pipeline_reset，
+            // 或者去表格里把「是否处理」拨走再拨回来（那样会连内容重做）。
+            // canReset 由宿主按 RESETTABLE_PHASES 算好，面板不自己判断。
+            t.canReset
+              ? h('button', {
+                type: 'button',
+                className: 'tp-btn tp-sm',
+                disabled: props.busy,
+                title: t.cancelledByUser ? '这是你手动取消的，重跑会重新排进队列' : '把这张票放回队列，下一轮重新跑',
+                onClick: function () { props.onRerun(t.recordId) },
+              }, rerunBusy ? '重开中…' : '重跑')
+              : null),
+          open ? h('div', { className: 'tp-run-detail' }, detail.map(function (line, index) {
+            return h('div', { key: index }, line)
+          })) : null)
+      })
+
+      var emptyText = null
+      if (data && !enabled) {
+        emptyText = '总开关是关的，插件不会扫表、不会建工作区、不会提交。去「参数」页签把它打开。'
+      } else if (data && tickets.length === 0) {
+        emptyText = '当前没有未收尾的票。确认总开关已开、项目已配好，然后点「跑一轮」看看。'
+      }
+
+      return h('section', { className: 'tp-card' },
+        h('h3', null,
+          '运行',
+          h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } },
+            props.polling ? h('span', { className: 'tp-note' }, '盯着…') : null,
+            props.message.length > 0 ? h('span', { className: 'tp-ok' }, props.message) : null,
+            h('button', {
+              type: 'button',
+              className: 'tp-btn tp-sm',
+              disabled: props.busy || !props.available,
+              title: '重新读一遍状态，不会触发扫表',
+              onClick: props.onRefresh,
+            }, '刷新状态'),
+            h('button', {
+              type: 'button',
+              className: 'tp-btn tp-sm tp-danger',
+              disabled: props.busy || !props.available || (data !== null && !running && !props.polling),
+              title: running || props.polling ? '打断正在跑的那张票' : '当前没有票在跑',
+              onClick: props.onCancel,
+            }, busyCancel ? '取消中…' : '取消当前'),
+            h('button', {
+              type: 'button',
+              className: 'tp-btn tp-primary',
+              disabled: props.busy || !props.available,
+              title: '立刻扫一轮表，最多跑一张票。这一轮不会等它跑完。',
+              onClick: props.onScan,
+            }, busyScan ? '触发中…' : '跑一轮'))),
+        props.available
+          ? h('p', { className: 'tp-note' },
+            '这里看的是宿主里真实的队列状态，和 pipeline_status 工具同一份口径。'
+            + '「跑一轮」不会等这一轮跑完（一张票可能几十分钟），想看进度就留着这一页。')
+          : h('p', { className: 'tp-err' },
+            '宿主 Remote 没挂上（typert 服务缺席）。命令行里仍然可以跑 pipeline_status 工具。'),
+        statusLine,
+        data && tierText.length > 0 ? h('p', { className: 'tp-run-tiers' }, '汇总：' + tierText) : null,
+        data && queue && queue.nextRecordId
+          ? h('p', { className: 'tp-run-tiers' },
+            '下一个：' + queue.nextRecordId
+            + (queue.backoff && queue.backoff.length > 0
+              ? '（另有 ' + queue.backoff.length + ' 张在退避，暂时拣不出来）'
+              : ''))
+          : null,
+        props.notice.length > 0 ? h('p', { className: 'tp-note' }, props.notice) : null,
+        emptyText ? h('p', { className: 'tp-note' }, emptyText) : null,
+        rows.length > 0 ? h('div', { style: { marginTop: '8px' } }, rows) : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
 
@@ -2110,7 +2443,9 @@ window.__ModuleLoader__.load({
         // 高级字段），把它们混称「高级设置」会让人以为是同一个开关能全放出来。
         hiddenCount > 0 && open ? h('span', { className: 'tp-badge' }, hiddenCount + ' 项未显示') : null,
         h('span', { className: 'tp-spacer' }),
-        record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, '开 MR') : null,
+        // 「开 MR」是实验性能力的徽标（工单 #19）：缺省关着，开了才出现，
+        // 而且带「实验性」三个字 —— 不让人以为这是产品主推的交付形态。
+        record && record.remoteMrEnabled ? h('span', { className: 'tp-badge' }, 'MR（实验性）') : null,
         // 删除已保存的项目是**结构性**动作（会 splice 掉数组里这一项，后面项目的
         // 下标跟着前移），所以有未保存的字段改动时禁用 —— 否则改了一半的字段会跟着
         // 换到别的项目上。删「还没保存的新增」不吃这层限制：它本来就不在宿主里，
@@ -2155,8 +2490,12 @@ window.__ModuleLoader__.load({
               }),
               h('span', { className: 'tp-switch-state' }, Boolean(value) ? '已开启' : '已关闭'))
           } else if (field.kind === 'select') {
+            // 选项默认用原值当文字；`optionLabels` 可以只给某几个值换说法（工单 #20：
+            // 金山源是实验性的，光写「wps」没人知道它现在就拿到票）。**value 永远是原值**。
+            var optionLabels = field.optionLabels || {}
             var options = field.options.map(function (option) {
-              return h('option', { key: option, value: option }, option)
+              var text = typeof optionLabels[option] === 'string' ? optionLabels[option] : option
+              return h('option', { key: option, value: option }, text)
             })
             control = h('select', {
               className: 'tp-select',
@@ -2312,9 +2651,23 @@ window.__ModuleLoader__.load({
         })
         : null
 
+      // 金山源是实验性的（工单 #20）：没有内置取数通道，选了它一张票都拿不到。
+      // 这条提示必须出现在**卡片顶上**（不是折在高级里），因为后果是「等了半天什么都不发生」——
+      // 不在这里说，人只会以为插件坏了。
+      var wpsNotice = platformNow === 'wps'
+        ? h('div', { key: 'wps-notice', className: 'tp-note tp-wps-notice' },
+          h('strong', null, '实验性：金山文档源当前没有内置取数通道。'),
+          ' 直接用它收不到任何工单（`pipeline_scan` 会报「取数通道缺失」）。',
+          ' 要真的用，需要自行注入 ',
+          h('code', null, 'fetchSheet()'),
+          '（见 ',
+          h('code', null, 'src/adapters/source-wps/index.js'),
+          ' 模块注释）；不打算接的话，把平台改成 feishu 或 mock。')
+        : null
+
       return h('div', { className: 'tp-proj' + (open ? '' : ' tp-collapsed') },
         head,
-        open ? h('div', { className: 'tp-proj-body' }, sections, tokenRow) : null)
+        open ? h('div', { className: 'tp-proj-body' }, [wpsNotice, ...sections, tokenRow]) : null)
     }
 
     /** 这张卡片里有多少个字段改过（用于「已改 N 项」徽标）。 */
@@ -2411,7 +2764,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'tp-list-bar' },
           // 高级字段开关：缺省视图只画日常要动的那些，想看全的点一下。
           // 这是一次性的「我现在要配细节」，所以不记进 localStorage。
-          h('label', { className: 'tp-check', title: '勾上就显示「开 draft MR」「验证命令」「允许的截图主机」等不常改的字段' },
+          h('label', { className: 'tp-check', title: '勾上就显示「远程 MR（实验性）」「验证命令」「允许的截图主机」等不常改的字段' },
             h('input', {
               type: 'checkbox',
               checked: props.showAdvanced === true,
@@ -2526,6 +2879,23 @@ window.__ModuleLoader__.load({
       // 高级是「不常看的收起」，所以缺省取值正好相反）。
       var [advMap, setAdvMap] = useState(readAdvMap)
       var [showAdvanced, setShowAdvanced] = useState(false)
+
+      // 「运行」页签（#16）的状态。数据全部来自宿主 ticketPipeline.status()，
+      // 面板不自己算任何东西 —— 算两遍就迟早两边打脸。
+      var [runData, setRunData] = useState(null)
+      var [runError, setRunError] = useState('')
+      var [runMessage, setRunMessage] = useState('')
+      // 宿主返回的一句人话（「上一轮还没跑完，这次不叠加。」这类）。
+      // 与 runMessage 分开：那个是「你做成了什么」，这个是「宿主怎么答的」，
+      // 掺在一起会变成一句分不清谁说的话。
+      var [runNotice, setRunNotice] = useState('')
+      // runAction 记录「现在哪个动作在跑」：'scan' / 'cancel' / 某个 recordId。
+      // 分开记而不是一个全局 busy，是为了只灰掉被点的那颗按钮 ——
+      // 全局 busy 会让整排按钮同时变灰，看起来像卡死了。
+      var [runAction, setRunAction] = useState('')
+      var [runOpen, setRunOpen] = useState({})
+      // 轮询开关。点「跑一轮」后打开，跑完 / 离开页签 / 10 分钟后关掉。
+      var [runPolling, setRunPolling] = useState(false)
 
       var isPage = props.view !== 'summary'
 
@@ -2657,6 +3027,21 @@ window.__ModuleLoader__.load({
         })
       }, [getNamespace])
 
+      var loadRun = useCallback(function () {
+        var ns = requireRunNamespace('读状态')
+        if (!ns) return Promise.resolve()
+        return ns.status().then(function (response) {
+          if (!response || !response.ok) {
+            setRunError('读状态失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          setRunData(response.value)
+          setRunError('')
+        }, function (error) {
+          setRunError('读状态失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }, [getNamespace])
+
       useEffect(function () {
         if (!isPage) return
         var cancelled = false
@@ -2705,6 +3090,56 @@ window.__ModuleLoader__.load({
         attempt()
         return function () { cancelled = true }
       }, [])
+
+      // 进「运行」页签时读一次状态（#16）。挂在这里而不是 init 里：
+      // 开面板的人多半是来改配置的，不该让设置页一打开就去问队列。
+      // 依赖里刻意**不放 loadRun**：它每次渲染都是新函数，放进去等于每渲染一次
+      // 就重读一次队列（在真浏览器里是白打接口，在自测里是渲染停不下来）。
+      useEffect(function () {
+        if (!isPage || !mounted || activeTab !== 'run') return undefined
+        loadRun()
+        return undefined
+      }, [isPage, mounted, activeTab])
+
+      // 点过「跑一轮」之后每 3 秒再读一次，最多 10 分钟（200 次）。
+      //
+      // 为什么是自递归 setTimeout 而不是 setInterval：宿主侧只有 direct 调用，
+      // 一次 status 读多久不知道；用 interval 会在慢的时候叠出并发读。
+      // 也刻意**不用 useRef 存 timer id** —— 面板只允许用 useState/useEffect
+      // （浏览器 bundle 与自测的假 React 都只有这四个 hook），timer id 放局部
+      // 变量，cleanup 时清掉即可。
+      useEffect(function () {
+        if (!runPolling) return undefined
+        var stopped = false
+        var timer = null
+        var rounds = 0
+        // 定时器在 Node 里要 unref：自测（client-smoke）中这个 effect 的 cleanup
+        // 永远不会被跑到（假 React 只执行 effect、不执行它的返回值），
+        // 不 unref 的话一个 3 秒的轮询就能把测试进程吊死在那儿，看起来像「卡住了」。
+        // 浏览器里 setTimeout 返回数字，没有 unref，问号调用自然跳过。
+        function schedule () {
+          timer = setTimeout(tick, 3000)
+          if (timer && typeof timer.unref === 'function') timer.unref()
+        }
+        function tick () {
+          if (stopped) return
+          rounds += 1
+          if (rounds > 200) {
+            setRunPolling(false)
+            setRunNotice('盯了 10 分钟还没跑完，先不盯了。想继续看就点「刷新状态」。')
+            return
+          }
+          loadRun().then(function () {
+            if (stopped) return
+            schedule()
+          })
+        }
+        schedule()
+        return function () {
+          stopped = true
+          if (timer !== null) clearTimeout(timer)
+        }
+      }, [runPolling])
 
       var leaves = useMemo(function () {
         var view = findNamespace(snapshot)
@@ -3283,6 +3718,103 @@ window.__ModuleLoader__.load({
         })
       }
 
+      // ── 运行页签（#16）─────────────────────────────────────────
+      // 三件事都走同一个 ns：status 读、scan 跑一轮、cancel 打断、reset 重开。
+      // 它们全是 direct 调用（不是 stream），所以「看进度」只能靠自己定时再读。
+      // 注意：这里之后只能是普通函数 —— 下面已经有 `if (!isPage) return`
+      // 之类的早退，再调 hook 会让 hook 顺序随状态变化，React 会直接报错。
+      function requireRunNamespace (action) {
+        var ns = getNamespace('ticketPipeline')
+        if (!ns) {
+          setRunError('运行通道没挂上（remote.ticketPipeline 命名空间缺席）。' + action + '没做成。')
+          return null
+        }
+        return ns
+      }
+
+      function onRunScan () {
+        var ns = requireRunNamespace('跑一轮')
+        if (!ns) return
+        setRunAction('scan')
+        setRunError('')
+        setRunMessage('')
+        ns.scan().then(function (response) {
+          setRunAction('')
+          if (!response || !response.ok) {
+            setRunError('跑一轮失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          var value = response.value || {}
+          setRunMessage(value.status === 'triggered' ? '已触发这一轮' : '')
+          // 只有真的起来了才盯着：disabled / already-running 盯着也没用，
+          // 反而让人以为「已经在跑了」。宿主那句解释放 runNotice。
+          if (value.status === 'triggered') setRunPolling(true)
+          setRunNotice(value.text || '')
+          loadRun()
+        }, function (error) {
+          setRunAction('')
+          setRunError('跑一轮失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }
+
+      function onRunCancel () {
+        var ns = requireRunNamespace('取消')
+        if (!ns) return
+        setRunAction('cancel')
+        setRunError('')
+        ns.cancel().then(function (response) {
+          setRunAction('')
+          if (!response || !response.ok) {
+            setRunError('取消失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          var value = response.value || {}
+          setRunPolling(false)
+          setRunNotice(value.text || '')
+          loadRun()
+        }, function (error) {
+          setRunAction('')
+          setRunError('取消失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }
+
+      function onRunRerun (recordId) {
+        var ns = requireRunNamespace('重跑')
+        if (!ns) return
+        setRunAction(recordId)
+        setRunError('')
+        // 只传 recordId：projectId 是可选的（acceptsUndefined），不传就是缺席，
+        // 传 undefined 反而会让网关的参数个数校验对不上。
+        ns.reset(recordId).then(function (response) {
+          setRunAction('')
+          if (!response || !response.ok) {
+            setRunError('重跑失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          var value = response.value || {}
+          // 没重开成（比如票已经不在可重开的 phase 里）也要把话说出来 ——
+          // 静默失败比报错更让人抓狂。
+          setRunNotice(value.text || '')
+          if (value.reset === true) setRunMessage('已放回队列')
+          loadRun()
+        }, function (error) {
+          setRunAction('')
+          setRunError('重跑失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }
+
+      function onRunToggle (recordId) {
+        setRunOpen(function (previous) {
+          var next = {}
+          for (var key in previous) {
+            if (Object.prototype.hasOwnProperty.call(previous, key)) next[key] = previous[key]
+          }
+          if (next[recordId]) delete next[recordId]
+          else next[recordId] = true
+          return next
+        })
+      }
+
       function onDoctor () {
         var ns = getNamespace('ticketPipeline')
         if (!ns) {
@@ -3312,7 +3844,7 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'tp-panel' },
           h('header', { className: 'tp-head' },
             h('h2', null, '工单流水线'),
-            h('p', null, '从工单表检测变化、定位代码、改动验证、开 draft MR 并推送通知。')),
+            h('p', null, '从工单表检测变化、定位代码、改动验证、在检出里做本地提交、回填表格并推送通知。')),
           h('p', { className: 'tp-note' }, '正在等待宿主就绪…'),
           h('p', { className: 'tp-note', style: { marginTop: '6px' } },
             '浏览器侧的 remote 通道要等 typert / connection 启动，通常一两秒。最多等 20 秒，超时会告诉你卡在哪一步。'))
@@ -3357,6 +3889,15 @@ window.__ModuleLoader__.load({
           count = doctorReport && doctorReport.ok === false
             ? ((doctorReport.blockers ? doctorReport.blockers.length : 0) + doctorReport.problems.length)
             : 0
+          bad = count > 0
+        } else if (key === 'run') {
+          // 只数「要人动手」的那一档：排队中的票不算事，正在跑的不算事。
+          // 把「已交付」也数进来，角标就永远是 5 以上 —— 等于没有角标。
+          if (runData && Array.isArray(runData.tiers)) {
+            for (var t = 0; t < runData.tiers.length; t += 1) {
+              if (runData.tiers[t].label === '需要你处理') count = runData.tiers[t].count
+            }
+          }
           bad = count > 0
         }
         if (count === 0) return null
@@ -3413,6 +3954,24 @@ window.__ModuleLoader__.load({
           }, saving ? '保存中…' : '保存')))
 
       var panels = {
+        run: function () {
+          return h(RunCard, {
+            data: runData,
+            busy: runAction !== '',
+            action: runAction,
+            error: runError,
+            message: runMessage,
+            notice: runNotice,
+            polling: runPolling,
+            available: mounted,
+            openOf: function (recordId) { return runOpen[recordId] === true },
+            onToggle: onRunToggle,
+            onScan: onRunScan,
+            onCancel: onRunCancel,
+            onRerun: onRunRerun,
+            onRefresh: loadRun,
+          })
+        },
         projects: function () {
           return h(ProjectListCard, {
             list: renderedProjects,
@@ -3495,12 +4054,12 @@ window.__ModuleLoader__.load({
         },
       }
 
-      var current = panels[activeTab] || panels.projects
+      var current = panels[activeTab] || panels.run
 
       return h('div', { className: 'tp-panel' },
         h('header', { className: 'tp-head' },
           h('h2', null, '工单流水线'),
-          h('p', null, '从工单表检测变化，定位代码、改动验证、开 draft MR 并推送通知。')),
+          h('p', null, '从工单表检测变化，定位代码、改动验证、在检出里做本地提交、回填表格并推送通知。')),
 
         toolbar,
 

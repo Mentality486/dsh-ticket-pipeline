@@ -1230,6 +1230,13 @@ export async function apply (ctx, config) {
       // 用 `ctx.get` 弱取（不声明进 inject）：settings 缺席时这个方法会明确报错，
       // 而不是把整个 Remote 拖挂不上。
       getSettings: () => ctx.get('settings'),
+      // 运行页签（#16）：读票 / 重开票要 store，跑一轮 / 取消要 scheduler，
+      // 改动摘要要 gitRunner。三个都跟工具侧用的同一份实例 —— 面板与对话
+      // 看到的状态必须是同一个 store 里的同一批票，不能各读一份。
+      store,
+      scheduler,
+      gitRunner,
+      log,
     }))
     if (mounted) log('已挂载 ticketPipeline Remote（设置页可用）')
   } catch (error) {

@@ -44,24 +44,35 @@ export function createPipelineCancelTool (options) {
     render: (value) => textBlocks(value.text),
     async execute (_args, exec) {
       void exec
-
-      const cancelled = options.cancelActive() === true
-
-      const lines = []
-      if (cancelled) {
-        lines.push('已发出取消信号：正在跑的那张票会中止。')
-        lines.push('它会落成 failed（原因：你取消的），不给你发通知，工作区保留。')
-        lines.push('要让它重跑：用 pipeline_reset 带上这张票的 recordId。')
-        lines.push('（另一条路是去表格里把「是否处理」拨走再拨回「处理中」，但那条路会重做一遍并覆盖旧回填，一般不推荐。）')
-      } else {
-        lines.push('当前没有票在跑，没有可取消的东西。')
-        lines.push('想马上推进一轮，用 pipeline_scan。')
-      }
-
-      return {
-        cancelled,
-        text: lines.join('\n'),
-      }
+      // 算结果与渲染分层：面板「运行」页签的「取消当前」走 ticketPipeline.cancel()
+      // → 同一个 collectCancel，两处判定不会各说各话（工单 #16）。
+      return collectCancel(options)
     },
   })
+}
+
+/**
+ * `pipeline_cancel` 的算结果层。
+ *
+ * @param {{ cancelActive: () => boolean }} options
+ * @returns {Record<string, unknown>}
+ */
+export function collectCancel (options) {
+  const cancelled = options.cancelActive() === true
+
+  const lines = []
+  if (cancelled) {
+    lines.push('已发出取消信号：正在跑的那张票会中止。')
+    lines.push('它会落成 failed（原因：你取消的），不给你发通知，工作区保留。')
+    lines.push('要让它重跑：用 pipeline_reset 带上这张票的 recordId。')
+    lines.push('（另一条路是去表格里把「是否处理」拨走再拨回「处理中」，但那条路会重做一遍并覆盖旧回填，一般不推荐。）')
+  } else {
+    lines.push('当前没有票在跑，没有可取消的东西。')
+    lines.push('想马上推进一轮，用 pipeline_scan。')
+  }
+
+  return {
+    cancelled,
+    text: lines.join('\n'),
+  }
 }

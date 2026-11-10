@@ -162,6 +162,25 @@ for (const warning of configWarnings) {
   warnings.push(warning)
   lines.push(`⚠️ 配置：${warning}`)
 }
+
+// ── 2c. 实验性工单源：选了也拿不到票 ──────────────────
+//
+// 为什么算**阻断**不是提醒：金山源 `platform: 'wps'` 的取数通道是注入式的，而主装配里
+// 没有注入（`src/adapters/source-wps/index.js` 的 MISSING_FETCH_SHEET）。选了它的项目
+// 每次扫描都会抛错、一张票都收不到。这种「配好了但永远没反应」比报错难查得多 ——
+// 必须在这张体检单上直接说「这条路现在不通」，别让人去猜是网络、凭据还是权限。
+const wpsProjects = projects.filter((project) => String(project?.match?.platform ?? '') === 'wps')
+if (wpsProjects.length > 0) {
+  const names = wpsProjects.map((project) => String(project?.name ?? '(未命名)')).join('、')
+  blockers.push(
+    `项目 ${names} 用的是金山文档源（platform: wps），而当前版本没有内置取数通道 —— `
+    + '这些项目一张票都拿不到。两条出路：① 把平台改成 feishu（多维表格或电子表格都能用）；'
+    + '② 确实要接金山就自行注入 fetchSheet()，见 src/adapters/source-wps/index.js 模块注释。',
+  )
+  lines.push(`❌ 金山文档源（实验性）：${names} —— 没有内置取数通道，拿不到票`)
+  lines.push('　　（金山源还有第二个已知限制：recordId 用行号，在表里插行/删行会让票换身份。）')
+}
+
 for (const project of projects) {
   const name = project?.name ?? '(未命名)'
   const repo = project?.repo ?? {}
@@ -302,8 +321,14 @@ if (pushAdapter === 'qqmail') {
 if (pushAdapter === 'pushplus') {
   requiredRefs.push({ ref: 'PUSHPLUS_TOKEN', blocker: true, why: 'PushPlus 推送要它' })
 }
-// GITLAB_TOKEN 只在开了远程交付时才需要；缺了不算阻断（本阶段交付形态是本地提交）。
-requiredRefs.push({ ref: 'GITLAB_TOKEN', blocker: false, why: '只在你打开 repo.gitlab.enabled 之后需要' })
+// GITLAB_TOKEN 只在真开了远程出口时才需要（工单 #19）：以前这条检查无条件执行，
+// 缺省安装（99% 的人只用本地提交）每次体检都被它念一句「未配置」，纯噪音 ——
+// 而且念多了人会学会忽略体检输出。所以现在只有**至少一个项目显式打开**
+// `repo.gitlab.enabled === true` 时才查，而且那时它是阻断（不配就开不了 MR）。
+const gitlabProjects = projects.filter((project) => project?.repo?.gitlab?.enabled === true)
+if (gitlabProjects.length > 0) {
+  requiredRefs.push({ ref: 'GITLAB_TOKEN', blocker: true, why: `项目 ${gitlabProjects.map((p) => String(p?.name ?? '')).join('、')} 打开了 repo.gitlab.enabled，开 draft MR 要它` })
+}
 const creds = options.credentials
 const credsUsable = Boolean(creds) && typeof creds.describe === 'function'
 const credsAvailable = credsUsable
@@ -428,6 +453,18 @@ if (feishuProjects.length === 0) {
           blockers.push(`飞书项目 ${name}：读不到表里的数据（${item?.records?.message ?? '原因未记录'}）${code}${fix}`)
           lines.push(`　❌ 读不到数据：${item?.records?.message ?? '原因未记录'}${code}`)
         }
+        // 电子表格回填（工单 #22）多一道**看不见的**前置条件：读票只要只读权限，
+        // 写回那三列要读写权限。缺这一档时读得好好的，票跑完了才在回填那一步失败 ——
+        // 而那时票已经是「完成」，人只会看到表格没更新。体检是唯一能在跑之前提醒的地方。
+        // 只提醒不动手：体检的硬约束是不写任何表格（写一次就能验权限，但那是越界）。
+        if (item?.kind === 'sheet' && config.writeBack !== false) {
+          warnings.push(
+            `项目 ${name} 是飞书「电子表格」：回填要**读写**权限。开放平台 →「权限管理」里`
+              + '要有 sheets:spreadsheet（不是 sheets:spreadsheet:readonly），并且**创建版本并发布**。'
+              + '只有只读权限时读票正常、跑完回填才失败（票成「完成」但表没更新）。'
+              + '不知道怎么确认的话，随便拿一张测试表跑一张票看回填结果。',
+          )
+        }
       }
     }
   } catch (error) {
@@ -447,6 +484,37 @@ lines.push(`ℹ️ 执行器：${executor}｜通知：${pushLine}`)
 lines.push(config.isolateWorktree === true
   ? 'ℹ️ 改代码落点：每票一个隔离 worktree（.agents/worktrees/）'
   : 'ℹ️ 改代码落点：项目工作区检出里（脏也能跑，只提交 agent 改过的文件）')
+
+// ── 6b. 远程 MR 出口（实验性，工单 #19）───────
+//
+// 缺省状态下这个能力**完全不出现**：99% 的人只用本地提交，把 MR 当主角介绍他们是错的。
+// 只有真的打开了 enabled 才有必要查 —— 而那时候缺字段就是「跑完整票、最后一步开不出 MR」，
+// 是最浪费时间的一种失败（改动做完了，白等）。
+if (gitlabProjects.length > 0) {
+  lines.push(`ℹ️ 远程 MR 出口：实验性功能，${gitlabProjects.length} 个项目打开了它`)
+  for (const project of gitlabProjects) {
+    const name = String(project?.name ?? '')
+    const gitlab = project?.repo?.gitlab ?? {}
+    const repoRemote = String(project?.repo?.remote ?? '').trim()
+    const baseUrl = String(gitlab.baseUrl ?? '').trim()
+    const projectId = gitlab.projectId === undefined || gitlab.projectId === null ? '' : String(gitlab.projectId).trim()
+    const missing = []
+    // 能从 repo.remote 推出来的就不算缺（`resolveGitlab` 支持这种简写）。
+    if (baseUrl.length === 0 && repoRemote.length === 0) missing.push('baseUrl（或上面的「GitLab 仓库地址」）')
+    if (projectId.length === 0 && repoRemote.length === 0) missing.push('projectId（或上面的「GitLab 仓库地址」）')
+    if (missing.length > 0) {
+      blockers.push(
+        `项目 ${name}：打开了 repo.gitlab.enabled 但缺 ${missing.join('、')} —— `
+        + '票会跑到最后一步才失败（改动都做完了，MR 开不出来）。去设置页项目卡片的「远程 MR（实验性）」组填上，'
+        + '或者把「开 draft MR」关掉只做本地提交。',
+      )
+      lines.push(`　❌ ${name}：缺 ${missing.join('、')}`)
+    } else {
+      lines.push(`　✅ ${name}：${projectId} @ ${baseUrl || repoRemote}`)
+    }
+  }
+  lines.push('　实验性说明：本机 git push 被封死，这条路只能走 GitLab Commits API；需要自备 GITLAB_TOKEN。')
+}
 
 // ── 7. 插件版本 ──────────────────────────────────
 // 「跑的是旧代码」不会报错，只表现为旧行为，所以必须主动比一次。
