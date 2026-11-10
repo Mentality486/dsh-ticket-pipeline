@@ -110,7 +110,7 @@
 | `match.tableId` | string | — | 多维表格的 `table_id`。与 `appToken` 一起构成显式绑定；显式填了优先于链接里的 `?table=` |
 | `match.viewId` | string | — | 只看某个视图 |
 | `match.docNamePattern` | string | — | 兜底：按文件名模糊搜。没有显式 `appToken`/`tableId` 时用 |
-| `match.statusValues` | string-array | `["处理中"]` | 状态列里哪些取值算「在处理中」（收票条件） |
+| `match.statusValues` | string-array | `["处理中"]` | 状态列里哪些取值算「在处理中」（收票条件）。**缺省只认「处理中」这一个词**，而很多表的「是否处理」填的是「是 / 否 / 已完成」—— 值与配置对不上时**一张票都收不到，但接口全绿**。体检会采样状态列前 100 行实际取值，一个都对不上就报「状态值对不上」并给出改法（只进提醒，不阻断） |
 | `match.recordIds` | string-array | `[]`（= 整张表） | 只处理这几条工单，收窄用 |
 | `match.allowedImageHosts` | string-array | — | 截图 URL 的放行主机白名单（SSRF 防护） |
 | `match.sheetUrl` | string | — | 金山文档表格的分享链接（`wps` 平台） |

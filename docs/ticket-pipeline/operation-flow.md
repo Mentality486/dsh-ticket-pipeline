@@ -204,7 +204,7 @@ flowchart TD
 flowchart LR
     T1[pipeline_scan<br/>立刻扫一轮] --> Q([队列])
     T2[pipeline_status<br/>看队列与各票阶段<br/>每票带 本地提交:sha12 @ branch<br/>+ 处理会话:sessionId + 回填表格:成功/没写成<br/>+ 待补:回填表格 / 通知（pendingEffects 没做完时）<br/>+ 关键节点流程日志:现在停在第 N 站,已多久没动] --> Q
-    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>GITLAB_TOKEN 未配只提示不告警<br/>检出脏只提醒（照跑,会拍基线）] --> Q
+    T3[pipeline_doctor<br/>环境体检:git链路/仓库/凭据/适配器<br/>插件版本:安装副本 vs 源码<br/>飞书连通性:表型/权限/首行数据/状态值对不上<br/>GITLAB_TOKEN 未配只提示不告警<br/>检出脏只提醒（照跑,会拍基线）] --> Q
     T4[pipeline_reset<br/>failed/needs-info/gone 放回重跑] --> Q
     T5[pipeline_cancel<br/>取消正在跑的那张票] --> Q
 ```
@@ -212,6 +212,8 @@ flowchart LR
 ---
 
 ## 7. 当前卡点速查
+
+状态基线（2026-11-10 深夜）：含**体检补上「状态值口径」**（体检探针不再按「`appToken` 非空」就认定多维表格 —— wiki 链接写进 `appToken` 的裸 token 背后可能是电子表格，飞书回 `1254003` 时要能降级；缺省的 `statusValues` 只认「处理中」，体检会采样状态列前 100 行实际取值，对不上就报「状态值对不上」并给修法，只进提醒不进阻断），自测 **495/495** + 链路冒烟 11/11。
 
 状态基线（2026-11-10 夜）：含**定位工单表只剩一个入口**（项目卡片最上面的「工单表链接」，`[wpsNotice, tokenRow, ...sections]`；`match.tableId` / `match.spreadsheetToken` / `match.sheetId` 三个输入框撤掉、面板项目字段 33 → 30）与**电子表格取票修复**（`extractSheetToken` 认 `/wiki/<token>`、带协议头却认不出时抛 `invalid-input`、`INVALID_INPUT_ERROR_CODES` 补 `1254003 WrongBaseToken` 让裸 token 能降级去试电子表格；`validateProject` 从「四选一」放宽成「至少一个定位依据」，两套 token 并存从静默放行改成警告），自测 **492/492** + 链路冒烟 11/11。
 
