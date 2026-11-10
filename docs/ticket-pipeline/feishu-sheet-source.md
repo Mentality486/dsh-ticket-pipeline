@@ -599,5 +599,5 @@ A 配置层 ──┬──> B 探测 ──> C 读值 ──> D 身份水位 �
 
 假服务端新增 `values_batch_update` 路由与 `state.sheetWrites` —— 它必须和读值分成两个分支，混在一起时写请求会被当成读、回一份「成功读到数据」，于是「回填失败」这个场景永远测不出来。
 
-`node scripts/dev-run.mjs` → **通过 483 项，失败 0 项**；`feishu-checks` 的电子表格断言全过。
+`node scripts/dev-run.mjs` → **通过 486 项，失败 0 项**；`feishu-checks` 的电子表格断言全过。
 

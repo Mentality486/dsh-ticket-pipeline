@@ -149,13 +149,13 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**483 项断言，全绿 exit 0**，共 **31 个小节**（编号到 18，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**486 项断言，全绿 exit 0**，共 **31 个小节**（编号到 18，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 
 | 段 | 项数 | 覆盖 |
 |---|---|---|
-| 内核与契约 | — | 调度、租约心跳、退避重试、状态机、store 持久化、`pipeline_*` 五工具、组合根接线；`pipeline_status` 两种视图（缺省 `view: 'overview'` 按项目聚合，`view: 'tickets'` 明细）；时间线 17 节点表 / 9 主站 / 80 条封顶 |
+| 内核与契约 | — | 调度、租约心跳、退避重试、状态机、store 持久化、`pipeline_*` 五工具、组合根接线；`pipeline_status` 两种视图（缺省 `view: 'overview'` 按项目聚合，`view: 'tickets'` 明细）；总览每票第二行是 9 主站流程带（`describeStations` / `renderFlowLine`，符号 `✓/✗/▶/–`、只标 ≥1 分钟的站、终态末站不标耗时、老票说「没有流程记录」）与返回体 `tickets[].flow`；时间线 17 节点表 / 9 主站 / 80 条封顶 |
 | `feishu-checks` | **93** | 假飞书服务端：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、错误码分类、扫描全程无写；回填 `PUT …/records/:id` 只写三列、字段缺失返 `{written:false,note}` 不抛、91403 分类；`parseBitableUrl` 链接解析；**电子表格 19 条**（表型分派、裸 token 双试、读值定位、`sheetHeaderRow=2`、列名别名、空序号兜底、序号重复报错、水位三态）；**电子表格回填 8 条**（写对三格、插行后重定位、行被删、缺列、只有读权限、失败票只写一格、回填后不重复收票、token 与工作表 id） |
 | `gitlab-checks` | **86** | 假 GitLab 服务端：ensureBranch、Commits API、Draft MR、错误分类、敏感文件过滤；本地提交 `commitLocally`；基线 `createBaseline`；保留会话；敏感名单 8 大类 41 条；`.git` 与 profile 篡改自检；`-z` 解析；会话 cwd 与 `workingDirectory` |
 | `push-qqmail-checks` | **18** | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |

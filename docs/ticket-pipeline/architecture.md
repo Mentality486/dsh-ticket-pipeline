@@ -1551,6 +1551,23 @@ delivery = {
   `compactTicketLine`（`✗/· recordId｜阶段｜模块｜站⑤（已跑 X）｜最近动静｜失败原因`），
   **每项目最多 `OVERVIEW_ROWS_PER_PROJECT = 8` 张**，超出折成「……还有 N 张没列出（明细用 view="tickets" 看全）」
   —— 折叠只影响行数，`total` 仍是真实总数。
+  **每票下面再多一行流程带**（`renderFlowLine` → `describeStations`）：把 9 个主站压成
+  `①✓ ②✓ ③✓ ④✓ ⑤✓（5 分 18 秒） ⑥✓ ⑦✓ ⑧✓ ⑨✓｜全程 5 分 31 秒`。
+  摘要是「现在怎么样」，流程带是「整条路走得顺不顺、哪站慢/哪站挂了」—— 这两问都答了才算
+  「看得到全流程状态」，否则人还得切 `view: 'tickets'` 去翻九行日志。
+  符号 `STATION_MARK = {ok:'✓', failed:'✗', now:'▶', unreached:'–'}`，**`now` 与 `ok` 必须分开**：
+  停在⑥时标 ✓ 会让人以为在等下一站。图例 `FLOW_LEGEND` **只打一次**（在总览抬头下面），
+  逐票重复九次解释会把总览撑成第二个明细视图。
+  时长只标 **≥1 分钟**的站（`formatShortDuration`）：①②③④ 常常都在 1 秒内，九个都标反而看不出
+  哪里慢。**终态票的最后一站不标耗时** —— 原地用 `now` 兜底的话，一张跑完 24 小时的票会显示
+  「⑨发送消息（24 时 32 分）」，看着像卡在发消息上；只有非终态票才用 `now` 补最后一站。
+  **老票没有时间线时不画全 `–`**，直接写「没有流程记录 —— 这张票的处理早于流程日志功能」：
+  画九个 `–` 等于断言「插件当时一个站都没走到」，而事实是当时还没有打点这个功能。
+  「现在停在哪一站」不自己算，直接取 `describeFlow(row, now).station.no` —— 两处各判一次，
+  迟早出现「带子上说停在⑥、结论说停在第⑤站」。
+  机器可读在返回体 `tickets[].flow = {stations[{no,node,label,state,at,elapsedMs}×9],
+  reachedCount, total, failedStation, currentStation, totalMs, strip, noRecord}`，将来面板画进度条
+  直接用这一份。
 - `view: 'tickets'`：原来的明细（逐票一段、带完整流程日志）。`dev-run` 里 20 处老断言都显式传这条路，
   所以老行为一字未变。
 - **传了 `recordId` 一律走明细**，不受 `view` 影响（查询单票时人要看的就是细节）。
@@ -1948,7 +1965,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 只有读权限 → `auth` + 点名 `sheets:spreadsheet` 与「重新发布版本」；限流 → 交给 `retryPolicy()` 分档。
 
 **自测**：`dev-run` 384 → **451**（19 条电子表格断言）→ **482**（#22 回填 8 条）→ **483**（探针归一 spreadsheetToken 1 条，其中
-「回填过的那一行下一轮不会被重复收票」是这一票的核心断言）；
+「回填过的那一行下一轮不会被重复收票」是这一票的核心断言）→ **486**（总览流程带 3 条，见 §11.5）；
 `feishu-checks` 60 → **80** → **93**；`client-smoke` **175** 条 `check(`。
 
 完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`（§12 是实施结果与三处

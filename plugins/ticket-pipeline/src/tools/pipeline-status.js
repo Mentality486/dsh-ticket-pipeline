@@ -343,6 +343,8 @@ function renderProjectOverview (projects, rowsByProject, now) {
   }
   const total = rowsByProject.length
   const lines = [`━━ 项目总览：${total} 张票 / ${projects.length} 个项目 ━━`]
+  // 图例只打一次：九次解释会把总览撑成第二个明细视图。
+  lines.push(`  ${FLOW_LEGEND}`)
   for (const project of projects) {
     const id = project.projectId
     const rows = (byId.get(id === null ? '' : id) ?? []).slice()
@@ -371,6 +373,9 @@ function renderProjectOverview (projects, rowsByProject, now) {
     const shown = rows.slice(0, OVERVIEW_ROWS_PER_PROJECT)
     for (const row of shown) {
       lines.push(`    ${compactTicketLine(row, now)}`)
+      // 每票第二行是流程带：一行摘要回答「现在怎么样」，流程带回答
+      // 「这一票整条路走得顺不顺、在哪一站慢了或挂了」。
+      lines.push(renderFlowLine(row, now))
     }
     if (rows.length > shown.length) {
       lines.push(`    ……还有 ${rows.length - shown.length} 张没列出（明细用 view="tickets" 看全）`)
@@ -412,6 +417,169 @@ function compactTicketLine (row, now) {
   const head = parts.join('｜')
   const error = row.lastError ? `｜${String(row.lastError)}` : ''
   return `${head}${station}｜${idle}${error}`
+}
+
+/**
+ * 9 个主站的节点 id，按流程顺序。与 `TIMELINE_NODES` 里的 `no` 一一对应。
+ *
+ * 总览里的「流程带」按这个顺序画，所以这里的顺序就是人对流程的直觉顺序 ——
+ * 改它等于改「①是什么」，别为了排版动它。
+ */
+const MAIN_STATIONS = Object.freeze(['discover', 'locate', 'workspace', 'session', 'editing', 'testing', 'mr-opening', 'writeback', 'notify'])
+
+/**
+ * 流程带上的状态符号。
+ *
+ * `now`（▶）必须与 `ok`（✓）分开：一张票正停在⑥跑验证时，⑥标 ✓ 会让人
+ * 以为它在等下一站 —— 而它其实还在这一站里。
+ */
+const STATION_MARK = Object.freeze({ ok: '✓', failed: '✗', now: '▶', unreached: '–' })
+
+/**
+ * 总览里「流程带」的一次性图例。只打一次，不逐票重复 ——
+ * 九次解释会把总览撑成第二个明细视图。
+ */
+const FLOW_LEGEND = '（①–⑨ 是 9 个主站：①获取工单 ②查找项目 ③检查工作区 ④创建会话 ⑤处理问题 '
+  + '⑥跑验证 ⑦提交 ⑧回填表格 ⑨发送消息；✓ 做成 / ✗ 没做成 / ▶ 正停在这一站 / – 没走过或没有记录；'
+  + '只有超过 1 分钟的站才标耗时）'
+
+/**
+ * 只给 1 分钟以上的站标耗时。
+ *
+ * 秒级的站标出来全是噪音（①②③④ 常常都在 1 秒内），九个都标反而看不出
+ * 「哪里慢」—— 而「哪里慢」正是这条流程带要回答的问题。
+ * @param {number} ms
+ * @returns {string} 空串 = 不标
+ */
+function formatShortDuration (ms) {
+  if (!Number.isFinite(ms) || ms < 60_000) return ''
+  const total = Math.floor(ms / 1000)
+  const m = Math.floor(total / 60)
+  if (m < 60) return `${m} 分 ${total % 60} 秒`
+  const h = Math.floor(m / 60)
+  return `${h} 时 ${pad2(m % 60)} 分`
+}
+
+/**
+ * 把一张票的时间线压成「9 个主站各自走没走过、成没成、花了多久」。
+ *
+ * 为什么要单独一层：`describeFlow` 只回答「现在停在哪一站」，而人看完总览
+ * 之后紧接着想知道的是「这一票的整条路走得顺不顺、在哪一站慢了/挂了」——
+ * 那正是流程带要说的事。明细视图里它是九行日志，这里是一行符号。
+ *
+ * 同一节点被打点多次（重跑、补做）时按**最后一次**算：人要看的是最终结果。
+ *
+ * @param {any} row
+ * @param {number} now
+ */
+function describeStations (row, now) {
+  const timeline = timelineOf(row)
+  // 老票没有时间线：明确区分「没记录」与「九个站都没走到」，别把前者画成九个 –。
+  if (timeline.length === 0) {
+    return {
+      stations: MAIN_STATIONS.map((node) => ({
+        no: TIMELINE_NODES[node].no,
+        node,
+        label: TIMELINE_NODES[node].label,
+        state: 'unreached',
+        at: null,
+        elapsedMs: null,
+      })),
+      reachedCount: 0,
+      total: MAIN_STATIONS.length,
+      failedStation: null,
+      currentStation: null,
+      totalMs: null,
+      strip: '',
+      noRecord: true,
+    }
+  }
+  const terminal = TERMINAL.includes(row.phase)
+  /** @type {Map<string, { entry: any, elapsedMs: number | undefined }>} */
+  const seen = new Map()
+  let firstAt
+  for (let i = 0; i < timeline.length; i += 1) {
+    const entry = timeline[i]
+    if (entry.heartbeat === true) continue
+    const next = timeline[i + 1]
+    // 一站花了多久 = 下一条打点 - 这一条打点。
+    //
+    // 只有**还在跑**的票才用「现在」兜底最后一条：跑着的最后一站正是「已经跑了多久」。
+    // 终态票不能这么算 —— 一张跑完的票如果再被 reset / 面板碰过，finishedAt 会被
+    // 重写，于是「⑨发送消息（24 时 32 分）」这种数字会出现，看着像它卡在发消息上。
+    // 终态就是「没有下一站」，不标耗时才是诚实的。
+    let elapsedMs
+    if (typeof entry.at === 'number') {
+      if (next && typeof next.at === 'number') elapsedMs = Math.max(0, next.at - entry.at)
+      else if (!terminal) elapsedMs = Math.max(0, now - entry.at)
+    }
+    seen.set(entry.node, { entry, elapsedMs })
+    if (firstAt === undefined && typeof entry.at === 'number') firstAt = entry.at
+  }
+  // 「现在停在哪一站」与 describeFlow 同一口径：两处各判一次，
+  // 迟早出现「带子上说停在⑥、结论说停在第⑤站」。
+  const flow = describeFlow(row, now)
+  const currentNo = !terminal && flow.station ? flow.station.no : undefined
+  const stations = []
+  let reachedCount = 0
+  let failedStation
+  let currentStation
+  let lastAt
+  for (const node of MAIN_STATIONS) {
+    const meta = TIMELINE_NODES[node]
+    const hit = seen.get(node)
+    let state
+    if (!hit) state = 'unreached'
+    else if (hit.entry.ok === false) state = 'failed'
+    else if (meta.no === currentNo) state = 'now'
+    else state = 'ok'
+    if (state !== 'unreached') reachedCount += 1
+    if (state === 'failed' && failedStation === undefined) failedStation = meta.no
+    if (state === 'now') currentStation = meta.no
+    if (hit && typeof hit.entry.at === 'number') lastAt = hit.entry.at
+    stations.push({
+      no: meta.no,
+      node,
+      label: hit?.entry.label ?? meta.label,
+      state,
+      at: hit && typeof hit.entry.at === 'number' ? hit.entry.at : null,
+      elapsedMs: hit && typeof hit.elapsedMs === 'number' ? hit.elapsedMs : null,
+    })
+  }
+  let totalMs
+  if (typeof firstAt === 'number') {
+    totalMs = terminal
+      ? (typeof lastAt === 'number' ? Math.max(0, lastAt - firstAt) : undefined)
+      : Math.max(0, now - firstAt)
+  }
+  return {
+    stations,
+    reachedCount,
+    total: MAIN_STATIONS.length,
+    failedStation: failedStation ?? null,
+    currentStation: currentStation ?? null,
+    totalMs: typeof totalMs === 'number' ? totalMs : null,
+    strip: stations.map((s) => `${s.no}${STATION_MARK[s.state]}`).join(' '),
+    // 老票（2026-11-09 之前跑过的）没有时间线：必须说清是「没有记录」而不是
+    // 「九个站一个都没走到」—— 后者会让人以为插件当时什么都没做。
+    noRecord: timeline.length === 0,
+  }
+}
+
+/**
+ * 总览里跟着每张票的第二行：流程带 + 全程耗时。
+ * @param {any} row
+ * @param {number} now
+ */
+function renderFlowLine (row, now) {
+  const flow = describeStations(row, now)
+  if (flow.noRecord) return '        （没有流程记录 —— 这张票的处理早于流程日志功能，或刚入队还没开始打点）'
+  const parts = flow.stations.map((station) => {
+    const duration = formatShortDuration(station.elapsedMs)
+    return `${station.no}${STATION_MARK[station.state]}${duration ? `（${duration}）` : ''}`
+  })
+  const total = typeof flow.totalMs === 'number' ? `｜全程 ${formatDuration(flow.totalMs)}` : ''
+  return `        ${parts.join(' ')}${total}`
 }
 
 function pad2 (n) {
@@ -1073,6 +1241,9 @@ export async function collectStatus (options, args) {
         revisionCount: row.revisionCount,
         attempt: row.attempt,
         timeline: flow.timeline,
+        // 压成 9 个主站的流程带（#20）：时间线是「原始日志」，这是「一眼看走顺不顺」。
+        // 总览的第二行、以及将来面板画进度条，都用这一份，不各自再压一遍。
+        flow: describeStations(row, now),
         // 只留真正的站点（心跳条目是「还在跑」的证据，不算站点）——
         // 调用方按站点数做判断时不该被每 60 秒一条的心跳带偏。
         stations: flow.stations,

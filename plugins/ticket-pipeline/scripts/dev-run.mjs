@@ -523,6 +523,126 @@ async function main () {
     assert.equal(out.projects[0].total, 11, '折叠不许把总数算少')
   })
 
+  await check('pipeline_status：总览每张票带一条「9 个主站」的流程带，一眼看出哪站慢、哪站挂', async () => {
+    // 动机：总览原来每票只有一行摘要（阶段 + 停在第几站），人还是看不出
+    // 「这一票整条路走得顺不顺、在哪一站慢/挂了」—— 那部分只在 view="tickets"
+    // 的九行日志里。流程带把九站压成一行符号，总览就能真的回答「全流程状态」。
+    const base = 1_000_000_000
+    const at = (delta) => ({ at: base + delta, ok: true })
+    const doneRow = {
+      key: k('flow-done'),
+      projectId: DEMO,
+      recordId: 'flow-done',
+      phase: 'done',
+      attempt: 0,
+      testOutcome: 'passed',
+      timeline: [
+        { node: 'discover', label: '获取工单', ...at(0) },
+        { node: 'locate', label: '查找对应工单的项目', ...at(1_000) },
+        { node: 'workspace', label: '检查工作区', ...at(2_000) },
+        { node: 'session', label: '创建会话（分支+模型）', ...at(3_000) },
+        { node: 'editing', label: '处理工单问题', ...at(4_000) },
+        // ⑤ 处理问题花了 5 分钟：只有它超过 1 分钟，应该只有它标耗时。
+        { node: 'testing', label: '跑验证', ...at(304_000) },
+        { node: 'mr-opening', label: '提交（本地提交 / PR）', ...at(306_000) },
+        { node: 'done', label: '已完成', ...at(307_000) },
+        { node: 'writeback', label: '回填工单表', ...at(307_500) },
+        { node: 'notify', label: '发送消息', ...at(308_000) },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [doneRow] }, getConfig: () => validateConfig({}).value, now: () => base + 400_000,
+    }).execute({}, {})
+    // 图例只打一次，且把符号含义说清（不然 ✓/✗/▶ 要人去猜）。
+    assert.match(out.text, /①–⑨ 是 9 个主站/, `要有流程带图例：${out.text}`)
+    assert.match(out.text, /✓ 做成 \/ ✗ 没做成 \/ ▶ 正停在这一站/, `图例要解释符号：${out.text}`)
+    // 走完的票：九站全 ✓，只有 ⑤ 标了耗时。
+    assert.ok(
+      out.text.includes('①✓ ②✓ ③✓ ④✓ ⑤✓（5 分 0 秒） ⑥✓ ⑦✓ ⑧✓ ⑨✓'),
+      `走完的票九站全 ✓、只标超过 1 分钟的站：${out.text}`,
+    )
+    assert.match(out.text, /｜全程 5 分 8 秒/, `要报全程耗时：${out.text}`)
+    // 终态票的最后一站不该标耗时：跑完 28 小时的票若用「现在」算，
+    // ⑨ 会显示成 28 小时，看着像卡在发消息上。
+    assert.ok(!/⑨✓（/.test(out.text), `终态票的最后一站不标耗时：${out.text}`)
+
+    // 机器可读：面板画进度条直接用这一份，不各自再压一遍。
+    const flow = out.tickets[0].flow
+    assert.equal(flow.stations.length, 9, '流程带固定 9 个主站')
+    assert.equal(flow.reachedCount, 9)
+    assert.equal(flow.totalMs, 308_000)
+    assert.equal(flow.noRecord, false)
+    assert.deepEqual(flow.stations.map((s) => s.state), Array(9).fill('ok'))
+    assert.equal(flow.stations[4].elapsedMs, 300_000, '⑤ 的耗时 = 下一条打点 - 这一条')
+  })
+
+  await check('pipeline_status：流程带能标出「正停在这一站」与「这一站挂了」', async () => {
+    const base = 1_000_000_000
+    // 正在跑：停在 ⑤（editing 是最后一条，phase 还没进终态）。
+    // 必须用 ▶ 而不是 ✓：⑨ 走完才是 ✓，停在站里说明它还在这一站里。
+    const running = {
+      key: k('flow-running'),
+      projectId: DEMO,
+      recordId: 'flow-running',
+      phase: 'editing',
+      attempt: 0,
+      timeline: [
+        { node: 'discover', label: '获取工单', at: base, ok: true },
+        { node: 'locate', label: '查找对应工单的项目', at: base + 1_000, ok: true },
+        { node: 'editing', label: '处理工单问题', at: base + 60_000, ok: true },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [running] }, getConfig: () => validateConfig({}).value, now: () => base + 90_000,
+    }).execute({}, {})
+    assert.ok(out.text.includes('①✓ ②✓ ③– ④– ⑤▶'), `停在 ⑤ 要标 ▶、没走到的标 –：${out.text}`)
+    const flow = out.tickets[0].flow
+    assert.equal(flow.currentStation, '⑤')
+    assert.equal(flow.failedStation, null)
+    assert.equal(flow.reachedCount, 3)
+    // 跑着的票：最后一站用「现在」算。这里 ⑤ 才跑了 30 秒 —— 不到 1 分钟的门槛，
+    // 所以带上不标耗时（秒级噪音），但机器可读的 elapsedMs 仍是真实值。
+    assert.equal(flow.stations[4].elapsedMs, 30_000)
+    assert.ok(!out.text.includes('⑤▶（'), `不到 1 分钟的站不标耗时：${out.text}`)
+
+    // 挂了的：② 这条打点 ok=false，要标 ✗，而且机器可读要能指出是第几站。
+    const broken = {
+      key: k('flow-broken'),
+      projectId: DEMO,
+      recordId: 'flow-broken',
+      phase: 'failed',
+      attempt: 0,
+      lastError: 'auth: 飞书 token 无效',
+      timeline: [
+        { node: 'discover', label: '获取工单', at: base, ok: true },
+        { node: 'locate', label: '查找对应工单的项目', at: base + 1_000, ok: false },
+        { node: 'failed', label: '失败', at: base + 2_000, ok: false },
+      ],
+    }
+    const brokenOut = await createPipelineStatusTool({
+      store: { listTickets: () => [broken] }, getConfig: () => validateConfig({}).value, now: () => base + 10_000,
+    }).execute({}, {})
+    assert.ok(brokenOut.text.includes('①✓ ②✗ ③– ④–'), `挂掉的站要标 ✗：${brokenOut.text}`)
+    assert.equal(brokenOut.tickets[0].flow.failedStation, '②')
+    assert.equal(brokenOut.tickets[0].flow.currentStation, null, '终态票没有「正停在」这一站')
+  })
+
+  await check('pipeline_status：老票没有时间线时说「没有流程记录」，不画一条全 – 的带', async () => {
+    // 2026-11-09 之前跑完的票没有 timeline。画九个 – 会让人以为「插件当时
+    // 一个站都没走到」—— 事实是当时还没有打点这个功能，两者必须分开说。
+    const old = { key: k('old'), projectId: DEMO, recordId: 'old', phase: 'done', attempt: 0, enqueuedAt: 1_000 }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [old] }, getConfig: () => validateConfig({}).value, now: () => 100_000,
+    }).execute({}, {})
+    assert.match(out.text, /没有流程记录 —— 这张票的处理早于流程日志功能/, `老票要说清没有记录：${out.text}`)
+    assert.ok(!out.text.includes('①– ②–'), `老票不画全 – 的带：${out.text}`)
+    const flow = out.tickets[0].flow
+    assert.equal(flow.noRecord, true)
+    assert.equal(flow.stations.length, 9, '即使是老票，结构上也给齐 9 站，面板不用判空')
+    assert.equal(flow.reachedCount, 0)
+    assert.equal(flow.totalMs, null)
+  })
+
   await check('pipeline_status：view="tickets" 保持原有明细；传 recordId 时一律走明细', async () => {
     // 老调用方（22 处自测断言 + 用户习惯）靠明细，必须能原样拿回来。
     const rows = [
