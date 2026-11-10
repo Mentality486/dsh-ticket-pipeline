@@ -189,6 +189,58 @@ async function feishuCall (input) {
 }
 
 /**
+ * 这个值是不是 wiki 形态（wiki 链接或 `wiki` 开头的 token）。
+ *
+ * 体检必须与适配器认同一组输入形态：用户在面板上贴的常常是知识库里的
+ * 一条 `/wiki/<node_token>?sheet=xxxx` 链接，而不是裸的 spreadsheetToken。
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function isWikiToken (raw) {
+  const text = String(raw ?? '').trim()
+  if (text.length === 0) return false
+  if (/\/wiki\//.test(text)) return true
+  return /^wiki/i.test(text)
+}
+
+/**
+ * 从 wiki 链接 / wiki token 里抠出裸 node token。
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function extractWikiToken (raw) {
+  const text = String(raw ?? '').trim()
+  if (text.length === 0) return ''
+  const urlMatch = text.match(/\/wiki\/([A-Za-z0-9]+)/)
+  if (urlMatch) return urlMatch[1]
+  const bare = text.match(/^([A-Za-z0-9]+)$/)
+  if (bare) return bare[1]
+  return text
+}
+
+/**
+ * 从用户填的值里抠出裸 spreadsheetToken（整条表格链接 / 裸 token / wiki 链接都认）。
+ *
+ * **这是补 Bug 的一层**：探针以前把 `match.spreadsheetToken` 原样塞进请求路径，
+ * 于是「面板上贴整条链接」这个被文档推荐的做法，在体检里必然 404 —— 而适配器本体
+ * （`index.js` 的 `extractSheetToken`）一直是会归一化的。两边认的输入形态不一致，
+ * 体检就会把「探针自己拼错了地址」报成「你读不到表元数据」，这是最坏的一种误导。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function extractSheetToken (raw) {
+  const text = String(raw ?? '').trim()
+  if (text.length === 0) return ''
+  const urlMatch = text.match(/\/sheets\/([A-Za-z0-9]+)/)
+  if (urlMatch) return urlMatch[1]
+  const bare = text.match(/^([A-Za-z0-9]+)$/)
+  if (bare) return bare[1]
+  return text
+}
+
+/**
  * 探测一个飞书项目的可达性：认证 → 表元数据 → 第一页数据。
  *
  * @param {object} input
@@ -214,11 +266,13 @@ async function probeOneProject (input) {
   if (spreadsheetToken.length > 0) kind = 'sheet'
   else if (appToken.length > 0) kind = 'bitable'
 
+  // 电子表格的 token 先归一一次（整条链接 → 裸 token），呈现给人看的 table 才不是一坨 URL。
+  let sheetToken = extractSheetToken(spreadsheetToken)
   const base = {
     name: input.projectName,
     kind,
     table: kind === 'sheet'
-      ? spreadsheetToken
+      ? (sheetToken || spreadsheetToken)
       : appToken.length > 0
         ? (tableId.length > 0 ? `${appToken}/${tableId}` : appToken)
         : '',
@@ -246,8 +300,30 @@ async function probeOneProject (input) {
   const resolvedSheetName = String(match.sheetName ?? '').trim()
   try {
     if (kind === 'sheet') {
+      // wiki 形态（知识库里存着的电子表格）要先用 `get_node` 换出 obj_token ——
+      // 直接拿 `/wiki/<node_token>` 的 node token 去查 sheets 接口同样会 404。
+      // 适配器本体的 resolveTable 走的就是这条：isWikiToken ⇒ probeWikiNode ⇒ obj_token。
+      // 体检不换这一步，就会把「知识库表格」整个报成读不到。
+      if (isWikiToken(spreadsheetToken) || isWikiToken(sheetToken)) {
+        const nodeToken = extractWikiToken(spreadsheetToken)
+        const node = await call(`/open-apis/wiki/v2/spaces/get_node`, { query: { token: nodeToken } })
+        const objType = String(node?.node?.obj_type ?? '')
+        const objToken = String(node?.node?.obj_token ?? '')
+        if (objType.length > 0 && objType !== 'sheet') {
+          base.metadata = {
+            ok: false,
+            message: `wiki 节点 ${nodeToken} 不是电子表格（实际类型 ${objType}）`,
+            fix: '在飞书里确认这张工单表是电子表格，或者把配置改成对应的表型。',
+          }
+          base.records = { ok: false, message: '上一步没通，这一步没查' }
+          return base
+        }
+        // obj_type 为空（老服务端）时按电子表格继续：这是显式配了 spreadsheetToken 的分支。
+        if (objToken.length > 0) sheetToken = objToken
+        base.table = sheetToken
+      }
       // 表型是电子表格：能列出它的 sheet 就算元数据通。
-      const data = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(base.table)}/sheets/query`, {})
+      const data = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(sheetToken)}/sheets/query`, {})
       const sheets = Array.isArray(data?.sheets) ? data.sheets : []
       base.metadata = { ok: true, message: `能读到电子表格元数据（${sheets.length} 个工作表）` }
       if (resolvedSheetId.length === 0) {
@@ -285,7 +361,7 @@ async function probeOneProject (input) {
       }
       const range = `${anchor}!A1:Z2`
       const data = await call(
-        `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(base.table)}/values/${encodeURIComponent(range)}`,
+        `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(sheetToken)}/values/${encodeURIComponent(range)}`,
         {},
       )
       const rows = Array.isArray(data?.valueRange?.values) ? data.valueRange.values : []

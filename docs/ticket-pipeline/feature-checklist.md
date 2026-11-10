@@ -844,6 +844,58 @@ record_id**，只有「第几行第几列」，而**行号会漂移** —— 人
 
 ---
 
+### 1.24 体检把「自己的 bug」报成「你配置错了」：探针忘了归一 spreadsheetToken（2026-11-10）
+
+**真机症状**：`pipeline_doctor` 报**阻断**——「飞书项目 pms：读不到表元数据（HTTP 404）」，而同一份配置下
+适配器扫票是正常的。人看到「读不到表元数据」，第一反应一定是去开放平台查权限、或者怀疑表格没把应用加成协作者，
+**而实际上什么都没配错**。
+
+**根因**：`probe.js` 的 `probeOneProject()` 判出表型是电子表格后，直接把 `match.spreadsheetToken` 原值
+`encodeURIComponent` 进请求路径：
+
+```js
+`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(base.table)}/sheets/query`
+```
+
+而面板推荐的填法是**贴整条工单表链接**，知识库里的表就是一条
+`https://<租户>.feishu.cn/wiki/<node_token>?sheet=<sheet_id>`。于是拼出来的是
+
+```
+…/spreadsheets/https%3A%2F%2F…%2Fwiki%2F…%2Fsheets%2Fquery
+```
+
+⇒ 必然 404。适配器本体从来不这么干：`index.js` 有 `extractSheetToken()`（抠 `/sheets/<token>` 或裸 token），
+`resolveSheetTarget()` 会先调它；wiki 形态还会先走 `probeWikiNode()` 用 `get_node` 换出 `obj_token`。
+**体检少抄了这两层归一，于是把「探针自己拼错了地址」报成了「你读不到表元数据」** —— 这是最坏的一种误导，
+因为修法方向完全相反（它会让人去改一个没问题的配置）。
+
+**修法（`probe.js`）**：
+1. 补 `isWikiToken()` / `extractWikiToken()` / `extractSheetToken()` 三个本地函数（**故意不复用 `index.js` 的**：
+   探针的硬约束是「绝不 import 适配器内部、绝不抛错」，一旦反过来依赖适配器的闭包，离线自测就跑不起来了；
+   代价是这三段小逻辑要跟着适配器保持一致 —— 用例里明写了「两边认同一组输入形态」）。
+2. 表型判定后先把 `spreadsheetToken` 归一成裸 token 再放进 `base.table`（报表里给人看的也是裸 token，不是一坨 URL）。
+3. `kind === 'sheet'` 且值是 wiki 形态时，先 `GET /open-apis/wiki/v2/spaces/get_node?token=<node_token>`：
+   - `obj_type` 是别的类型 ⇒ 明说「wiki 节点不是电子表格（实际类型 X）」，不再发第二个请求；
+   - `obj_token` 有值 ⇒ 拿它当 `spreadsheetToken` 继续；
+   - `obj_type` 为空（老服务端）⇒ 按电子表格继续（因为这一步是**显式配了 `spreadsheetToken`** 才进来的）。
+4. 后面的 `sheets/query` 与 `values/{range}` 都用归一后的 `sheetToken`（不是 `base.table`）。
+
+**自测**：`dev-run` 482 → **483**。新增一条 `体检：电子表格配成整条链接 / 知识库 wiki 链接时，先归一再查
+（不能拿 URL 当 token）`，走**真探针 + 假 fetch**，两个子场景：
+- wiki 链接 ⇒ 断言**先**打了 `get_node?token=wikcnABCDEFG`、**再**用**换出来的 `obj_token`** 查 `sheets/query`，
+  且**全链路没有一处把整条 URL 编进路径**（`!/spreadsheets%2F|spreadsheets\/https/.test(p)`）；
+- 普通 `/sheets/shtcnXXX?sheet=…` 链接 ⇒ 断言抠出 `shtcnXXX` 段，且报表里的 `table` 字段是裸 token。
+
+**真机验证**（同一天，用真实 credentials 打真飞书，只读）：修复前 `HTTP 404`；修复后
+`kind: sheet` / `metadata.ok: true`（「能读到电子表格元数据（1 个工作表）」）/ `records.ok: true`（「能读到第一页数据（2 行）」），
+`table` 是 `get_node` 换出来的裸 token。
+
+**教训**：**一个工具报出的「环境问题」，本身也可能是那个工具的 bug**。体检这类「诊断器」必须与被执行的那条真实
+链路口径完全一致 —— 否则它比不体检更糟：它会把一个能跑的配置说成不能跑，让人去改对的东西。凡是「探针/校验器
+复制了一份被检对象的解析逻辑」，就要问一句「它抄全了吗？」，并为此写一条**跨两份实现的一致性断言**。
+
+---
+
 ## 2. 代码清单
 
 `src/` 共 **46 个 .js / 21 026 行**；`scripts/` 共 9 个 .mjs / **13 736 行**（`dev-run.mjs` **5 061 行**）；`lib/client.js` **4 395 行**（浏览器端设置面板）。
@@ -1118,7 +1170,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **482** | 通过 482，失败 0（2026-11-10 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）。这 482 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 93 条（见 §1.23 注） |
+| `node scripts/dev-run.mjs` | **483** | 通过 483，失败 0（2026-11-10 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）。这 483 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 93 条（见 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 
 `dev-run.mjs` 分 31 个小节：
@@ -1257,7 +1309,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **482** 项离线断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **483** 项离线断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
@@ -1287,7 +1339,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | **上线加固**（**已完成**，2026-11-06） | 5 条阻断项 + 4 条重要项：适配器名强校验（`workExecutor` / `pushAdapter` 的 `enum`，写错抛 `invalid-input` 不静默退 mock）、验证命令超时与取消（30 分钟缺省、退出码 124、取消真 kill）、敏感名单 9 → **8 大类 41 条正则**、`.git`/profile 篡改自检（28 + 10 + 4）、终态与事后动作同一次落库（`pendingEffects` + `replayPendingEffects`）、回填失败进通知、就地重跑起点、租约诚实化（best-effort，不是原子 CAS），见 §1.14 | ✅ 自测 325 → **363/363**（当轮；新增 38 条，`dev-run.mjs` 第 16b 节 14 条 + 各 checks）；`gitlab-checks` 78 → 86、`wps-checks` 25 → 34、`workspace-checks` 11 → 19 |
 | **关键节点流程日志（时间线）**（**已完成**，2026-11-06） | 票据 `timeline` 17 节点表（9 主站 ①–⑨ + 8 补充站）、`markNode` / `markExtra` / `onFlow` 全链路打点、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、历史不清空 + 80 条封顶，见 §1.16 | ✅ 自测 363 → **376/376**（新增 13 条，`dev-run.mjs` 第 16c 节）；26 小节；真实链路探针 11 条时间线、渲染探针给出 `station`/`stalledForMs` |
 | **飞书电子表格支持**（**已完成**，2026-11-09） | 新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数：列名别名、工作表定位、range、读值、行身份、日期/优先级）；`get_node` 不再硬写 `obj_type`；`resolveTable` 成表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`）；`scan` 拆 `scanBitable` / `scanSheet`；`validateProject` 四选一；9 个配置键透传；面板加「飞书电子表格」一组（含 `kind:'columns'` 一行写法）。见 §1.21 | ✅ 自测 384 → **451/451**；`feishu-checks` 60 → **80**（19 条电子表格断言）；`client-smoke` **175** 条；`client-check` 面板字段 29 项与 descriptor 对得上 |
-| **22 张产品工单落地批次**（**已完成**，2026-11-10） | 产品评审出的 22 张票全部实施完（见 `.scratch/ticket-pipeline-product/spec.md` 索引）：配置 33 → **25 键 4 组**、`skipped` 终态文案四档、面板加「运行」第五页签、`delivery` 交付维度、`appToken` 面板贴链接、多维表格列名别名、电子表格回填、WPS 与 GitLab 降级为 experimental、doctor 三档体检、校验带修复建议与拼错键检测 | ✅ `dev-run` 451 → **482/482**；`feishu-checks` **93** 条；`client-check` **9 个 Remote 方法** / 25 叶子 / 72 节点 / `projects` 可写 34 字段；`client-smoke`、`chain-smoke`（11）、`wps-checks` 全绿 |
+| **22 张产品工单落地批次**（**已完成**，2026-11-10） | 产品评审出的 22 张票全部实施完（见 `.scratch/ticket-pipeline-product/spec.md` 索引）：配置 33 → **25 键 4 组**、`skipped` 终态文案四档、面板加「运行」第五页签、`delivery` 交付维度、`appToken` 面板贴链接、多维表格列名别名、电子表格回填、WPS 与 GitLab 降级为 experimental、doctor 三档体检、校验带修复建议与拼错键检测 | ✅ `dev-run` 451 → **483/483**；`feishu-checks` **93** 条；`client-check` **9 个 Remote 方法** / 25 叶子 / 72 节点 / `projects` 可写 34 字段；`client-smoke`、`chain-smoke`（11）、`wps-checks` 全绿 |
 | 第二步（当前） | 真实飞书票 `pms\|reczz28VWNWVefNA` 复跑一次全链路 | 收到真 QQ 邮件、邮件里有本地提交 sha 且能 `git show` 到、`verify.test` 真跑过 |
 | 第二步半（**代码已完成**，2026-11-09） | **飞书电子表格支持**（设计见 `docs/ticket-pipeline/feishu-sheet-source.md`，决策见 `docs/adr/0005-飞书电子表格源按表型分派.md`；回填见 §1.23） | ✅ `dev-run` 384 → **451** → **482**（#22 回填）；真表读数据与回填待 §8.2 人工前置（开 `sheets:spreadsheet` **读写** + 「添加文档应用」加成可编辑） |
 | 第三步 | 补金山开放平台取数通道 | 给一张真实金山表链接 + 凭据，能扫出票 |

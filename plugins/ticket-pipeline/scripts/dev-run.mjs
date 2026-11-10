@@ -2494,6 +2494,77 @@ async function main () {
     assert.ok(!timedOut.token.message.includes('App Secret'), '超时不能冤枉成凭据填错')
   })
 
+  await check('体检：电子表格配成整条链接 / 知识库 wiki 链接时，先归一再查（不能拿 URL 当 token）', async () => {
+    // 这是真机踩出来的 bug：配置里 match.spreadsheetToken 填的是面板上贴的
+    // 「工单表链接」（一条 /wiki/<node_token>?sheet=xxx 的 URL），而探针以前把
+    // 这条 URL 整个 encode 进 /sheets/v3/spreadsheets/<token>/sheets/query 的路径，
+    // 拼出来的地址必然 404 —— 体检就报「读不到表元数据」，看上去像用户配错了。
+    // 适配器本体一直是会归一的（extractSheetToken / isWikiToken ⇒ probeWikiNode），
+    // 两边认的输入形态必须一致，否则体检会给出方向完全错的修法。
+    const seen = []
+    const fakeFeishu = async (url) => {
+      const u = new URL(String(url))
+      seen.push(u.pathname + u.search)
+      const json = (body) => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      })
+      if (u.pathname.endsWith('/tenant_access_token/internal')) {
+        // 真接口把这个字段放在**顶层**（不在 data 里），探针也是这么读的。
+        return json({ code: 0, tenant_access_token: 't-1' })
+      }
+      if (u.pathname.endsWith('/wiki/v2/spaces/get_node')) {
+        return json({ code: 0, data: { node: { obj_type: 'sheet', obj_token: 'shtcnObjToken' } } })
+      }
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+        return json({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }] } })
+      }
+      if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+        return json({ code: 0, data: { valueRange: { values: [['序号', '问题描述'], ['A-1', 'x']] } } })
+      }
+      // 走到这里说明拼错地址了：返回 404，让用例以「失败」收场而不是静默通过。
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404, msg: 'not found' }), text: async () => '{"code":404}' }
+    }
+    const probeWithLink = (spreadsheetToken) => probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken, sheetId: 'sh1' } }],
+      fetch: fakeFeishu,
+    })
+
+    // ① 知识库（wiki）形态：要先 get_node 换 obj_token，再拿 obj_token 查。
+    const wiki = await probeWithLink('https://x.feishu.cn/wiki/wikcnABCDEFG?sheet=sh1')
+    assert.equal(wiki.projects[0].kind, 'sheet')
+    assert.ok(
+      seen.some((p) => p.includes('/wiki/v2/spaces/get_node') && p.includes('token=wikcnABCDEFG')),
+      `wiki 链接要先查 get_node：${seen.join(' | ')}`,
+    )
+    assert.ok(
+      seen.some((p) => p.includes('/sheets/v3/spreadsheets/shtcnObjToken/sheets/query')),
+      `查工作表要用 get_node 换出来的 obj_token：${seen.join(' | ')}`,
+    )
+    assert.ok(
+      !seen.some((p) => /spreadsheets%2F|spreadsheets\/https/.test(p)),
+      `绝不能把整条 URL 当 token 拼进路径：${seen.join(' | ')}`,
+    )
+    assert.equal(wiki.projects[0].metadata.ok, true, 'wiki 表格应该被验通')
+    assert.equal(wiki.projects[0].records.ok, true)
+
+    // ② 普通表格链接：抠出 /sheets/<token> 那一段。
+    seen.length = 0
+    const plain = await probeWithLink('https://x.feishu.cn/sheets/shtcnPlain?sheet=sh1')
+    assert.ok(
+      seen.some((p) => p.includes('/sheets/v3/spreadsheets/shtcnPlain/sheets/query')),
+      `普通链接要抠出 shtcn 段：${seen.join(' | ')}`,
+    )
+    assert.equal(plain.projects[0].metadata.ok, true)
+    // 报表里给人看的 table 也要是裸 token，不是一坨 URL。
+    assert.equal(plain.projects[0].table, 'shtcnPlain')
+  })
+
   // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
   await check('plugin-version：profile 声明解析与链接安装识别', async () => {
     // profile 的 package.json 只认 file:/link:，版本号形态说明来自 registry。
