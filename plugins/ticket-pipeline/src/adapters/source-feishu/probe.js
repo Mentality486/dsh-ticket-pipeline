@@ -22,12 +22,47 @@
  */
 
 import { PipelineError } from '../../contracts/errors.js'
+import { normalizeCellText, resolveStatusValues } from './index.js'
+import {
+  BITABLE_COLUMN_ALIASES,
+  mapColumns,
+  normalizeHeaderKey,
+} from './sheets.js'
 
 const FEISHU_API_BASE = 'https://open.feishu.cn'
 const AUTH_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
 
 /** 体检里每个网络请求的超时（毫秒）。10 秒：够慢网出结果，又不至于让体检拖成分钟级。 */
 export const PROBE_TIMEOUT_MS = 10_000
+
+/**
+ * 这些错误码的意思是「你拿错类型来问我了」，不是故障 —— 值得换另一种表型再试。
+ *
+ * `1254003 WrongBaseToken` 是最常见的那个：拿电子表格的 token 去问
+ * `/bitable/v1/apps/<token>/tables`，飞书回的就是它。归成「真故障」会让
+ * 「只贴了一个 wiki token 的电子表格」永远走不到电子表格分支（实测 2026-11-10）。
+ */
+const TYPE_MISMATCH_CODES = new Set([1254003, 1254005, 1254006, 1254007, 1254043, 1254045])
+
+/**
+ * 这个错误值不值得「再按电子表格试一次」。
+ *
+ * 与适配器 `resolveTable()` 里的 `shouldTrySheet()` 同一口径（2026-11-10 对齐）：
+ * 只有「不是这个类型」那类错才该换条路 —— `1254003 WrongBaseToken`（拿电子表格
+ * token 问多维表格）、`1254005/1254006/1254007`、表不存在（`1254043/1254045`）、
+ * 以及非 2xx 的 400/404。凭据错、限流、网络错都是真故障，换条路只会把真因埋掉。
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function shouldFallbackToSheet (error) {
+  if (error instanceof ProbeHttpError) {
+    if (error.code !== undefined && TYPE_MISMATCH_CODES.has(error.code)) return true
+    return error.status === 400 || error.status === 404
+  }
+  if (error instanceof PipelineError && error.kind === 'invalid-input') return true
+  return false
+}
 
 /**
  * 飞书错误码 → 人话 + 修法。
@@ -235,6 +270,10 @@ function extractSheetToken (raw) {
   if (text.length === 0) return ''
   const urlMatch = text.match(/\/sheets\/([A-Za-z0-9]+)/)
   if (urlMatch) return urlMatch[1]
+  // 知识库里的电子表格从地址栏复制出来是 `/wiki/<node_token>`：node token 本身就能
+  // 当 spreadsheetToken 用（实测 2026-11-10），抠出来即可，不必先换成 obj_token。
+  const wikiMatch = text.match(/\/wiki\/([A-Za-z0-9]+)/)
+  if (wikiMatch) return wikiMatch[1]
   const bare = text.match(/^([A-Za-z0-9]+)$/)
   if (bare) return bare[1]
   return text
@@ -258,24 +297,37 @@ async function probeOneProject (input) {
   const appToken = String(match.appToken ?? '').trim()
   const tableId = String(match.tableId ?? '').trim()
   const spreadsheetToken = String(match.spreadsheetToken ?? '').trim()
+  const tableKindOption = String(match.tableKind ?? '').trim()
+  const resolvedSheetName = String(match.sheetName ?? '').trim()
+  let resolvedSheetId = String(match.sheetId ?? '').trim()
 
-  // 表型判定：先看显式配的是哪一种。两者都空说明这个项目根本没配表 ——
-  // 那不用发任何请求，直接告诉人「项目没绑表」。
+  // 表型判定：`spreadsheetToken` 与 `appToken` 谁非空只决定**先试哪条路**，
+  // 真正的类型以下面的探测结果为准。
+  //
+  // 为什么不能只看「哪个字段非空」就说结论（2026-11-10 的真实事故）：
+  // 面板上「工单表链接」贴一条 `/wiki/<token>` 链接时，宿主把**裸 wiki token**
+  // 写进 `appToken`（那个节点背后既可能是多维表格，也可能是电子表格）。
+  // 以前的体检看到 `appToken` 非空就直接按多维表格去问 `bitable/v1/apps/<token>`，
+  // 电子表格必然回 `1254003 WrongBaseToken` —— 于是**扫票明明是好的，体检却报红**，
+  // 人就被引去改配置。体检与适配器必须认同一套输入形态。
   /** @type {'bitable' | 'sheet' | 'unknown'} */
   let kind = 'unknown'
-  if (spreadsheetToken.length > 0) kind = 'sheet'
+  if (tableKindOption === 'sheet' && (spreadsheetToken.length > 0 || appToken.length > 0)) kind = 'sheet'
+  else if (tableKindOption === 'bitable' && appToken.length > 0) kind = 'bitable'
+  else if (spreadsheetToken.length > 0) kind = 'sheet'
   else if (appToken.length > 0) kind = 'bitable'
 
   // 电子表格的 token 先归一一次（整条链接 → 裸 token），呈现给人看的 table 才不是一坨 URL。
-  let sheetToken = extractSheetToken(spreadsheetToken)
+  let sheetToken = extractSheetToken(spreadsheetToken.length > 0 ? spreadsheetToken : (kind === 'sheet' ? appToken : ''))
+  let bitableToken = appToken
+  let resolvedTableId = tableId
+
   const base = {
     name: input.projectName,
     kind,
     table: kind === 'sheet'
-      ? (sheetToken || spreadsheetToken)
-      : appToken.length > 0
-        ? (tableId.length > 0 ? `${appToken}/${tableId}` : appToken)
-        : '',
+      ? (sheetToken || spreadsheetToken || appToken)
+      : (tableId.length > 0 ? `${appToken}/${tableId}` : appToken),
     metadata: { ok: false },
     records: { ok: false },
   }
@@ -294,53 +346,186 @@ async function probeOneProject (input) {
     timeoutMs: input.timeoutMs ?? PROBE_TIMEOUT_MS,
   })
 
-  // ── 表元数据 ──────────────────────────────────────────────
-  let resolvedTableId = tableId
-  let resolvedSheetId = String(match.sheetId ?? '').trim()
-  const resolvedSheetName = String(match.sheetName ?? '').trim()
+  // ── 表型探测 + 表元数据 ────────────────────────────────────
+  //
+  // `appToken` 不一定真是多维表格：面板「工单表链接」贴 `/wiki/<token>` 时，宿主
+  // 写进去的是**裸 wiki token**，而那个节点背后可能是多维表格、也可能是电子表格。
+  // 所以这里不能「看到 appToken 就按多维表格问」，要照适配器 `resolveTable()` 的
+  // 同一套顺序探测；否则扫票明明是好的，体检却报 `1254003 WrongBaseToken` 把人引偏。
+  /** 多维表格侧要试的 app_token 候选（wiki 节点会带两个）。 */
+  const bitableCandidates = appToken.length > 0 ? [appToken] : []
+
+  /** 读电子表格元数据（同时定下要读第一页数据的 sheet 锚点）。 */
+  const readSheetMetadata = async () => {
+    // wiki 形态（知识库里存着的电子表格）要先用 `get_node` 换出 obj_token ——
+    // 直接拿 `/wiki/<node_token>` 的 node token 去查 sheets 接口同样会 404。
+    if (isWikiToken(spreadsheetToken) || isWikiToken(sheetToken)) {
+      const nodeToken = extractWikiToken(spreadsheetToken.length > 0 ? spreadsheetToken : appToken)
+      const node = await call('/open-apis/wiki/v2/spaces/get_node', { query: { token: nodeToken } })
+      const objToken = String(node?.node?.obj_token ?? '')
+      // 注意：wiki token 与 obj_token **两者都能当 spreadsheetToken 用**（实测 2026-11-10），
+      // 所以 obj_token 读不到时退回 nodeToken 也是一条能跑的路，不必当成错误。
+      if (objToken.length > 0) sheetToken = objToken
+      else if (sheetToken.length === 0) sheetToken = nodeToken
+      base.table = sheetToken
+    }
+    const data = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(sheetToken)}/sheets/query`, {})
+    const sheets = Array.isArray(data?.sheets) ? data.sheets : []
+    base.metadata = { ok: true, message: `能读到电子表格元数据（${sheets.length} 个工作表）` }
+    if (resolvedSheetId.length === 0) {
+      // 没指定 sheet 时挑第一个：体检只需要「能不能读到数据」，不需要挑对表。
+      const first = sheets[0]
+      if (first?.sheet_id) resolvedSheetId = String(first.sheet_id)
+      else if (first?.title) resolvedSheetId = String(first.title)
+    }
+  }
+
+  /** 读多维表格元数据；wiki 节点先问 `get_node` 定真实类型。 */
+  const readBitableMetadata = async () => {
+    if (isWikiToken(appToken)) {
+      const nodeToken = extractWikiToken(appToken)
+      const node = await call('/open-apis/wiki/v2/spaces/get_node', { query: { token: nodeToken } })
+      const objType = String(node?.node?.obj_type ?? '')
+      const objToken = String(node?.node?.obj_token ?? '')
+      if (objType.length > 0 && objType !== 'bitable' && objType !== 'sheet') {
+        const error = new PipelineError('invalid-input', `wiki 节点 ${nodeToken} 是「${objType}」，既不是多维表格也不是电子表格`)
+        error.probeKind = objType
+        throw error
+      }
+      // 多维表格：obj_token 与 wiki token 都可能被 bitable API 接受（新版吃 wiki token，
+      // 旧版要 obj_token），两个都试。裸 wiki token 要抠出来，整条 URL 拼进 path 是另一回事。
+      if (objToken.length > 0 && !bitableCandidates.includes(objToken)) bitableCandidates.unshift(objToken)
+      if (!bitableCandidates.includes(nodeToken)) bitableCandidates.push(nodeToken)
+    }
+    let lastError = null
+    const attempts = []
+    for (const candidate of bitableCandidates) {
+      try {
+        const data = await call(`/open-apis/bitable/v1/apps/${encodeURIComponent(candidate)}/tables`, { query: { page_size: 100 } })
+        const tables = Array.isArray(data?.items) ? data.items : []
+        base.kind = 'bitable'
+        base.table = resolvedTableId.length > 0 ? `${candidate}/${resolvedTableId}` : candidate
+        base.metadata = { ok: true, message: `能读到多维表格元数据（${tables.length} 张数据表）` }
+        if (resolvedTableId.length === 0 && tables.length > 0) {
+          // 没写 tableId 时配置层靠 docNamePattern 猜；体检没有那个上下文，
+          // 就退一步用第一张表 —— 只为了验证「能不能读数据」，不承诺挑对表。
+          const first = tables[0]
+          if (first?.table_id) resolvedTableId = String(first.table_id)
+          bitableToken = candidate
+        } else {
+          bitableToken = candidate
+        }
+        return
+      } catch (error) {
+        attempts.push(error)
+        lastError = error
+      }
+    }
+    throw lastError ?? new PipelineError('internal', '多维表格读表失败')
+  }
+
+  // ── 状态值口径采样 ────────────────────────────────────────
+  //
+  // 「环境体检全绿、却一张票都收不到」最常见的原因不是权限，是**状态列的取值对不上**：
+  // 插件缺省只认「处理中」（`IN_PROGRESS_VALUE`），而这批表的实际取值是「是 / 否」或
+  // 空 —— 实测（2026-11-10）同一张表 `statusValues: ['处理中']` 收 0 张、`['是']` 收 73 张。
+  //
+  // 这件事**体检原来查不出来**：它只看「读不读得到数据」，不看「读到的状态值是不是你要的」。
+  // 于是人看到一片绿却收不到票，只能去翻文档猜字段名。这里把采样结果摆出来，
+  // 对不上时直接说「表里实际是这些值，你的配置是那些」。
+  //
+  // 只报「一个都对不上」，不报「少了一个」：真实表里常有历史脏值（空、错别字），
+  // 只要有一个能对上就说明配置没错，剩下的交给 `sheetIdentity` / 过滤逻辑处理。
+
+  /** 采样里最多看多少行。100 行足够看出取值分布，又不会让体检读整张表。 */
+  const STATUS_SAMPLE_ROWS = 100
+
+  /** 把一组「表里真实出现的状态值」与「配置里认的状态值」放一起比。 */
+  const compareStatusValues = (values) => {
+    const actual = [...new Set(values.map((text) => String(text ?? '').trim()).filter((text) => text.length > 0))]
+    const expected = resolveStatusValues(match.statusValues)
+    if (actual.length === 0) {
+      // 采样里一个非空值都没有：表可能真没填，或状态列认错了。不猜，交给列映射那层报错。
+      base.statusValues = { ok: true, values: [], expected, message: '这一批采样里状态列没有非空值（表可能是空的）' }
+      return
+    }
+    const hit = actual.filter((text) => expected.includes(text))
+    if (hit.length > 0) {
+      base.statusValues = {
+        ok: true,
+        values: actual,
+        expected,
+        message: `状态值对得上（表里出现 ${actual.slice(0, 6).map((t) => `「${t}」`).join(' ')}${actual.length > 6 ? ' …' : ''}）`,
+      }
+      return
+    }
+    const shown = actual.slice(0, 6).map((text) => `「${text}」`).join(' ')
+    base.statusValues = {
+      ok: false,
+      values: actual,
+      expected,
+      message: `状态列里没有一个是配置认的值（表里实际是 ${shown}${actual.length > 6 ? ' …' : ''}，配置认 ${expected.map((t) => `「${t}」`).join(' ')}）—— 这样一张票都收不到`,
+      fix: `把「在处理中的状态值」改成表里真实出现的那个，比如 ${actual.slice(0, 2).map((t) => `「${t}」`).join(' 或 ')}。`,
+    }
+  }
+
+  /** 电子表格：读表头 → 认状态列 → 采样这一列的值。 */
+  const sampleSheetStatus = (rows) => {
+    const matrix = Array.isArray(rows) ? rows : []
+    const headerRow = Number(match.sheetHeaderRow ?? 1)
+    const header = matrix[Number.isInteger(headerRow) && headerRow >= 1 ? headerRow - 1 : 0]
+    if (!Array.isArray(header)) return
+    let columns
+    try {
+      columns = mapColumns({ actualNames: header, overrides: match.sheetColumns }).columns
+    } catch {
+      return // 列名覆盖写坏了不在这里报 —— 真正扫票时会报得更清楚
+    }
+    if (columns.status === undefined) return // 认不出状态列，交给列映射那层的报错
+    const values = []
+    for (let index = (Number.isInteger(headerRow) && headerRow >= 1 ? headerRow : 1); index < matrix.length; index += 1) {
+      const row = matrix[index]
+      if (!Array.isArray(row)) continue
+      const cell = row[columns.status]
+      if (cell === null || cell === undefined || cell === '') continue
+      values.push(String(cell).trim())
+    }
+    compareStatusValues(values)
+  }
+
+  /** 多维表格：用同一张别名表认字段名 → 采样该字段的值。 */
+  const sampleBitableStatus = (items) => {
+    const list = Array.isArray(items) ? items : []
+    const values = []
+    for (const item of list) {
+      const fields = item?.fields ?? {}
+      const key = Object.keys(fields).find((name) => {
+        const normalized = normalizeHeaderKey(name)
+        return (BITABLE_COLUMN_ALIASES.status ?? []).some((alias) => normalizeHeaderKey(alias) === normalized)
+      })
+      if (key === undefined) return // 认不出状态字段，交给别处报
+      const text = normalizeCellText(fields[key])
+      if (text.length > 0) values.push(text)
+    }
+    if (values.length === 0) return
+    compareStatusValues(values)
+  }
+
   try {
     if (kind === 'sheet') {
-      // wiki 形态（知识库里存着的电子表格）要先用 `get_node` 换出 obj_token ——
-      // 直接拿 `/wiki/<node_token>` 的 node token 去查 sheets 接口同样会 404。
-      // 适配器本体的 resolveTable 走的就是这条：isWikiToken ⇒ probeWikiNode ⇒ obj_token。
-      // 体检不换这一步，就会把「知识库表格」整个报成读不到。
-      if (isWikiToken(spreadsheetToken) || isWikiToken(sheetToken)) {
-        const nodeToken = extractWikiToken(spreadsheetToken)
-        const node = await call(`/open-apis/wiki/v2/spaces/get_node`, { query: { token: nodeToken } })
-        const objType = String(node?.node?.obj_type ?? '')
-        const objToken = String(node?.node?.obj_token ?? '')
-        if (objType.length > 0 && objType !== 'sheet') {
-          base.metadata = {
-            ok: false,
-            message: `wiki 节点 ${nodeToken} 不是电子表格（实际类型 ${objType}）`,
-            fix: '在飞书里确认这张工单表是电子表格，或者把配置改成对应的表型。',
-          }
-          base.records = { ok: false, message: '上一步没通，这一步没查' }
-          return base
-        }
-        // obj_type 为空（老服务端）时按电子表格继续：这是显式配了 spreadsheetToken 的分支。
-        if (objToken.length > 0) sheetToken = objToken
-        base.table = sheetToken
-      }
-      // 表型是电子表格：能列出它的 sheet 就算元数据通。
-      const data = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(sheetToken)}/sheets/query`, {})
-      const sheets = Array.isArray(data?.sheets) ? data.sheets : []
-      base.metadata = { ok: true, message: `能读到电子表格元数据（${sheets.length} 个工作表）` }
-      if (resolvedSheetId.length === 0) {
-        // 没指定 sheet 时挑第一个：体检只需要「能不能读到数据」，不需要挑对表。
-        const first = sheets[0]
-        if (first?.sheet_id) resolvedSheetId = String(first.sheet_id)
-        else if (first?.title) resolvedSheetId = String(first.title)
-      }
+      await readSheetMetadata()
     } else {
-      const data = await call(`/open-apis/bitable/v1/apps/${encodeURIComponent(appToken)}/tables`, { query: { page_size: 100 } })
-      const tables = Array.isArray(data?.items) ? data.items : []
-      base.metadata = { ok: true, message: `能读到多维表格元数据（${tables.length} 张数据表）` }
-      if (resolvedTableId.length === 0 && tables.length > 0) {
-        // 没写 tableId 时配置层靠 docNamePattern 猜；体检没有那个上下文，
-        // 就退一步用第一张表 —— 只为了验证「能不能读数据」，不承诺挑对表。
-        const first = tables[0]
-        if (first?.table_id) resolvedTableId = String(first.table_id)
+      try {
+        await readBitableMetadata()
+      } catch (error) {
+        // 「不是这个类型」才值得再试电子表格 —— 与适配器 `shouldTrySheet()` 同一口径。
+        // 凭据错 / 限流 / 网络错都是真故障，改成试 sheet 只会把真因埋掉。
+        if (!shouldFallbackToSheet(error)) throw error
+        kind = 'sheet'
+        sheetToken = extractSheetToken(appToken)
+        base.kind = 'sheet'
+        base.table = sheetToken || appToken
+        await readSheetMetadata()
       }
     }
   } catch (error) {
@@ -359,7 +544,7 @@ async function probeOneProject (input) {
         base.records = { ok: false, message: '这张电子表格里没找到任何工作表，读不到数据' }
         return base
       }
-      const range = `${anchor}!A1:Z2`
+      const range = `${anchor}!A1:Z${STATUS_SAMPLE_ROWS}`
       const data = await call(
         `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(sheetToken)}/values/${encodeURIComponent(range)}`,
         {},
@@ -372,14 +557,15 @@ async function probeOneProject (input) {
           ? `能读到第一页数据（${rows.length} 行）`
           : '表是空的（能连上，但一行数据都没有 —— 先确认填的是不是同一张表）',
       }
+      sampleSheetStatus(rows)
     } else {
       if (resolvedTableId.length === 0) {
         base.records = { ok: false, message: '配置里没写 tableId，也没能自动猜出是哪张数据表' }
         return base
       }
       const data = await call(
-        `/open-apis/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(resolvedTableId)}/records/search`,
-        { method: 'POST', body: { page_size: 1, automatic_fields: true } },
+        `/open-apis/bitable/v1/apps/${encodeURIComponent(bitableToken || appToken)}/tables/${encodeURIComponent(resolvedTableId)}/records/search`,
+        { method: 'POST', body: { page_size: STATUS_SAMPLE_ROWS, automatic_fields: true } },
       )
       const items = Array.isArray(data?.items) ? data.items : []
       base.records = {
@@ -388,6 +574,7 @@ async function probeOneProject (input) {
           ? `能读到第一页数据（这张表里有记录）`
           : '表是空的（能连上，但一条记录都没有 —— 先确认填的是不是同一张表）',
       }
+      sampleBitableStatus(items)
     }
   } catch (error) {
     base.records = { ok: false, ...describeProbeFailure(error) }

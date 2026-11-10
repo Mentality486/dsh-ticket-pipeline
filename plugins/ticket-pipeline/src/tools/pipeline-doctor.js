@@ -453,6 +453,18 @@ if (feishuProjects.length === 0) {
           blockers.push(`飞书项目 ${name}：读不到表里的数据（${item?.records?.message ?? '原因未记录'}）${code}${fix}`)
           lines.push(`　❌ 读不到数据：${item?.records?.message ?? '原因未记录'}${code}`)
         }
+        // 状态值口径：体检以前只查「读不读得到数据」，不查「读到的状态值是不是你要的」。
+        // 于是权限、表、数据全绿，却一张票都收不到 —— 缺省只认「处理中」（`IN_PROGRESS_VALUE`），
+        // 而这批表实际填的是「是 / 否」（实测 2026-11-10：同一张表 `['处理中']` 收 0 张、
+        // `['是']` 收 73 张）。这一层只提醒、不阻塞：票收不到不等于流水线坏了，
+        // 而且人可能正在按别的状态值跑。
+        if (item?.statusValues?.ok === false) {
+          const fix = item.statusValues.fix ? ` —— 修复：${item.statusValues.fix}` : ''
+          warnings.push(`飞书项目 ${name}：${item.statusValues.message}${fix}`)
+          lines.push(`　⚠️ 状态值对不上：${item.statusValues.message}`)
+        } else if (item?.statusValues?.ok === true && item.statusValues.values?.length > 0) {
+          lines.push(`　${item.statusValues.message}`)
+        }
         // 电子表格回填（工单 #22）多一道**看不见的**前置条件：读票只要只读权限，
         // 写回那三列要读写权限。缺这一档时读得好好的，票跑完了才在回填那一步失败 ——
         // 而那时票已经是「完成」，人只会看到表格没更新。体检是唯一能在跑之前提醒的地方。

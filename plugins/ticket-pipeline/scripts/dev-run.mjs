@@ -2685,6 +2685,176 @@ async function main () {
     assert.equal(plain.projects[0].table, 'shtcnPlain')
   })
 
+  await check('体检：appToken 里装的是 wiki 节点的电子表格时，不能按多维表格问（1254003 要能降级）', async () => {
+    // 真机事故（2026-11-10）：面板「工单表链接」贴一条 /wiki/<token>，宿主把**裸 wiki token**
+    // 写进 match.appToken（节点背后既可能是多维表格也可能是电子表格）。探针以前看到
+    // appToken 非空就按多维表格问 bitable/v1/apps/<token>/tables，电子表格必然回
+    // 1254003 WrongBaseToken —— 于是**扫票明明是 73 张，体检却报红**，人被引去改配置。
+    const seen = []
+    const fakeFeishu = async (url) => {
+      const u = new URL(String(url))
+      const path = u.pathname + u.search
+      seen.push(path)
+      const json = (body) => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      })
+      if (u.pathname.endsWith('/tenant_access_token/internal')) return json({ code: 0, tenant_access_token: 't-1' })
+      // wiki 节点说：我是电子表格（obj_type: sheet），我的 obj_token 是 shtcnObjTok。
+      if (u.pathname.endsWith('/wiki/v2/spaces/get_node')) {
+        return json({ code: 0, data: { node: { obj_type: 'sheet', obj_token: 'shtcnObjTok' } } })
+      }
+      // 多维表格接口对这个 token 回「你拿错类型了」（HTTP 200 + 业务码，飞书就是这么回的）。
+      if (/\/bitable\/v1\/apps\/[^/]+\/tables$/.test(u.pathname)) {
+        return json({ code: 1254003, msg: 'WrongBaseToken' })
+      }
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+        return json({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }] } })
+      }
+      if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+        return json({ code: 0, data: { valueRange: { values: [['序号'], ['1']] } } })
+      }
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404 }), text: async () => '{"code":404}' }
+    }
+
+    // appToken 装的是裸 wiki token（面板贴链接后的真实形态），没有 spreadsheetToken。
+    const out = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'wikcnNodeTok' } }],
+      fetch: fakeFeishu,
+    })
+    const project = out.projects[0]
+    assert.ok(seen.some((p) => p.includes('/bitable/v1/apps/wikcnNodeTok/tables')), `要先按多维表格试一次：${seen.join(' | ')}`)
+    assert.equal(project.kind, 'sheet', `1254003 是「类型不对」，应该降级认成电子表格：${JSON.stringify(project)}`)
+    // 裸 wiki token 本身就能当 spreadsheetToken 用（实测 2026-11-10），
+    // 所以降级时直接用手里这个 token 查，不必先多调一次 get_node —— 少一次往返。
+    assert.ok(
+      seen.some((p) => p.includes(`/sheets/v3/spreadsheets/wikcnNodeTok/sheets/query`)),
+      `降级后要查工作表：${seen.join(' | ')}`,
+    )
+    assert.equal(project.metadata.ok, true, '电子表格应该能验通（不能报 1254003）')
+    assert.equal(project.records.ok, true)
+    assert.ok(!JSON.stringify(project).includes('1254003'), '成功时不该把 1254003 漏进报告')
+
+    // 真故障不能降级：凭据错还是凭据错，换条路只会把真因埋掉。
+    seen.length = 0
+    const badAuth = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'wikcnNodeTok' } }],
+      fetch: async (url) => {
+        const u = new URL(String(url))
+        seen.push(u.pathname)
+        const json = (body) => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => body, text: async () => JSON.stringify(body) })
+        if (u.pathname.endsWith('/tenant_access_token/internal')) return json({ code: 0, tenant_access_token: 't-1' })
+        if (u.pathname.endsWith('/wiki/v2/spaces/get_node')) return json({ code: 0, data: { node: { obj_type: 'bitable', obj_token: 'bascnTok' } } })
+        return json({ code: 99991663, msg: 'tenant token invalid' })
+      },
+    })
+    assert.equal(badAuth.projects[0].metadata.ok, false, '凭据错要报失败，不能假装成功')
+    assert.ok(
+      !seen.some((p) => p.includes('/sheets/')),
+      `凭据错不该再试电子表格：${seen.join(' | ')}`,
+    )
+  })
+
+  await check('体检：状态值跟表里实际值对不上时要明说（全绿却收不到票的头号原因）', async () => {
+    // 真机事故（2026-11-10）：权限、表、数据全绿，却一张票都收不到 —— 因为缺省只认
+    // 「处理中」（`IN_PROGRESS_VALUE`），而这张表的「是否处理」实际填的是「是 / 否」。
+    // 实测同一张表：statusValues=['处理中'] 收 0 张、['是'] 收 73 张。
+    // 体检以前只看「读不读得到数据」，所以这种情况一片绿，人只能去翻文档猜。
+    const makeFetch = (values) => async (url) => {
+      const u = new URL(String(url))
+      const json = (body) => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      })
+      if (u.pathname.endsWith('/tenant_access_token/internal')) return json({ code: 0, tenant_access_token: 't-1' })
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+        return json({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }] } })
+      }
+      if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+        return json({ code: 0, data: { valueRange: { values } } })
+      }
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404 }), text: async () => '{"code":404}' }
+    }
+    const rows = [['序号', '问题描述', '是否处理'], ['1', '某某问题', '是'], ['2', '另一个问题', '否']]
+
+    // ① 配置认「处理中」，表里是「是 / 否」→ 必须点出来，并给出修法。
+    const bad = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
+      fetch: makeFetch(rows),
+    })
+    const badProject = bad.projects[0]
+    assert.equal(badProject.metadata.ok, true, '这一层不是权限问题，元数据该是通的')
+    assert.equal(badProject.records.ok, true, '数据也读得到')
+    assert.equal(badProject.statusValues?.ok, false, `状态值对不上要报出来：${JSON.stringify(badProject)}`)
+    assert.deepEqual(badProject.statusValues.values, ['是', '否'], '要把表里实际出现的值原样摆出来')
+    assert.ok(badProject.statusValues.message.includes('一张票都收不到'), `要说清后果：${badProject.statusValues.message}`)
+    assert.ok(badProject.statusValues.fix.includes('是'), `修法要给出具体该填什么：${badProject.statusValues.fix}`)
+
+    // ② 配对了就该是绿的，并且把「表里出现什么」也带上（人一眼能确认自己没配错）。
+    const good = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['是'] } }],
+      fetch: makeFetch(rows),
+    })
+    assert.equal(good.projects[0].statusValues?.ok, true, '配对了不该误报')
+    assert.ok(good.projects[0].statusValues.message.includes('对得上'), good.projects[0].statusValues.message)
+
+    // ③ 认不出状态列时闭嘴，别在这里再报一个错 —— 列映射那层报得更清楚。
+    const noColumn = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
+      fetch: makeFetch([['序号', '问题描述'], ['1', '某某问题']]),
+    })
+    assert.equal(noColumn.projects[0].statusValues, undefined, '认不出状态列就不该下结论')
+  })
+
+  await check('体检：状态值对不上只进提醒，不进阻断（收不到票不等于流水线坏了）', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'shtcn', sheetId: 'sh1' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+      probeFeishu: async () => ({
+        skipped: false,
+        token: { ok: true, message: 'token 有效' },
+        projects: [{
+          name: 'pms',
+          kind: 'sheet',
+          table: 'shtcn',
+          metadata: { ok: true, message: '能读到电子表格元数据（1 个工作表）' },
+          records: { ok: true, message: '能读到第一页数据（100 行）' },
+          statusValues: { ok: false, values: ['是', '否'], expected: ['处理中'], message: '状态列里没有一个是配置认的值', fix: '把「在处理中的状态值」改成「是」。' },
+        }],
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.ok(out.warnings.some((w) => w.includes('状态列里没有一个是配置认的值')), `要进提醒档：${JSON.stringify(out.warnings)}`)
+    assert.ok(out.warnings.some((w) => w.includes('改成「是」')), '提醒里要带修法')
+    assert.equal(out.ok, true, '这不该让整份体检判定为不可用')
+    assert.equal(out.blockers.length, 0, '不该进阻断档')
+    assert.ok(out.text.includes('状态值对不上'), `正文也要看得见：${out.text}`)
+  })
+
   // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
   await check('plugin-version：profile 声明解析与链接安装识别', async () => {
     // profile 的 package.json 只认 file:/link:，版本号形态说明来自 registry。
