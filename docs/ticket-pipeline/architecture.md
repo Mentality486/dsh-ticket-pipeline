@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-10，**22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`（579 行纯函数）、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-10 夜，**定位工单表只剩一个入口** —— 项目卡片上的「工单表」组 / 「飞书电子表格」组 / 「工单表链接」行三处都能指定同一件事，填了也不知道哪个生效；现在只留「工单表链接」，`extractSheetToken` 认 `/wiki/<token>` 并补齐错误码 `1254003`，`validateProject` 放宽成「至少一个定位依据」，见 §12.10「一个入口」小节。上一轮 2026-11-10 是 **22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；再上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -1153,8 +1153,8 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 | `ticketPipeline.config()` | 配置快照 | 渲染整棵设置表单 |
 | `ticketPipeline.projects()` | 项目清单的**扁平视图** | 渲染项目卡片；`appToken` 只给 `hasAppToken` + `appTokenPreview`（前 4…后 4），**明文绝不下发** |
 | `ticketPipeline.branches()` | 每个项目检出的分支清单 | 给 `repo.baseBranch` / `repo.targetBranch` 当候选（`listBranches()` 跑 `git for-each-ref`）；按项目 index 对齐，某个项目配错只让它自己空着 |
-| `ticketPipeline.setProjectTable(index, url)` | 写入后的项目投影 + 一句人话 | 面板「粘贴工单表链接」唯一入口：浏览器只转交整条 URL，**宿主**用 `parseFeishuLink()` 解析出 app_token / spreadsheetToken，再经 `ctx.get('settings').mutate()` 写进 profile。这样 `match.appToken` 不用手改文件，而明文也永远不会出现在浏览器内存或请求体里 |
-| `ticketPipeline.status()` | 与 `pipeline_status` **同一份**结果 | 设置页「运行」页签的票列表与汇总行。**不许另写一套算法** —— 工具侧早把「算结果」抽成了模块级 `collectStatus(options, args)`，Remote 直接调它（`view:'tickets'`，面板要明细不要按项目聚合） |
+| `ticketPipeline.setProjectTable(index, url)` | 写入后的项目投影 + 一句人话 | 面板「粘贴工单表链接」**唯一入口**：浏览器只转交整条 URL，**宿主**用 `parseFeishuLink()` 解析出 app_token / spreadsheetToken / tableId / viewId / sheetId，再经 `ctx.get('settings').mutate()` 写进 profile，并**把另一套定位字段清掉**（换表型时 `appToken`/`tableId` 与 `spreadsheetToken`/`sheetId` 不会并存）。这样四个定位键都不用卡片上的输入框，明文也永远不会出现在浏览器内存或请求体里 |
+| `ticketPipeline.status(includeDone?)` | 与 `pipeline_status` **同一份**结果 | 设置页「运行」页签的票列表与汇总行。**不许另写一套算法** —— 工具侧早把「算结果」抽成了模块级 `collectStatus(options, args)`，Remote 直接调它（`view:'tickets'`，面板要明细不要按项目聚合）。`includeDone` 是 `acceptsUndefined` 的可选参数，对应面板上的「显示历史」勾选：不传 = `false`（先回答「还要我做什么」），传 `true` 才把终态票一起拉进来。**只认严格的 `true`** —— 面板把这个方法同时当 `onClick` 处理器用（`onRefresh: loadRun`），那里第一参是事件对象，从别的类型里猜意图会把「点一下刷新」变成「突然看历史」 |
 | `ticketPipeline.scan()` | `{status, text}` | 「跑一轮」（等价 `pipeline_scan`）。同样复用 `collectScan()`；`disabled` / `already-running` 在这里就同步判掉，不叠后台任务 |
 | `ticketPipeline.cancel()` | `{cancelled, text}` | 「取消当前」（等价 `pipeline_cancel`），复用 `collectCancel()` |
 | `ticketPipeline.reset(recordId, projectId?)` | `{reset, reason, phase, text}` | 失败票行尾「重跑」（等价 `pipeline_reset`），复用 `collectReset()`。`projectId` 是 `acceptsUndefined` 的可选参数：**浏览器侧只传 1 个实参**，不传 `undefined` 占位（否则参数个数校验对不上） |
@@ -1244,6 +1244,13 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
   以及**失败票行尾的「重跑」**（`canReset` 由宿主按 `RESETTABLE_PHASES` 算好下发，面板不抄名单）。
   点过「跑一轮」后每 3 秒自递归 `setTimeout` 拉一次 `status()`，最多 200 轮；**不做 WebSocket / 实时流**，
   因为 `host.js` 只有 direct 调用没有 stream。
+- **「显示历史」勾选（2026-11-10 补）**：这一屏缺省只列未收尾的票（`includeDone: false`），
+  于是票一旦全部收尾，打开面板就是空的 —— 用户原话「在哪里能查到历史的工单处理流程」。
+  修法是把 `includeDone` 做成 `status()` 的可选参数、在状态行右侧挂一个勾选，
+  **缺省仍关着**（票据只增不删，反过来的缺省会在跑一个月之后让开屏渲染几百行）。
+  勾选状态记在 localStorage 的 `ticket-pipeline:run-history`（值就是 `'1'` / 不存在），
+  因为「重开面板又变回空白」会被读成「历史被删了」。切换时**立刻**按新口径重读一次，不等下一次轮询。
+  空列表文案也随开关分岔：关着时说「没有未收尾的票」并提示可以勾上历史，开着才说「库里还没有任何票」。
 - 页签角标只在**真有**未保存/待修时才挂数字，平时不占位：参数页 = 未保存的配置项数（有校验错转红显示错误数）、
   凭据页 = 待提交的凭据条数、项目页 = 未保存的项目改动数、体检页 = `problems.length`。
 - **保存类提示不随页签切换消失**（`saveError` / `saveMessage` / `loadError` 渲染在页签内容之外）：
@@ -1894,6 +1901,8 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 **实施后（同一位置现在的行为）**：`get_node` 的 query 只剩 `token`，表型读 `node.obj_type`；`sheet` 走
 电子表格分支；云文档搜索改名 `searchCloudDocs` 并认 `type ∈ {bitable, sheet}`；`validateProject` 改成
 四选一（`appToken`+`tableId` / `spreadsheetToken`+`sheetId` / `spreadsheetToken`+`sheetName` / `docNamePattern`）。
+**2026-11-10 夜进一步放宽成「至少一个定位依据」**（`appToken` / `spreadsheetToken` / `docNamePattern`
+三者有一个即可，不再要求配 `tableId` / `sheetId` / `sheetName`），理由见本节末「一个入口」。
 
 **两种表型的八维对照**（下面每一行都是电子表格分支要单独处理的差异）：
 
@@ -1949,6 +1958,9 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 两个组各画一次会变成两个输入框绑同一个草稿键。`sheetColumns`（列名覆盖）用一行文本
 `description=我的列名, status=我的状态`，保存时由 `parseColumnsDraft()` 解析回对象。
 
+> **2026-11-10 夜已收敛**（见下「一个入口」一节）：组名改「表格读取参数」，
+> `spreadsheetToken` / `sheetId` / `tableId` 三个输入框撤掉，定位工单表只留卡片头上的「工单表链接」。
+
 **多维表格也一样（工单 #21 起）**：`match.columns` 与 `match.sheetColumns` 完全同形、同一个
 `kind: 'columns'` 控件，只是白名单用 `contracts/feishu-columns.js` 的 13 个语义字段。两种表型
 共用 `source-feishu/sheets.js` 的 `mapColumns({ actualNames, overrides, aliases })` —— 电子表格拿
@@ -1970,6 +1982,44 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 
 完整设计、代码落点清单与排期见 `docs/ticket-pipeline/feishu-sheet-source.md`（§12 是实施结果与三处
 与设计不同的决定）；决策记录见 `docs/adr/0005-飞书电子表格源按表型分派.md`。
+
+**一个入口（2026-11-10 夜）**：以前「工单表」组、「飞书电子表格」组和卡片头上的「工单表链接」行
+**三处都能指定同一件事**，用户在设置页上同时填了两套 token，然后问「根本不清楚用的那个」——
+而实际生效的是 `resolveTable()` 的判定顺序，那东西根本不在配置里。现在：
+
+- **面板**：只留「工单表链接」一个入口（`ProjectCard` 的返回体从 `[wpsNotice, ...sections, tokenRow]`
+  改成 `[wpsNotice, tokenRow, ...sections]`，链接行提到最上）。`match` 组删 `tableId`，
+  `sheet` 组改名「表格读取参数」并删 `spreadsheetToken` / `sheetId` —— 剩下的只有读取细节
+  （表头行号、序号列名、行身份、读取范围、列名覆盖、强制表型）。面板画出的项目字段从 33 项降到 **30 项**
+  （`client-check` 会报出剩下落差的四条：`match.appToken` / `match.tableId` /
+  `match.spreadsheetToken` / `match.sheetId` 只能改配置文件或经「工单表链接」写入）。
+- **适配器**（`source-feishu/index.js` 的 `extractSheetToken`）：四种写法都认 ——
+  `/sheets/<token>` → `/wiki/<token>` → 裸 token → `shtcn…`；带协议头却一个都不匹配时
+  **抛 `invalid-input`**，不再「原样返回整串」去拼 404。这就是「电子表格取不到工单」的直接原因：
+  知识库里的电子表格从地址栏复制出来是 `/wiki/<token>?sheet=…`，两处正则都命中不了，整条 URL 被
+  `encodeURIComponent` 拼进 `/open-apis/sheets/v3/spreadsheets/<...>/sheets/query`，飞书回
+  `HTTP 404 404 page not found`。实测（2026-11-10）wiki token 与 `obj_token` **都能直接当
+  `spreadsheetToken` 用**，不需要多调一次 `get_node` 换算。
+- **错误码**：`INVALID_INPUT_ERROR_CODES` 补上 `1254003 WrongBaseToken` ——
+  它是「拿电子表格 token 去问多维表格 `apps/{token}/tables`」时飞书回的业务码，
+  `shouldTrySheet()` 只在 `invalid-input` / `not-found` 上才降级去试电子表格，
+  归成 `internal` 就会被当**真故障**抛出去 ⇒ 只贴裸 token 的电子表格永远走不到电子表格分支。
+- **配置校验**（`core/config.js` 的 `validateProject`）：从「四选一」放宽成
+  **「`appToken` / `spreadsheetToken` / `docNamePattern` 至少有一个」** ——
+  不再要求 token 必须配 `tableId` / `sheetId` / `sheetName`。理由：面板只有一个入口，
+  而 `/wiki/<token>` 不带 `?table=`/`?sheet=`，运行期本来就能自己解决；配置层硬拦等于
+  「运行期能跑、配置层不让存」，逼人回头手改 YAML。两套 token 并存**不拦但警告**
+  （走 `warnings` 通道，与「未知键只警告」同一套）。例外：`/base/` 链接缺 `?table=` 且没有
+  `docNamePattern`、也没有 `spreadsheetToken` 时**仍然拦** —— `/base/` 是多维表格自己的地址栏形态，
+  飞书一定带 `?table=`，不带是坏输入；非 `/base/` 的 URL 缺配套参数只警告，否则 wiki 表会被全挡在门外。
+- **`?sheet=` 不能丢**（`contracts/types.js` 的 `parseFeishuLink` wiki 分支 + `remote/host.js` 的
+  `setProjectTable`）：wiki 里既能放多维表格也能放表格，`?sheet=` 只在那确实是表格时有意义；
+  丢掉会让「一个工作簿多张工作表」退回取第一张。所以 bitable/wiki 分支从「无条件 `unset sheetId`」
+  改成「有 `?sheet=` 就 set、没有才 unset」。
+
+**自测**：`dev-run` 486 → **492**（5 条：wiki 链接能过校验、两套并存给警告、1254003 降级、
+整条 wiki 链接要抠出 token 再请求、认不出的链接要报 `invalid-input`；「显示历史」另 1 条见 §11.5）；
+`feishu-checks` 93 → **96**；`client-smoke` **215** 条。
 
 ### 12.11 插件改动为什么会静默不生效（`pipeline_doctor` 第 5 节）
 

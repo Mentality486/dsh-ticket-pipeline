@@ -21,7 +21,9 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
    插件用 `tenant_access_token`，没法自己给自己授权，这一步只能人做。
 
 然后填一个 `projects[]`（工单表定位 + 本地 git 检出路径），先用 `workExecutor: mock` +
-`pushAdapter: mock` 跑通半程，再切真执行。
+`pushAdapter: mock` 跑通半程，再切真执行。**工单表定位只需一步**：在项目卡片最上面的
+「工单表链接」里把表格的浏览器地址整条贴进去，多维表格 / 电子表格 / 知识库里的表都行 ——
+插件自己认表型，不用你分辨，也不用再填别的 token。
 
 ## 接下来读哪页
 

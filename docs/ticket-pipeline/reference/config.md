@@ -9,7 +9,7 @@
 > |---|---|---|
 > | **25 个键 / 4 个分组** | 顶层配置项（不含 `projects` 数组内部） | `src/core/config.js` 的 `CONFIG_FIELDS` / `CONFIG_GROUPS` |
 > | **34 个字段** | 一个 `projects[]` 元素里可写的深层路径 | `listProjectDescriptorPaths()` |
-> | **33 个字段** | 设置面板「项目」页里画出来的控件数（34 里 `match.appToken` 没有明文输入框，走「工单表链接」） | `src/remote/host.js` 的 `describeProject()` |
+> | **30 个字段** | 设置面板「项目」页里画出来的控件数（34 里 `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框：定位工单表只走卡片头上的「工单表链接」） | `src/remote/host.js` 的 `describeProject()` |
 >
 > 所有缺省值都与 `src/core/config.js` 的 `default` 一一对应。改这一页之前先改代码。
 
@@ -91,10 +91,22 @@
 
 ### 2.2 工单表定位（`match.*`）
 
+> **定位工单表只有一个入口：项目卡片头上的「工单表链接」。** 把工单表的浏览器地址整条贴进去，
+> 宿主解析后写进下面这几个 key —— 多维表格写 `appToken`（+`tableId`/`viewId`）、电子表格写
+> `spreadsheetToken`（+`sheetId`）、知识库里的表写 `appToken`（表型留到运行时探测），
+> 并且**一次只留一套**（写另一套时会把前一套清掉）。面板上这四个 key 都没有输入框，
+> 手动改 YAML 当然可以，但要自己保证不并存两套。
+>
+> **校验口径（2026-11-10 起）**：`appToken` / `spreadsheetToken` / `docNamePattern`
+> **至少有一个**就能通过 —— 不再要求 token 必须配 `tableId` / `sheetId` / `sheetName`。
+> 理由：`/wiki/<token>` 这种链接不带 `?table=`/`?sheet=`，运行期本来就能自己解决
+> （多维表格按表名或「表里恰好一张」定位、电子表格取第一张可见工作表）。
+> 两套 token 同时存在**不拦，但会给一条警告**说「实际按哪套取工单，另一套不起作用」。
+
 | 键 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `match.platform` | string | `"feishu"` | `feishu` / `wps` / `mock`。**`wps` 是实验性**：没有内置取数通道，选它一张工单都拿不到（面板亮橙框，体检报阻断）。`webform` 已移除，老配置会拿到迁移提示 |
-| `match.appToken` | string | — | 飞书多维表格的 `app_token`。**可直接写整条表格 URL**，插件从 `/base/<token>` 取 token、从 `?table=` 取 table_id。面板上没有明文输入框，用「工单表链接」写入 |
+| `match.appToken` | string | — | 飞书**多维表格**的 `app_token`，或**知识库（wiki）里任意一张表的 token**。**可直接写整条链接**：从 `/base/<token>` 或 `/wiki/<token>` 取 token，从 `?table=` 取 table_id。表型不一定写死 —— wiki 链接的表型到运行时问 `get_node` 才知道。面板上没有明文输入框，用「工单表链接」写入 |
 | `match.tableId` | string | — | 多维表格的 `table_id`。与 `appToken` 一起构成显式绑定；显式填了优先于链接里的 `?table=` |
 | `match.viewId` | string | — | 只看某个视图 |
 | `match.docNamePattern` | string | — | 兜底：按文件名模糊搜。没有显式 `appToken`/`tableId` 时用 |
@@ -106,7 +118,7 @@
 | `match.statusColumn` | string | — | 「是否处理」列名（`wps` 平台） |
 | `match.statusValue` | string | — | 在处理中的取值（`wps` 单值形态；飞书用 `statusValues`） |
 | `match.mediaPrefix` | string | — | 截图 fileToken 的前缀（`wps` 平台） |
-| `match.spreadsheetToken` | string | — | 飞书**电子表格**的链接或 token（`shtcn…`）。和多维表格的 `appToken` 二选一，贴整条链接也行 |
+| `match.spreadsheetToken` | string | — | 飞书**电子表格**的链接或 token。**四种写法都认**：`https://…/sheets/<token>`、`https://…/wiki/<token>`（知识库里的表格，最常踩坑的一种）、裸 token、`shtcn…`。带协议头却一个都认不出时直接报 `invalid-input`，不会静默拼出 404 |
 | `match.sheetId` | string | — | 电子表格里的工作表 id（`sh…`）。不知道就留空并填 `sheetName`；两个都不填取第一张可见工作表 |
 | `match.sheetHeaderRow` | integer | `1` | 表头在第几行。**不会自动往下找**，表头上方有标题行时改成实际行号 |
 | `match.sheetIdentity` | string | `"seq"` | 行身份来源：`seq`（按序号列的值）/ `row`（按物理行号，插行会换身份） |
