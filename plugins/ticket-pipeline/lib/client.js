@@ -3581,18 +3581,21 @@ window.__ModuleLoader__.load({
         var ns = getNamespace('settings')
         if (!view || !ns) return
         var ops = collectOps()
-        if (ops.length === 0) {
-          setDraft(Object.assign({}, initialDraft))
-          setProjDraft(Object.assign({}, projInitial))
-          setSaveMessage('没有需要保存的改动')
-          return
-        }
+
         // 凭据先写：它和配置 mutate 是两个独立通道，不互相阻塞 —— 凭据失败只报
         // 凭据那条，配置照样存；反过来也一样。这里刻意**不 await**，让 mutate 立刻
         // 发出去（自测按「点保存 → 同一拍里 mutate 数 +1」断言）。
-        if (pendingCreds.length > 0) {
+        //
+        // **必须先于下面那个 `ops.length === 0` 的提前返回。** 原来这段在它之后：
+        // 只往凭据输入框里填了值、没改任何配置字段时，`collectOps()` 是空数组，
+        // 点保存直接跳去「没有需要保存的改动」并 return，凭据一个都没写进去 ——
+        // 而页签上的「未保存 N 项」又确实在涨（`credDirty` 算进去了），两句话自相矛盾。
+        var savingCreds = pendingCreds.length > 0
+        if (savingCreds) {
           var credNs = getNamespace('credentials')
-          if (credNs) {
+          if (!credNs) {
+            setCredMessage('保存凭据失败：这个环境没有 credentials 命名空间，凭据没法写')
+          } else {
             for (var pc = 0; pc < pendingCreds.length; pc += 1) {
               (function (entry) {
                 credNs.set(entry.ref, entry.value).then(function (response) {
@@ -3615,6 +3618,15 @@ window.__ModuleLoader__.load({
               })(pendingCreds[pc])
             }
           }
+        }
+
+        if (ops.length === 0) {
+          setDraft(Object.assign({}, initialDraft))
+          setProjDraft(Object.assign({}, projInitial))
+          // 只提交了凭据时，「没有需要保存的改动」是假的 —— 人明明填了东西，
+          // 而且结果由 credMessage 逐条报（成功/失败各有文案），这里别抢话。
+          setSaveMessage(savingCreds ? '' : '没有需要保存的改动')
+          return
         }
         setSaving(true)
         setSaveError('')

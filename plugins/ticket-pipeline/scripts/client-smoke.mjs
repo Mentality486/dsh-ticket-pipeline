@@ -1073,6 +1073,31 @@ async function main () {
   check('凭据行的「清除」带二次确认',
     findAll(tree, (node) => node.type === 'button' && textOf(node) === '清除').length >= 1)
 
+  // ④b 只填凭据、不动任何配置字段，点顶部「保存」也必须真的把凭据写进去。
+  // 回归点：`onSave` 里 `collectOps()` 为空时曾**先 return**，凭据那段在 return 之后，
+  // 于是「只填凭据 → 点保存」既不写凭据、还回一句「没有需要保存的改动」，
+  // 而页签上又挂着「未保存 1 项」—— 两句话自相矛盾，用户只会以为保存坏了。
+  {
+    const beforeSet = ctx.calls.credentialSet.length
+    const beforeMutate = ctx.calls.mutate.length
+    const pushplusInput = secretInputs[secretInputs.length - 1]
+    pushplusInput.props.onChange({ target: { value: 'tok-only-cred' } })
+    tree = await render(Panel, { view: 'page' })
+    const credSave = findButton(tree, '保存', 'tp-primary')
+    check('只填凭据时保存按钮是能点的',
+      credSave !== undefined && credSave.props.disabled === false,
+      credSave === undefined ? '没找到保存按钮' : String(credSave.props.disabled))
+    credSave.props.onClick()
+    tree = await render(Panel, { view: 'page' })
+    const written = ctx.calls.credentialSet.slice(beforeSet)
+    check('只填凭据也能写进去（不能被「没有需要保存的改动」提前返回掉）',
+      written.length === 1 && written[0].value === 'tok-only-cred', JSON.stringify(written))
+    check('只填凭据时不该编出一条配置 mutate',
+      ctx.calls.mutate.length === beforeMutate, String(ctx.calls.mutate.length - beforeMutate))
+    check('只填凭据时不说「没有需要保存的改动」',
+      textOf(tree).indexOf('没有需要保存的改动') < 0, textOf(tree).slice(0, 300))
+  }
+
   // ⑤ 项目清单：读的是 remote.projects() 的只读投影，写的是深层路径 mutate。
   tree = await switchTab(Panel, '项目')
   check('渲染出「项目清单」', textOf(tree).indexOf('项目清单') >= 0)
