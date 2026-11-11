@@ -980,11 +980,23 @@ export async function collectStatus (options, args) {
   if (filteredScope) {
     lines.push(...formatDistribution(filtered, '（无）').map((line, i) => `${i === 0 ? '本次筛选：' : '        '}${line}`))
   }
-  // 交付未完成单独一行（#08）：这类票 phase 上看是「已完成」，但改动/回填/通知
-  // 有一项没交到你手里 —— 只看「已完成 3」会以为全好了。
-  const deliveryIncomplete = allTicketsInitial.filter((row) => deliveryIssues(row).length > 0).length
-  if (deliveryIncomplete > 0) {
-    lines.push(`交付未完成：${deliveryIncomplete} 张（票态已经是完成，但该交给你的东西没交到 —— 见下面带「（表格未回写）」的票）`)
+  // 交付未完成单独一行（#08）：这类票回填/通知/提交有一项没交到你手里 ——
+  // 只看 phase 分布会漏掉它们（phase=done 但表格没回写的那张最典型）。
+  //
+  // 但**不能一律说成「票态已经是完成」**：2026-11-11 真机上 4 张交付未完成的票
+  // 全都是 phase=failed，banner 却写「票态已经是完成」，人一看就觉得文案在胡说。
+  // 两种票要处理的动作完全不同（failed 要 reset 重跑，done 只要补回填），
+  // 所以分开数、分开说。
+  const deliveryIncompleteRows = allTicketsInitial.filter((row) => deliveryIssues(row).length > 0)
+  const deliveryDoneButIncomplete = deliveryIncompleteRows.filter((row) => row.phase === 'done').length
+  const deliveryFailedToo = deliveryIncompleteRows.filter((row) => row.phase === 'failed').length
+  if (deliveryIncompleteRows.length > 0) {
+    const parts = []
+    if (deliveryDoneButIncomplete > 0) parts.push(`${deliveryDoneButIncomplete} 张票态已完成却漏了交付`)
+    if (deliveryFailedToo > 0) parts.push(`${deliveryFailedToo} 张本身就跑失败了、交付也没做成`)
+    const rest = deliveryIncompleteRows.length - deliveryDoneButIncomplete - deliveryFailedToo
+    if (rest > 0) parts.push(`${rest} 张其它状态`)
+    lines.push(`交付未完成：${deliveryIncompleteRows.length} 张（${parts.join('；')} —— 见下面带「（表格未回写）」或「（交付未完成：…）」的票）`)
   }
   lines.push('')
 

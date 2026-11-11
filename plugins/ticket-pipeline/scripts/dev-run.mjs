@@ -4718,6 +4718,34 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(out.tickets[0].deliveryIssues[0].giveUp, false)
   })
 
+  // 2026-11-11 真机：4 张交付未完成的票**全都是 failed**，banner 却写
+  // 「票态已经是完成」—— 人看到的是一句和明细自相矛盾的话。
+  // 已完成漏交付 与 跑失败且没交付 要处理的动作完全不同（前者补回填，后者 reset 重跑），
+  // 所以必须分开数、分开说。
+  await check('pipeline_status：交付未完成里失败的票不能被说成「票态已完成」', async () => {
+    const source = createMockSource()
+    source.setFailWrite(true)
+    const { scheduler, store } = harness({ source })
+    await scheduler.tick()
+    // 把那张票改成 failed：模拟「本身跑失败 + 交付也没做成」的真机状态。
+    // 走 force —— done 是终态，正常转移表不允许 done → failed，这里是要造一个
+    // 真机上确实存在（但状态机不产出）的行。
+    const firstRow = store.listTickets()[0]
+    assert.ok(firstRow, '前置：tick 之后应该有一张票')
+    assert.equal(firstRow.phase, 'done', '前置：setFailWrite 只让回填失败，票态本身仍是 done')
+    await store.setPhase(ticketKey(firstRow.projectId, firstRow.recordId), 'failed', { lastError: 'agent 没有产生任何文件改动' }, { force: true })
+    assert.equal(store.listTickets()[0].phase, 'failed', '前置：造出来的行必须是 phase=failed')
+    const status = createPipelineStatusTool({
+      store,
+      getConfig: () => validateConfig({ enabled: true }).value,
+    })
+    const out = await status.execute({ view: 'tickets', includeDone: true }, {})
+    assert.match(out.text, /交付未完成：1 张/, out.text)
+    // 关键断言：不能再说「票态已经是完成」
+    assert.doesNotMatch(out.text, /票态已经是完成/, `失败票被说成已完成：${out.text.match(/交付未完成：[^\n]*/)}`)
+    assert.match(out.text, /本身就跑失败了/, `要如实说是跑失败的那一类：${out.text.match(/交付未完成：[^\n]*/)}`)
+  })
+
   // ── #14：失败票回填「处理结果」列 ─────────────────────────────
   // 表格里那一行永久停在「处理中」，在飞书 UI 里看跟「还没开始」完全一样。
   // 但把「是否处理」也写上会变成另一种谎 —— 所以只写「处理结果」一列，且缺省关。
