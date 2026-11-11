@@ -46,6 +46,12 @@ import { createAgentExecutor } from './adapters/executor-agent/index.js'
 import { createMockPush } from './adapters/push-mock/index.js'
 import { createPushplusPush, pushplusOptionsFromConfig, PUSHPLUS_SECRET_REF } from './adapters/push-pushplus/index.js'
 import { createQqmailPush, qqmailOptionsFromConfig, QQMAIL_SECRET_REF } from './adapters/push-qqmail/index.js'
+import {
+  createFeishuPush,
+  feishuPushOptionsFromConfig,
+  FEISHU_PUSH_APP_ID_REF,
+  FEISHU_PUSH_APP_SECRET_REF,
+} from './adapters/push-feishu/index.js'
 import { createGitlabClient } from './adapters/gitlab-client/index.js'
 
 import { createPipelineScanTool } from './tools/pipeline-scan.js'
@@ -232,6 +238,7 @@ export const PUSHES = {
   mock: (opts) => createMockPush(opts),
   pushplus: (opts) => createPushplusPush(opts),
   qqmail: (opts) => createQqmailPush(opts),
+  feishu: (opts) => createFeishuPush(opts),
 }
 
 /**
@@ -931,6 +938,12 @@ export async function apply (ctx, config) {
     createGitlabClient,
     getSecret: readSecret,
     readFile: makeTextFileReader(ctx, logger),
+    // 停滞判定阈值。放在这里而不是让适配器自己 import：这两个数是「一台机器上的
+    // 经验值」，将来可能要按模型快慢调，组合根是唯一该知道它们的地方。
+    limits: {
+      agentStallWarnMinutes: BUILTIN_LIMITS.agentStallWarnMinutes,
+      agentStallNudges: BUILTIN_LIMITS.agentStallNudges,
+    },
     log: (message, detail) => logger.info?.(`[ticket-pipeline] ${message}`, detail),
   })
   const push = pushFactory(pushAdapterOptions(config, logger, readSecret))
@@ -1301,6 +1314,19 @@ function pushAdapterOptions (config, logger, getSecret) {
     return {
       ...qqmailOptionsFromConfig(config),
       getSecret: (ref) => getSecret(ref ?? QQMAIL_SECRET_REF),
+      log: logger,
+    }
+  }
+  if (config.pushAdapter === 'feishu') {
+    // 应用凭据与读工单表共用同一对（应用级凭据，权限分开开通）。
+    // 收件人写在明文配置里 —— 它不是密钥，而且面板要能显示/修改。
+    return {
+      ...feishuPushOptionsFromConfig(config),
+      getSecret: (ref) => getSecret(
+        ref === FEISHU_PUSH_APP_SECRET_REF
+          ? FEISHU_PUSH_APP_SECRET_REF
+          : (ref ?? FEISHU_PUSH_APP_ID_REF)
+      ),
       log: logger,
     }
   }

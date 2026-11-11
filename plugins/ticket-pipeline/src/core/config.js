@@ -204,8 +204,10 @@ export const CONFIG_FIELDS = Object.freeze({
     default: 'mock',
     // 与 `src/index.js` 的 `PUSHES` 键保持一致（理由同上面的 workExecutor）。
     // 以前写错只会静默退回 mock 推送：人一封真通知都收不到，插件日志里也看不出来。
-    enum: Object.freeze(['mock', 'pushplus', 'qqmail']),
-    description: '通知适配器 id（mock / pushplus / qqmail）。缺省 mock = 不发真消息，先这么跑通再换',
+    enum: Object.freeze(['mock', 'pushplus', 'qqmail', 'feishu']),
+    description: '通知适配器 id（feishu / qqmail / mock / pushplus）。'
+      + 'feishu = 用你自己的飞书自建应用直接发（不经过任何第三方，推荐）；'
+      + 'qqmail = 发邮件；mock = 不发真消息，先这么跑通再换',
   },
   'pushplus.channel': {
     type: 'string',
@@ -243,6 +245,21 @@ export const CONFIG_FIELDS = Object.freeze({
     type: 'string',
     default: '',
     description: '收件邮箱；多个用逗号分隔',
+  },
+  // ── 飞书机器人（用你自己的自建应用直接发，不经第三方）──
+  // App ID / App Secret 是应用级凭据，与读工单表共用同一对，不在这里（走 ctx.credentials）。
+  'feishuPush.receiveId': {
+    type: 'string',
+    default: '',
+    description: '收件人。open_id 形如 ou_xxx；也可以填你的邮箱（配 receiveIdType=email），'
+      + '或群的 chat_id（配 receiveIdType=chat_id）。'
+      + '第一次不知道填什么：在飞书里把机器人加进一个群，群设置里能拿到 chat_id',
+  },
+  'feishuPush.receiveIdType': {
+    type: 'string',
+    default: 'open_id',
+    enum: Object.freeze(['open_id', 'email', 'chat_id']),
+    description: '收件人 id 的类型：open_id（默认）/ email（邮箱）/ chat_id（群）',
   },
   notifyOn: {
     type: 'string-array',
@@ -297,6 +314,27 @@ export const BUILTIN_LIMITS = Object.freeze({
   leaseHeartbeatSeconds: 60,
   /** 建隔离 worktree / 打开工作区前先 fetch 一次基准分支。 */
   fetchBeforeCreate: true,
+  /**
+   * agent 多久既没改文件、也没让会话往前走，就认为是卡住了（分钟）。
+   *
+   * 2026-11-11 的事故：一张「改个小功能」的票，agent 花了 39 分钟读 23 个文件、
+   * 写 0 个文件，最后整票在 40 分钟硬超时被判 failed —— 人只看到「超时」，
+   * 不知道它其实一直在读。硬超时是**终点**，不是**告警**：等它触发时已经浪费了
+   * 整张票的时间预算，而且票上留下的是一句没有信息量的「超时」。
+   *
+   * 所以要在中途就发现并说出来：连续这么多分钟「文件没变、会话 seq 没动」，
+   * 就记一条 flow 事件告诉人「它卡在读文件上了」。注意这只**记日志、不中止** ——
+   * 卡住的原因可能是模型慢、可能在跑一个长验证，我们没有足够信息替它下结论。
+   */
+  agentStallWarnMinutes: 8,
+  /**
+   * agent 卡住时最多催几次（每次催一句「别读了，先改」）。
+   *
+   * 为什么是催而不是杀：催一次的成本是一轮模型往返，杀掉一张票的成本是整张重跑。
+   * 催了还不动，说明不是「忘了动手」而是真的没法动手（模型不通、工具坏了），
+   * 那时候中止才是对的 —— 由硬超时兜底。
+   */
+  agentStallNudges: 2,
 })
 
 /**
@@ -346,6 +384,8 @@ export const CONFIG_GROUPS = Object.freeze([
       Object.freeze(['qqmail.encryption', 'SMTP 加密方式']),
       Object.freeze(['qqmail.user', '发件邮箱']),
       Object.freeze(['qqmail.to', '收件邮箱']),
+      Object.freeze(['feishuPush.receiveId', '飞书收件人']),
+      Object.freeze(['feishuPush.receiveIdType', '收件人类型']),
     ]),
   }),
   Object.freeze({

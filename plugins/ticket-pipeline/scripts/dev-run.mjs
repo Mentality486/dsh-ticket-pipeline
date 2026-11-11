@@ -45,6 +45,7 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
+import { waitForAgentIdle, createNudgeMessage } from '../src/adapters/executor-agent/index.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
@@ -1107,12 +1108,15 @@ async function main () {
     assert.equal('logLevel' in described, false)
   })
 
-  await check('配置面收敛到 25 个键 / 4 个分组，且每个键都归到了组里', async () => {
+  await check('配置面收敛到 27 个键 / 4 个分组，且每个键都归到了组里', async () => {
     // 涨键是有代价的：每多一个键，面板就多一格要人判断的东西，文档就多一行。
     // 这条断言把当前数字钉住 —— 想加键必须先回答「为什么这个人必须懂这件事」。
     // 24 → 25 是 #14 加的 `writeBackOnFailure`（失败也写「处理结果」列，缺省关）。
+    // 25 → 27 是 2026-11-11 加的 `feishuPush.receiveId` / `feishuPush.receiveIdType`：
+    // PushPlus 要收费实名，改用飞书自建应用直接发消息（不经第三方），
+    // 「发给谁」必须人能改 —— 这个值猜不出来，猜错就发给别人。
     const keys = Object.keys(CONFIG_FIELDS)
-    assert.equal(keys.length, 25, '顶层配置字段应当是 25 个，实际：' + keys.join(', '))
+    assert.equal(keys.length, 27, '顶层配置字段应当是 27 个，实际：' + keys.join(', '))
     assert.equal(CONFIG_GROUPS.length, 4, '分组应当是 4 组')
     assertGroupCoverage() // 漏写分组会在这里抛
     // 死键必须真的死了：这两个键曾经在面板上可编辑、改了什么也不发生。
@@ -1442,6 +1446,111 @@ async function main () {
     assert.match(seenCtx.prompt, /待修改项目（工单原文）：日报系统/)
     assert.match(seenCtx.prompt, /模块（工单原文）：问题管理/)
     assert.match(seenCtx.prompt, /不要拿它们当目录名直接去改/)
+  })
+
+  await check('任务书里必须有探索预算：不许无限读下去，先改一版再补细节', async () => {
+    // 2026-11-11 真实事故：一张「改个小功能」的票，agent 花了 39 分钟读了 23 个文件、
+    // 写了 0 个文件，最后整票超时。「代码定位」那节只说了「先读仓库结构」，
+    // 没说「读够多少就该动手」—— 它可以一直读下去，每读一轮就是一次完整的模型往返。
+    // 这条断言把预算钉住：删掉预算，就等着超时复发。
+    const source = createMockSource()
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler } = harness({ source, executor })
+    await scheduler.tick()
+    assert.match(seenCtx.prompt, /## 工作方式/, '任务书里要有一节专门讲怎么干活')
+    assert.match(seenCtx.prompt, /先动手，再补细节/, '必须明说先改一版再补细节')
+    assert.match(seenCtx.prompt, /探索预算/, '必须点名「探索预算」这件事')
+    assert.match(seenCtx.prompt, /不要超过 12 次/, '预算要是一个具体数字，不能只说「别读太多」')
+    assert.match(seenCtx.prompt, /同一类信息只查一次/, '重复读同一个文件是最常见的浪费时间')
+    assert.match(seenCtx.prompt, /卡住就停/, '查不到就停，比无限展开好')
+  })
+
+  await check('停滞监控：文件一直不变时按「文件没变」判停滞，而不是按 session.seq（它一直在涨）', async () => {
+    // 2026-11-11 真实事故：39 分钟、63 次工具调用、读了 23 个文件、写了 0 个文件。
+    // 关键在于 `session.seq` 全程都在动 —— 它确实在「干活」，只是干的全是读。
+    // 所以停滞的唯一可信信号是**工作区有没有文件真的变了**。
+    let clock = 0
+    const nudges = []
+    const phases = []
+    const snapshots = []
+    const agent = {
+      get status () { return 'idle' },
+      // 每次读 seq 都往后走一格，模拟「它一直在动」——这正是事故里的形态。
+      get session () { const seq = Math.floor(clock / 1000); return { seq: seq + Math.random() } },
+      whenIdle: async () => { clock += 60_000 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      // 快照永远返回同一份输出 = 一个文件都没改。
+      worktreeSnapshot: async () => { snapshots.push(1); return ' M some/unchanged.js\n' },
+      stallWarnMs: 5 * 60_000,
+      maxNudges: 2,
+      now: () => clock,
+      onStall: ({ minutes, nudgeCount }) => { phases.push({ minutes, nudgeCount }) },
+      makeNudgeMessage: (minutes) => ({ kind: 'nudge', minutes }),
+    }).then(() => { /* 正常返回 */ }).catch((error) => {
+      // 循环跑满会抛 internal，这也是可接受的结束方式（说明它没真的卡到无限等）。
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    assert.ok(snapshots.length >= 2, '必须真的去看了工作区状态，不能只凭 seq 判断')
+    assert.ok(nudges.length >= 1, `文件一直没变就该催一下，实际催了 ${nudges.length} 次`)
+    assert.ok(nudges.length <= 2, `最多催 2 次，实际 ${nudges.length} 次`)
+    assert.ok(phases.length >= 1, '催的时候要写一条时间线，否则人不知道为什么突然催它')
+    assert.ok(phases[0].minutes >= 5, `写给人看的分钟数要真实：${phases[0].minutes}`)
+    assert.ok(nudges[0].kind === 'nudge' && nudges[0].minutes >= 5, '催的话术要带上「多久没动了」')
+  })
+
+  await check('停滞监控：文件一有变化就重新计时，不能把「在改」当成「卡住」', async () => {
+    let clock = 0
+    let snapCount = 0
+    const nudges = []
+    const agent = {
+      get status () { return 'idle' },
+      get session () { return { seq: Math.random() } },
+      whenIdle: async () => { clock += 60_000 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      // 每次快照都不一样 = 工作区一直在动。
+      worktreeSnapshot: async () => { snapCount += 1; return ` M file${snapCount}.js\n` },
+      stallWarnMs: 5 * 60_000,
+      maxNudges: 2,
+      now: () => clock,
+      onStall: () => { throw new Error('文件一直在变，绝不该判成停滞') },
+      makeNudgeMessage: (minutes) => ({ kind: 'nudge', minutes }),
+    }).catch((error) => {
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    assert.equal(nudges.length, 0, '文件一直在变，不该催')
+  })
+
+  await check('停滞监控：催话术说的是「现在该做什么」，不是「你花太久了」', async () => {
+    // 措辞有讲究：提「你花太久了」会让模型解释自己为什么慢，白烧一轮。
+    const msg = createNudgeMessage(9, (input) => input)
+    const text = msg.content[0].text
+    assert.match(text, /已经 9 分钟没有任何文件改动/)
+    assert.match(text, /直接改/, '要给一个能立刻执行的最小动作')
+    assert.match(text, /停下来/, '查不到也要给出口，不然它只会继续读')
+    assert.ok(!/为什么|太久|慢/.test(text.replace(/多久没动/g, '')), '别让它有机会解释自己')
+  })
+
+  await check('BUILTIN_LIMITS 里有停滞阈值，且是「分钟」量级', async () => {
+    // 这两个数是硬超时的补充：硬超时（ticketTimeoutMinutes，缺省 40 分钟）是终点，
+    // 等它触发时整张票的时间预算已经烧完了，票上只留一句没信息量的「超时」。
+    assert.ok(Number(BUILTIN_LIMITS.agentStallWarnMinutes) > 0, '要有一个大于 0 的停滞阈值')
+    assert.ok(Number(BUILTIN_LIMITS.agentStallWarnMinutes) < 40, '阈值必须小于硬超时，否则它永远轮不到触发')
+    assert.ok(Number.isInteger(BUILTIN_LIMITS.agentStallNudges), '催的次数要是整数')
+    assert.ok(BUILTIN_LIMITS.agentStallNudges >= 1, '至少要催一次，否则这个机制等于不存在')
   })
 
   await check('saveImage 什么都没返回时跳过空图块，不塞进 content', async () => {
@@ -3246,6 +3355,116 @@ function makeFakeCtx ({ domain, registered }) {
     // 关键：构造期不该因为「凭据还没配」而抛 —— 装了插件但还没填授权码是常态。
     await apply(ctx, config)
     assert.ok(registered.length >= 5, 'qqmail 配置下工具仍要正常注册')
+  })
+
+  await check('PUSHES 里有 feishu，且能造出 id=feishu 的适配器', async () => {
+    // 2026-11-11：PushPlus 卡在「905 未实名、实名要付费」，用户问「不能自己集成吗」。
+    // 答案是能 —— 我们本来就有飞书自建应用，它带 IM 能力。这条钉住注册表。
+    const { PUSHES } = await import('../src/index.js')
+    assert.ok(typeof PUSHES.feishu === 'function', 'PUSHES 必须注册 feishu，否则配了也不生效')
+    const adapter = PUSHES.feishu({
+      receiveId: 'ou_test',
+      receiveIdType: 'open_id',
+      getSecret: async () => undefined,
+    })
+    assert.equal(adapter.id, 'feishu', '造出来的适配器 id 必须是 feishu')
+    for (const name of ['mock', 'pushplus', 'qqmail', 'feishu']) {
+      assert.ok(typeof PUSHES[name] === 'function', `PUSHES.${name} 应该在表里`)
+    }
+  })
+
+  await check('push-feishu：把 msg_type/content 按飞书要的形状发出去，收件人类型进 query', async () => {
+    const { createFeishuPush } = await import('../src/adapters/push-feishu/index.js')
+    const seen = []
+    const push = createFeishuPush({
+      appId: 'cli_x',
+      appSecret: 'secret_x',
+      receiveId: 'ou_abc',
+      receiveIdType: 'open_id',
+      fetch: async (url, init) => {
+        seen.push({ url: String(url), body: JSON.parse(init.body), headers: init.headers })
+        if (String(url).includes('/tenant_access_token/internal')) {
+          // 坑：认证接口的响应体没有 data 包装，token 在顶层。
+          return { ok: true, status: 200, json: async () => ({ code: 0, tenant_access_token: 't-1', expire: 7200 }) }
+        }
+        return { ok: true, status: 200, json: async () => ({ code: 0, data: { message_id: 'om_1' } }) }
+      },
+    })
+    const receipt = await push.send({ title: '票跑完了', body: '改了 2 个文件' }, new AbortController().signal)
+    assert.equal(seen.length, 2, '先换 token 再发消息')
+    const send = seen[1]
+    assert.ok(send.url.includes('receive_id_type=open_id'), '收件人类型必须进 query 参数')
+    assert.equal(send.body.receive_id, 'ou_abc')
+    assert.equal(send.body.msg_type, 'text')
+    // 飞书的 content 是**字符串化的 JSON**，传对象会被拒 —— 这条是踩过的坑。
+    assert.equal(typeof send.body.content, 'string', 'content 必须是字符串')
+    assert.equal(JSON.parse(send.body.content).text.includes('改了 2 个文件'), true)
+    assert.equal(receipt.accepted, true)
+    assert.equal(receipt.traceId, 'om_1', 'message_id 要作为 traceId 回报')
+  })
+
+  await check('push-feishu：230013「机器人可用范围没有你」要说清人该干什么，而不是报成内部错误', async () => {
+    // 真机第一次试发的就是这个：拿机器人自己的 open_id 发，飞书回
+    // 230013 Bot has NO availability to this user。人看到「发通知失败」会去反复重试，
+    // 而真正的动作是去开放平台改「可用范围」。所以错误里必须带上该干什么。
+    const { createFeishuPush, mapSendErrorKind, describeSendError } = await import('../src/adapters/push-feishu/index.js')
+    assert.equal(mapSendErrorKind({ code: 230013 }), 'invalid-input', '230013 是配置问题，重试无意义')
+    const text = describeSendError({ code: 230013, msg: 'Bot has NO availability to this user.' })
+    assert.ok(text.includes('可用范围'), '必须告诉人去改机器人的可用范围：' + text)
+
+    const push = createFeishuPush({
+      appId: 'cli_x',
+      appSecret: 'secret_x',
+      receiveId: 'ou_abc',
+      fetch: async (url) => {
+        if (String(url).includes('/tenant_access_token/internal')) {
+          return { ok: true, status: 200, json: async () => ({ code: 0, tenant_access_token: 't-1', expire: 7200 }) }
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ code: 230013, msg: 'Bot has NO availability to this user.' }),
+        }
+      },
+    })
+    let caught
+    try {
+      await push.send({ title: 'x', body: 'y' }, new AbortController().signal)
+    } catch (error) {
+      caught = error
+    }
+    assert.ok(caught, '必须抛错')
+    assert.equal(caught.kind, 'invalid-input')
+    assert.ok(caught.message.includes('可用范围'), '错误文案要带修法：' + caught.message)
+  })
+
+  await check('push-feishu：没有收件人时构造不抛，真发时才报 invalid-input', async () => {
+    // 与 pushplus / qqmail 同一条纪律：装了插件但还没填配置是常态，
+    // 构造期抛会让整个插件挂载失败。
+    const { createFeishuPush } = await import('../src/adapters/push-feishu/index.js')
+    const push = createFeishuPush({ appId: 'cli_x', appSecret: 'secret_x', log: { warn: () => {} } })
+    assert.equal(push.id, 'feishu', '构造必须成功')
+    let caught
+    try {
+      await push.send({ title: 'x', body: 'y' }, new AbortController().signal)
+    } catch (error) {
+      caught = error
+    }
+    assert.ok(caught, '必须抛错')
+    assert.equal(caught.kind, 'invalid-input')
+    assert.ok(caught.message.includes('receiveId'), '要点名缺哪个字段：' + caught.message)
+  })
+
+  await check('pushAdapter: feishu 时组合根能把飞书应用凭据读取器注入进去', async () => {
+    const { domain } = makeFakeDomain()
+    const registered = []
+    const ctx = makeFakeCtx({ domain, registered })
+    const { value: config } = validateConfig({
+      pushAdapter: 'feishu',
+      feishuPush: { receiveId: 'ou_abc', receiveIdType: 'open_id' },
+    })
+    await apply(ctx, config)
+    assert.ok(registered.length >= 5, 'feishu 通知配置下工具仍要正常注册')
   })
 
   await check('EXECUTORS.agent 被注入 agents / git / createGitlabClient 等宿主依赖', async () => {

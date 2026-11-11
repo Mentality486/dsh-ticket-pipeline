@@ -532,12 +532,23 @@ function flowWorkspaceLabel (ctx) {
  * @param {(ref: string) => Promise<string|undefined>} [options.getSecret] 凭据读取器（默认给 gitlab-client）
  * @param {typeof fetch} [options.fetch] 注入给 gitlab-client（自测用）
  * @param {{ untrustedNotice?: string }} [options.prompts] 内核统一给的反注入提醒，拼在消息最前面
+ * @param {{ agentStallWarnMinutes?: number, agentStallNudges?: number }} [options.limits]
+ *   停滞判定阈值。缺省从 `core/config.js` 的 `BUILTIN_LIMITS` 取（组合根会传整份 limits 进来）。
+ * @param {() => number} [options.now] 时钟（自测用，缺省 `Date.now`）
  * @param {(msg: string, detail?: unknown) => void} [options.log]
  * @returns {import('../../contracts/work-executor.js').WorkExecutor}
  */
 export function createAgentExecutor (options = {}) {
   const log = typeof options.log === 'function' ? options.log : () => {}
   const createUserMessage = resolveCreateUserMessage(options.createUserMessage)
+  // 停滞阈值：组合根把整份 limits 传进来；单独跑这个适配器时缺省值与 BUILTIN_LIMITS 保持一致。
+  const stallWarnMinutes = Number(options.limits?.agentStallWarnMinutes) > 0
+    ? Number(options.limits.agentStallWarnMinutes)
+    : 8
+  const stallNudges = Number.isFinite(Number(options.limits?.agentStallNudges))
+    ? Math.max(0, Number(options.limits.agentStallNudges))
+    : 2
+  const now = typeof options.now === 'function' ? options.now : Date.now
 
   return assertWorkExecutor({
     id: 'agent',
@@ -727,7 +738,27 @@ export function createAgentExecutor (options = {}) {
         await ctx.onPhase('editing', 'agent 已接到任务书，开始改代码')
 
         // ── 4. 等 agent 干完 ───────────────────────────────
-        await waitForAgentIdle(agent, signal, cancelAgent)
+        //
+        // 这里除了「等结束」还要盯一件事：它到底有没有动手。
+        // 2026-11-11 的事故是 39 分钟读了 23 个文件、写了 0 个文件 —— 按
+        // `session.seq` 看一直在推进，按文件看一步没走。所以进步信号只能是
+        // 工作区的真实状态，不能用 seq。
+        await waitForAgentIdle(agent, signal, cancelAgent, {
+          // 用 porcelain 状态当「有没有东西变了」的指纹：
+          // 它同时覆盖「改了已有文件」「新增了文件」「删了文件」三种，
+          // 而且不碰索引、不产生任何副作用。
+          worktreeSnapshot: async () => {
+            const status = await options.git(['status', ...PORCELAIN_STATUS_ARGS, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES], { cwd: worktreePath })
+            return String(status?.stdout ?? '')
+          },
+          stallWarnMs: stallWarnMinutes * 60_000,
+          maxNudges: stallNudges,
+          now,
+          onStall: async ({ minutes, nudgeCount }) => {
+            log(`executor-agent：已经 ${minutes} 分钟没有任何文件改动（第 ${nudgeCount} 次催），催它先动手`)
+            await ctx.onPhase('editing', `agent 已 ${minutes} 分钟没有改动任何文件，第 ${nudgeCount} 次催它先动手`)
+          },
+        })
 
         // ── 5. 收集改动 ────────────────────────────────────
         // 不只是「改了哪些文件」，还要知道每个文件是新增 / 修改 / 删除：
@@ -1169,20 +1200,76 @@ function quietTicks () {
 /**
  * 等 agent 停下来，且连排的改动静止下来再返回。
  *
+ * 除了「等结束」，这里还负责一件 2026-11-11 才加上去的事：**发现它一直没有动手**。
+ *
+ * 为什么不能只看 `session.seq`：那次事故里 seq 一直在变（它在不停地读文件、搜符号），
+ * 按 seq 看是「一直在进展」，按文件看是「39 分钟写了 0 个文件」。所以进展的唯一可信
+ * 信号是**工作区里有没有文件真的变了**。
+ *
+ * 发现之后先催、不杀：催一次的成本是一轮模型往返，杀一张票的成本是整张重跑。
+ * 催了还不动的，交给整票硬超时兜底 —— 那多半不是「忘了动手」而是模型不通或工具坏了。
+ *
  * @param {any} agent
  * @param {AbortSignal} signal
  * @param {() => void} cancelAgent
+ * @param {{
+ *   worktreeSnapshot?: () => Promise<string>,
+ *   stallWarnMs?: number,
+ *   maxNudges?: number,
+ *   onStall?: (input: { minutes: number, nudgeCount: number }) => Promise<void> | void,
+ *   makeNudgeMessage?: (minutes: number) => any,
+ *   now?: () => number,
+ * }} [options]
  */
-async function waitForAgentIdle (agent, signal, cancelAgent) {
+export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}) {
   if (!signal || !signal.aborted) {
     signal?.addEventListener('abort', cancelAgent, { once: true })
   }
   try {
     const quiet = quietTicks()
     let stable = 0
+    const snapshot = typeof options.worktreeSnapshot === 'function' ? options.worktreeSnapshot : null
+    const stallWarnMs = Number(options.stallWarnMs) > 0 ? Number(options.stallWarnMs) : 0
+    const maxNudges = Number.isFinite(Number(options.maxNudges)) ? Math.max(0, Number(options.maxNudges)) : 0
+    const now = typeof options.now === 'function' ? options.now : Date.now
+    let lastFingerprint = snapshot ? await snapshot() : ''
+    let lastProgressAt = now()
+    let nudges = 0
+    /**
+     * 每醒来一次就问一遍「这期间有东西真的变了吗」。
+     *
+     * 为什么放在每轮循环开头而不是「不空闲」那个分支里：`await agent.whenIdle()`
+     * 会一直阻塞到 agent 空闲为止，也就是说循环体每执行一次，就代表 agent 刚
+     * 说完一段话/做完一批工具调用。39 分钟里它每读几个文件就会空一下、seq 前进一次，
+     * 于是循环一直在转 —— 这正是**唯一**能观察到它的地方。放进「不空闲」分支等于
+     * 把观察点放到一个实际进不去的分支里。
+     *
+     * @returns {Promise<void>}
+     */
+    const checkStall = async () => {
+      if (!snapshot || stallWarnMs <= 0) return
+      if (now() - lastProgressAt < stallWarnMs) return
+      const fingerprint = await snapshot()
+      if (fingerprint !== lastFingerprint) {
+        lastFingerprint = fingerprint
+        lastProgressAt = now()
+        nudges = 0
+        return
+      }
+      if (nudges >= maxNudges) return
+      nudges += 1
+      const minutes = Math.max(1, Math.round((now() - lastProgressAt) / 60_000))
+      await options.onStall?.({ minutes, nudgeCount: nudges })
+      // 催的话术要具体到「现在该做什么」，泛泛的「加油」只会换来一轮空转。
+      const makeNudge = typeof options.makeNudgeMessage === 'function'
+        ? options.makeNudgeMessage
+        : (mins) => createNudgeMessage(mins, createUserMessage)
+      agent.followup(makeNudge(minutes))
+    }
     for (let guard = 0; guard < 1000; guard += 1) {
       if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：被取消')
       await agent.whenIdle()
+      await checkStall()
       const idleSeq = agent.session?.seq
       // 宿主版本的 while 里还等子 agent；插件拿不到 `subagents` 服务，
       // 所以这里判的是「连续几次 whenIdle 之间 seq 都没动」。
@@ -1202,6 +1289,32 @@ async function waitForAgentIdle (agent, signal, cancelAgent) {
     signal?.removeEventListener('abort', cancelAgent)
   }
 }
+
+/**
+ * 卡住时催它一句。
+ *
+ * 措辞要点：不提「你花太久了」（模型会解释自己为什么慢，又浪费一轮），
+ * 直接给下一步动作，并且**给一个能立刻执行的最小动作** —— 「先改最可能的那处」。
+ *
+ * @param {number} minutes 已经多久没改过任何文件
+ * @param {(input: { content: unknown, source?: { kind: string } }) => unknown} createUserMessage
+ * @returns {any}
+ */
+function createNudgeMessage (minutes, createUserMessage) {
+  const text = [
+    `已经 ${minutes} 分钟没有任何文件改动了 —— 你还在读和搜，但这一轮需要的是先产出一版改动。`,
+    '',
+    '现在请立刻做这件事：挑你目前最有把握的那一处，直接改。',
+    '改完再跑一次验证命令看结果，比继续读代码更快也更准。',
+    '',
+    '如果确实一处都定位不到，就停下来，在最终说明里写清「查了哪些地方、卡在哪里」——',
+    '这会被当成「需要人补信息」，比拖到整票超时好。',
+  ].join('\n')
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+/** 导出给自测：催话术本身也是需要被钉住的东西（见 dev-run 的停滞用例）。 */
+export { createNudgeMessage }
 
 /**
  * 在宿主 publish 之前把子 agent 装配起来。这是 setup 的全部职责。
