@@ -2022,7 +2022,7 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
 
 **自测**：`dev-run` 486 → **492**（5 条：wiki 链接能过校验、两套并存给警告、1254003 降级、
 整条 wiki 链接要抠出 token 再请求、认不出的链接要报 `invalid-input`；「显示历史」另 1 条见 §11.5）；
-再涨到 **495**（体检补状态值口径 2 条，见 §12.13）；再涨到 **497**（`tableId` 抢走电子表格分派
+再涨到 **495**（体检补状态值口径 2 条，见 §12.13）；再涨到 **498**（`tableId` 抢走电子表格分派
 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §12.15）；
 `feishu-checks` 93 → **96** → **97**；`client-smoke` **219** 条。
 
@@ -2224,13 +2224,44 @@ sheetId:  3a5d28
 - **配置期**：`tableId` 与 `sheetId` 同时存在就出警告，说清「这是两种表型各自的坐标」并建议重贴链接
   （`src/core/config.js` 的 `validateProject`，与「两套 token 并存」那条警告并列）。
 
-**判据**：任何一条「配了 X 就不用再验证 Y」的捷径，先问「X 是否蕴含 Y」。
-不蕴含的话，这条捷径省下的那一次请求，迟早会由用户在别处付出一次排查。
+**第三层：写入期必须成对 set/unset**（复盘时才补上的，前面两层放不住这个病）。
+
+建议里那句「重贴链接就好了」当时并不成立。`src/remote/host.js` 的 `setProjectTable` 的 else 分支
+（贴 wiki / 多维表格链接时走）原本是：
+
+```js
+if (parsed.tableId.length > 0) ops.push({ op: 'set', path: [...base, 'tableId'], value: parsed.tableId })
+if (parsed.viewId.length > 0) ops.push({ op: 'set', path: [...base, 'viewId'], value: parsed.viewId })
+```
+
+**只有「有就 set」，没有「没有就 unset」。** wiki 链接不带 `?table=`，这两句根本不执行，旧的
+`tableId` 原样留着。用户按建议重贴一次，`spreadsheetToken` 被清、`appToken` 换成 wiki token，
+那个**属于另一个多维表格 App** 的 `tableId` 却还在原地。
+
+真机取证（现场那个 `tableId` 不是「不新鲜」，是**外来 id**）：
+
+| 问题 | 答案 |
+| --- | --- |
+| `appToken: It5g…` 是什么 | wiki 节点，`get_node` → `obj_type: sheet`、`obj_token: MuVEsnmEbhnYH8tDUyvc0c6Wnch` |
+| 拿它问 `apps/<token>/tables` | `code: 1254003 WrongBaseToken` |
+| 拿它问 `spreadsheets/<token>/sheets/query` | `code: 0`，1 个工作表 `{id: '3a5d28', rows: 199}` |
+| `tableId: tblWhRSGf0osJqrE` 属于谁 | **另一个**多维表格 App `RZZQbY4SkaY6z0shZaBcVpQCnhh` |
+
+修法：`tableId` / `viewId` 改成与 `sheetId` 一样成对 —— 有就 `set`，没有就 `unset`。
+语义上也站得住：新贴的链接没指定数据表，那么任何旧的 `tableId` 都属于**上一张**表，留着只可能指错。
+
+**判据（两条）**：
+
+1. 任何一条「配了 X 就不用再验证 Y」的捷径，先问「X 是否蕴含 Y」。
+   不蕴含的话，这条捷径省下的那一次请求，迟早会由用户在别处付出一次排查。
+2. 任何一处写了「条件 `set`」，立刻问「条件不成立时旧值怎么办」。
+   `set` 与 `unset` 必须成对考虑 —— 缺一半的写入逻辑不会报错，只会让配置越用越脏。
 
 **为什么这次特别难查**：同一个毛病在两条路径上表现不同 —— 体检 ✅ 全绿（探针走 `get_node`，认得出
 电子表格），真正跑票的 `source.scan()` 却抛 `WrongBaseToken`，而后者只出现在后台 tick 里，界面上
 一片安静。体检的绿色会主动掩盖故障，所以运行期改完必须补一条 `feishu-checks`（假服务端 + 假 token），
-配置期改完必须补一条 `dev-run`；修好一条路径不等于修好这个毛病。
+配置期改完必须补一条 `dev-run`，写入期改完必须补一条 `dev-run` 的 `setProjectTable` 用例；
+修好一条路径不等于修好这个毛病。
 
 ## 13. 事实来源
 

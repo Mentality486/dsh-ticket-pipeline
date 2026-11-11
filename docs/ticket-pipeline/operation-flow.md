@@ -213,7 +213,7 @@ flowchart LR
 
 ## 7. 当前卡点速查
 
-状态基线（2026-11-11 晚）：含**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是一张电子表格）、却还留着上一轮多维表格的 `tableId`；旧的 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 的降级路被堵死（降级只在**定位失败**时发生），一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken` —— 而体检说「能读」（探针问 `get_node` 的 `obj_type`，不认 `tableId`），于是表现成「scan 跑了但一张票都没进来，界面一片安静」。修法两层：运行期配了 `tableId` 也先验一次 `tables`（真是多维表格只多一个请求；是电子表格就在这儿失败成 `invalid-input`，降级照常发生）；配置期 `tableId` 与 `sheetId` 并存就警告「这是两种表型各自的坐标」。自测 **497/497** + `feishu-checks` **97 条** + 链路冒烟 11/11。
+状态基线（2026-11-11 晚）：含**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是一张电子表格）、却还留着上一轮多维表格的 `tableId`；旧的 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 的降级路被堵死（降级只在**定位失败**时发生），一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken` —— 而体检说「能读」（探针问 `get_node` 的 `obj_type`，不认 `tableId`），于是表现成「scan 跑了但一张票都没进来，界面一片安静」。修法两层：运行期配了 `tableId` 也先验一次 `tables`（真是多维表格只多一个请求；是电子表格就在这儿失败成 `invalid-input`，降级照常发生）；配置期 `tableId` 与 `sheetId` 并存就警告「这是两种表型各自的坐标」。自测 **498/498** + `feishu-checks` **97 条** + 链路冒烟 11/11。
 
 状态基线（2026-11-11）：含**「凭据」页签填了 token 点保存什么都没发生**的修复 —— `lib/client.js` 的 `onSave()` 先算配置改动 `collectOps()`，为空就 `return`，而写凭据那段挂在这行 `return` 之后，于是「只填凭据、不动配置」时一个字节都没写进去，还回一句「没有需要保存的改动」；而页签计数把 `credDirty` 算进去了 ⇒ 能点、会涨、点了没用。现在凭据写入移到提前返回之前，两条通道互不阻塞（凭据失败只报凭据那条，配置照样发），只提交凭据时不再说那句假话。`client-smoke` 215 → **219 条**（4 条守着这个回归），`dev-run` 当时 **495/495**。
 
