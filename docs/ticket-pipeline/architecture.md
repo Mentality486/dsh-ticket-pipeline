@@ -2419,6 +2419,14 @@ if (agent.status !== 'idle' || seq !== idleSeq) continue   // ← 错在这里
 3. **阈值要跟兜底机制比，不能跟「感觉」比。** 8 分钟看门狗 + 2 次催促，必须能在 40 分钟硬超时
    之内跑完它的全部动作，否则永远不触发。
 
+**2026-11-11 当天又补了两个坑**（都是看门狗上线后第一次真机跑就撞上的）：
+
+1. **兜底分支引用不到工厂闭包里的变量。** `waitForAgentIdle` 是模块级导出函数，而 `createUserMessage` 是 `createAgentExecutor()` 里的局部量。兜底那条 `: (mins) => createNudgeMessage(mins, createUserMessage)` 在生产路径（没传 `makeNudgeMessage`）上必然被执行，于是一催就抛 `ReferenceError`，把整张票打成 `failed`。修法：兜底自己造 —— `resolveCreateUserMessage(undefined)`。判据：**模块级函数里出现的每个标识符，都必须在模块作用域里能找到**；「兜底 / 默认值」这类平时不跑的分支尤其要查。
+2. **`await agent.whenIdle()` 让看门狗在最该响的时候全程失聪。** `whenIdle()` 只在一整轮 turn 结束时 resolve，而事故形态正是「一轮 turn 连跑 40 分钟、中间一次没空闲」⇒ 本该 8 分钟就响的监控等到 40 分钟 turn 结束才响第一次，一秒钟后票已收尾。修法：定时器与 `whenIdle` 竞速（`waitForIdleWithStallCheck`，`Promise.race([idle, ticked])`），阈值 8 分钟 ⇒ 每 60 秒醒一次看工作区。判据：**轮询的频率不能绑在「对方什么时候有空」上**；看门狗必须能在对方正忙的时候工作。
+
+两条各配一条自测，且都做过「把代码改回 bug 写法、对应用例必须变红」的回归验证（改回 bug1 只红「催办自己不许崩」；改回 bug2 只红「一轮 turn 连跑」）。
+坑 2 的更普遍教训：**上一轮的 4 条停滞断言全绿，但假 agent 的 `whenIdle` 是「立刻返回」，恰好绕开了真正出事的路径** —— 测试形态与事故形态不重合时，绿色是假的。
+
 ### 12.18 通知适配器可插拔，优先用「已经有凭据」的那条通道
 
 第三方通知服务有个隐形成本：**它自己的准入条件**。PushPlus 的 ClawBot 渠道要求实名认证，

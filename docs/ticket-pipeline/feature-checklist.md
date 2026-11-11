@@ -1994,6 +1994,79 @@ if (deliveryIncompleteRows.length > 0) {
 
 ---
 
+### 1.37 停滞看门狗自己崩了，而且在最该响的 40 分钟里全程失聪（2026-11-11 真实事故）
+
+**现场**：`sh-row-81` 第三次跑（13:50:11 进 ⑤ 站）结局：
+
+```
+11-11 14:30:05  ⑤ ✓ 处理工单问题 —— agent 已 40 分钟没有改动任何文件，第 1 次催它先动手（上一站 39 分 54 秒）
+11-11 14:30:06  · ✗ 失败 —— 执行器收尾：createUserMessage is not defined（上一站 0 秒）
+```
+
+票态 `失败（交付未完成：回填表格、发通知）`，`最近错误：createUserMessage is not defined`。
+会话日志：226 帧 / 563 事件 / **62 次工具调用全是 `run_code`**，最后一次工具调用 14:29:59 —— 也就是整整 40 分钟内它一直在读，一次没写完。
+
+上一轮刚加的看门狗**触发了**（14:30:05 那条「第 1 次催它先动手」就是它写的），但它同时暴露两个独立的 bug。
+
+**bug 1：催办那一行引用了不存在的名字**
+
+`plugins/ticket-pipeline/src/adapters/executor-agent/index.js` 里 `waitForAgentIdle(agent, signal, cancelAgent, options)` 是**模块级导出函数**，而真正的 `createUserMessage` 是 `createAgentExecutor()` 里的局部量（`:543` `const createUserMessage = resolveCreateUserMessage(options.createUserMessage)`）。兜底那条写作：
+
+```js
+: (mins) => createNudgeMessage(mins, createUserMessage)   // ← 这一层作用域里没有这个名字
+```
+
+生产的 `run()` 调用 `waitForAgentIdle` 时只传了 `worktreeSnapshot` / `stallWarnMs` / `maxNudges` / `now` / `onStall`，**没传 `makeNudgeMessage`** ⇒ 必然走兜底 ⇒ 催办那一瞬抛 `ReferenceError`。看门狗把一个「催它继续干活」的动作变成了「把整张票打成失败」。
+
+修法：
+
+```js
+: (mins) => createNudgeMessage(mins, resolveCreateUserMessage(undefined))
+```
+
+**bug 2：看门狗在最该响的时候全程失聪**
+
+主循环里 `await agent.whenIdle()` **干等** —— 而 `whenIdle()` 只在一整轮 turn 结束时才 resolve。事故形态恰恰是「一轮 turn 连跑 39 分 54 秒、中间一次都没空闲」，于是：
+
+- 该在 8 分钟就响的看门狗，等到 14:30:05（turn 结束那一瞬）才响第一次；
+- 一秒钟后票就收尾失败了（14:30:06），催了没有任何意义。
+
+修法是让定时器与 `whenIdle` 竞速：
+
+```js
+const pollMs = stallWarnMs > 0 && snapshot
+  ? Math.max(1000, Math.min(60_000, Math.floor(stallWarnMs / 8)))
+  : 0
+// ...
+if (pollMs > 0) {
+  await waitForIdleWithStallCheck(agent, checkStall, pollMs, signal)
+} else {
+  await agent.whenIdle()
+}
+await checkStall()
+```
+
+`waitForIdleWithStallCheck` 用 `Promise.race([idle, ticked])`，定时器赢就跑一次 `onTick()`（= `checkStall`）。阈值 8 分钟 ⇒ 每 60 秒醒一次看工作区，这样「一轮 turn 跑 40 分钟」也能在第 8 分钟被叫醒。
+
+**新增两条自测**（`dev-run` 512 → **514**），各锁一个 bug、互不重叠：
+
+| 用例 | 假 agent 的形态 | 抓的是 |
+| --- | --- | --- |
+| 「一轮 turn 连跑不停时也要能催」 | `whenIdle: () => new Promise(() => {})`（**永不 resolve**） | bug 2 —— 旧实现会挂死在这里，催 0 次 |
+| 「催办自己不许崩」 | **不传 `makeNudgeMessage`**，走兜底分支 | bug 1 —— 旧实现在这里抛 `createUserMessage is not defined` |
+
+**两个 bug 都做过回归验证**：把代码临时改回 bug 写法，对应用例立刻变红，且**只红那一条**（bug1 改回 ⇒ 只有「催办自己不许崩」红；bug2 改回 ⇒ 只有「一轮 turn 连跑」红，报 `实际催了 0 次`）。
+
+**四条教训**：
+
+1. **模块级函数不能伸手去摸工厂闭包里的变量** —— 那个名字在定义处根本不存在，只有运行时走到才炸。凡是「兜底 / 默认值」这种平时不跑的分支，尤其要检查它引用的东西在当前作用域里到底有没有。
+2. **计时器的对手是「永远不返回的 promise」** —— 用 `await whenIdle()` 做轮询的宿主，等于把轮询频率绑在对方什么时候空闲上；对方一轮跑 40 分钟，你就 40 分钟没法观察它。
+3. **看门狗必须能在「对方正在忙」的时候工作**，而不是「等对方忙完了再判断刚才有没有卡住」。后者在语义上是自相矛盾的：等它闲下来，本来就不需要催了。
+4. **自测必须造出真实故障的形态**。上一轮那 4 条停滞断言全绿，但假 agent 的 `whenIdle` 是 `async () => { clock += 60_000 }`（立刻返回）—— 恰恰绕开了这次真正出事的那条路径。全部通过的测试如果和事故形态不重合，它的绿色是假的。
+
+**基线**：`dev-run` 512 → **514/514**；`chain-smoke` 11/11；`client-check` ✅（Remote 9 方法）。
+
+
 ## 2. 代码清单
 
 `src/` 共 **47 个 .js / 22 311 行**；`scripts/` 共 10 个 .mjs / **15 047 行**（`dev-run.mjs` **5 835 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
@@ -2409,7 +2482,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **512** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **514** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 
