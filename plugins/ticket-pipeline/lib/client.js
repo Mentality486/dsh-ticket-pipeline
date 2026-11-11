@@ -337,6 +337,87 @@ window.__ModuleLoader__.load({
             },
           ],
         },
+        {
+          // 历史票行尾的「删除记录」（2026-11-11 补）。和 reset 同形：recordId 必填、
+          // projectId 可选。**两个参数必须传满位置**：浏览器的 prepareInvocation 用
+          // `parameters.length` 校验实参个数，`acceptsUndefined` 只在宿主侧生效 ——
+          // 少传一个就抛 `expected 2 argument(s), got 1`（这正是「重跑报错」的成因）。
+          id: 'ticket-pipeline#ticketPipeline/forget',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'forget',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ForgetResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [
+            {
+              name: 'recordId',
+              wire: 'recordId',
+              description: '要删掉本地记录的那张工单标识（飞书 record_id）',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/forget:recordId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('forget: recordId 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/forget:recordId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('forget: recordId 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+            {
+              name: 'projectId',
+              wire: 'projectId',
+              description: '工单所属项目名；只有同名 recordId 会冲突时才需要传',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/forget:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('forget: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/forget:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('forget: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
+        },
       ],
     }
 
@@ -1785,6 +1866,24 @@ window.__ModuleLoader__.load({
       '.tp-run-history{flex:0 0 auto;white-space:nowrap;cursor:pointer;',
       '  display:flex;align-items:center;gap:4px;user-select:none}',
       '.tp-run-row{border-top:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.04));padding:8px 0}',
+      // 分组标题：一屏几十张票时，「要我动手的」必须一眼能定位。
+      // 小号大写间距的标题 + 上面一条细线，靠视觉断点分区，不占太多高度。
+      '.tp-run-group{margin-top:10px}',
+      '.tp-run-group:first-child{margin-top:0}',
+      '.tp-run-group-head{font-size:11px;letter-spacing:.04em;font-weight:600;',
+      '  color:var(--dsw-alias-label-secondary,#61666b);padding:4px 0 2px;',
+      '  border-bottom:.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06));margin-bottom:2px}',
+      // 流程带：第二行，小一号、等宽数字，符号靠颜色区分（✓绿 / ✗红 / ▶蓝 / –灰）。
+      '.tp-run-flow{margin:3px 0 0 2px;font-size:11px;line-height:1.7;',
+      '  font-family:var(--dsw-font-family,ui-monospace,monospace);',
+      '  color:var(--dsw-alias-label-secondary,#61666b);word-break:break-word}',
+      '.tp-run-flow .tp-st{margin-right:6px;white-space:nowrap}',
+      '.tp-run-flow .tp-st-ok{color:#16a34a}',
+      '.tp-run-flow .tp-st-failed{color:#dc2626;font-weight:600}',
+      '.tp-run-flow .tp-st-now{color:#2563eb;font-weight:600}',
+      '.tp-run-flow .tp-st-unreached{color:#b0b4ba}',
+      '.tp-run-flow .tp-flow-total{margin-left:4px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-run-flow.tp-flow-empty{font-family:inherit;color:var(--dsw-alias-label-tertiary,#81858c)}',
       '.tp-run-row:first-child{border-top:0}',
       '.tp-run-row-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.tp-run-toggle{display:flex;align-items:baseline;gap:8px;flex:1 1 auto;min-width:0;',
@@ -2064,6 +2163,74 @@ window.__ModuleLoader__.load({
     var ACTIVE_PHASES = ['worktree-ready', 'planning', 'editing', 'testing', 'mr-opening']
 
     /**
+     * 运行页签里票列表的分组顺序。
+     *
+     * 与 `src/tools/pipeline-status.js` 的 `PHASE_TIERS` 同一份口径（那份给工具的文字
+     * 输出用，这里是面板分组）。浏览器 bundle 里 import 不到 src 的常量，只能抄一份；
+     * 抄的内容只是「哪些 phase 归哪一档」，改的时候两处一起改。
+     *
+     * 为什么必须分组：勾上「显示历史」后一屏可能有几十张票，平铺的话
+     * 「要我动手的」和「早就验收完的」混在一起，人得逐行读才知道该看哪几张。
+     */
+    var RUN_GROUPS = [
+      { label: '需要你处理', phases: ['needs-info', 'failed'] },
+      { label: '正在跑', phases: ['pending', 'worktree-ready', 'planning', 'editing', 'testing', 'mr-opening'] },
+      { label: '待人工验证', phases: ['skipped'] },
+      { label: '已交付', phases: ['done'] },
+      { label: '已退役', phases: ['gone'] },
+    ]
+
+    /** 站耗时：只有 ≥1 分钟的才标 —— 秒级的站标出来全是噪音，看不出哪里慢。 */
+    function stationDuration (ms) {
+      if (typeof ms !== 'number' || !isFinite(ms) || ms < 60000) return ''
+      return fullDuration(ms)
+    }
+
+    /** 全程耗时：一秒也要标（「这票一共花了 8 秒」是有信息量的）。 */
+    function fullDuration (ms) {
+      if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return ''
+      var total = Math.floor(ms / 1000)
+      if (total < 60) return total + ' 秒'
+      var m = Math.floor(total / 60)
+      if (m < 60) return m + ' 分 ' + (total % 60) + ' 秒'
+      return Math.floor(m / 60) + ' 时 ' + (m % 60) + ' 分'
+    }
+
+    /** 9 个主站的符号：与宿主 `STATION_MARK` 一致。 */
+    var STATION_SYMBOL = { ok: '✓', failed: '✗', now: '▶', unreached: '–' }
+
+    /**
+     * 一张票的流程带（面板版）：`①– ②✓ ③✓ ④✓ ⑤✓（4 分 32 秒） ⑥✓ …`。
+     *
+     * 用宿主下发的 `flow.stations` 渲染，不自己再读 timeline ——「第几站」「这一站
+     * 花了多久」的判定口径只在 `describeStations()` 一处，面板重算一遍迟早分家
+     * （工具说停在第⑤站、面板说停在⑥）。
+     */
+    function renderFlowStrip (flow) {
+      if (!flow) return null
+      if (flow.noRecord === true) {
+        return h('span', { className: 'tp-flow tp-flow-empty' },
+          '没有流程记录 —— 这张票处理得早于流程日志功能，或刚入队还没打点')
+      }
+      var stations = Array.isArray(flow.stations) ? flow.stations : []
+      var parts = []
+      for (var i = 0; i < stations.length; i += 1) {
+        var s = stations[i]
+        var duration = stationDuration(s.elapsedMs)
+        parts.push(h('span', {
+          key: s.no,
+          className: 'tp-st tp-st-' + s.state,
+          title: (s.label || '') + (duration ? '（这一站花了 ' + duration + '）' : ''),
+        }, s.no + (STATION_SYMBOL[s.state] || '?') + (duration ? '（' + duration + '）' : '')))
+      }
+      return h('span', { className: 'tp-flow' },
+        parts,
+        typeof flow.totalMs === 'number' && fullDuration(flow.totalMs).length > 0
+          ? h('span', { className: 'tp-flow-total' }, '全程 ' + fullDuration(flow.totalMs))
+          : null)
+    }
+
+    /**
      * 「运行」页签（工单 #16）。
      *
      * 为什么要把这个页签放在第一位：人打开设置面板时的第一个问题几乎总是
@@ -2071,9 +2238,9 @@ window.__ModuleLoader__.load({
      * 去对话里敲 pipeline_status —— 而不知道有这个工具的人，永远看不到。
      * 于是「插件到底跑没跑」变成了一个谜，失败票也躺在那里没人知道要重开。
      *
-     * 这一块**不重复算任何东西**：票列表、档位汇总、能不能重跑，全部来自
-     * 宿主 `ticketPipeline.status()`（它内部调的是 pipeline_status 同一个
-     * collectStatus）。面板只做渲染与三个动作（跑一轮 / 取消 / 重跑）。
+     * 这一块**不重复算任何东西**：票列表、档位汇总、能不能重跑、能不能删记录，
+     * 全部来自宿主 `ticketPipeline.status()`（它内部调的是 pipeline_status 同一个
+     * collectStatus）。面板只做渲染与四个动作（跑一轮 / 取消 / 重跑 / 删除记录）。
      */
     function RunCard (props) {
       var data = props.data
@@ -2099,9 +2266,18 @@ window.__ModuleLoader__.load({
           enabled ? '流水线：已开启' : '流水线：关着（enabled=false），不会自动扫表')
         : null
 
-      var rows = tickets.map(function (t) {
+      /**
+       * 一张票一行（+ 可展开的详情）。
+       *
+       * 三件事在这一行里说清楚，顺序就是人看它的顺序：
+       * 1. **现在怎么样** —— recordId｜阶段｜标题；
+       * 2. **整条路走得顺不顺** —— 第二行流程带（`flow.stations`，宿主给的）；
+       * 3. **我能做什么** —— 能重跑的给「重跑」，能删记录的给「删除」。
+       */
+      function renderRunRow (t) {
         var open = props.openOf(t.recordId)
         var rerunBusy = props.busy && props.action === t.recordId
+        var forgetBusy = props.busy && props.action === ('forget:' + t.recordId)
         var detail = []
         if (t.lastError) detail.push('最近错误：' + t.lastError)
         if (t.testDetail) detail.push('验证：' + t.testDetail)
@@ -2146,11 +2322,50 @@ window.__ModuleLoader__.load({
                 title: t.cancelledByUser ? '这是你手动取消的，重跑会重新排进队列' : '把这张票放回队列，下一轮重新跑',
                 onClick: function () { props.onRerun(t.recordId) },
               }, rerunBusy ? '重开中…' : '重跑')
+              : null,
+            // 「删除」删的只是**本地记录**：工单表那一行还在、代码不回滚、工作区不删。
+            // 所以按钮叫「删除记录」不叫「删除」，点下去还要再确认一次 ——
+            // 人看到「删除」时想的常常是「连它做的事一起别要了」，那是做不到的。
+            t.canForget
+              ? h('button', {
+                type: 'button',
+                className: 'tp-btn tp-sm',
+                disabled: props.busy,
+                title: '把这张票从插件的历史里删掉（不碰工单表、不回滚代码）',
+                onClick: function () { props.onForget(t) },
+              }, forgetBusy ? '删除中…' : '删除记录')
               : null),
+          t.flow ? h('div', { className: 'tp-run-flow' }, renderFlowStrip(t.flow)) : null,
           open ? h('div', { className: 'tp-run-detail' }, detail.map(function (line, index) {
             return h('div', { key: index }, line)
           })) : null)
-      })
+      }
+
+      // 分组渲染：勾上「显示历史」后一屏可能几十张票，平铺会把
+      // 「要我动手的」埋在「早验收完的」里。空组不画 —— 五个标题行全是 0 更乱。
+      var rows = []
+      for (var g = 0; g < RUN_GROUPS.length; g += 1) {
+        var group = RUN_GROUPS[g]
+        var inGroup = []
+        for (var k = 0; k < tickets.length; k += 1) {
+          if (group.phases.indexOf(tickets[k].phase) >= 0) inGroup.push(tickets[k])
+        }
+        if (inGroup.length === 0) continue
+        rows.push(h('div', { key: 'group-' + group.label, className: 'tp-run-group' },
+          h('div', { className: 'tp-run-group-head' }, group.label + ' ' + inGroup.length),
+          inGroup.map(renderRunRow)))
+      }
+      // 宿主要是给了我们还不认识的 phase（新版本先跑在旧面板上），别把它吞了。
+      var known = {}
+      for (var gi = 0; gi < RUN_GROUPS.length; gi += 1) {
+        for (var pi = 0; pi < RUN_GROUPS[gi].phases.length; pi += 1) known[RUN_GROUPS[gi].phases[pi]] = true
+      }
+      var others = tickets.filter(function (t) { return known[t.phase] !== true })
+      if (others.length > 0) {
+        rows.push(h('div', { key: 'group-other', className: 'tp-run-group' },
+          h('div', { className: 'tp-run-group-head' }, '其它 ' + others.length),
+          others.map(renderRunRow)))
+      }
 
       var emptyText = null
       if (data && !enabled) {
@@ -3079,8 +3294,18 @@ window.__ModuleLoader__.load({
         return out
       }, [projList, projPending])
 
+      /**
+       * 读项目清单。
+       *
+       * 首参 `target` 是给「刚拿到的 namespace」用的（`loadProjects(ns)` 那种内部调用）。
+       * **它同时被当 `onClick` 处理器传下去**（「重新读取」按钮 `onReload: loadProjects`），
+       * 那里第一个参数是 React 的 click 事件对象 —— 以前写 `target !== undefined` 判定，
+       * 于是点一下按钮就把事件对象当成 namespace，报出「宿主还没提供
+       * ticketPipeline.projects()（Remote 版本比面板旧）」这句冤枉话。
+       * 判定必须是「它到底像不像一个 namespace」。
+       */
       var loadProjects = useCallback(function (target) {
-        var ns = target !== undefined ? target : getNamespace('ticketPipeline')
+        var ns = (target && typeof target.projects === 'function') ? target : getNamespace('ticketPipeline')
         setProjError('')
         if (!ns || typeof ns.projects !== 'function') {
           setProjList([])
@@ -3898,9 +4123,12 @@ window.__ModuleLoader__.load({
         if (!ns) return
         setRunAction(recordId)
         setRunError('')
-        // 只传 recordId：projectId 是可选的（acceptsUndefined），不传就是缺席，
-        // 传 undefined 反而会让网关的参数个数校验对不上。
-        ns.reset(recordId).then(function (response) {
+        // **必须传满位置实参**：浏览器的 `prepareInvocation` 用 `descriptor.parameters.length`
+        // 校验实参个数，`acceptsUndefined` 只在宿主侧参与判定。少传一个就抛
+        // `client api: …/reset expected 2 argument(s), got 1` —— 这正是「点重跑报错」的成因。
+        // 传 `undefined` 不会写进 args（`if (value !== undefined)`），宿主侧再接住缺席，
+        // 所以既满足个数校验、又不产生多余的 wire 字段。
+        ns.reset(recordId, undefined).then(function (response) {
           setRunAction('')
           if (!response || !response.ok) {
             setRunError('重跑失败：' + ((response && response.error && response.error.message) || '未知错误'))
@@ -3915,6 +4143,57 @@ window.__ModuleLoader__.load({
         }, function (error) {
           setRunAction('')
           setRunError('重跑失败：' + (error && error.message ? error.message : String(error)))
+        })
+      }
+
+      /**
+       * 「删除记录」—— 把一张历史票从插件的历史里删掉。
+       *
+       * 为什么要二次确认、且确认框里把「删什么、不删什么」列清楚：
+       * 人点「删除」时脑子里想的往往是「这张票连同它做的事都别要了」，
+       * 而这里只删本地记录 —— 工单表那一行还在、提交不回滚、工作区不删。
+       * 与其删完再解释，不如点之前就问明白。
+       *
+       * 传参必须**传满位置实参**（recordId + projectId）：浏览器侧
+       * `prepareInvocation` 用 `parameters.length` 校验个数，少传一个就抛
+       * `expected 2 argument(s), got 1`。projectId 这里**真的传值**（不是 undefined）：
+       * 多项目撞同一个 record_id 时，凭它才能定位到正确那一条。
+       */
+      function onRunForget (ticket) {
+        var ns = requireRunNamespace('删除记录')
+        if (!ns) return
+        var recordId = ticket && ticket.recordId ? String(ticket.recordId) : ''
+        if (recordId.length === 0) return
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          var label = ticket.phaseLabel || ticket.phase || ''
+          var ok = window.confirm(
+            '要删掉这条记录吗？\n\n'
+            + recordId + (label ? '（' + label + '）' : '') + '\n\n'
+            + '只会删掉插件本地这条记录：\n'
+            + '· 工单表里那一行不动\n'
+            + '· 代码提交不回滚、工作区不删\n'
+            + '· 下一轮扫描不会把它重新收进来\n\n'
+            + '想让它再跑一遍，请用「重跑」而不是删除。')
+          if (!ok) return
+        }
+        setRunAction('forget:' + recordId)
+        setRunError('')
+        var projectId = typeof ticket.projectId === 'string' && ticket.projectId.length > 0
+          ? ticket.projectId
+          : undefined
+        ns.forget(recordId, projectId).then(function (response) {
+          setRunAction('')
+          if (!response || !response.ok) {
+            setRunError('删除失败：' + ((response && response.error && response.error.message) || '未知错误'))
+            return
+          }
+          var value = response.value || {}
+          setRunNotice(value.text || '')
+          if (value.forgotten === true) setRunMessage('已删除记录')
+          loadRun()
+        }, function (error) {
+          setRunAction('')
+          setRunError('删除失败：' + (error && error.message ? error.message : String(error)))
         })
       }
 
@@ -4093,6 +4372,7 @@ window.__ModuleLoader__.load({
             onScan: onRunScan,
             onCancel: onRunCancel,
             onRerun: onRunRerun,
+            onForget: onRunForget,
             onRefresh: loadRun,
             history: runHistory,
             onHistory: onRunHistory,

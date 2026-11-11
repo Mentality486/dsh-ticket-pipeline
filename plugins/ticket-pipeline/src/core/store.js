@@ -581,6 +581,32 @@ export class TicketStore {
     return true
   }
 
+  /**
+   * 忘掉一张票：把它从存储里删掉。
+   *
+   * 为什么需要这个：票据只增不删，跑上几个月以后运行页签里堆满早就验收完的
+   * 历史票 —— 人看着一屏「已完成」却没法清理，会以为插件没有收拾的能力。
+   *
+   * **只删本地记录**，三件事刻意不做：
+   * - 不碰工单表（那一行还在，人自己决定要不要留）；
+   * - 不动工作区与提交（代码已经在那儿了，删记录不等于回滚）；
+   * - 不碰水位 `seen`（下面说）。
+   *
+   * 水位不动的后果是可控的：`seen` 里还留着它，所以下一轮扫描**不会**把它
+   * 当成新票重新收进来（`created` 只在 `!prev` 时才推）。只有人去表格里把它
+   * 拨离「处理中」再拨回来 —— 那本来就是「我要重做一遍」的明确动作。
+   *
+   * @param {string} key 票据复合主键
+   * @returns {Promise<boolean>} 删掉了没有（本来就不在时 false）
+   */
+  async forgetTicket (key) {
+    const row = this.getTicket(key)
+    if (!row) return false
+    const removed = await this.repo.delete(TABLES.tickets, key)
+    if (removed) this.log('票据记录已删除', { key, projectId: row.projectId, recordId: row.recordId, phase: row.phase })
+    return removed
+  }
+
   // ── 水位 ────────────────────────────────────────────────
 
   /**

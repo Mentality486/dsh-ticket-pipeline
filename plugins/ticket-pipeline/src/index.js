@@ -58,6 +58,7 @@ import { createPipelineScanTool } from './tools/pipeline-scan.js'
 import { createPipelineStatusTool } from './tools/pipeline-status.js'
 import { createPipelineCancelTool } from './tools/pipeline-cancel.js'
 import { createPipelineResetTool } from './tools/pipeline-reset.js'
+import { createPipelineForgetTool } from './tools/pipeline-forget.js'
 import { createPipelineDoctorTool } from './tools/pipeline-doctor.js'
 import { TicketPipelineRemote, mountTicketPipelineRemote } from './remote/host.js'
 
@@ -844,7 +845,9 @@ function makeTextFileReader (ctx, logger) {
  * 1. 打开 storage-domain、包成 `TicketStore`
  * 2. 遍历 `config.projects[]` 按平台造每个项目的工单源；仓库定位器查表化
  * 3. 造 scheduler，注入 `prepareWorkspace` / `saveImage` / `removeWorktree`
- * 4. 注册四个工具（`pipeline_scan` / `pipeline_status` / `pipeline_cancel` / `pipeline_reset`）
+ * 4. 注册五个工具（`pipeline_scan` / `pipeline_status` / `pipeline_cancel` /
+ *    `pipeline_reset` / `pipeline_forget`；`pipeline_doctor` 在下面单独挂，因为它要用
+ *    体检那套装配）
  * 5. 启动恢复：把跑到一半的票从当前 phase 往后接着走
  * 6. 起轮询定时器（`ctx.interval`），`enabled` 关着时 tick 会直接 `disabled`
  *
@@ -1199,6 +1202,9 @@ export async function apply (ctx, config) {
   }))
   // 人工重开：store.resetByHuman 早就实现了却没有入口，文档承诺的「再跑一次」在生产里走不通。
   ctx.tools.register(createPipelineResetTool({ store }))
+  // 清理历史：票据只增不删，跑久了运行页签里全是早验收完的票却清不掉。
+  // 它只删本地记录（不碰工单表、不回滚代码），边界写在 tools/pipeline-forget.js 文件头。
+  ctx.tools.register(createPipelineForgetTool({ store }))
   // 环境体检：把「跑票时才炸」的环境问题（git 链路、仓库、凭据、mock 状态）提前到装完就能看到。
   //
   // 同一份 `doctorOptions` 给两个调用方：agent 侧的 `pipeline_doctor` 工具，和

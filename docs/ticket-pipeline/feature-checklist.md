@@ -2,7 +2,19 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「40 分钟改一个小功能 + 通知换掉付费第三方」的代码与本文同一次提交，上一轮已提交代码为 `fdf8895`（图片块字段名改成 `attachment`）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-11 深夜（二），**一张改小功能的票跑了 40 分钟、写了 0 个文件** ——
+> 最近一次更新：2026-11-11 更晚，**运行页签三件事一起修** —— 用户原话
+> 「运行页面的历史 重试报错 也删除不了 优化一下显示历史的ui和展现方式。项目页面的重新读取失败」。
+> 三个互不相干的原因：①「重跑」每次都抛 `expected 2 argument(s), got 1` ——
+> 浏览器侧 `prepareInvocation` 按 `parameters.length` 数个数，**`acceptsUndefined` 只有宿主侧认**，
+> 面板只传了一个实参；②「重新读取」必报「宿主还没提供 projects()」—— `loadProjects` 的第一参被
+> `onClick` 的 click 事件顶掉（**宿主一直是好的**，这句冤枉话把人指向完全错误的方向）；
+> ③「删除不了」= 压根没有删除能力，三层补上 `store.forgetTicket` / 工具 `pipeline_forget` /
+> Remote `forget` / 面板「删除记录」（只删本地记录，不动工单表与代码，且删完不会被下一轮重收）。
+> 同时按用户要求重做历史屏：票按档位**分组**、每票第二行加**九站流程带**
+> （`①– ②✓ ③✓ ④✓ ⑤✓（4 分 32 秒） …｜全程 13 分 53 秒`）。
+> 基线：`dev-run` 512 → **517/517**、`client-smoke` **228**、`client-check` ✅（Remote **10** 方法）。
+> 见 §1.38。
+> 同日深夜（二），**一张改小功能的票跑了 40 分钟、写了 0 个文件** ——
 > `sh-row-81` 在 ⑤ 站整票硬超时失败。解会话日志才看清：39 分钟、63 次工具调用、
 > 读了 23 个文件（平均每个读 2 次）、**写/改过的文件 0 个**，而 `session.seq` 全程都在涨。
 > 两个独立的病：① 任务书 `## 代码定位` 只说「先读仓库结构」，**没说读到什么时候该动手**；
@@ -2066,19 +2078,109 @@ await checkStall()
 
 **基线**：`dev-run` 512 → **514/514**；`chain-smoke` 11/11；`client-check` ✅（Remote 9 方法）。
 
+---
+
+### 1.38 运行页签三件事：重跑报错、删不掉记录、历史屏看不出全流程（2026-11-11）
+
+**用户的诉求**（原文）：「运行页面的历史 重试报错 也删除不了 优化一下显示历史的ui和展现方式。
+项目页面的重新读取失败」。四条，背后是三个互不相干的原因。
+
+**bug 1：「重跑」每次都报错 —— 浏览器侧的位置参数是硬校验**
+
+面板调的是 `ns.reset(recordId)`，只传了**一个**实参，而描述符声明了两个
+（`recordId` 必填 + `projectId` 可选）。两级校验的规则不一样：
+
+```js
+// 宿主侧（app.asar 的 dsh-typert，assertExactArguments）
+const acceptsMissing = new Set(descriptor.parameters.filter((p) => p.source === 'json'
+  && (p.acceptsUndefined === true || p.codec.mode === 'src-json')).map((p) => p.wire));
+const missing = [...expected].filter((key) => !Object.hasOwn(args, key) && !acceptsMissing.has(key));
+// 浏览器侧（prepareInvocation）
+const expected = descriptor.parameters.length - (projection?.parameterIndex === void 0 ? 0 : 1);
+if (values.length !== expected && !hasCallerSignal) throw new Error(
+  `client api: ${endpoint} expected ${expected} argument(s), got ${values.length}`);
+```
+
+**`acceptsUndefined` 只在宿主侧生效，浏览器侧只数个数。** 少传一个立刻抛
+`client api: ticketPipeline#ticketPipeline/reset expected 2 argument(s), got 1`，
+而 `onRunRerun` 的 `.catch` 把它写成「重跑失败：…」，人只看到一条报错。
+修法：`ns.reset(recordId, undefined)` —— `undefined` 不会写进 `args`（`if (value !== undefined)`），
+宿主侧再靠 `acceptsUndefined` 接住缺席，两头都合法。
+
+**bug 2：项目页「重新读取」必然失败 —— 第一参被当成 namespace**
+
+```js
+// 原来
+var ns = target !== undefined ? target : getNamespace('ticketPipeline')
+```
+
+它同时被当 `onClick` 传给「重新读取」（`onReload: loadProjects`）—— React 把 click 事件对象
+塞进第一参，`target !== undefined` 成立 ⇒ `ns` 变成事件对象 ⇒ 报出
+「宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）」。
+**宿主一直是好的**，这句冤枉话把人指向了完全错误的方向。
+判定改成「它到底像不像一个 namespace」：`(target && typeof target.projects === 'function') ? target : getNamespace(...)`。
+`loadRun` 早先已用「只认布尔」防住同一类问题（`onRefresh: loadRun`），这里是同一个坑换了个入口。
+
+**bug 3：「删除不了」= 根本没有删除能力**
+
+票据只增不删（`store.js` 里没有任何删票方法），历史票在界面上也没有任何清理入口。
+三层补上：`store.forgetTicket(key)` / 工具 `pipeline_forget` / Remote `forget(recordId, projectId?)` / 面板「删除记录」。
+
+边界写死在 `tools/pipeline-forget.js` 的文件头，**只删插件本地的票据行**：
+
+- 不碰工单表里那一行、不回滚代码提交、不删工作区；
+- 可删的只有 `FORGETTABLE_PHASES = [...TERMINAL, 'needs-info']`；排队中与正在跑的一律拒绝
+  （删了正在跑的票，`runOne` 的 `finally` 会摸到一条不存在的记录）；
+- **删完不会被下一轮扫描重新收进来**：水位 `seen[recordId]` 还留着，扫描器只在 `!prev` 时才推 `created`；
+- 同名 `recordId` 跨项目冲突时不猜，返 `ambiguous` 并列出候选。
+
+按钮叫「删除记录」而不是「删除」，点下去先弹二次确认，把「删什么、不删什么」列清楚 ——
+人点「删除」时想的常常是「连同它做的事都别要了」，而那是做不到的。
+
+**UI：历史屏按档位分组 + 每票第二行流程带**
+
+勾上「显示历史」后几十张票平铺，「要我动手的」被埋在「早验收完的」里。改法：
+
+- 按 `RUN_GROUPS`（需要你处理 / 正在跑 / 待人工验证 / 已交付 / 已退役）分组，空组不画；
+  宿主要是给了面板不认识的新 phase，落到「其它」而不是吞掉。
+- 每票第二行渲染 `tickets[].flow.stations` 的九站符号带：
+  `①– ②✓ ③✓ ④✓ ⑤✓（4 分 32 秒） ⑥✓ ⑦✓ ⑧✓ ⑨✓｜全程 13 分 53 秒`。
+  符号与宿主 `STATION_MARK` 一致（✓ 做成 / ✗ 没做成 / ▶ 正停在这一站 / – 没走过），
+  只有 ≥1 分钟的站标耗时（秒级噪音会让每一站都显示「0 秒」，反而看不出哪里慢）。
+- **面板不自己读 timeline 重算站点** —— 口径只在 `describeStations()` 一处，
+  重算一遍迟早出现「带子上说停在⑥、结论说停在第⑤站」。
+
+**自测**（`dev-run` 514 → **517**，`client-smoke` 215 → **228**）：
+
+| 脚本 | 新增断言 |
+| --- | --- |
+| `dev-run` | `apply()` 注册**五**个工具且 `pipeline_forget` 接同一份 store（pending 拒删 / failed 删得掉 / 删完 `getTicket` 为 `undefined`）；`remote.reset(recordId, undefined)` 两个实参；`remote.forget()` 三态（not-forgettable / ok / not-found）；`canReset` 与 `canForget` 两个布尔一起下发 |
+| `client-smoke` | 「重跑」调用实参表长度为 2；「删除记录」只挂在 `canForget` 的票上（正在跑的那张没有）；点删除先弹二次确认且文案含「本地 / 工单表 / 不会把它重新收进来」；确认后 `forget(recordId, projectId)` 两实参；分组标题出现；流程带 ①…⑨ 渲染；失败站是 `⑤✗`；正在跑的是 `⑤▶` |
+
+**两条教训**：
+
+1. **`acceptsUndefined` 是宿主侧的概念，别指望浏览器侧认它。** 任何声明了可选参数的
+   Remote 方法，调用侧都必须传满位置实参（`undefined` 占位），不能靠「少传一个」表达可选。
+   两级校验规则不一致时，报错信息会出现在离真正原因很远的地方。
+2. **同一个「处理器兼作回调」的坑会换入口复发。** `loadRun` 修过一次（只认布尔），
+   `loadProjects` 又栽了一次（只认 namespace）。凡是既要能被直接调用、又要能当 `onClick`
+   传下去的函数，第一参必须做形态判定，不能做 `!== undefined` 判定。
+
+**基线**：`dev-run` 514 → **517/517**；`client-smoke` **228**；`client-check` ✅（Remote **10** 方法）；`chain-smoke` 11/11。
+
 
 ## 2. 代码清单
 
-`src/` 共 **47 个 .js / 22 311 行**；`scripts/` 共 10 个 .mjs / **15 047 行**（`dev-run.mjs` **5 835 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
+`src/` 共 **48 个 .js / 22 759 行**；`scripts/` 共 10 个 .mjs / **15 454 行**（`dev-run.mjs` **6 121 行**）；`lib/client.js` **4 800 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 649（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
 | `src/core/` | 5 774（13 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**）、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 10 283（16 个 .js） | 见下表 |
-| `src/tools/` | 2 587（6 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 684（2 个 .js） | `descriptors.js`（**9 个 Remote 方法**，含三个带参的 `setProjectTable(index, url)`、`status(includeDone?)` 与 `reset(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
-| 根 | 1 334（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| `src/adapters/` | 10 396（16 个 .js） | 见下表 |
+| `src/tools/` | 2 810（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
+| `src/remote/` | 741（2 个 .js） | `descriptors.js`（**10 个 Remote 方法**，含四个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`reset(recordId, projectId?)` 与 `forget(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
+| 根 | 1 340（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -2095,14 +2197,15 @@ await checkStall()
 | `push-mock/` | 65 | 测试 | |
 | `locator-table/` | 187 | **真实可用** | 工单 projectId → 仓库/分支/remote 的查表定位器 |
 
-### 2.1 工具（对宿主暴露的 5 个）
+### 2.1 工具（对宿主暴露的 6 个）
 
 | 工具 | 作用 |
 | --- | --- |
 | `pipeline_scan` | 立刻扫一轮工单表 |
-| `pipeline_status` | 看队列与各票阶段 |
+| `pipeline_status` | **缺省给按项目聚合的总览**（每项目一行战报 + 每票一行摘要 + 一行 9 主站流程带）；`view: "tickets"` 才是逐票明细，传 `recordId` 一律走明细 |
 | `pipeline_doctor` | 环境体检：git 链路、各项目仓库连通性、凭据、执行器与通知适配器，以及**正在跑的插件是不是比本地源码旧** |
 | `pipeline_reset` | 把 failed / needs-info / gone 的票放回队列重跑 |
+| `pipeline_forget` | **删掉一张历史票的本地记录**（清理历史用）。不碰工单表、不回滚代码、不删工作区；只对 `done` / `skipped` / `failed` / `gone` / `needs-info` 生效 |
 | `pipeline_cancel` | 取消正在跑的那张票（并发恒 1） |
 
 ---
@@ -2342,7 +2445,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **512** | 通过 512，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36）。这 512 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 97 条（见 §1.26 与 §1.23 注） |
+| `node scripts/dev-run.mjs` | **517** | 通过 517，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36），**514**（停滞看门狗的 2 条，见 §1.37），**517**（运行页签三件事：删除记录 / 重跑实参 / canReset+canForget 3 条，见 §1.38）。这 517 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 97 条（见 §1.26 与 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 | `node scripts/client-smoke.mjs` | **219** | 通过 219（215 → 219：§1.29 的 4 条「只填凭据也要真的写进去」） |
 
@@ -2390,7 +2493,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
-| 设置面板（新） | ✅ `client-check.mjs`：descriptor 25 叶子 / 4 组、schema 信封 72 节点 25 叶子、**Remote 9 个方法**（含带参 `setProjectTable`、`status` 与 `reset`）、`projects` 可写 34 字段；`client-smoke.mjs` 全过（页签式布局见 §1.17，「添加项目」见 §1.18，运行页签见 §1.22，「显示历史」见 §1.27） |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 27 叶子 / 4 组、schema 信封 75 节点 27 叶子、**Remote 10 个方法**（含带参 `setProjectTable`、`status`、`reset` 与 `forget`）、`projects` 可写 34 字段；`client-smoke.mjs` 全过（页签式布局见 §1.17，「添加项目」见 §1.18，运行页签见 §1.22，「显示历史」见 §1.27，删除记录 / 分组 / 流程带见 §1.38） |
 | 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 482/482）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
 | appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **60** 条、`dev-run` 加 2 条配置校验断言（那是当轮的值；现为 **482/482** 与 **93** 条） |
@@ -2482,7 +2585,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **514** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **517** 项离线断言 + **228** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 

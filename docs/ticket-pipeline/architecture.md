@@ -1257,6 +1257,41 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
   勾选状态记在 localStorage 的 `ticket-pipeline:run-history`（值就是 `'1'` / 不存在），
   因为「重开面板又变回空白」会被读成「历史被删了」。切换时**立刻**按新口径重读一次，不等下一次轮询。
   空列表文案也随开关分岔：关着时说「没有未收尾的票」并提示可以勾上历史，开着才说「库里还没有任何票」。
+- **「重跑」报错的真正原因（2026-11-11 修）**：面板调用的是 `ns.reset(recordId)`，只传了
+  **一个**位置实参，而描述符声明了两个（`recordId` + 可选的 `projectId`）。浏览器侧的
+  `prepareInvocation` 用 `descriptor.parameters.length` 硬校验实参个数 ——
+  **`acceptsUndefined: true` 只在宿主侧参与判定，浏览器侧不认它** ——
+  于是每次点「重跑」都抛 `client api: ticketPipeline#ticketPipeline/reset expected 2 argument(s), got 1`。
+  修法是补满位置实参：`ns.reset(recordId, undefined)`。`undefined` 不会写进 `args`
+  （`if (value !== undefined)`），宿主侧再靠 `acceptsUndefined` 接住缺席，两头都合法。
+  **这条约束对所有「可选参数」的 Remote 方法都成立**：调用侧必须传满位置，
+  不能靠「少传一个」来表达可选。`client-smoke.mjs` 有一条断言专门看实参表长度。
+- **「可选的第一个参数」是另一个同类坑（2026-11-11 修）**：`loadProjects(target)` 原来写
+  `target !== undefined ? target : getNamespace(...)`，而它同时被当 `onClick` 传给「重新读取」
+  按钮 —— React 会把 click 事件对象塞进第一参，于是点一下就把事件当 namespace，
+  报出「宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）」这句冤枉话。
+  判定改成「它到底像不像一个 namespace」（`target && typeof target.projects === 'function'`）。
+  `loadRun` 早先已用「只认布尔」防住同一类问题，这里补上同类修法。
+- **「删除记录」（2026-11-11 补）**：票据只增不删，跑久了运行页签里全是早验收完的票却清不掉，
+  用户原话「也删除不了」。新增 `store.forgetTicket(key)` + 工具 `pipeline_forget` +
+  Remote `forget(recordId, projectId?)` + 面板按钮。
+  边界写死在 `tools/pipeline-forget.js` 的文件头：**只删插件本地的票据行** ——
+  不碰工单表里那一行、不回滚代码提交、不删工作区。可删的只有
+  `FORGETTABLE_PHASES = [...TERMINAL, 'needs-info']`；排队中与正在跑的一律拒绝
+  （删了正在跑的票，`runOne` 的 `finally` 会摸到一条不存在的记录）。
+  删完**不会被下一轮扫描重新收进来**：水位 `seen[recordId]` 还留着，
+  扫描器只在 `!prev` 时推 `created`。面板上按钮叫「删除记录」而不是「删除」，
+  点下去先弹二次确认，把「删什么、不删什么」列清楚。
+- **运行页签的票列表按档位分组 + 每票第二行流程带（2026-11-11 补）**：
+  用户原话「优化一下显示历史的 ui 和展现方式」。勾上历史后几十张票平铺，
+  「要我动手的」被埋在「早验收完的」里。改法：
+  ①按 `RUN_GROUPS`（需要你处理 / 正在跑 / 待人工验证 / 已交付 / 已退役）分组，
+  空组不画，宿主要是有面板不认识的新 phase 就落到「其它」不留吞；
+  ②每票第二行渲染 `tickets[].flow.stations` 的九站符号带
+  （`①– ②✓ ③✓ ④✓ ⑤✓（4 分 32 秒） …`），符号与宿主 `STATION_MARK` 一致
+  （✓ 做成 / ✗ 没做成 / ▶ 正停在这一站 / – 没走过），只有 ≥1 分钟的站标耗时。
+  **面板不自己读 timeline 重算站点** —— 「第几站」「这一站花了多久」的口径只在
+  `describeStations()` 一处，重算一遍迟早出现「带子上说停在⑥、结论说停在第⑤站」。
 - 页签角标只在**真有**未保存/待修时才挂数字，平时不占位：参数页 = 未保存的配置项数（有校验错转红显示错误数）、
   凭据页 = 待提交的凭据条数、项目页 = 未保存的项目改动数、体检页 = `problems.length`。
 - **保存类提示不随页签切换消失**（`saveError` / `saveMessage` / `loadError` 渲染在页签内容之外）：

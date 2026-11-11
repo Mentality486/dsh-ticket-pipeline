@@ -114,6 +114,9 @@ const cancelResult = codec('CancelResult', (value) => value)
 /** 重开的结果：与 `pipeline_reset` 同形（`reset` + `reason` + `text`）。 */
 const resetResult = codec('ResetResult', (value) => value)
 
+/** 删掉本地记录的结果：`{ forgotten, reason, text }`。 */
+const forgetResult = codec('ForgetResult', (value) => value)
+
 /** 一个非空字符串参数。 */
 function requiredString (method, name, description) {
   return parameter(method, name, description, (value) => {
@@ -241,6 +244,37 @@ function reset () {
   }
 }
 
+/**
+ * 面板「运行」页签的「删除记录」按钮：`forget(recordId, projectId?)`。
+ *
+ * 为什么要有这个方法：票据**只增不删**，跑上几个月以后那一屏全是早验收完的
+ * 历史票，人看着却没法清理 —— 用户原话是「也删除不了」。
+ *
+ * 它删的只是**本地这条记录**，不碰工单表里那一行、不回滚代码、不动工作区。
+ * 这一点在 `host.js` 与面板的二次确认文案里必须说清楚：人点「删除」时脑子里
+ * 想的往往是「这张票连同它做的事都别要了」，而这里做不到、也不该做。
+ *
+ * 与 `reset` 一样带一个可选的 `projectId`：多项目撞同一个 record_id 时才能定位。
+ */
+function forget () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/forget`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'forget',
+    invocation: { kind: 'direct' },
+    result: forgetResult,
+    parameters: [
+      requiredString('forget', 'recordId', '要删掉本地记录的那张工单标识（飞书 record_id）'),
+      parameter('forget', 'projectId', '工单所属项目名；只有同名 recordId 会冲突时才需要传', (value) => {
+        if (value === undefined) return undefined
+        if (typeof value !== 'string') throw new TypeError('forget: projectId 必须是字符串')
+        return value
+      }, true),
+    ],
+  }
+}
+
 /** 宿主与浏览器共用的方法表。 */
 export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('doctor'),
@@ -248,11 +282,13 @@ export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('projects'),
   method('branches'),
   setProjectTable(),
-  // 运行页签（#16）：先 status 拉一屏，再 scan / cancel / reset 三个动作。
+  // 运行页签（#16）：先 status 拉一屏，再 scan / cancel / reset / forget 四个动作。
   status(),
   method('scan'),
   method('cancel'),
   reset(),
+  // 删掉本地记录（2026-11-11 补）：票据只增不删，历史票得能清。
+  forget(),
 ])
 
 /**

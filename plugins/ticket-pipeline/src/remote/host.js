@@ -20,6 +20,7 @@ import { collectStatus } from '../tools/pipeline-status.js'
 import { collectScan } from '../tools/pipeline-scan.js'
 import { collectCancel } from '../tools/pipeline-cancel.js'
 import { collectReset } from '../tools/pipeline-reset.js'
+import { collectForget } from '../tools/pipeline-forget.js'
 import { TICKET_PIPELINE_DESCRIPTORS, TICKET_PIPELINE_NAMESPACE } from './descriptors.js'
 
 /**
@@ -225,9 +226,9 @@ export class TicketPipelineRemote {
 
   // ── 运行页签（工单 #16）──────────────────────────────────────
   //
-  // 这四个方法是面板上「运行」页的一整屏动作。硬约束：**不许复制工具实现** ——
+  // 这几个方法是面板上「运行」页的一整屏动作。硬约束：**不许复制工具实现** ——
   // 它们全部转调 tools/ 里已经抽好的算结果层（collectStatus / collectScan /
-  // collectCancel / collectReset），与对话里的同名工具是同一份代码。
+  // collectCancel / collectReset / collectForget），与对话里的同名工具是同一份代码。
   // 复制一份的后果不是代码丑，而是两处判定迟早分道扬镳：工具说 already-running、
   // 按钮说 triggered，人就再也信不过任何一边。
 
@@ -291,6 +292,26 @@ export class TicketPipelineRemote {
   async reset (recordId, projectId) {
     requireStore(this.store, 'reset')
     return collectReset({ store: this.store }, { recordId, projectId })
+  }
+
+  /**
+   * 历史票行尾的「删除记录」按钮 —— 与 `pipeline_forget` 工具同一个 `collectForget()`。
+   *
+   * 删的只是**本地这条记录**：工单表里那一行不动、代码提交不回滚、工作区不删。
+   * 为什么要说三遍：人点「删除」时想的是「这张票连同它做的事都别要了」，
+   * 而这里一件都做不到 —— 与其事后解释，不如在返回值与按钮确认框里写清楚。
+   *
+   * 为什么删完不会被下一轮扫描重新收进来：水位 `seen` 里还记着这个 recordId，
+   * 扫描器只在「第一次看见」时推 `created`。详见 `store.forgetTicket()` 的注释。
+   *
+   * `projectId` 可选：只有多项目撞同一个 record_id 时才需要补。
+   *
+   * @param {string} recordId
+   * @param {string} [projectId]
+   */
+  async forget (recordId, projectId) {
+    requireStore(this.store, 'forget')
+    return collectForget({ store: this.store }, { recordId, projectId })
   }
 }
 

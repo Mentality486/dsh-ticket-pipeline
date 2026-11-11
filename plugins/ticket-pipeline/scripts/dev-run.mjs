@@ -1627,6 +1627,47 @@ async function main () {
     assert.ok(phases.length >= 1, '催的时候要写一条时间线')
   })
 
+  await check('停滞监控：两次催之间要隔一个完整阈值，不能醒来一次就连发把预算烧光', async () => {
+    // 2026-11-11 真机形态：台账上写着「agent 已 8 分钟没有改动任何文件，第 2 次催它先动手」，
+    // 但**没有「第 1 次」的记录**，而且之后再卡 50 分钟一句话都没有。
+    //
+    // 根因是两处叠加：
+    // ① 竞速 helper 在定时器赢时自己调了一次 onTick，主循环返回后又调一次 checkStall
+    //    ⇒ 每醒来一次连催两遍，几毫秒内 `maxNudges: 2` 就用完了；
+    // ② 即使只催一次，轮询粒度是「阈值/8」，催完不设冷却就会按轮询节奏继续催。
+    //
+    // 用真时钟还原比例：阈值 8000ms（≈8 分钟），pollMs 下限 1000ms ⇒ 8 秒催第 1 次、
+    // 16 秒催第 2 次。整条用例约 9 秒。
+    const nudges = []
+    const agent = {
+      get status () { return 'running' },
+      get session () { return { seq: 1 } },
+      // 永不 resolve：一轮 turn 连跑不停
+      whenIdle: () => new Promise(() => {}),
+      followup: (msg) => { nudges.push({ at: Date.now(), msg }) },
+    }
+    const started = Date.now()
+    void waitForAgentIdle(agent, undefined, () => {}, {
+      worktreeSnapshot: async () => ' M unchanged.js\n',
+      stallWarnMs: 8000,
+      maxNudges: 2,
+      onStall: () => {},
+      makeNudgeMessage: (minutes) => ({ kind: 'nudge', minutes }),
+    }).catch(() => {})
+    // 等到第 2 次催（或超时 15 秒）
+    while (nudges.length < 2 && Date.now() - started < 15000) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.ok(nudges.length >= 1, `一次都不催是旧 bug，实际 ${nudges.length} 次`)
+    if (nudges.length >= 2) {
+      const gap = nudges[1].at - nudges[0].at
+      assert.ok(gap >= 6000, `两次催之间要接近一个阈值（8 秒），实际只隔了 ${gap}ms —— 预算被一次烧光了`)
+    }
+    // 关键：不能出现「同一瞬间连发两次」
+    const burst = nudges.some((n, i) => i > 0 && nudges[i].at - nudges[i - 1].at < 200)
+    assert.ok(!burst, nudges.map((n) => n.at - started).join(", ") + " 这几个时刻挨得太近，像连发")
+  })
+
   await check('停滞监控：催办自己不许崩（兜底分支不能引用执行器闭包里的变量）', async () => {
     // 2026-11-11 真机：看门狗第 1 次催办时抛 `createUserMessage is not defined`，
     // 把整张票打成 failed。根因是 `waitForAgentIdle` 是模块级导出函数，
@@ -3371,7 +3412,7 @@ async function main () {
 
   section('12. 组合根接线：工具真的注册进 ctx、真的拿到 store')
 
-  await check('apply() 注册四个工具，pipeline_reset 接的是同一个 store', async () => {
+  await check('apply() 注册五个工具，pipeline_reset / pipeline_forget 接的是同一个 store', async () => {
     // 前面的断言都是自己 new 工具再 execute，从来不经过 index.js ——
     // 注册行被删、或 store 传错成别的对象，那些断言照样全绿。这里补上真实接线。
     const { domain } = makeFakeDomain()
@@ -3381,7 +3422,7 @@ async function main () {
     await apply(ctx, config)
 
     const byName = new Map(registered.map((tool) => [tool.name, tool]))
-    for (const toolName of ['pipeline_scan', 'pipeline_status', 'pipeline_cancel', 'pipeline_reset', 'pipeline_doctor']) {
+    for (const toolName of ['pipeline_scan', 'pipeline_status', 'pipeline_cancel', 'pipeline_reset', 'pipeline_forget', 'pipeline_doctor']) {
       assert.ok(byName.has(toolName), `${toolName} 应该被注册进来，实际注册了：${[...byName.keys()].join(', ')}`)
     }
 
@@ -3394,6 +3435,14 @@ async function main () {
     const out = await byName.get('pipeline_reset').execute({ recordId: 'rec-mock-001' }, {})
     assert.equal(out.reset, true, `工具必须能读到插件自己打开的那张表：${out.text}`)
     assert.equal(store.getTicket(k('rec-mock-001')).phase, 'pending', '重置要落到同一份存储上')
+
+    // 删除记录接的也必须是同一份存储：删完那张表里就真的没有这条了。
+    const forgotten = await byName.get('pipeline_forget').execute({ recordId: 'rec-mock-001' }, {})
+    assert.equal(forgotten.forgotten, false, `pending 的票不该允许删：${forgotten.text}`)
+    await store.setPhase(k('rec-mock-001'), 'failed', { lastError: 'internal: 又假的' })
+    const forgotten2 = await byName.get('pipeline_forget').execute({ recordId: 'rec-mock-001' }, {})
+    assert.equal(forgotten2.forgotten, true, `failed 的票应该能删：${forgotten2.text}`)
+    assert.equal(store.getTicket(k('rec-mock-001')), undefined, '删记录要落到同一份存储上')
   })
 
 // 组合根接线用的最小假 ctx / 假 storageDomain：
@@ -5542,6 +5591,27 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(out.tickets[0].timeline, [], '没时间线就是空数组')
   })
 
+  await check('pipeline_status：canReset 与 canForget 两个布尔一起下发，口播名单独成名单', async () => {
+    // 面板只读这两个布尔（浏览器 bundle import 不到 src 的常量）。名单各只有一处，
+    // 两处各抄一份迟早出现「按钮画了、工具又说不让）。
+    const rows = [
+      { key: k('r-f'), projectId: DEMO, recordId: 'r-f', phase: 'failed', attempt: 0 },
+      { key: k('r-e'), projectId: DEMO, recordId: 'r-e', phase: 'editing', attempt: 0 },
+      { key: k('r-d'), projectId: DEMO, recordId: 'r-d', phase: 'done', attempt: 0 },
+      { key: k('r-p'), projectId: DEMO, recordId: 'r-p', phase: 'pending', attempt: 0 },
+    ]
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => rows }, getConfig: () => validateConfig({}).value, now: () => 1_000,
+    }).execute({ view: 'tickets', includeDone: true }, {})
+    const byId = new Map(out.tickets.map((t) => [t.recordId, t]))
+    assert.equal(byId.get('r-f').canReset, true, 'failed 能重跑')
+    assert.equal(byId.get('r-f').canForget, true, 'failed 能删记录')
+    assert.equal(byId.get('r-d').canForget, true, 'done 能删记录')
+    assert.equal(byId.get('r-e').canForget, false, '正在跑的不许删')
+    assert.equal(byId.get('r-e').canReset, false, '正在跑的不许重跑')
+    assert.equal(byId.get('r-p').canForget, false, '排队中的不许删')
+  })
+
   section('16d. 长站点心跳：跑十几分钟也不能看起来像卡死')
 
   await check('时间线：心跳只和心跳合并，不吃掉进站那条，也不占 80 条额度', async () => {
@@ -5815,7 +5885,7 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(result.branches[2].reason, /repo\.path/, `要说清是没配路径：${result.branches[2].reason}`)
   })
 
-  section('18. 设置面板「运行」页签：宿主 remote 的四个新方法（#16）')
+  section('18. 设置面板「运行」页签：宿主 remote 的五个新方法（#16）')
   await check('remote.status()：面板拿到的就是工具那份结果，不另算一套', async () => {
     const { TicketPipelineRemote } = await import('../src/remote/host.js')
     const env = harness()
@@ -5912,9 +5982,10 @@ function makeFakeCtx ({ domain, registered }) {
     const row = await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
     await env.store.setPhase(row.key, 'failed', { lastError: '模型说它不想干' })
     const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
-    // 只传 recordId：projectId 是 acceptsUndefined 的可选参数，
-    // 显式传 undefined 会让浏览器侧「参数个数」校验对不上（票 #16 验收项）。
-    const out = await remote.reset(scan.created[0].recordId)
+    // **两个位置实参都传满**：浏览器侧的 prepareInvocation 用 parameters.length
+    // 校验个数，acceptsUndefined 只在宿主侧生效。曾经面板只传 recordId 一个，
+    // 于是每次点「重跑」都抛 `client api: …/reset expected 2 argument(s), got 1`。
+    const out = await remote.reset(scan.created[0].recordId, undefined)
     assert.equal(out.reset, true, `要重开成功：${JSON.stringify(out)}`)
     assert.equal(out.reason, 'ok', out.text)
     assert.equal(out.phase, 'pending', '重开后回 pending')
@@ -5927,10 +5998,38 @@ function makeFakeCtx ({ domain, registered }) {
     const scan = await env.source.scan(new AbortController().signal)
     await env.store.enqueue(scan.created[0], { phase: 'worktree-ready' })
     const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
-    const out = await remote.reset(scan.created[0].recordId)
+    const out = await remote.reset(scan.created[0].recordId, undefined)
     assert.equal(out.reset, false)
     assert.equal(out.reason, 'not-resettable', `只有 failed / needs-info / gone 能重开：${JSON.stringify(out)}`)
     assert.match(out.text, /是否处理/, '要教人去表格里拨，而不是让人以为按钮坏了')
+  })
+
+  await check('remote.forget()：历史票能删掉本地记录，正在跑的票拒绝删', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const scan = await env.source.scan(new AbortController().signal)
+    const row = await env.store.enqueue(scan.created[0], { phase: 'pending' })
+    const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
+
+    // 还没收尾：拒绝。删了正在跑的票，runOne 的 finally 会摸到一条不存在的记录。
+    const busy = await remote.forget(row.recordId, undefined)
+    assert.equal(busy.forgotten, false, JSON.stringify(busy))
+    assert.equal(busy.reason, 'not-forgettable', busy.text)
+    assert.match(busy.text, /还在队列里或正在跑/, '要说明为什么不让删')
+
+    // 收尾之后：允许，而且真的从存储里消失。
+    await env.store.setPhase(row.key, 'failed', { lastError: 'internal: 假的' })
+    const out = await remote.forget(row.recordId, undefined)
+    assert.equal(out.forgotten, true, JSON.stringify(out))
+    assert.equal(out.reason, 'ok', out.text)
+    assert.equal(out.phase, 'failed', '回执里要带上删之前是什么状态，人才知道删掉的是哪一张')
+    assert.match(out.text, /工单表里那一行还在/, '必须在回执里说清「只删本地记录」')
+    assert.equal(env.store.getTicket(row.key), undefined, '存储里真的没了')
+
+    // 查不到就给 not-found，不抛错。
+    const missing = await remote.forget('rec-not-exist', undefined)
+    assert.equal(missing.forgotten, false)
+    assert.equal(missing.reason, 'not-found', missing.text)
   })
 
   await check('remote.setProjectTable()：贴一条不带 ?table= 的链接，必须把旧的 tableId 清掉', async () => {

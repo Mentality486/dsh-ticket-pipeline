@@ -276,6 +276,10 @@ function makeSettingsResponse () {
  *
  * `withHistory` 为真时再补一张**终态票**，对应「勾上显示历史」那一屏：
  * 宿主 collectStatus 在 includeDone 时才把终态票放进来，面板只负责画。
+ *
+ * `flow` 是宿主的 9 站流程带（`describeStations()` 产出）：面板拿它画每票第二行，
+ * 不自己读 timeline。这里给两套形状 —— 有记录的（九站 + 耗时）与老票的
+ * `noRecord: true`，面板两种都要能画。
  */
 function makeRunSnapshot (withHistory) {
   return {
@@ -301,8 +305,11 @@ function makeRunSnapshot (withHistory) {
             phaseLabel: '已完成（已验证）',
             problemSummary: '上个月那张已经跑完的票',
             canReset: false,
+            // 老票：没有时间线。面板必须画「没有流程记录」而不是九个 –。
+            canForget: true,
             cancelledByUser: false,
             deliveryIssues: [],
+            flow: { stations: makeStations({}), noRecord: true, totalMs: null, strip: '' },
           },
         ]
       : []).concat([
@@ -313,9 +320,13 @@ function makeRunSnapshot (withHistory) {
         phaseLabel: '失败',
         problemSummary: '登录页报 500',
         canReset: true,
+        // 终态票能删记录：这是本轮的「也删除不了」。
+        canForget: true,
         cancelledByUser: false,
         lastError: '模型说它不想干',
         deliveryIssues: [],
+        // ⑤ 处理问题没做成：面板该把 ⑤ 画成 ✗ 且带耗时。
+        flow: makeStations({ failed: 'editing', failedElapsedMs: 272000 }),
       },
       {
         projectId: 'pms',
@@ -324,8 +335,11 @@ function makeRunSnapshot (withHistory) {
         phaseLabel: '改代码',
         problemSummary: '列表翻页丢数据',
         canReset: false,
+        // 正在跑的票不给删 —— 删了 runOne 的 finally 会摸到一条不存在的记录。
+        canForget: false,
         cancelledByUser: false,
         deliveryIssues: [],
+        flow: makeStations({ now: 'editing', nowElapsedMs: 95000 }),
       },
     ]),
     config: {},
@@ -333,12 +347,53 @@ function makeRunSnapshot (withHistory) {
   }
 }
 
+/**
+ * 造一条 9 站的流程带，形状与宿主 `describeStations()` 一致。
+ *
+ * 面板只渲染宿主给的 `flow.stations`（不自己读 timeline）：站点成没成、花了多久
+ * 的口径只有 src 里那一份，面板重算一遍迟早分家。
+ *
+ * @param {{ failed?: string, failedElapsedMs?: number, now?: string, nowElapsedMs?: number }} spec
+ */
+function makeStations (spec) {
+  spec = spec || {}
+  const nodes = [
+    ['discover', '①'], ['locate', '②'], ['workspace', '③'], ['session', '④'], ['editing', '⑤'],
+    ['testing', '⑥'], ['mr-opening', '⑦'], ['writeback', '⑧'], ['notify', '⑨'],
+  ]
+  const active = Object.keys(spec).length > 0
+  const stations = nodes.map(([node, no]) => ({
+    no,
+    node,
+    label: node,
+    state: !active
+      ? 'unreached'
+      : (spec.failed === node ? 'failed' : (spec.now === node ? 'now' : 'ok')),
+    at: null,
+    elapsedMs: spec.failed === node ? spec.failedElapsedMs : (spec.now === node ? spec.nowElapsedMs : null),
+  }))
+  const reached = stations.filter((s) => s.state !== 'unreached')
+  return {
+    stations,
+    reachedCount: reached.length,
+    total: 9,
+    failedStation: spec.failed ? (stations.find((s) => s.node === spec.failed) || {}).no || null : null,
+    currentStation: spec.now ? (stations.find((s) => s.node === spec.now) || {}).no || null : null,
+    totalMs: 300000,
+    strip: stations.map((s) => s.no + 'x').join(' '),
+    noRecord: false,
+  }
+}
+
 function makeHost () {
   const calls = {
     mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0,
     pickDirectory: [], setProjectTable: [],
-    // 运行页签（#16）四个新方法各记一份，断言要验「点了按钮有没有真的发出去」。
-    status: 0, statusArgs: [], scan: 0, cancel: 0, reset: [],
+    // 运行页签（#16）的五个方法各记一份，断言要验「点了按钮有没有真的发出去」。
+    // reset / forget 记的是**整个实参表**（不是第一个）：浏览器侧的位置参数
+    // 个数是硬校验（`parameters.length`），少传一个就抛 `expected N argument(s)` ——
+    // 「点重跑报错」正是这么来的，所以断言必须看得见个数。
+    status: 0, statusArgs: [], scan: 0, cancel: 0, reset: [], forget: [],
   }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
@@ -391,7 +446,7 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到九个描述符', contribution.descriptors.length === 9, String(contribution.descriptors.length))
+      check('$mount 收到十个描述符', contribution.descriptors.length === 10, String(contribution.descriptors.length))
       check('第三个描述符是 projects',
         contribution.descriptors.some((item) => item.method === 'projects' &&
           item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
@@ -475,9 +530,14 @@ function makeHost () {
           calls.cancel += 1
           return { ok: true, value: { cancelled: true, text: '已让当前这张票停下。' } }
         },
-        reset: async (recordId) => {
-          calls.reset.push(recordId)
+        reset: async function (recordId, projectId) {
+          // 记整个实参表：位置参数个数是浏览器侧的硬校验，断言要看得到。
+          calls.reset.push([recordId, projectId])
           return { ok: true, value: { reset: true, reason: 'ok', recordId, projectId: 'pms', phase: 'pending', text: '已重开：下一轮轮询会把它当成一张新票重新跑。' } }
+        },
+        forget: async function (recordId, projectId) {
+          calls.forget.push([recordId, projectId])
+          return { ok: true, value: { forgotten: true, reason: 'ok', recordId, projectId: 'pms', phase: 'failed', text: '已删除本地记录。' } }
         },
       }
       namespaces.set('ticketPipeline', { service })
@@ -499,6 +559,8 @@ function makeHost () {
  * 真实浏览器里有；沙箱里给一个内存版，顺便让断言能看到「有没有真的写进去」。
  */
 let STORAGE = null
+/** 「删除记录」的二次确认弹窗：记下每次的文案，断言要验它说清楚了什么。 */
+let CONFIRMS = []
 
 function makeStorage () {
   const data = Object.create(null)
@@ -515,10 +577,18 @@ async function loadBundle () {
   const source = await readFile(join(root, 'lib/client.js'), 'utf8')
   let registered
   STORAGE = makeStorage()
+  CONFIRMS = []
   const context = {
     window: {
       __ModuleLoader__: {
         load (registration) { registered = registration },
+      },
+      // 「删除记录」要二次确认。沙箱里给一个会自动点「确定」的 confirm，
+      // 并把弹出来的话记下来 —— 那段话是本功能最要紧的部分
+      // （说清楚删的是什么、不删什么），只靠人眼验收等于没验。
+      confirm (message) {
+        CONFIRMS.push(String(message))
+        return true
       },
     },
     document: {
@@ -824,8 +894,14 @@ async function main () {
     rerunAfter.props.onClick()
     await new Promise((resolve) => setTimeout(resolve, 0))
     tree = await render(Panel, { view: 'page' })
-    check('点「重跑」调的是宿主 reset(recordId)，只传一个参数',
-      ctx.calls.reset.length === 1 && ctx.calls.reset[0] === 'recFailed001',
+    // **必须传满位置实参**：浏览器侧 `prepareInvocation` 按 `parameters.length`
+    // 校验个数，`acceptsUndefined` 只在宿主侧生效。曾经这里只传 recordId 一个，
+    // 于是每次点「重跑」都抛 `client api: …/reset expected 2 argument(s), got 1`。
+    check('点「重跑」调的是宿主 reset(recordId, projectId)，两个位置实参都传满',
+      ctx.calls.reset.length === 1 &&
+        Array.isArray(ctx.calls.reset[0]) &&
+        ctx.calls.reset[0].length === 2 &&
+        ctx.calls.reset[0][0] === 'recFailed001',
       JSON.stringify(ctx.calls.reset))
   }
 
@@ -864,6 +940,51 @@ async function main () {
         JSON.stringify(ctx.calls.statusArgs))
     }
   }
+
+  // ── 「删除记录」（2026-11-11 补）──────────────────────────────
+  // 用户原话：「也删除不了」。票据只增不删，历史票以前在界面上没有任何清理入口。
+  const forgetButtons = findAll(tree, (node) => node.type === 'button' && textOf(node).indexOf('删除记录') >= 0)
+  check('canForget 的票行尾有「删除记录」按钮', forgetButtons.length >= 1, String(forgetButtons.length))
+  // 夹具里只有 recFailed001 的 canForget=true，recRunning001 是 false：
+  // 按钮个数必须等于 canForget 的票数，多出来那个就是「正在跑的票也被允许删了」。
+  check('「删除记录」只挂在 canForget 的票上（正在跑的那张没有）',
+    forgetButtons.length === 1, String(forgetButtons.length))
+
+  if (forgetButtons.length > 0) {
+    // 点下去先弹二次确认：那段话必须说清「只删本地记录」。
+    forgetButtons[0].props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('点「删除记录」会先弹二次确认', CONFIRMS.length === 1, JSON.stringify(CONFIRMS))
+    check('确认框里写清只删本地记录、不碰工单表与代码',
+      CONFIRMS.length === 1 &&
+        CONFIRMS[0].indexOf('本地') >= 0 &&
+        CONFIRMS[0].indexOf('工单表') >= 0 &&
+        CONFIRMS[0].indexOf('不会把它重新收进来') >= 0,
+      CONFIRMS[0] || '（没有弹）')
+    check('确认后调的是宿主 forget(recordId, projectId)，两个位置实参都传满',
+      ctx.calls.forget.length === 1 &&
+        Array.isArray(ctx.calls.forget[0]) &&
+        ctx.calls.forget[0].length === 2 &&
+        ctx.calls.forget[0][0] === 'recFailed001',
+      JSON.stringify(ctx.calls.forget))
+  }
+
+  // ── 分组 + 流程带（2026-11-11 补）─────────────────────────────
+  // 用户原话：「优化一下显示历史的 ui 和展现方式」——勾上历史后几十张票平铺，
+  // 「要我动手的」被埋在「早验收完的」里。
+  check('票列表按档位分组（需要你处理 / 正在跑 …）',
+    textOf(tree).indexOf('需要你处理 1') >= 0 && textOf(tree).indexOf('正在跑 1') >= 0,
+    textOf(tree).slice(0, 600))
+  check('每票第二行是 9 站流程带（①…⑨）',
+    textOf(tree).indexOf('①') >= 0 && textOf(tree).indexOf('⑨') >= 0,
+    textOf(tree).slice(0, 600))
+  check('失败票那一站的符号是 ✗（不是和成功一样的 ✓）',
+    textOf(tree).indexOf('⑤✗') >= 0,
+    textOf(tree).slice(0, 600))
+  check('正在跑的那张标 ▶（与「已经做成」区分开）',
+    textOf(tree).indexOf('⑤▶') >= 0,
+    textOf(tree).slice(0, 600))
 
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)
   check('工具条上的「放弃改动」在', findButton(tree, '放弃改动') !== undefined)

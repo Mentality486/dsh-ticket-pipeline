@@ -21,6 +21,8 @@ import { foundAtSortKey, summarize, ticketKey } from '../core/store.js'
 // 运行页签（#16）要按它决定给不给按钮，所以这里把它转成一个布尔随票下发 ——
 // 浏览器 bundle 里 import 不到 src 里的常量，面板自己再抄一份判定就会两边不一致。
 import { RESETTABLE_PHASES } from './pipeline-reset.js'
+// 同理：「能不能删记录」的口径只在 pipeline-forget.js 里定（FORGETTABLE_PHASES）。
+import { canForget } from './pipeline-forget.js'
 
 // 9 个主站的编号。补充站的 no 是 '·'，不参与「第 N 站」的说法。
 const MAIN_STATION_NO = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨']
@@ -1225,6 +1227,9 @@ export async function collectStatus (options, args) {
         // 能不能用 pipeline_reset 重开（#16）：口径来自 RESETTABLE_PHASES，
         // 面板只读这个布尔，不自己判断 phase 名单（名单在 src 里，浏览器取不到）。
         canReset: RESETTABLE_PHASES.includes(row.phase),
+        // 能不能用 pipeline_forget 删掉本地记录（2026-11-11 补）：票据只增不删，
+        // 历史票得能清。同样只把布尔下发，名单留在 src 里 —— 见 FORGETTABLE_PHASES。
+        canForget: canForget(row.phase),
         problemSummary: row.problemSummary,
         module: row.module,
         priority: row.priority,
