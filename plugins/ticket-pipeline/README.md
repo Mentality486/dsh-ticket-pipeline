@@ -16,7 +16,7 @@
                               │
                               ├──WorkExecutor──▶ 在工作区检出里改码 + 构建/测试 + 本地提交（可选：隔离 worktree、draft MR）
                               │
-                              └──PushAdapter──▶ 通知（qqmail 直发 SMTP / pushplus 中继微信，channel=clawbot）
+                              └──PushAdapter──▶ 通知（feishu 用你自己的飞书应用直发 / qqmail 直发 SMTP / pushplus 中继微信）
 ```
 
 ## 目录
@@ -34,7 +34,8 @@ src/
     executor-agent/  真执行器：拍基线 → 起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交 → 保留会话 → 可选：开 draft MR
     gitlab-client/   GitLab REST 客户端（分支/提交/MR/错误分类）；只在 repo.gitlab.enabled=true 时被调用
     push-mock/       假通知（记内存）
-    push-pushplus/   PushPlus 真实现
+    push-feishu/     飞书直发真实现（im/v1/messages，复用读表那对凭据，不经过第三方）
+    push-pushplus/   PushPlus 真实现（中继微信 ClawBot；需实名认证）
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
   tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_doctor
                      （每个都导出一个 collect* 纯「算结果」函数，Remote 那边调同一个）
@@ -46,7 +47,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 ```
 
 `TicketSource` 注册表键：`mock` / `feishu` / `wps`（`webform` 已移除，实现留档在
-`scripts/fixtures/source-webform/`）。`WorkExecutor`：`mock` / `agent`。`PushAdapter`：`mock` / `pushplus` / `qqmail`。
+`scripts/fixtures/source-webform/`）。`WorkExecutor`：`mock` / `agent`。`PushAdapter`：`mock` / `feishu` / `qqmail` / `pushplus`。
 换平台 = 在 `src/adapters/<name>/` 写一个实现 + 在 `src/index.js` 的表里加一行，**内核一行都不用改**。
 
 ## Remote 方法与设置页
@@ -163,7 +164,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**498 项断言，全绿 exit 0**，共 **31 个小节**（编号到 18，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**508 项断言，全绿 exit 0**，共 **31 个小节**（编号到 18，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 

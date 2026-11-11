@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-11 深夜，**内容块的字段名是宿主的契约** —— 第一张真实工单 `sh-row-81` 带截图，在 ⑤ 站崩 `Cannot read properties of undefined (reading 'attachmentId')`：`renderTicketContent` 把图片引用放在自己起的 `image` 字段上，而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是 `{ type: 'image', attachment: ImageAttachmentRef }`，所有读图代码都写 `block.attachment.attachmentId`。更要记的是**自测把错误形状抄了进去** —— `dev-run` 与 `chain-smoke` 的断言照着实现写 `.image`，两边自洽所以 498 条全绿，契约方从没被引用过。见 §12.16。此前最近一轮是**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是电子表格）、却还留着上一轮多维表格的 `tableId`；旧版 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 降级路被堵死，一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken`，而体检说「能读」—— 同一个毛病体检全绿、真正跑票失败，界面上还一片安静。修法两层：运行期配了 `tableId` 也先验一次 `tables`、配置期 `tableId`+`sheetId` 并存就警告。见 §12.15。上一轮是**面板两条写入通道不能串成一个总闸** —— 「凭据」页签填了 token 点保存什么都没发生：`onSave()` 先算配置改动，为空就 `return`，写凭据那段在这行 `return` 之后，于是只填凭据时一个字节都没写进去，面板还回一句「没有需要保存的改动」，而页签计数又把 `credDirty` 算进去了 —— 能点、会涨、点了没用。现在凭据写入移到提前返回之前，两条通道互不阻塞，见 §12.14。上一轮 2026-11-10 深夜是**体检与适配器认同一套输入形态与状态值口径** —— 用户报「用电子表格链接体检不通过、取不到工单」，查下去是两个独立毛病：体检探针按「`appToken` 非空」就认定多维表格（面板贴 `/wiki/<token>` 时写进 `appToken` 的正是裸 wiki token，背后可能是电子表格）→ 飞书回 `1254003` 报红，而适配器本体一直是好的；真正「一张票都收不到」的是**状态值对不上**（缺省只认「处理中」，这张表实际填「是 / 否」，实测 `['处理中']` 收 0 张、`['是']` 收 73 张）。体检现在会采样状态列实际取值并给出修法，只进提醒不进阻断，见 §12.13。同日上一轮，**定位工单表只剩一个入口** —— 项目卡片上的「工单表」组 / 「飞书电子表格」组 / 「工单表链接」行三处都能指定同一件事，填了也不知道哪个生效；现在只留「工单表链接」，`extractSheetToken` 认 `/wiki/<token>` 并补齐错误码 `1254003`，`validateProject` 放宽成「至少一个定位依据」，见 §12.10「一个入口」小节。上一轮 2026-11-10 是 **22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；再上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-11 深夜（二），**进步信号要选你真的关心的那个量** —— 第一张真实工单 `sh-row-81` 在 ⑤ 站跑了 39 分钟、63 次工具调用、读了 23 个文件（平均每个读 2 次），**改过的文件 0 个**，最后整票硬超时失败。两个独立的病：任务书 `## 代码定位` 只说「先读仓库结构」而没说读到什么时候该动手；执行器「等 agent 干完」只有一句 `await waitForAgentIdle(...)`，且它判进展用的是 `session.seq`（读文件也会涨）—— 卡在读文件和飞快改代码在它眼里一样。修法：任务书加 `## 工作方式`（探索预算 **12 次**、先动手再补细节、同一类信息只查一次、卡住就停）；`waitForAgentIdle` 加停滞看门狗（`BUILTIN_LIMITS.agentStallWarnMinutes = 8`、`agentStallNudges = 2`），**进步信号换成工作区文件指纹**，催而不杀。同一轮把通知从 PushPlus（ClawBot 要实名付费、回 `905`）换成**飞书自建应用直发**（`push-feishu` 适配器，`im/v1/messages`，真机实发成功 `om_x100b600a…`），见 §12.17 与 §12.18。上一轮是**内容块的字段名是宿主的契约** —— `sh-row-81` 带截图，在 ⑤ 站崩 `Cannot read properties of undefined (reading 'attachmentId')`：`renderTicketContent` 把图片引用放在自己起的 `image` 字段上，而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是 `{ type: 'image', attachment: ImageAttachmentRef }`，所有读图代码都写 `block.attachment.attachmentId`。更要记的是**自测把错误形状抄了进去** —— `dev-run` 与 `chain-smoke` 的断言照着实现写 `.image`，两边自洽所以 498 条全绿，契约方从没被引用过。见 §12.16。再上一轮是**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是电子表格）、却还留着上一轮多维表格的 `tableId`；旧版 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 降级路被堵死，一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken`，而体检说「能读」—— 同一个毛病体检全绿、真正跑票失败，界面上还一片安静。修法两层：运行期配了 `tableId` 也先验一次 `tables`、配置期 `tableId`+`sheetId` 并存就警告。见 §12.15。上一轮是**面板两条写入通道不能串成一个总闸** —— 「凭据」页签填了 token 点保存什么都没发生：`onSave()` 先算配置改动，为空就 `return`，写凭据那段在这行 `return` 之后，于是只填凭据时一个字节都没写进去，面板还回一句「没有需要保存的改动」，而页签计数又把 `credDirty` 算进去了 —— 能点、会涨、点了没用。现在凭据写入移到提前返回之前，两条通道互不阻塞，见 §12.14。更早 2026-11-10 深夜是**体检与适配器认同一套输入形态与状态值口径** —— 用户报「用电子表格链接体检不通过、取不到工单」，查下去是两个独立毛病：体检探针按「`appToken` 非空」就认定多维表格（面板贴 `/wiki/<token>` 时写进 `appToken` 的正是裸 wiki token，背后可能是电子表格）→ 飞书回 `1254003` 报红，而适配器本体一直是好的；真正「一张票都收不到」的是**状态值对不上**（缺省只认「处理中」，这张表实际填「是 / 否」，实测 `['处理中']` 收 0 张、`['是']` 收 73 张）。体检现在会采样状态列实际取值并给出修法，只进提醒不进阻断，见 §12.13。同日上一轮，**定位工单表只剩一个入口** —— 项目卡片上的「工单表」组 / 「飞书电子表格」组 / 「工单表链接」行三处都能指定同一件事，填了也不知道哪个生效；现在只留「工单表链接」，`extractSheetToken` 认 `/wiki/<token>` 并补齐错误码 `1254003`，`validateProject` 放宽成「至少一个定位依据」，见 §12.10「一个入口」小节。更早 2026-11-10 是 **22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；再往前 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -27,6 +27,8 @@
     - [12.14 面板的两条写入通道：凭据与配置不能串成一个总闸](#1214-面板的两条写入通道凭据与配置不能串成一个总闸)
     - [12.15 定位捷径不能跳过「这 token 到底是哪种表」](#1215-定位捷径不能跳过这-token-到底是哪种表)
 - [12.16 内容块的字段名是宿主的契约，不是我们随口起的](#1216-内容块的字段名是宿主的契约不是我们随口起的)
+    - [12.17 进步信号要选你真的关心的那个量](#1217-进步信号要选你真的关心的那个量执行器停滞看门狗)
+    - [12.18 通知适配器可插拔，优先用「已经有凭据」的那条通道](#1218-通知适配器可插拔优先用已经有凭据的那条通道)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -2345,6 +2347,124 @@ assert.equal(imageBlocks[0].image, undefined, '不能把引用放在 `image` 字
 原样交给 `createUserMessage({ content })`，不改形状。其余适配器（`executor-mock`、
 `push-*`）不碰内容块。所以修一处即可，不存在第二份实现。
 
+
+### 12.17 进步信号要选你真的关心的那个量（执行器停滞看门狗）
+
+2026-11-11 `sh-row-81` 超时失败。`pipeline_status` 只给了「⑤ 站 38 分 53 秒」这一个数字，
+把 agent 的会话日志解出来才看清实际形状：
+
+| 指标 | 实测值 |
+| --- | --- |
+| 会话跨度 | 2 422 秒 |
+| 工具调用次数 | 63（全部是 `run_code`） |
+| 涉及文件 | 23 个，平均每个被读 **2.0** 次 |
+| 单次调用最长间隔 | 119 / 103 / 102 / 82 / 77 / 72 / 69 / 66 秒 |
+| **写/改过的文件** | **0 个** |
+
+39 分钟里它一次都没改代码，全在读和搜。而 `waitForAgentIdle` 那 39 分钟完全满意：
+`session.seq` 一直在涨（每次读文件都涨），在它眼里这就是「持续进展」。
+
+**教训是：`session.seq` 是「这个 agent 还活着」的信号，不是「它在推进这件事」的信号。**
+两者在一个只会读不会写的循环里完全脱钩。要判有没有进展，只能看**这件事的产出物**变了没有 ——
+这里就是工作区里的文件。
+
+#### 实现
+
+`plugins/ticket-pipeline/src/adapters/executor-agent/index.js` 的 `waitForAgentIdle` 新增
+`options.worktreeSnapshot`（缺省不启用，自测传桩），每轮循环开头调 `checkStall()`：
+
+```js
+const fingerprint = await options.worktreeSnapshot()      // git status --porcelain -z 的 stdout
+if (fingerprint !== lastFingerprint) {
+  lastFingerprint = fingerprint
+  lastProgressAt = now()
+  nudges = 0                                             // 有新改动就把额度还回去
+} else if (nudges < maxNudges) {
+  nudges += 1
+  await options.onStall?.({ minutes, nudgeCount: nudges })
+  agent.followup(makeNudgeMessage(minutes))              // 催，但不中止
+}
+```
+
+配套的两个常量放在 `src/core/config.js` 的 `BUILTIN_LIMITS`：
+
+| 键 | 值 | 为什么是这个值 |
+| --- | --- | --- |
+| `agentStallWarnMinutes` | `8` | 必须远小于整票硬超时（`ticketTimeoutMinutes` 缺省 40 分钟），否则轮到它的时候票已经死了 |
+| `agentStallNudges` | `2` | 催一次 = 一轮完整往返（可能好几分钟）；无限催会把「卡住」变成「烧钱」。催了不杀 —— 杀一张票等于整张重跑 |
+
+催话术（`createNudgeMessage`）刻意**不提「你花太久了」**：模型被指责会先解释自己为什么慢，
+白烧一轮。只说「已经 N 分钟没有任何文件改动了」「挑最有把握的那一处，直接改」
+「确实定位不到就停下来，这会被当成需要人补信息，比拖到整票超时好」。
+
+#### 一个实现上的坑（自测抓出来的）
+
+`checkStall()` 第一版放进了这个分支里：
+
+```js
+if (agent.status !== 'idle' || seq !== idleSeq) continue   // ← 错在这里
+```
+
+它永远进不去 —— `await agent.whenIdle()` 本身就阻塞到空闲，循环体能执行一次就说明它刚做完一批
+工具调用。放到 `await agent.whenIdle()` 之后、`seq` 判断之前才对。
+
+#### 判据
+
+1. **判「是否在进展」的，必须是这件事的产出物，不是活动量。** CPU、token、工具调用次数、
+   `seq` 都是活动量。
+2. **看门狗只在「能叫醒它」的时候有用。** 只记日志不干预等于没装；但干预也不能是中止 ——
+   中止的代价是整张票重跑，通常大于再等 8 分钟。
+3. **阈值要跟兜底机制比，不能跟「感觉」比。** 8 分钟看门狗 + 2 次催促，必须能在 40 分钟硬超时
+   之内跑完它的全部动作，否则永远不触发。
+
+### 12.18 通知适配器可插拔，优先用「已经有凭据」的那条通道
+
+第三方通知服务有个隐形成本：**它自己的准入条件**。PushPlus 的 ClawBot 渠道要求实名认证，
+未实名账户每个渠道额度都是 0，接口回 `905 account not real-name authenticated` ——
+这个错在插件侧看起来像「配置错了」，实际是「你得去别的地方办个手续，且要付费」。
+
+而同一个插件手里已经有飞书应用凭据（读工单表本来就要）。飞书自建应用自带机器人能力，
+`POST /open-apis/im/v1/messages?receive_id_type=<type>` 就能发：
+
+```
+{ receive_id: 'ou_…', msg_type: 'text', content: JSON.stringify({ text }) }
+```
+
+`content` **必须是字符串化的 JSON**（传对象会被接口拒），这是这个接口最容易踩的一处。
+真机实测（2026-11-11）：`http=200 code=0 message_id = om_x100b600a00e0c138b085f97545dd125`。
+
+#### `230013` 不是「没有发消息权限」
+
+第一次试发时收到 `230013 Bot has NO availability to this user`。这句话很容易被读成
+「缺 `im:message:send_as_bot` scope」，但它跟缺 scope 是两回事：
+
+| 错误码 | 含义 | 修法 |
+| --- | --- | --- |
+| `99991672` | 缺 scope（响应 `error.message` 会**点名**缺哪个） | 开放平台「权限管理」加 scope 并**创建版本发布** |
+| `230013` | 机器人**「可用范围」**里没有这个收件人 | 开放平台「应用功能 → 机器人」设可用范围，或把机器人拉进群用 `chat_id` |
+
+所以 `mapSendErrorKind` 把 `230013` 归成 `invalid-input` 而不是 `auth` —— 它是「收件人不对」，
+不是「凭据不对」，归成 `auth` 会让人去重填 App Secret。
+
+#### 适配器的注册形状
+
+`src/contracts/push-adapter.js` 的契约是 `{ id, send(msg, signal) → PushReceipt }`，
+`src/index.js` 的 `PUSHES` 注册表一行一个工厂。加一条通道 = 加一个目录 + `PUSHES` 一行 +
+`config.pushAdapter` 的 enum 加一个值 + `CONFIG_GROUPS` 对齐（`assertGroupCoverage()` 会当场报错，
+漏不掉）。当前四条：`mock` / `feishu` / `qqmail` / `pushplus`。
+
+**注意 `accepted` 的语义**：它只代表服务端受理，不代表送达。飞书的 `message_id`、
+PushPlus 的 `sendStatus`（0 未发 / 1 发送中 / 2 成功 / 3 失败）都只是受理侧的回执，
+真正的送达要有回执通道，目前没有 —— 文档里必须说清这一点，别让人以为「accepted 就是收到了」。
+
+#### 判据
+
+1. **引入一个第三方之前，先问「我手里已有的凭据能不能干这件事」。** 多一个依赖就多一套
+   准入条件、一套额度、一个可能收费的环节。
+2. **报错文案要区分「谁的错」。** 「你配置错了」和「对方账号没办手续」对使用者是完全不同的
+   两条行动，归错类会让人白折腾。
+3. **受理 ≠ 送达，在任何通知适配器里都要写进契约注释。** 否则下游会拿 `accepted: true`
+   当「用户已经知道了」。
 
 ## 13. 事实来源
 

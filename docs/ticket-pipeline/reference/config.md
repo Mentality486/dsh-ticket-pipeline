@@ -7,7 +7,7 @@
 >
 > | 数字 | 指什么 | 来源 |
 > |---|---|---|
-> | **25 个键 / 4 个分组** | 顶层配置项（不含 `projects` 数组内部） | `src/core/config.js` 的 `CONFIG_FIELDS` / `CONFIG_GROUPS` |
+> | **27 个键 / 4 个分组** | 顶层配置项（不含 `projects` 数组内部） | `src/core/config.js` 的 `CONFIG_FIELDS` / `CONFIG_GROUPS` |
 > | **34 个字段** | 一个 `projects[]` 元素里可写的深层路径 | `listProjectDescriptorPaths()` |
 > | **30 个字段** | 设置面板「项目」页里画出来的控件数（34 里 `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框：定位工单表只走卡片头上的「工单表链接」） | `src/remote/host.js` 的 `describeProject()` |
 >
@@ -15,7 +15,7 @@
 
 ---
 
-## 1. 顶层键（25 个，4 个分组）
+## 1. 顶层键（27 个，4 个分组）
 
 ### 1.1 行为（10 个）
 
@@ -44,8 +44,10 @@
 
 | 键 | 类型 | 默认值 | 能填什么 / 什么时候需要动 |
 |---|---|---|---|
-| `pushAdapter` | string | `"mock"` | `mock`（不发真消息）/ `pushplus`（中继微信，token 走凭据 `PUSHPLUS_TOKEN`）/ `qqmail`（直发 SMTP，授权码走凭据 `QQMAIL_AUTH_CODE`）。写错直接报错 |
+| `pushAdapter` | string | `"mock"` | `mock`（不发真消息）/ **`feishu`（用你自己的飞书应用直发 IM，不经过第三方，推荐）** / `qqmail`（直发 SMTP，授权码走凭据 `QQMAIL_AUTH_CODE`）/ `pushplus`（中继微信，token 走凭据 `PUSHPLUS_TOKEN`，**需实名认证**）。写错直接报错 |
 | `notifyOn` | string-array | `["done","skipped","failed","needs-info"]` | 哪些终态发通知 |
+| `feishuPush.receiveId` | string | `""`（空） | `pushAdapter: feishu` 时的收件人。`open_id` 形如 `ou_…`；用 `open_id` 类型时**必须**先把这个人在开放平台「应用功能 → 机器人」的可用范围里加上，否则接口回 `230013`（那不是缺 scope） |
+| `feishuPush.receiveIdType` | string | `"open_id"` | `open_id` / `email` / `chat_id`。`email` 需要 `contact:user.id:readonly`（否则 `99991672`）；群发用 `chat_id`（先把机器人拉进群） |
 | `pushplus.channel` | string | `"clawbot"` | PushPlus 推送渠道，ClawBot 用 `clawbot` |
 | `pushplus.callbackUrl` | string | `""`（空） | 送达回执地址（可选）。PushPlus 把 `sendStatus` 回吐到这里；HTTP 200 只代表受理，不代表送达 |
 | `qqmail.host` | string | `"smtp.qq.com"` | SMTP 主机。企业邮箱换成自己的 |
@@ -74,6 +76,11 @@
 
 已**删除**的键：`pushplus.token`（改走凭据 `PUSHPLUS_TOKEN`）、`pushplus.template`（恒 `txt`）、
 `qqmail.port` + `qqmail.secure`（合成 `qqmail.encryption`）、`logLevel`（从来没被消费过）。
+
+> `pushAdapter: feishu` 复用读工单表那对凭据（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`），**不需要额外凭据**，
+> 也不经过任何第三方服务。代价是「机器人可用范围」得在开放平台里配一次（`230013` 就是没配它）。
+> 若那两个凭据还没填，适配器仍能装上（构造不抛），第一次真发时才报 `invalid-input` 并点名收件人 ——
+> 装插件时配置常为空，在构造期抛会让整个插件挂载失败。
 
 ---
 

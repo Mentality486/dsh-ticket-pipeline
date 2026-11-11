@@ -1,8 +1,23 @@
 # 工单流水线插件 · 功能清单与完成度
 
 > 生成日期：2026-11-05
-> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「带截图的票崩在 ⑤ 站」的代码与本文同一次提交，上一轮已提交代码为 `237bf0a`（贴链接时成对清 `tableId`）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-11 深夜，**带截图的工单在 ⑤ 站崩** —— pms 第一张真实工单 `sh-row-81`
+> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「40 分钟改一个小功能 + 通知换掉付费第三方」的代码与本文同一次提交，上一轮已提交代码为 `fdf8895`（图片块字段名改成 `attachment`）；插件目录 `plugins/ticket-pipeline`
+> 最近一次更新：2026-11-11 深夜（二），**一张改小功能的票跑了 40 分钟、写了 0 个文件** ——
+> `sh-row-81` 在 ⑤ 站整票硬超时失败。解会话日志才看清：39 分钟、63 次工具调用、
+> 读了 23 个文件（平均每个读 2 次）、**写/改过的文件 0 个**，而 `session.seq` 全程都在涨。
+> 两个独立的病：① 任务书 `## 代码定位` 只说「先读仓库结构」，**没说读到什么时候该动手**；
+> ② 执行器「4. 等 agent 干完」只有一句 `await waitForAgentIdle(...)`，全文件
+> `grep setTimeout|setInterval|progress|stall` 零命中 —— 卡在读文件和飞快改代码在它眼里一样。
+> 修法：任务书加 `## 工作方式`（探索预算 **12 次**、先动手再补细节、同一类信息只查一次、
+> 卡住就停）；`waitForAgentIdle` 加停滞看门狗，**进步信号只认工作区文件**
+> （`git status --porcelain` 指纹）**不认 `session.seq`**，超 8 分钟没变就记时间线 + 催一句
+> （最多 2 次，催了不杀，交给硬超时兜底）。同时把通知换成**飞书自建应用直发**
+> （`push-feishu` 适配器）：PushPlus 的 ClawBot 要实名付费、回 `905`，而应用本来就带 IM 能力，
+> `im/v1/messages` 真机已实发成功（`om_x100b600a…`），不经过任何第三方；
+> `230013` 是「机器人可用范围里没这个人」，不是缺 scope。
+> 基线：`dev-run` **504 → 508/508**、`chain-smoke` **11/11**、`client-smoke` **219**、`feishu-checks` **97**。
+> 见 §1.32 与 §1.33。
+> 同日上一轮，**带截图的工单在 ⑤ 站崩** —— pms 第一张真实工单 `sh-row-81`
 > 带着一张附件截图，跑到 ⑤ 站直接失败：
 > `Cannot read properties of undefined (reading 'attachmentId')`。
 > 同批没截图的票一切正常，这正是它藏得久的原因。根因：内核 `src/core/prompt.js` 的 `renderTicketContent`
@@ -1547,18 +1562,197 @@ for (const block of images) assert.ok(block.image)   // chain-smoke
 4. **崩在别人代码里的堆栈，第一时间找「我们交给它什么」。** 报错在宿主的 `attachmentId`，
    根因在我们的块结构；堆栈里没有我们的文件名，不代表不是我们的事。
 
+### 1.32 40 分钟改一个小功能：任务书没给边界，执行器也没在看（2026-11-11 真实事故）
+
+#### 现场
+
+用户 `sh-row-81` 跑到 ⑤ 站后，整票在 **40 分钟硬超时**被判失败，回填与通知都没做成。
+票上留的原因只有一句「超时」，看不出它这 40 分钟在干什么。
+
+解 agent 的会话日志（`.scratch/_sessstats.cjs` 统计调用分布与间隔，`.scratch/_readpattern.cjs`
+统计每文件读/搜/写次数）得到的事实：
+
+| 指标 | 数值 |
+|---|---|
+| 会话跨度 | 2422 秒（约 40 分钟） |
+| 工具调用 | 63 次（全部是 `run_code`） |
+| 涉及文件 | 23 个，**平均每个文件被读 2.0 次** |
+| 单次调用间隔最长 | 119 / 103 / 102 / 82 / 77 秒 |
+| **写/改过的文件** | **0 个** |
+
+它是真的在干活 —— 一直在读，一直在搜，`session.seq` 全程都在涨。**它就是一次代码都没改。**
+
+#### 两个独立的病
+
+**病一：任务书没有边界。** `src/core/prompt.js` 的 `## 代码定位` 那节只说「先读仓库结构，
+自己判断工单说的是哪个页面/接口」，**没说读到什么时候该动手**。于是它可以无限读下去，
+每读一轮就是一次完整的模型往返 —— 39 分钟里 63 次调用，平均 38 秒一次。
+
+**病二：执行器在盲等。** `src/adapters/executor-agent/index.js` 的「4. 等 agent 干完」
+只有一句 `await waitForAgentIdle(agent, signal, cancelAgent)`，一次性放行到结束，
+中间没有任何干预点。全文件 `grep setTimeout|setInterval|progress|stall|elapsed` 零命中
+—— 它没有任何停滞检测。于是「卡在读文件上」和「正在飞快改代码」在它眼里一模一样。
+
+#### 修法
+
+**(a) 任务书给探索预算**（`src/core/prompt.js` 新增 `## 工作方式` 一节，五条）：
+
+- 先动手，再补细节：读到能说出「要改哪个文件的哪一段」就开始改第一版。
+- **探索预算：读文件/搜索合计不要超过 12 次。** 超过还没定位到，就按目前最好的判断改，
+  然后在说明里写清「还有哪几处没确认」。
+- 同一类信息只查一次：读过的文件别重复读同一区段，定位到的符号别再全局搜一遍。
+- 不要为了确认而确认：编译/测试会告诉你对不对，先改一版跑一次。
+- 卡住就停：12 次之内既定位不到也说不清该改什么，就停下来说清查了什么、卡在哪
+  —— 这会被当成「需要人补信息」，比超时好。
+
+**(b) 执行器加停滞看门狗**（`waitForAgentIdle` 新增第 4 个 `options` 参数）：
+
+关键设计决定：**进步信号只能看文件，不能看 `session.seq`。** 事故里 seq 全程都在动，
+按 seq 判是「一直在进展」，按文件判是「一步没走」。所以：
+
+- 每醒来一次跑一次 `git status --porcelain` 当工作区指纹（`PORCELAIN_STATUS_ARGS`
+  已在 `assertAllowedGit` 白名单里，不产生任何副作用、不碰索引）。
+- 指纹超过 `agentStallWarnMinutes`（缺省 **8 分钟**，见 `BUILTIN_LIMITS`）没变
+  → `onPhase('editing', ...)` 记一条时间线（否则人不知道为什么突然催它）+ 催一句。
+- 最多催 `agentStallNudges`（缺省 **2**）次。**催了不杀**：催一次成本一轮往返，
+  杀一张票成本整张重跑；催了还不动说明不是「忘了动手」而是模型/工具坏了，交给硬超时兜底。
+- 文件一有变化就把计时归零、催的次数也归零 —— 「在改」不能被当成「卡住」。
+
+**停滞判定放在每轮循环开头，而不是「不空闲」那个分支里。** 这是自测抓出来的：
+`await agent.whenIdle()` 本来就会阻塞到 agent 空闲，循环体每执行一次就代表它刚做完
+一批工具调用 —— 那是唯一能观察到它的地方。放进「不空闲」分支等于把观察点放到一个
+实际进不去的分支里（测试里 `snapshots.length` 一直是 0 就是证据）。
+
+**催的话术不提「你花太久了」**：模型会解释自己为什么慢，白烧一轮。直接给最小可执行动作
+（「挑最有把握的那一处，直接改」）+ 一个出口（「一处都定位不到就停下来说清查了什么」）。
+
+**(c) 免费通知**：见 §1.33。三件事同一次提交，因为都是这张超时票逼出来的。
+
+#### 自测
+
+`dev-run` **504 → 508**（探索预算 1 条、停滞 4 条）：
+
+- 「任务书里必须有探索预算：不许无限读下去，先改一版再补细节」—— 断言 `## 工作方式` /
+  「先动手，再补细节」/「探索预算」/「不要超过 12 次」/「同一类信息只查一次」/「卡住就停」。
+  删掉任一条都会红：这不是措辞问题，是「删了它就等着超时复发」。
+- 「停滞监控：文件一直不变时按『文件没变』判停滞，而不是按 session.seq（它一直在涨）」——
+  假 agent 让 `session.seq` 每次都变、`whenIdle` 每次推进 60 秒、快照恒定不变；
+  断言看了 ≥2 次快照、催了 1–2 次、时间线有记录、分钟数真实。**这条就是事故的复现器。**
+- 「停滞监控：文件一有变化就重新计时」—— 快照每次都不同，`onStall` 里直接抛错，
+  证明「在改」不会被判成「卡住」。
+- 「催话术说的是『现在该做什么』，不是『你花太久了』」—— 断言含「直接改」「停下来」，
+  且不含「为什么/太久/慢」。
+- 「BUILTIN_LIMITS 里有停滞阈值，且是『分钟』量级」—— 断言阈值 >0 且 <40
+  （必须小于硬超时，否则永远轮不到触发）、催的次数是 ≥1 的整数。
+
+#### 教训
+
+1. **「超时」不是原因，是结果。** 票上写「超时」时，真正的信息在会话日志里 ——
+   它花了多少秒、调了多少次、读了多少文件、写了几个文件。不量化就只能猜。
+2. **没有边界的任务书会把模型拖进无限探索。** 模型不是懒，是没有「该动手了」的信号；
+   给一个具体数字（12 次）比说「不要读太多」有用得多。
+3. **进步信号要选「真的关心」的那个量。** 我们关心的是「代码有没有动」，
+   而 `session.seq`、工具调用次数、消息条数都只是「它在忙」的代理指标 ——
+   事故里它们全都健康，只有文件数停在 0。
+4. **看门狗放在观察不到的位置等于没有。** 判定逻辑放对了、放进了进不去的分支，
+   和没写一样；只有自测能抓出这种错（真人不会盯着一个永远不打印的日志）。
+5. **催比杀便宜，但要给上限。** 催一次 = 一轮往返；重跑一张票 = 40 分钟 + 全部上下文重建。
+
+### 1.33 通知不再依赖要实名的第三方：用你自己的飞书应用直接发（2026-11-11）
+
+#### 现场
+
+`sh-row-81` 超时后，⑨ 站发通知失败：
+
+```
+pushplus：905 账户未进行实名认证
+```
+
+PushPlus 的 ClawBot 渠道要实名认证（付费）才能用；官方额度表里未实名用户每个渠道额度都是
+**0 次**。用户问得很直接：「为什么都是第三方 推荐使用第三方的吗 不能自己集成吗」。
+
+#### 结论：能自己集成，而且早就具备条件
+
+真机探针（`.scratch/_feishu-im-probe.cjs`、`_feishu-dm-probe.cjs`、`_feishu-send-probe.cjs`）：
+
+| 探测 | 结果 |
+|---|---|
+| `GET /open-apis/bot/v3/info` | `code:0`，机器人名「Mentality的工作流智能助手」⇒ **应用本来就带 IM 能力** |
+| `GET /im/v1/chats` | 0 个群 |
+| 按邮箱查 open_id（`contact/v3/users/batch_get_id`） | `99991672`，缺 `contact:user.id:readonly` |
+| `GET /contact/v3/users` | 成功，唯一用户 `ou_68380a136afe29e800b6225e25a94a6c` |
+| 发给机器人自己的 open_id | `230013 Bot has NO availability to this user` |
+| 发给上面那个用户的 open_id | **`code:0` + `message_id: om_x100b600a00e0c138b085f97545dd125`** |
+
+关键认知：`230013` **不是**「没有发消息权限」（那会回 `99991672` 并点名缺哪个 scope），
+而是**机器人的「可用范围」里没有这个人**。解法是开放平台「应用功能 → 机器人」把可用范围
+设成包含目标用户，或把机器人拉进群用 `chat_id`。
+
+#### 实现
+
+新增 `src/adapters/push-feishu/index.js`（约 400 行），与其余推送适配器同一契约
+（`{ id, send(msg, signal) → PushReceipt }`）：
+
+- `POST /open-apis/im/v1/messages?receive_id_type=<open_id|email|chat_id>`，
+  body `{ receive_id, msg_type: 'text', content: JSON.stringify({ text }) }`。
+  **`content` 必须是字符串化的 JSON**，传对象会被拒。
+- 认证接口 `POST /open-apis/auth/v3/tenant_access_token/internal` 的响应体
+  **没有 `data` 包装**，`tenant_access_token` 在顶层 —— 这里踩过一次。
+- token 进程内缓存，提前 60 秒过期（与 `source-feishu` 的单飞做法不同：推送是低频动作，
+  简单缓存够了）。
+- 复用读工单表那对应用级凭据（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`），不新增凭据项。
+- **收件人缺失时构造不抛**：装插件时配置常为空，在这里抛会让整插件挂载失败。
+  第一次真发才报 `invalid-input` 并点名 `receiveId`。
+- 错误分类：`99991663/99991664`→`auth`；`230013`→`invalid-input`（附「去设可用范围」的修法）；
+  `230001/230002`→`invalid-input`；`99991400/230020`→`rate-limit`；其余→`internal`。
+
+接线三处：`src/index.js` 的 `PUSHES` 注册表 + `pushAdapterOptions` 的 `feishu` 分支；
+`src/core/config.js` 的 `pushAdapter` enum 加 `'feishu'`，新增 `feishuPush.receiveId` 与
+`feishuPush.receiveIdType` 两个键（`notify` 组），顶层配置键 25 → **27**。
+
+真机验证（`.scratch/_push-feishu-live.mjs`）：
+`[debug] push-feishu：已受理 om_x100b600a174890a8b0f030fb0e75325`，
+回执 `{"accepted":true,"traceId":"om_x100b600a174890a8b0f030fb0e75325"}`。
+
+#### 自测（新增 5 条）
+
+- `PUSHES` 里有 `feishu`，且能造出 `id: 'feishu'` 的适配器。
+- 发的形状对：先换 token 再发消息、URL 带 `receive_id_type`、`msg_type: 'text'`、
+  **`typeof body.content === 'string'`**、`JSON.parse(content).text` 含正文。
+- `230013` 要说清人该干什么（`kind === 'invalid-input'` 且文案含「可用范围」）。
+- 没有收件人时构造不抛、真发才报 `invalid-input`。
+- 组合根能把飞书应用凭据读取器注入进去（`apply()` 不抛且注册 ≥5 个工具）。
+
+#### 注意事项
+
+`accepted: true` **只代表飞书服务端收下了请求，不代表人收到了**。这个纪律与
+PushPlus / QQ 邮箱一致：日志只记 `message_id`，不说「已送达」。
+
+#### 教训
+
+1. **「要第三方」通常是没查过自己手里已有什么。** 应用本来就有 IM 能力，
+   探一次 `/bot/v3/info` 就知道了 —— 这一条省掉一个付费依赖。
+2. **错误码要读到「它到底在拒绝什么」。** `230013` 看起来像权限问题，
+   实际是机器人可用范围；判错方向会让人去开一堆用不上的 scope。
+3. **配置项缺失不该在构造期炸。** 插件挂载失败会牵连整条流水线，
+   而「还没填收件人」是个完全正常的中间状态。
+4. **同一对应用凭据可以服务两件事**（读表 + 发消息），但权限要分开开通 ——
+   所以适配器里不假设「能读表就能发消息」。
+
+
+
 ## 2. 代码清单
 
-`src/` 共 **46 个 .js / 21 760 行**；`scripts/` 共 10 个 .mjs / **14 828 行**（`dev-run.mjs` **5 616 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
+`src/` 共 **47 个 .js / 22 311 行**；`scripts/` 共 10 个 .mjs / **15 047 行**（`dev-run.mjs` **5 835 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 649（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 5 718（13 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约）、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 9 814（15 个 .js） | 见下表 |
+| `src/core/` | 5 774（13 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**）、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 10 283（16 个 .js） | 见下表 |
 | `src/tools/` | 2 587（6 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
 | `src/remote/` | 684（2 个 .js） | `descriptors.js`（**9 个 Remote 方法**，含三个带参的 `setProjectTable(index, url)`、`status(includeDone?)` 与 `reset(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
-| 根 | 1 308（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| 根 | 1 334（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -1566,11 +1760,12 @@ for (const block of images) assert.ok(block.image)   // chain-smoke
 | `source-wps/` | 1 675 | **experimental（解析可用，取数通道未接）** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数走注入的 `fetchSheet`（**主装配不注入 ⇒ 选 wps 的项目一张票都拿不到**，工单 #20）；`recordId` 用行号 ⇒ 插行会让票换身份（已知限制）；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
 | ~~`source-webform/`~~ | ~~106~~ | **已移除（工单 #18）** | 演示用内存表单源，水位只在内存里 `memoryWatermark = new Map()`，重启就把同一批工单重收一遍。实现已移到 `plugins/ticket-pipeline/scripts/fixtures/source-webform/index.js` 留档（`scripts/` 不进安装包），`PLATFORMS` 只剩 `feishu / wps / mock`，老配置会拿到「改用 mock 或 feishu」的迁移提示 |
 | `source-mock/` | 337 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
-| `executor-agent/` | 2 524 | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
+| `executor-agent/` | 2 637（`index.js` 2 385 + `agent-failure.js` 252） | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试） |
 | `executor-mock/` | 144 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
 | `gitlab-client/` | 495 | **真实可用** | Commits API + MR API；源分支已有开放 MR 时复用而不撞 409 |
 | `push-qqmail/` | 581 | **真实可用** | 零依赖手写 SMTP（`node:net` / `node:tls` / `node:crypto`），已实发成功 |
-| `push-pushplus/` | 205 | 可用 | HTTP `pushplus.plus/send`；微信走它的 `clawbot` 渠道 |
+| `push-feishu/` | 356 | **真实可用（推荐）** | 用你自己的飞书自建应用直接发 IM 消息（`im/v1/messages`，`content` 必须字符串化 JSON），**不经过任何第三方**；与读表共用一对应用凭据；`230013` 归 `invalid-input` 并给出「去设机器人可用范围」的修法 |
+| `push-pushplus/` | 205 | 可用（需实名） | HTTP `pushplus.plus/send`；微信走它的 `clawbot` 渠道。**未实名账户每个渠道额度都是 0**，接口回 `905` |
 | `push-mock/` | 65 | 测试 | |
 | `locator-table/` | 187 | **真实可用** | 工单 projectId → 仓库/分支/remote 的查表定位器 |
 
@@ -1821,7 +2016,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **498** | 通过 498，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30）。这 498 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 97 条（见 §1.26 与 §1.23 注） |
+| `node scripts/dev-run.mjs` | **508** | 通过 508，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33）。这 508 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 97 条（见 §1.26 与 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 | `node scripts/client-smoke.mjs` | **219** | 通过 219（215 → 219：§1.29 的 4 条「只填凭据也要真的写进去」） |
 
@@ -1961,7 +2156,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **498** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **508** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 

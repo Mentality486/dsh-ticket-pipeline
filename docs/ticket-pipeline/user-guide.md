@@ -25,7 +25,7 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 
 ### 2. 填凭据
 
-设置页「凭据」页签，或 DSH 凭据存储，键名一字不差：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`（用飞书工单源时必填）；`QQMAIL_AUTH_CODE`（发 QQ 邮件时）、`PUSHPLUS_TOKEN`（走 PushPlus 时）。`GITLAB_TOKEN` **只**在项目打开远程 MR 时才要，缺省不用配。**过了没有**：该页显示「已配置」；`pipeline_doctor` 的凭据行是 ✅。
+设置页「凭据」页签，或 DSH 凭据存储，键名一字不差：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`（用飞书工单源时必填）；`QQMAIL_AUTH_CODE`（发 QQ 邮件时）、`PUSHPLUS_TOKEN`（走 PushPlus 时）。**用飞书直发通知不需要额外凭据** —— 它复用上面那对 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。`GITLAB_TOKEN` **只**在项目打开远程 MR 时才要，缺省不用配。**过了没有**：该页显示「已配置」；`pipeline_doctor` 的凭据行是 ✅。
 
 ### 3. 给飞书应用开权限、发布、加协作者
 
@@ -77,7 +77,18 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 
 **过了没有**：`pipeline_status` 里出现一张走到 `done` 的工单，表格被回填（不想让它动真表就先关掉 `writeBack`）。
 
-半程通了再切真执行：`workExecutor` → `agent`、`pushAdapter` → `qqmail`（并填 `qqmail.user` / `qqmail.to`），`enabled` 保持开。
+半程通了再切真执行：`workExecutor` → `agent`、`pushAdapter` → `feishu`（或 `qqmail` / `pushplus`），`enabled` 保持开。
+
+**通知适配器怎么选**（`pushAdapter`）：
+
+| 值 | 走哪条通道 | 要先准备什么 | 花钱吗 |
+|---|---|---|---|
+| `mock` | 什么都不发，只记日志 | 无 | 不 |
+| **`feishu`** | **你自己的飞书应用直接发 IM** | 复用 `FEISHU_APP_ID`/`SECRET`；把收件人加进机器人「可用范围」；填 `feishuPush.receiveId` | 不 |
+| `qqmail` | SMTP 直发邮件 | `QQMAIL_AUTH_CODE` + `qqmail.user`/`qqmail.to` | 不 |
+| `pushplus` | 经 PushPlus 中继到微信 ClawBot | `PUSHPLUS_TOKEN` + **实名认证** | **实名要付费** |
+
+`pushAdapter: feishu` 的 `feishuPush.receiveId` 从哪拿：让机器人**先给自己发一条**，或调 `/open-apis/contact/v3/users`（要有通讯录读权限）拿 `open_id`（形如 `ou_…`）。发不出去时看错误码：`230013` 是**机器人「可用范围」里没有这个人**（去开放平台「应用功能 → 机器人」把人加上，这不是缺权限 scope）；`99991672` 才是真缺权限，报文里会点名缺哪个。
 
 ---
 
