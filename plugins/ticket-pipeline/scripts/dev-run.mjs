@@ -5521,6 +5521,78 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(out.text, /是否处理/, '要教人去表格里拨，而不是让人以为按钮坏了')
   })
 
+  await check('remote.setProjectTable()：贴一条不带 ?table= 的链接，必须把旧的 tableId 清掉', async () => {
+    // 真实事故（2026-11-11，pms 项目）：配置里 `appToken` 是 wiki 里的电子表格、
+    // `tableId` 却还是上一轮多维表格留下的 —— 而那个 tableId 属于**另一个**多维表格
+    // App（RZZQ…），与当前这张表毫无关系。查下来根因就在这句：
+    //   if (parsed.tableId.length > 0) ops.push({ op:'set', ... })
+    // wiki 链接不带 `?table=`，这句不执行；因为**没有 else unset**，旧值就一直赖着。
+    // `sheet` 分支是三件成对的 set/unset，`else` 分支必须同样成对。
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    /** @type {Array<{ op: string, path: string[], value?: unknown }>} */
+    let written = []
+    /** @type {any} */
+    let current = {
+      projects: [{
+        name: 'pms',
+        match: {
+          platform: 'feishu',
+          appToken: 'RZZQbY4SkaY6z0shZaBcVpQCnhh',
+          tableId: 'tblWhRSGf0osJqrE',
+          viewId: 'vewsyZldQC',
+          spreadsheetToken: 'shtcnOld',
+          sheetId: '3a5d28',
+        },
+        repo: { path: 'D:/repo' },
+      }],
+    }
+    const remote = new TicketPipelineRemote({
+      getConfig: () => current,
+      doctorOptions: {},
+      // `settings.mutate` 的最小桩：只记录被人写了什么，并按 set/unset 真的改到 current 上。
+      getSettings: () => ({
+        mutate: async (_ns, ops) => {
+          written = ops
+          const target = current.projects[0].match
+          for (const op of ops) {
+            const key = op.path[op.path.length - 1]
+            if (op.op === 'set') target[key] = op.value
+            else delete target[key]
+          }
+          return { ok: true }
+        },
+      }),
+    })
+
+    // wiki 链接：knowledge base 里的表，没有 `?table=`。
+    await remote.setProjectTable(0, 'https://vcn6ijgss3oy.feishu.cn/wiki/WikcnSomeNode')
+
+    assert.ok(
+      written.some((op) => op.op === 'unset' && op.path.join('.') === 'projects.0.match.tableId'),
+      `贴 wiki 链接时必须显式 unset 旧的 tableId，实际写了 ${JSON.stringify(written)}`,
+    )
+    assert.ok(
+      written.some((op) => op.op === 'unset' && op.path.join('.') === 'projects.0.match.viewId'),
+      '旧的 viewId 同理：它属于上一张表',
+    )
+    assert.equal(current.projects[0].match.tableId, undefined, 'tableId 必须真的被清掉')
+    assert.equal(current.projects[0].match.spreadsheetToken, undefined, '换到 wiki 形态时旧的 spreadsheetToken 也要清')
+    assert.equal(
+      current.projects[0].match.appToken,
+      'WikcnSomeNode',
+      '新链接的 token 要写进 appToken（wiki 节点 token）',
+    )
+
+    // 反过来：链接里带了 `?table=`，就该写进去，且不能再 unset 掉刚写的值。
+    await remote.setProjectTable(0, 'https://x.feishu.cn/base/bascnFreshToken?table=tblFresh&view=vewFresh')
+    assert.equal(current.projects[0].match.tableId, 'tblFresh', '带 ?table= 的链接要把 tableId 写进去')
+    assert.equal(current.projects[0].match.viewId, 'vewFresh', 'viewId 同理')
+    assert.ok(
+      !written.some((op) => op.op === 'unset' && op.path.join('.').endsWith('.tableId')),
+      `写了新 tableId 就不该再 unset 掉它，实际 ${JSON.stringify(written)}`,
+    )
+  })
+
   // ── 收尾 ────────────────────────────────────────────────
   console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
   if (failed > 0) {

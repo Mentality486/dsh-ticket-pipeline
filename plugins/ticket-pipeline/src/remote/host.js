@@ -179,8 +179,20 @@ export class TicketPipelineRemote {
     } else {
       ops.push({ op: 'set', path: [...base, 'appToken'], value: parsed.appToken })
       ops.push({ op: 'unset', path: [...base, 'spreadsheetToken'] })
+      // `tableId` 必须和 `sheetId` 一样成对处理：有就 set、没有就 unset。
+      //
+      // 2026-11-11 的现场配置就是漏了这一句：`appToken` 贴的是 wiki 里的电子表格
+      // （`/wiki/It5g…?sheet=3a5d28`，不带 `?table=`），于是这条 `set tableId` 不执行；
+      // 而这里又没有 `else unset`，上一轮用多维表格时留下的 `tableId: tblWhRS…`
+      // 就一直赖着 —— 那个 tableId 属于**另一个**多维表格 App（`RZZQ…`），和当前这张表
+      // 毫无关系。结果是 `resolveTable()` 拿着一个外来的 tableId 去判定表型。
+      //
+      // 语义上也该 unset：新贴的链接没指定数据表，那么任何旧的 tableId 都属于**上一张**表，
+      // 留着只可能指错。
       if (parsed.tableId.length > 0) ops.push({ op: 'set', path: [...base, 'tableId'], value: parsed.tableId })
+      else ops.push({ op: 'unset', path: [...base, 'tableId'] })
       if (parsed.viewId.length > 0) ops.push({ op: 'set', path: [...base, 'viewId'], value: parsed.viewId })
+      else ops.push({ op: 'unset', path: [...base, 'viewId'] })
       // wiki 链接里的表可能是电子表格：`?sheet=` 就是那张工作表的 id。留着它，
       // 探测出表型之后 `resolveWorksheet` 才能挑对工作表，而不是退回「取第一张」。
       // 反过来，不带 `?sheet=` 的 wiki 链接说明它要么是多维表格、要么只有一张表 ——
