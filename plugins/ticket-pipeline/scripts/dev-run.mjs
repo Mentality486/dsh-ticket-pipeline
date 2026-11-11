@@ -2418,6 +2418,48 @@ async function main () {
     assert.ok(out.text.includes('projects 为空') === false || out.warnings.length > 0, '空项目要提醒')
   })
 
+  // 通知通道这一条曾经在自己身上踩过坑：加了 `pushAdapter: feishu` 之后，
+  // 适配器、配置 schema、PUSHES 注册表都改了，**偏偏体检里的白名单没改** ——
+  // 于是配好了的新通道被体检报成「feishu（不认识的值）」+ 阻断。
+  // 体检的目的就是把「看起来配好了其实不行」提前暴露，它自己不能成为那一个。
+  await check('pipeline_doctor 认得 pushAdapter=feishu（别把配好的通道报成不认识）', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        projects: [],
+        workExecutor: 'agent',
+        pushAdapter: 'feishu',
+        feishuPush: { receiveId: 'ou_68380a136afe29e800b6225e25a94a6c', receiveIdType: 'open_id' },
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, true, `配好的飞书直发不该被拦：${out.text}`)
+    assert.equal(out.problems.length, 0, `不该进 problems：${JSON.stringify(out.problems)}`)
+    assert.doesNotMatch(out.text, /不认识的值/, '体检自己的白名单必须跟上适配器')
+    assert.match(out.text, /飞书直发/, '要说清楚走的是飞书直发')
+    assert.match(out.text, /230013/, '要提前说清 230013 是可用范围问题，不是缺 scope')
+    assert.match(out.text, /ou_68380a136afe29e800b6225e25a94a6c/, '要把收件人印出来，方便核对')
+  })
+
+  await check('pipeline_doctor：pushAdapter=feishu 但没填收件人 → 阻断，并说清去哪儿填', async () => {
+    // 收件人没填是个完全正常的中间状态（刚切过来还没填），
+    // 但它会让「票跑完了却通知不到人」，所以必须是阻断而不是提醒。
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({ projects: [], workExecutor: 'agent', pushAdapter: 'feishu', feishuPush: { receiveId: '', receiveIdType: 'open_id' } }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false, '没填收件人必须阻断')
+    // 阻断项在 `blockers` 里，不在 `problems` 里（problems 是「能跑但结果不对」）。
+    const blocked = [...(out.blockers ?? []), ...(out.problems ?? [])]
+    assert.ok(blocked.some((p) => p.includes('feishuPush.receiveId')), `要点名缺哪个字段：${JSON.stringify(blocked)}`)
+    assert.match(out.text, /参数/, '要说清去设置页哪个地方填')
+  })
+
   // 版本检查这一节的三种结论都要能看见：一致 / 落后 / 比不出来。
   // 落后者必须同时进 warnings（人要被告知）和正文（同一份 text 给 GUI 与 agent）。
   await check('pipeline_doctor 报告插件版本落后，并给出同步命令', async () => {

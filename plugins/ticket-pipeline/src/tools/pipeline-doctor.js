@@ -321,6 +321,12 @@ if (pushAdapter === 'qqmail') {
 if (pushAdapter === 'pushplus') {
   requiredRefs.push({ ref: 'PUSHPLUS_TOKEN', blocker: true, why: 'PushPlus 推送要它' })
 }
+// 飞书直发复用读表那对应用凭据。已经因为「有飞书项目」加进去过就别重复加，
+// 否则同一行会在体检里出现两次（重复的告警会训练人忽略体检）。
+if (pushAdapter === 'feishu' && !requiredRefs.some((item) => item.ref === 'FEISHU_APP_ID')) {
+  requiredRefs.push({ ref: 'FEISHU_APP_ID', blocker: true, why: '飞书直发通知要它换 tenant_access_token' })
+  requiredRefs.push({ ref: 'FEISHU_APP_SECRET', blocker: true, why: '飞书直发通知要它换 tenant_access_token' })
+}
 // GITLAB_TOKEN 只在真开了远程出口时才需要（工单 #19）：以前这条检查无条件执行，
 // 缺省安装（99% 的人只用本地提交）每次体检都被它念一句「未配置」，纯噪音 ——
 // 而且念多了人会学会忽略体检输出。所以现在只有**至少一个项目显式打开**
@@ -377,7 +383,7 @@ if (credsUsable && credsAvailable) {
 const pushLine = typeof config.pushAdapter === 'string' ? config.pushAdapter : '(默认)'
 if (pushAdapter === 'mock') {
   warnings.push('pushAdapter=mock：通知走假推送（不会真的发邮件/微信），消息只写进插件日志。')
-  lines.push('ℹ️ 通知：mock（不会真的发；换成 qqmail / pushplus 才会真发）')
+  lines.push('ℹ️ 通知：mock（不会真的发；换成 feishu / qqmail / pushplus 才会真发）')
 } else if (pushAdapter === 'qqmail') {
   const qqmail = config.qqmail ?? {}
   const user = String(qqmail.user ?? '').trim()
@@ -393,8 +399,27 @@ if (pushAdapter === 'mock') {
   }
 } else if (pushAdapter === 'pushplus') {
   lines.push('✅ 通知：PushPlus（体检不会真发；要验就跑一张 mock 票看日志）')
+} else if (pushAdapter === 'feishu') {
+  // 飞书直发：最常踩的两个坑都不在「凭据配没配」，而在应用那边 ——
+  // ① 收件人没填；② 机器人可用范围里没这个人（发消息回 230013）。
+  // 两条都**不真发**就能判断：①看配置，②只能靠人自己去开放平台确认（查可用范围
+  // 需要通讯录权限，而缺通讯录权限正是常见状态，所以这里不硬查）。
+  const feishuPush = config.feishuPush ?? {}
+  const receiveId = String(feishuPush.receiveId ?? '').trim()
+  const receiveIdType = String(feishuPush.receiveIdType ?? 'open_id').trim() || 'open_id'
+  if (receiveId.length === 0) {
+    blockers.push('通知通道不完整：pushAdapter=feishu 但 feishuPush.receiveId（发给谁）没配 —— 票跑完了也发不出通知。去设置页「参数 → 通知」填上收件人的 open_id。')
+    lines.push('❌ 通知：飞书 缺 feishuPush.receiveId（发给谁）')
+  } else {
+    lines.push(`✅ 通知：飞书直发（${receiveIdType} → ${receiveId}，不经过第三方）`)
+    lines.push('　体检不会真发一条（有副作用）。要验就跑一张 mock 票看日志。')
+    // 这一行是「首次配置最容易卡住、而且报错方向会把人带偏」的那条：
+    // 230013 说的是「机器人可用范围里没这个人」，不是「缺发消息权限」（那会是
+    // 99991672 并且点名缺哪个 scope）。判错方向会让人去开放平台开一堆用不上的权限。
+    lines.push('　若发送报 230013：不是缺权限，是开放平台「应用功能 → 机器人」的可用范围里没有这个收件人。')
+  }
 } else {
-  blockers.push(`pushAdapter=${pushLine} 不是认识的通道（只能是 mock / pushplus / qqmail）——通知不会发出去。`)
+  blockers.push(`pushAdapter=${pushLine} 不是认识的通道（只能是 mock / feishu / pushplus / qqmail）——通知不会发出去。`)
   lines.push(`❌ 通知：${pushLine}（不认识的值）`)
 }
 
