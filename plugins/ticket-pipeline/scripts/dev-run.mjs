@@ -1448,11 +1448,14 @@ async function main () {
     assert.match(seenCtx.prompt, /不要拿它们当目录名直接去改/)
   })
 
-  await check('任务书里必须有探索预算：不许无限读下去，先改一版再补细节', async () => {
-    // 2026-11-11 真实事故：一张「改个小功能」的票，agent 花了 39 分钟读了 23 个文件、
-    // 写了 0 个文件，最后整票超时。「代码定位」那节只说了「先读仓库结构」，
-    // 没说「读够多少就该动手」—— 它可以一直读下去，每读一轮就是一次完整的模型往返。
-    // 这条断言把预算钉住：删掉预算，就等着超时复发。
+  await check('任务书里必须有探索预算，且预算不是「随便改一版」的借口', async () => {
+    // 2026-11-11 两段真实事故：
+    // 第一段 —— 一张「改个小功能」的票，agent 花了 39 分钟读了 23 个文件、写了 0 个文件，
+    // 最后整票超时。「代码定位」那节只说了「先读仓库结构」，没说「读够多少就该动手」。
+    // 第二段（同日晚）—— 加了预算后用户立刻指出措辞是错的：预算不能变成
+    // 「读满 12 次就交一版大概是这儿的改动」。**流水线要的是真修好，不是交差。**
+    // 所以这条断言钉两件事：① 预算存在且是个具体数字；② 预算超支的出路是
+    // 「说明还缺哪条线索」，而**不是**「按最好判断改一版」。
     const source = createMockSource()
     let seenCtx = null
     const executor = {
@@ -1469,10 +1472,43 @@ async function main () {
     await scheduler.tick()
     assert.match(seenCtx.prompt, /## 工作方式/, '任务书里要有一节专门讲怎么干活')
     assert.match(seenCtx.prompt, /先动手，再补细节/, '必须明说先改一版再补细节')
-    assert.match(seenCtx.prompt, /探索预算/, '必须点名「探索预算」这件事')
-    assert.match(seenCtx.prompt, /不要超过 12 次/, '预算要是一个具体数字，不能只说「别读太多」')
+    assert.match(seenCtx.prompt, /探索预算 12 次/, '预算要是一个具体数字，不能只说「别读太多」')
     assert.match(seenCtx.prompt, /同一类信息只查一次/, '重复读同一个文件是最常见的浪费时间')
-    assert.match(seenCtx.prompt, /卡住就停/, '查不到就停，比无限展开好')
+    // 质量底线：预算超支 ≠ 允许交半成品。这两句必须同时在场，
+    // 把「改成什么样」和「实在改不了怎么办」分开讲死。
+    assert.match(seenCtx.prompt, /绝对不要交一版自己都不确定能修好的改动/, '预算不能被当成交半成品的许可')
+    assert.match(seenCtx.prompt, /你要交的是真正修好的改动/, '必须把「修好」而不是「交差」讲成目标')
+    assert.match(seenCtx.prompt, /缺哪一条信息/, '定位不到时要说出还缺什么，而不是硬猜')
+    // 反向断言：这句一回来，事故就会回来 —— 它是「允许交半成品」的原话。
+    assert.doesNotMatch(seenCtx.prompt, /按你目前最好的判断改/, '「按最好判断改一版」是错的出路，不能回来')
+  })
+
+  await check('任务书要给两条定位路径：按操作流程走页面、拿截图里的字面量搜源码', async () => {
+    // 效率不是靠「少读」得来的，是靠「读对地方」得来的。
+    // 用户明确要求：根据操作流程定位页面，再通过页面信息和截图解决问题描述。
+    // 所以任务书必须把这两条路径写成可执行的动作，而不是笼统的「自己判断」。
+    const source = createMockSource()
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed' })
+      },
+    }
+    const { scheduler } = harness({ source, executor })
+    await scheduler.tick()
+    const text = seenCtx.prompt
+    // 路径一：操作流程 → 页面 → 路由/组件 → 它调的接口
+    assert.match(text, /## 定位到具体页面/, '要有一节专门讲怎么从操作流程走到代码')
+    assert.match(text, /「操作流程」那一列就是用户走过的页面路径/, '要点明操作流程是页面路径')
+    assert.match(text, /框出\*\*出问题的那个页面\*\*/, '第一步必须是框出页面，不是搜关键词')
+    assert.match(text, /只读这个页面组件 \+ 它直接调用的接口/, '要把读的范围限死在页面及其接口')
+    // 路径二：截图里的字面量 → grep 源码
+    assert.match(text, /截图是证据，不是配图/, '截图必须被当成定位线索')
+    assert.match(text, /都是可以直接在源码里搜的字面量/, '截图上的文字是可以直接搜的字面量')
+    assert.match(text, /拿它们去 grep/, '要明说拿图上的字去搜源码')
   })
 
   await check('停滞监控：文件一直不变时按「文件没变」判停滞，而不是按 session.seq（它一直在涨）', async () => {
@@ -1534,13 +1570,21 @@ async function main () {
     assert.equal(nudges.length, 0, '文件一直在变，不该催')
   })
 
-  await check('停滞监控：催话术说的是「现在该做什么」，不是「你花太久了」', async () => {
-    // 措辞有讲究：提「你花太久了」会让模型解释自己为什么慢，白烧一轮。
+  await check('停滞监控：催话术给的是「怎么定位」，不是「你花太久了」也不是「随便改一个」', async () => {
+    // 措辞有讲究，两个都不能踩：
+    // ① 提「你花太久了」→ 模型先解释自己为什么慢，白烧一轮。
+    // ② 说「挑最有把握的那处直接改」→ 那是「交一版大概是这儿」的许可。
+    //    2026-11-11 用户明确否掉了这个口径：流水线要的是真修好。
+    // 所以催话术必须换成「再走一遍定位路径」+「定位不到就说缺什么」。
     const msg = createNudgeMessage(9, (input) => input)
     const text = msg.content[0].text
     assert.match(text, /已经 9 分钟没有任何文件改动/)
-    assert.match(text, /直接改/, '要给一个能立刻执行的最小动作')
-    assert.match(text, /停下来/, '查不到也要给出口，不然它只会继续读')
+    assert.match(text, /操作流程/, '催它先回到操作流程找页面，而不是继续漫游读代码')
+    assert.match(text, /截图/, '截图上的字面量是最快的定位线索')
+    assert.match(text, /grep/, '要给出一个能立刻执行的动作')
+    assert.match(text, /还缺哪一条信息/, '查不到时要说缺什么，而不是硬猜')
+    assert.match(text, /不要硬猜一个改动交上去/, '不能把「随便改一个」当成出路')
+    assert.doesNotMatch(text, /最有把握的那一处/, '「挑最有把握的那处直接改」是交半成品的许可，不能回来')
     assert.ok(!/为什么|太久|慢/.test(text.replace(/多久没动/g, '')), '别让它有机会解释自己')
   })
 
