@@ -22,6 +22,21 @@ import { PHASE_LABEL } from '../contracts/types.js'
  */
 
 /**
+ * 宿主的 `ImageBlock` 里那个 `attachment` 字段的契约（照抄
+ * `@deepseek-ai/dsh-llm` 的 `ImageAttachmentRef`，宿主是 `attachmentId` 拼
+ * `sha256:<64hex>` 的持久引用）。
+ *
+ * @typedef {object} ImageAttachmentRef
+ * @property {string} attachmentId 形如 `sha256:<64 位十六进制>`
+ * @property {string} mediaType 如 `image/png`
+ * @property {number} bytes
+ * @property {number} width
+ * @property {number} height
+ * @property {string} [name]
+ * @property {{ width: number, height: number }} [originalDimensions] 被宿主降采样过才有
+ */
+
+/**
  * @param {Ticket} ticket
  * @param {LocateResult} located
  * @returns {string}
@@ -81,16 +96,25 @@ export function renderTicketPrompt (ticket, located) {
  * `images` 里可能有 undefined（`saveImage` 什么都不返回时），这里直接跳过：
  * 空引用塞进 content 会让适配器组装消息时炸掉，而没有图本身不是错误。
  *
+ * **字段名必须是 `attachment`，不是 `image`**（2026-11-11 真实事故）：
+ * 宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是
+ * `{ type: 'image', attachment: ImageAttachmentRef, offloaded?: boolean }`，
+ * 所有读图代码都写 `block.attachment.attachmentId`（`collectImageRefs`、
+ * `visitImageBlocks` 的调用方、`llm-pi-ai` 的 `case "image"`）。
+ * 我们原先把引用放在 `image` 字段上，宿主取 `block.attachment.attachmentId`
+ * 就拿到 undefined 并抛 `Cannot read properties of undefined (reading 'attachmentId')`
+ * —— 只有**带截图的票**会炸，没图的票一切正常，所以这个问题藏了很久。
+ *
  * @param {Ticket} ticket
  * @param {LocateResult} located
- * @param {unknown[]} [images] 截图引用（`saveImage` 的返回值）
- * @returns {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>}
+ * @param {ImageAttachmentRef[]} [images] 截图引用（`saveImage` 的返回值）
+ * @returns {Array<{ type: 'text', text: string } | { type: 'image', attachment: ImageAttachmentRef }>}
  */
 export function renderTicketContent (ticket, located, images = []) {
   const blocks = [{ type: 'text', text: renderTicketPrompt(ticket, located) }]
   for (const image of images) {
     if (!image) continue
-    blocks.push({ type: 'image', image })
+    blocks.push({ type: 'image', attachment: image })
   }
   return blocks
 }

@@ -191,7 +191,12 @@ async function main () {
       assert.equal(seenCtx.content[0].text, seenCtx.prompt)
       const images = seenCtx.content.filter((b) => b.type === 'image')
       assert.equal(images.length, 2)
-      for (const block of images) assert.ok(block.image, '图片块不能是空的')
+      // 引用必须挂在 `attachment` 上：宿主 @deepseek-ai/dsh-llm 的 ImageBlock 契约是
+      // `{ type: 'image', attachment: ImageAttachmentRef }`，读的是
+      // `block.attachment.attachmentId`。挂在 `image` 上会让带截图的票在 ⑤ 站崩
+      // `Cannot read properties of undefined (reading 'attachmentId')`。
+      for (const block of images) assert.ok(block.attachment, '图片块不能是空的（引用在 `attachment` 上）')
+      for (const block of images) assert.equal(block.image, undefined, '不要把引用放在 `image` 字段上')
     })
 
     await check('通知里有本地提交 sha，标题是「已完成」', async () => {

@@ -32,7 +32,7 @@
  *   为什么要单独一个回调：票失败（抛异常）、超时、被取消时执行器根本**返回不了结果**，
  *   会话 id 只有它自己知道 —— 不在这里交出去，人在失败的票上就永远看不到「处理会话」，
  *   也就没法点进那次会话看它到底怎么想的。可选，老调用方不传不影响行为。
- * @property {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图
+ * @property {Array<{ type: 'text', text: string } | { type: 'image', attachment: object }>} content 含截图的内容块数组：text 块是任务书，image 块是已存进附件库的截图（**字段名是 `attachment`，照宿主 `ImageBlock` 契约**，写成 `image` 会让宿主读 `block.attachment.attachmentId` 时崩）
  * @property {unknown[]} images 截图引用数组（saveImage 的返回值），content 里只用到了非空项
  * @property {Record<string, any>} config 生效中的插件配置
  */

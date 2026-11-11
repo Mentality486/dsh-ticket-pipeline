@@ -1408,8 +1408,14 @@ async function main () {
     assert.ok(seenCtx.content[0].text.includes('问题描述'), '正文里要有工单内容')
     const imageBlocks = seenCtx.content.filter((block) => block.type === 'image')
     assert.equal(imageBlocks.length, 1, '截图表现在内容块里')
-    assert.equal(imageBlocks[0].image.refId, 'img-1', '内容块指向同一份 ref')
-    assert.equal(imageBlocks[0].image, seenCtx.images[0], '内容块与 images 必须引用同一个对象，别各拷一份')
+    // 字段名必须是 `attachment`：宿主 @deepseek-ai/dsh-llm 的 ImageBlock 契约是
+    // `{ type: 'image', attachment: ImageAttachmentRef }`，所有读图代码都写
+    // `block.attachment.attachmentId`。这条断言以前写的是 `.image`，等于把错误形状
+    // 抄进了测试 —— 于是带截图的票在 ⑤ 站炸 `Cannot read properties of undefined
+    // (reading 'attachmentId')`，而自测全绿（2026-11-11 真实事故）。
+    assert.equal(imageBlocks[0].attachment.refId, 'img-1', '内容块指向同一份 ref')
+    assert.equal(imageBlocks[0].attachment, seenCtx.images[0], '内容块与 images 必须引用同一个对象，别各拷一份')
+    assert.equal(imageBlocks[0].image, undefined, '不能把引用放在 `image` 字段上 —— 宿主读的是 `attachment`')
     assert.equal(typeof seenCtx.prompt, 'string', 'prompt 字符串仍然保留，向后兼容')
     assert.equal(seenCtx.content[0].text, seenCtx.prompt, 'content 的正文块必须与 prompt 一字不差，否则两条通路会看到两份任务书')
   })

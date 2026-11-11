@@ -1032,7 +1032,7 @@ function sanitizeSegment (value) {
  * @param {import('../../contracts/types.js').Ticket} ticket
  * @param {import('../../contracts/work-executor.js').ExecCtx} ctx
  * @param {string} [untrustedNotice]
- * @returns {Array<{ type: 'text', text: string } | { type: 'image', image: unknown }>}
+ * @returns {Array<{ type: 'text', text: string } | { type: 'image', attachment: object }>}
  */
 export function buildMessages (ticket, ctx, untrustedNotice) {
   void ticket
