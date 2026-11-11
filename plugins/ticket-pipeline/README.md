@@ -194,7 +194,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 它同时校验 `require()` 白名单（只允许 `react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、
 `dsh.client.platform === 'web'`（写错宿主会静默跳过整个 bundle），以及 descriptor 数字：
 叶子 **25 个 / 4 组**、schema 信封 **72 节点 / 25 叶子**、Remote **9 个方法**、`projects` 可写 **34 字段**、
-面板项目字段 **30 项**。`client-smoke` 真跑一遍 bundle，**215 条**断言。
+面板项目字段 **30 项**。`client-smoke` 真跑一遍 bundle，**219 条**断言。
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 
