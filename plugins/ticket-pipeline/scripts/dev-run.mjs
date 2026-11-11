@@ -1588,6 +1588,79 @@ async function main () {
     assert.ok(!/为什么|太久|慢/.test(text.replace(/多久没动/g, '')), '别让它有机会解释自己')
   })
 
+  await check('停滞监控：一轮 turn 连跑不停时也要能催（不能只在 whenIdle 返回后才检查）', async () => {
+    // 2026-11-11 真机事故的**真正形态**：⑤ 站 13:50:11 进、14:30:05 才第一次催，
+    // 而那时 turn 刚好结束、紧接着就收尾失败了（14:30:06）。
+    // 也就是说旧实现里 `await agent.whenIdle()` 连跑 39 分 54 秒一次都没返回，
+    // 看门狗在最该响的时候**全程失聪**，等它醒过来票已经在收尾，催了没有意义。
+    //
+    // 这条用例专门造「whenIdle 永远不 resolve」的假 agent —— 旧实现会挂死在这里，
+    // 新实现（定时器与 whenIdle 竞速）会在 pollMs 到点时醒过来催它。
+    //
+    // 时钟用真的：竞速走的是真定时器，假时钟会让 checkStall 的「够久没动」判断失效。
+    // 阈值压到 500ms（pollMs 有 1000ms 下限），整条用例约 1 秒。
+    const nudges = []
+    const phases = []
+    let whenIdleCalls = 0
+    const agent = {
+      get status () { return 'running' },
+      get session () { return { seq: Math.floor(Date.now() / 1000) } },
+      // 永远不结束：模拟一整轮 turn 一直在跑（读代码也算在跑）。
+      whenIdle: () => { whenIdleCalls += 1; return new Promise(() => {}) },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    const started = Date.now()
+    void waitForAgentIdle(agent, undefined, () => {}, {
+      worktreeSnapshot: async () => ' M some/unchanged.js\n',
+      stallWarnMs: 500,
+      maxNudges: 1,
+      onStall: ({ minutes, nudgeCount }) => { phases.push({ minutes, nudgeCount }) },
+      makeNudgeMessage: (minutes) => ({ kind: 'nudge', minutes }),
+    }).catch(() => { /* whenIdle 永不返回，这里等不到结束，只关心催发生了没有 */ })
+    while (nudges.length === 0 && Date.now() - started < 5000) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    // 每醒来一次都重新 whenIdle() 是设计（等价于原来的每轮循环），所以这里不断言总数，
+    // 只要求「催真的发生了」—— 旧实现干等 whenIdle，这种情况下永远催不出来。
+    assert.ok(whenIdleCalls >= 1, 'whenIdle 至少要被调一次')
+    assert.ok(nudges.length >= 1, `whenIdle 一直不返回时也必须能催，实际催了 ${nudges.length} 次`)
+    assert.ok(phases.length >= 1, '催的时候要写一条时间线')
+  })
+
+  await check('停滞监控：催办自己不许崩（兜底分支不能引用执行器闭包里的变量）', async () => {
+    // 2026-11-11 真机：看门狗第 1 次催办时抛 `createUserMessage is not defined`，
+    // 把整张票打成 failed。根因是 `waitForAgentIdle` 是模块级导出函数，
+    // 而真正的 createUserMessage 是 `createAgentExecutor()` 的局部量 ——
+    // 兜底那条 `?:` 分支引用了一个这一层作用域里根本不存在的名字。
+    //
+    // 所以这条用例**故意不传 makeNudgeMessage**，走兜底分支：
+    // 它必须自己造得出消息，而不是抛 ReferenceError。
+    let clock = 0
+    const nudges = []
+    const agent = {
+      get status () { return 'idle' },
+      get session () { return { seq: Math.floor(clock / 1000) } },
+      whenIdle: async () => { clock += 60_000 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      worktreeSnapshot: async () => ' M some/unchanged.js\n',
+      // 假 agent 的 status=idle + seq 稳定 ⇒ 循环 2 轮就 return，clock 只走到 120000，
+      // 所以阈值必须小到第 1 轮就能触发，否则测的是「没触发」而不是「兜底不崩」。
+      stallWarnMs: 60_000,
+      maxNudges: 1,
+      now: () => clock,
+      // 不传 makeNudgeMessage —— 走兜底
+    }).catch((error) => {
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    assert.ok(nudges.length >= 1, '兜底分支必须真的催得出来')
+    const msg = nudges[0]
+    assert.equal(msg.role, 'user', `兜底造的消息形状要跟宿主一致，实际 role=${msg.role}`)
+    assert.ok(typeof msg.id === 'string' && msg.id.length > 0, '必须带 id（宿主 inbox 投影按 id 记账）')
+    assert.ok(Array.isArray(msg.content) && msg.content[0].type === 'text', '内容要是 text 块')
+  })
+
   await check('BUILTIN_LIMITS 里有停滞阈值，且是「分钟」量级', async () => {
     // 这两个数是硬超时的补充：硬超时（ticketTimeoutMinutes，缺省 40 分钟）是终点，
     // 等它触发时整张票的时间预算已经烧完了，票上只留一句没信息量的「超时」。

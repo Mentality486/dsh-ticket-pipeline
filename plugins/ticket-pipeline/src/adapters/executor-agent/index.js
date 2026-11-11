@@ -1221,6 +1221,75 @@ function quietTicks () {
  *   now?: () => number,
  * }} [options]
  */
+/**
+ * 等 agent 空闲，但最多等 `pollMs`；到点就先跑一次 `onTick` 再继续等。
+ *
+ * 为什么不能直接 `await agent.whenIdle()`：它只在一整轮 turn 结束（或彻底空闲）时
+ * 才 resolve。而 2026-11-11 的真机形态恰恰是「一轮 turn 连跑 39 分 54 秒，中间一次
+ * 都没空闲」—— 干等的话看门狗在最该响的时候全程失聪，等它终于 resolve 时票已经
+ * 走到收尾，催办毫无意义（现场日志：14:30:05 催办，14:30:06 收尾失败）。
+ *
+ * 用「定时器与 whenIdle 竞速」把观察点搬到**一轮运行途中**。定时器赢的时候不能
+ * 丢弃 whenIdle 的 promise 又不管它（会留下未处理的拒绝），所以这里显式挂一个
+ * 空的 catch；下一轮循环会重新 `whenIdle()`，语义与原来一致。
+ *
+ * @param {{ whenIdle: () => Promise<unknown> }} agent
+ * @param {() => Promise<void>} onTick 到点时做的检查
+ * @param {number} pollMs 最长等多久（毫秒）
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<void>}
+ */
+async function waitForIdleWithStallCheck (agent, onTick, pollMs, signal) {
+  let idled = false
+  let failed = null
+  const idle = Promise.resolve()
+    .then(() => agent.whenIdle())
+    .then(() => { idled = true })
+    .catch((error) => { failed = error })
+  let timer = null
+  const ticked = new Promise((resolve) => {
+    timer = setTimeout(resolve, pollMs)
+    // Node 里这是「别为一个定时器拖住进程退出」；浏览器/自测环境没有这个方法。
+    timer?.unref?.()
+  })
+  try {
+    await Promise.race([idle, ticked])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：被取消')
+  if (failed) throw toPipelineError(failed, 'executor-agent：等 agent 空闲时出错')
+  // 定时器赢 = 它还没空闲。此时跑一次检查；到了阈值就会催它动手。
+  // idle 赢的话由主循环那句 `await checkStall()` 负责，这里不重复。
+  if (!idled) await onTick()
+  // whenIdle 仍在路上时它可能稍后才拒绝，别让它变成 unhandledRejection。
+  idle.catch(() => {})
+}
+
+/**
+ * 等 agent 停下来，且连排的改动静止下来再返回。
+ *
+ * 除了「等结束」，这里还负责一件 2026-11-11 才加上去的事：**发现它一直没有动手**。
+ *
+ * 为什么不能只看 `session.seq`：那次事故里 seq 一直在变（它在不停地读文件、搜符号），
+ * 按 seq 看是「一直在进展」，按文件看是「39 分钟写了 0 个文件」。所以进展的唯一可信
+ * 信号是**工作区里有没有文件真的变了**。
+ *
+ * 发现之后先催、不杀：催一次的成本是一轮模型往返，杀一张票的成本是整张重跑。
+ * 催了还不动的，交给整票硬超时兜底 —— 那多半不是「忘了动手」而是模型不通或工具坏了。
+ *
+ * @param {any} agent
+ * @param {AbortSignal} signal
+ * @param {() => void} cancelAgent
+ * @param {{
+ *   worktreeSnapshot?: () => Promise<string>,
+ *   stallWarnMs?: number,
+ *   maxNudges?: number,
+ *   onStall?: (input: { minutes: number, nudgeCount: number }) => Promise<void> | void,
+ *   makeNudgeMessage?: (minutes: number) => any,
+ *   now?: () => number,
+ * }} [options]
+ */
 export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}) {
   if (!signal || !signal.aborted) {
     signal?.addEventListener('abort', cancelAgent, { once: true })
@@ -1232,6 +1301,12 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     const stallWarnMs = Number(options.stallWarnMs) > 0 ? Number(options.stallWarnMs) : 0
     const maxNudges = Number.isFinite(Number(options.maxNudges)) ? Math.max(0, Number(options.maxNudges)) : 0
     const now = typeof options.now === 'function' ? options.now : Date.now
+    // 多久醒一次去看工作区。只在开了停滞监控时才有意义：没开就退化成原来的
+    // 「一直等到 whenIdle」，多一个定时器纯属浪费。
+    // 取阈值的 1/8 且不超过 60 秒 —— 阈值 8 分钟时每 60 秒看一次，够及时又不吵。
+    const pollMs = stallWarnMs > 0 && snapshot
+      ? Math.max(1000, Math.min(60_000, Math.floor(stallWarnMs / 8)))
+      : 0
     let lastFingerprint = snapshot ? await snapshot() : ''
     let lastProgressAt = now()
     let nudges = 0
@@ -1261,14 +1336,29 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       const minutes = Math.max(1, Math.round((now() - lastProgressAt) / 60_000))
       await options.onStall?.({ minutes, nudgeCount: nudges })
       // 催的话术要具体到「现在该做什么」，泛泛的「加油」只会换来一轮空转。
+      //
+      // 兜底这一支**必须自己造 createUserMessage**，不能去闭包里抓：本函数是模块级
+      // 导出函数（自测要直接调它），而真正的 createUserMessage 是 createAgentExecutor()
+      // 里的局部量。2026-11-11 真机事故就出在这儿 —— 兜底写了 `createUserMessage`，
+      // 而生产路径**没传** makeNudgeMessage，于是催办的一瞬间抛
+      // `createUserMessage is not defined`，把整张票打成失败。
       const makeNudge = typeof options.makeNudgeMessage === 'function'
         ? options.makeNudgeMessage
-        : (mins) => createNudgeMessage(mins, createUserMessage)
+        : (mins) => createNudgeMessage(mins, resolveCreateUserMessage(undefined))
       agent.followup(makeNudge(minutes))
     }
     for (let guard = 0; guard < 1000; guard += 1) {
       if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：被取消')
-      await agent.whenIdle()
+      // 等 agent 空闲，但**不能干等**：`whenIdle()` 只在一整轮 turn 结束时才 resolve，
+      // 而最需要监控的恰恰是「一轮 turn 跑了 40 分钟、中间一次都没空闲」这种形态。
+      // 2026-11-11 事故里第 1 次催办是在 turn 结束那一瞬才触发的（日志 14:30:05 催办、
+      // 14:30:06 就收尾失败），那时已经在收尾，催了没用。用「定时器与 whenIdle 竞速」
+      // 才能在一轮运行**途中**醒过来看工作区。
+      if (pollMs > 0) {
+        await waitForIdleWithStallCheck(agent, checkStall, pollMs, signal)
+      } else {
+        await agent.whenIdle()
+      }
       await checkStall()
       const idleSeq = agent.session?.seq
       // 宿主版本的 while 里还等子 agent；插件拿不到 `subagents` 服务，
