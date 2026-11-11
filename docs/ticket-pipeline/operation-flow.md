@@ -22,8 +22,8 @@ flowchart TD
     I --> J[detectBaseBranch<br/>显式配置→origin/HEAD→HEAD→main]
     J --> K[fetchBeforeCreate 先 git fetch<br/>仅 isolateWorktree: true 时]
     K --> L[prepareWorkspace<br/>确保项目工作区 workspaceRegistry<br/>缺省：inspectCheckout + describeDirtyCheckout<br/>（脏只提醒、照跑）就地改<br/>isolateWorktree: true 才 git worktree add 开隔离目录]
-    L --> M[取截图字节 → saveImage → ImageBlock<br/>三形态 attachment/path/url]
-    M --> N[渲染任务书<br/>renderTicketPrompt 文本 + renderTicketContent 图文]
+    L --> M[取截图字节 → saveImage → attachment ref<br/>三形态 attachment/path/url<br/>块形状必须是 {type:image, attachment}]
+    M --> N[渲染任务书<br/>renderTicketPrompt 文本 + renderTicketContent 图文<br/>图片块字段名是 attachment（宿主契约）]
     N --> N2[createBaseline 拍基线<br/>git stash create 只读：不写 ref / 不动工作区<br/>人的未提交改动一个都不进本次提交]
     N2 --> O[executor.run ticket,target,ctx<br/>agent 改码 / mock 只演]
     O --> P{执行结果}
@@ -212,6 +212,8 @@ flowchart LR
 ---
 
 ## 7. 当前卡点速查
+
+状态基线（2026-11-11 深夜）：含**带截图的工单在 ⑤ 站崩**的修复 —— pms 第一张真实工单 `sh-row-81` 带一张附件截图，跑到 ⑤ 站失败 `Cannot read properties of undefined (reading 'attachmentId')`；没截图的票正常，正是它藏得久的原因。根因是 `src/core/prompt.js` 的 `renderTicketContent` 把图片引用放在自己起的 `image` 字段上，而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是 `{ type: 'image', attachment: ImageAttachmentRef }`、所有读图代码都写 `block.attachment.attachmentId`。自测也把错误形状抄了进去（`dev-run` 与 `chain-smoke` 都断言 `.image`，两边自洽所以全绿，契约方从没被引用过），修完实现后那两条断言立刻变红。块改成 `attachment`，两条断言改成断言 `attachment` 并各加一条反向断言。自测 **498/498** + `chain-smoke` 11/11 + `client-smoke` 219 条。
 
 状态基线（2026-11-11 晚）：含**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是一张电子表格）、却还留着上一轮多维表格的 `tableId`；旧的 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 的降级路被堵死（降级只在**定位失败**时发生），一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken` —— 而体检说「能读」（探针问 `get_node` 的 `obj_type`，不认 `tableId`），于是表现成「scan 跑了但一张票都没进来，界面一片安静」。修法两层：运行期配了 `tableId` 也先验一次 `tables`（真是多维表格只多一个请求；是电子表格就在这儿失败成 `invalid-input`，降级照常发生）；配置期 `tableId` 与 `sheetId` 并存就警告「这是两种表型各自的坐标」。自测 **498/498** + `feishu-checks` **97 条** + 链路冒烟 11/11。
 

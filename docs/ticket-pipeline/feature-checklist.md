@@ -1,8 +1,19 @@
 # 工单流水线插件 · 功能清单与完成度
 
 > 生成日期：2026-11-05
-> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「定位捷径不能跳过表型判定」的代码与本文同一次提交，上一轮已提交代码为 `8bc728c`（凭据保存失效）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-11，**定位捷径不能跳过表型判定** —— 跑了一次 `pipeline_scan`，
+> 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「带截图的票崩在 ⑤ 站」的代码与本文同一次提交，上一轮已提交代码为 `237bf0a`（贴链接时成对清 `tableId`）；插件目录 `plugins/ticket-pipeline`
+> 最近一次更新：2026-11-11 深夜，**带截图的工单在 ⑤ 站崩** —— pms 第一张真实工单 `sh-row-81`
+> 带着一张附件截图，跑到 ⑤ 站直接失败：
+> `Cannot read properties of undefined (reading 'attachmentId')`。
+> 同批没截图的票一切正常，这正是它藏得久的原因。根因：内核 `src/core/prompt.js` 的 `renderTicketContent`
+> 把图片引用放在自己起的 `image` 字段上，而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock`
+> 契约是 `{ type: 'image', attachment: ImageAttachmentRef }`，所有读图代码一律写 `block.attachment.attachmentId`
+> （`collectImageRefs` / `imageIdentity` / `textOnlyImageText` / `llm-pi-ai` 的 `case "image"` / `llm-deepseek` 的 upload 校验）。
+> 更要记的是：**自测把错误形状抄了进去** —— `dev-run` 与 `chain-smoke` 的断言照着实现写 `.image`，
+> 两边自洽所以 498 条全绿，契约方从没被引用过一次；修完实现后那两条断言立刻变红，
+> 说明它们并没有「测到」，只是「附和了」。修法：块改成 `attachment`，两条断言改成断言 `attachment` 并各加一条反向断言。
+> 基线不变：`dev-run` **498/498**、`chain-smoke` **11/11**、`client-smoke` **219**、`feishu-checks` **97**。见 §1.31。
+> 同日上一轮，**定位捷径不能跳过表型判定** —— 跑了一次 `pipeline_scan`，
 > 一张新票都没进来，界面安静得像什么都没发生。查下去：现场配置同时有
 > `appToken: It5g…`（裸 wiki token，背后是一张**电子表格**）、`tableId: tblWhRS…`（上一轮用
 > 多维表格时留下的）与 `sheetId: 3a5d28`。适配器的 `resolveBitableTableByIdentity` 开头有一句
@@ -1451,17 +1462,102 @@ if (tableId) return { kind: 'bitable', appToken: resolvedAppToken, tableId }
 
 ---
 
+### 1.31 带截图的工单在 ⑤ 站崩：内容块的字段名是宿主的契约（2026-11-11 真实事故）
+
+#### 现场
+
+pms 第一张真实工单 `sh-row-81`（电子表格第 81 行，项目编号 80）带一张附件形态的截图，
+10:11 跑到 ⑤ 站直接失败：
+
+```
+agent 这一轮以错误结束：Cannot read properties of undefined (reading 'attachmentId')
+```
+
+同时入队的其它票（没有截图）一路正常。**「只有带截图的票崩」** 是这个 bug 的关键特征。
+
+#### 根因
+
+内核渲染消息内容块的地方 `src/core/prompt.js` 的 `renderTicketContent` 原先写：
+
+```js
+blocks.push({ type: 'image', image })   // 字段名是我们自己起的
+```
+
+宿主 `@deepseek-ai/dsh-llm` 的契约是 `ImageBlock`：
+
+```ts
+export interface ImageAttachmentRef {
+    attachmentId: AttachmentId
+    mediaType: ImageMediaType
+    bytes: number
+    width: number
+    height: number
+    name?: string
+    originalDimensions?: { width: number; height: number; }
+}
+// ImageBlock: { type: 'image'; attachment: ImageAttachmentRef; offloaded?: boolean }
+```
+
+宿主读的字段叫 `attachment`，而且处处写 `block.attachment.attachmentId`：
+`collectImageRefs`、`imageIdentity`、`textOnlyImageText`、`llm-pi-ai` 的 `case "image"`、
+`llm-deepseek` 的 upload index 校验（后者还要求形如 `sha256:<64 hex>`）。
+我们的块没有 `attachment` ⇒ 宿主取 `undefined.attachmentId` ⇒ 崩在宿主自己的代码里，堆栈里连我们的文件名都没有。
+
+#### 更值得记的：自测把错误形状抄了进去
+
+这条链路本来就断言过（`scripts/dev-run.mjs` 的 §11「截图进 prompt」那节、
+`scripts/chain-smoke.mjs` 的端到端那一节），但两边写的都是：
+
+```js
+assert.equal(imageBlocks[0].image.refId, 'img-1')   // dev-run
+for (const block of images) assert.ok(block.image)   // chain-smoke
+```
+
+**断言照着实现写的，而实现在照着自己的想象写。** 两边自洽 ⇒ 498 条全绿；
+真正的契约方（宿主）从没被引用过一次。改完实现之后这两条断言立刻变红 ——
+它们并不是「测到了」，只是「附和了」。
+
+#### 修法
+
+- `src/core/prompt.js`：块改成 `{ type: 'image', attachment: image }`，并补 `ImageAttachmentRef` 的 typedef（照抄宿主声明），
+  文件头写清为什么字段名必须是 `attachment`。
+- `src/contracts/work-executor.js` 的 `ExecCtx.content` 与 `src/adapters/executor-agent/index.js` 的 `buildMessages` JSDoc 同步改。
+- 两条断言改成断言 `attachment`，并加一条反向断言 `assert.equal(imageBlocks[0].image, undefined)`。
+
+#### 自测
+
+- `dev-run`：断言从 `.image` 改成 `.attachment`，并新增反向断言
+  「不能把引用放在 `image` 字段上」—— 改回旧写法会红。
+- `chain-smoke`：同样改断言，并新增反向断言。
+- 基线不变：`dev-run` **498/498**、`chain-smoke` **11/11**、`client-smoke` **219**、`feishu-checks` **97**。
+
+#### 影响面
+
+`grep "type: 'image'"` 在 `src/` 下只命中 `src/core/prompt.js` 一处（另两处是 JSDoc 注释）；消费端只有 `src/adapters/executor-agent/index.js` 的 `buildMessages`，它把 `ctx.content` 原样交给 `createUserMessage({ content })`，不改形状。
+其余执行器/推送适配器不碰内容块 ⇒ 修一处即可，不存在第二份实现。
+
+#### 教训
+
+1. **跨进程边界的结构体，字段名归对面所有。** 名字对不对，唯一权威是宿主的类型声明，
+   不是我们的注释、也不是我们的直觉。
+2. **自测里断言外部契约形状的那几条，必须能从契约本身引证。** 否则它只是在给实现盖章：
+   实现错了它跟着错，还替错误背书。
+3. **「只有带 X 的输入才崩」先看有没有一段只在 X 存在时才走的分支。** 全绿 + 少数输入崩溃，
+   通常说明测试的输入面比真实输入面窄。
+4. **崩在别人代码里的堆栈，第一时间找「我们交给它什么」。** 报错在宿主的 `attachmentId`，
+   根因在我们的块结构；堆栈里没有我们的文件名，不代表不是我们的事。
+
 ## 2. 代码清单
 
-`src/` 共 **46 个 .js / 21 724 行**；`scripts/` 共 10 个 .mjs / **14 745 行**（`dev-run.mjs` **5 538 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
+`src/` 共 **46 个 .js / 21 760 行**；`scripts/` 共 10 个 .mjs / **14 828 行**（`dev-run.mjs` **5 616 行**）；`lib/client.js` **4 520 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 649（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 5 694（13 个 .js） | `scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/core/` | 5 718（13 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约）、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点**）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
 | `src/adapters/` | 9 814（15 个 .js） | 见下表 |
 | `src/tools/` | 2 587（6 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」）**、`pipeline-doctor.js`、`pipeline-reset.js`、`pipeline-cancel.js` |
-| `src/remote/` | 672（2 个 .js） | `descriptors.js`（**9 个 Remote 方法**，含三个带参的 `setProjectTable(index, url)`、`status(includeDone?)` 与 `reset(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
+| `src/remote/` | 684（2 个 .js） | `descriptors.js`（**9 个 Remote 方法**，含三个带参的 `setProjectTable(index, url)`、`status(includeDone?)` 与 `reset(recordId, projectId?)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
 | 根 | 1 308（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
@@ -1725,7 +1821,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **498** | 通过 498，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30）。这 498 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 96 条（见 §1.26 与 §1.23 注） |
+| `node scripts/dev-run.mjs` | **498** | 通过 498，失败 0（2026-11-11 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09）→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30）。这 498 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 97 条（见 §1.26 与 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 | `node scripts/client-smoke.mjs` | **219** | 通过 219（215 → 219：§1.29 的 4 条「只填凭据也要真的写进去」） |
 
@@ -1865,7 +1961,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **498** 项离线断言 + **219** 条面板断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **498** 项离线断言 + **219** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 

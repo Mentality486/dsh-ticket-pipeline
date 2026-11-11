@@ -1,7 +1,7 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-11，**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是电子表格）、却还留着上一轮多维表格的 `tableId`；旧版 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 降级路被堵死，一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken`，而体检说「能读」—— 同一个毛病体检全绿、真正跑票失败，界面上还一片安静。修法两层：运行期配了 `tableId` 也先验一次 `tables`、配置期 `tableId`+`sheetId` 并存就警告。见 §12.15。上一轮是**面板两条写入通道不能串成一个总闸** —— 「凭据」页签填了 token 点保存什么都没发生：`onSave()` 先算配置改动，为空就 `return`，写凭据那段在这行 `return` 之后，于是只填凭据时一个字节都没写进去，面板还回一句「没有需要保存的改动」，而页签计数又把 `credDirty` 算进去了 —— 能点、会涨、点了没用。现在凭据写入移到提前返回之前，两条通道互不阻塞，见 §12.14。上一轮 2026-11-10 深夜是**体检与适配器认同一套输入形态与状态值口径** —— 用户报「用电子表格链接体检不通过、取不到工单」，查下去是两个独立毛病：体检探针按「`appToken` 非空」就认定多维表格（面板贴 `/wiki/<token>` 时写进 `appToken` 的正是裸 wiki token，背后可能是电子表格）→ 飞书回 `1254003` 报红，而适配器本体一直是好的；真正「一张票都收不到」的是**状态值对不上**（缺省只认「处理中」，这张表实际填「是 / 否」，实测 `['处理中']` 收 0 张、`['是']` 收 73 张）。体检现在会采样状态列实际取值并给出修法，只进提醒不进阻断，见 §12.13。同日上一轮，**定位工单表只剩一个入口** —— 项目卡片上的「工单表」组 / 「飞书电子表格」组 / 「工单表链接」行三处都能指定同一件事，填了也不知道哪个生效；现在只留「工单表链接」，`extractSheetToken` 认 `/wiki/<token>` 并补齐错误码 `1254003`，`validateProject` 放宽成「至少一个定位依据」，见 §12.10「一个入口」小节。上一轮 2026-11-10 是 **22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；再上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
+> 日期：2026-11-03（最近一次按实现校准：2026-11-11 深夜，**内容块的字段名是宿主的契约** —— 第一张真实工单 `sh-row-81` 带截图，在 ⑤ 站崩 `Cannot read properties of undefined (reading 'attachmentId')`：`renderTicketContent` 把图片引用放在自己起的 `image` 字段上，而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是 `{ type: 'image', attachment: ImageAttachmentRef }`，所有读图代码都写 `block.attachment.attachmentId`。更要记的是**自测把错误形状抄了进去** —— `dev-run` 与 `chain-smoke` 的断言照着实现写 `.image`，两边自洽所以 498 条全绿，契约方从没被引用过。见 §12.16。此前最近一轮是**定位捷径不能跳过表型判定** —— pms 项目里 `appToken` 是裸 wiki token（背后是电子表格）、却还留着上一轮多维表格的 `tableId`；旧版 `resolveBitableTableByIdentity` 开头一句 `if (tableId) return { kind:'bitable', … }` 一个请求都不打就「定位成功」，于是表型分派被 `tableId` 抢走、`shouldTrySheet()` 降级路被堵死，一路拖到 `resolveBitableColumns` 才炸 `1254003 WrongBaseToken`，而体检说「能读」—— 同一个毛病体检全绿、真正跑票失败，界面上还一片安静。修法两层：运行期配了 `tableId` 也先验一次 `tables`、配置期 `tableId`+`sheetId` 并存就警告。见 §12.15。上一轮是**面板两条写入通道不能串成一个总闸** —— 「凭据」页签填了 token 点保存什么都没发生：`onSave()` 先算配置改动，为空就 `return`，写凭据那段在这行 `return` 之后，于是只填凭据时一个字节都没写进去，面板还回一句「没有需要保存的改动」，而页签计数又把 `credDirty` 算进去了 —— 能点、会涨、点了没用。现在凭据写入移到提前返回之前，两条通道互不阻塞，见 §12.14。上一轮 2026-11-10 深夜是**体检与适配器认同一套输入形态与状态值口径** —— 用户报「用电子表格链接体检不通过、取不到工单」，查下去是两个独立毛病：体检探针按「`appToken` 非空」就认定多维表格（面板贴 `/wiki/<token>` 时写进 `appToken` 的正是裸 wiki token，背后可能是电子表格）→ 飞书回 `1254003` 报红，而适配器本体一直是好的；真正「一张票都收不到」的是**状态值对不上**（缺省只认「处理中」，这张表实际填「是 / 否」，实测 `['处理中']` 收 0 张、`['是']` 收 73 张）。体检现在会采样状态列实际取值并给出修法，只进提醒不进阻断，见 §12.13。同日上一轮，**定位工单表只剩一个入口** —— 项目卡片上的「工单表」组 / 「飞书电子表格」组 / 「工单表链接」行三处都能指定同一件事，填了也不知道哪个生效；现在只留「工单表链接」，`extractSheetToken` 认 `/wiki/<token>` 并补齐错误码 `1254003`，`validateProject` 放宽成「至少一个定位依据」，见 §12.10「一个入口」小节。上一轮 2026-11-10 是 **22 张产品工单落地** —— 配置 33 → **25 键 4 组**（§11.2）、`delivery` 交付维度（ADR-0007）、`pipeline_status` 缺省改成「按项目聚合的总览」（`view: 'overview' | 'tickets'`，见 §11.5）、**设置面板第五页签「运行」+ 9 个 Remote 方法**（§10）、多维表格列名别名（§12.10）、**电子表格回填**（§12.10）、WPS 与 GitLab 降级为 experimental、doctor 三档体检；再上一轮 2026-11-09 是**飞书电子表格支持落地** —— `get_node` 不再硬写 `obj_type`、`resolveTable` 成为表型分派总闸、新增 `src/adapters/source-feishu/sheets.js`、`validateProject` 改成四选一，见 §12.10；此前「`appToken` 贴整条表格链接」的 `parseBitableUrl`（`src/contracts/types.js`，配置校验与飞书适配器共用）也已回填；时间线见 §11.4）
 > 决策来源：地图 `00` 的 Decisions、票 `01` / `03` / `05` / `08` 的 Resolution、`.scratch/ticket-pipeline/research/` 下四份调研报告
 > 语言约定：本文与全部代码注释、提交信息、通知文案一律用中文；代码标识符保持英文。
 
@@ -26,6 +26,7 @@
     - [12.13 体检与适配器必须认同一套输入形态与口径](#1213-体检与适配器必须认同一套输入形态与口径pipeline_doctor-飞书连通性)
     - [12.14 面板的两条写入通道：凭据与配置不能串成一个总闸](#1214-面板的两条写入通道凭据与配置不能串成一个总闸)
     - [12.15 定位捷径不能跳过「这 token 到底是哪种表」](#1215-定位捷径不能跳过这-token-到底是哪种表)
+- [12.16 内容块的字段名是宿主的契约，不是我们随口起的](#1216-内容块的字段名是宿主的契约不是我们随口起的)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -2262,6 +2263,88 @@ if (parsed.viewId.length > 0) ops.push({ op: 'set', path: [...base, 'viewId'], v
 一片安静。体检的绿色会主动掩盖故障，所以运行期改完必须补一条 `feishu-checks`（假服务端 + 假 token），
 配置期改完必须补一条 `dev-run`，写入期改完必须补一条 `dev-run` 的 `setProjectTable` 用例；
 修好一条路径不等于修好这个毛病。
+
+### 12.16 内容块的字段名是宿主的契约，不是我们随口起的
+
+2026-11-11，pms 第一张真实工单 `sh-row-81` 在 ⑤ 站崩了：
+
+```
+agent 这一轮以错误结束：Cannot read properties of undefined (reading 'attachmentId')
+```
+
+它带一张截图。同批没截图的票一切正常 —— 这就是这个 bug 藏了这么久的原因：
+整条流水线只有**附图**的票才会走到那行。
+
+#### 原因
+
+内核渲染消息内容块的地方（`src/core/prompt.js` 的 `renderTicketContent`）原先是：
+
+```js
+blocks.push({ type: 'image', image })   // ← 字段名自己起的
+```
+
+而宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 契约是：
+
+```ts
+export interface ImageAttachmentRef {
+    attachmentId: AttachmentId
+    mediaType: ImageMediaType
+    bytes: number
+    width: number
+    height: number
+    name?: string
+    originalDimensions?: { width: number; height: number; }
+}
+// ImageBlock: { type: 'image'; attachment: ImageAttachmentRef; offloaded?: boolean }
+```
+
+宿主管这个字段叫 **`attachment`**，且所有读图代码一律写 `block.attachment.attachmentId`：
+
+- `dsh-llm/lib/types/content.js` 的 `collectImageRefs`：`refs.set(block.attachment.attachmentId, block.attachment)`
+- `dsh-llm/lib/types/content.js` 的 `imageIdentity(ref)` / `textOnlyImageText(ref)`：`ref.attachmentId`
+- `dsh-llm-pi-ai/lib/index.js`：`case "image": requestImages.get(block.attachment.attachmentId)`
+- `dsh-llm-deepseek/lib/index.js` 的 upload index 校验：`/^sha256:[0-9a-f]{64}$/u.test(record.attachmentId)`
+
+我们的块上没有 `attachment` ⇒ 宿主取 `undefined.attachmentId` ⇒ 崩在它自己的代码里，
+堆栈里连我们的文件名都没有。
+
+#### 更值得记的：我们的自测把错误形状抄了进去
+
+`scripts/dev-run.mjs` 与 `scripts/chain-smoke.mjs` 里本来就有断言覆盖这条链路，但写的是：
+
+```js
+assert.equal(imageBlocks[0].image.refId, 'img-1')   // dev-run
+for (const block of images) assert.ok(block.image)   // chain-smoke
+```
+
+**断言照着实现写的，而实现在照着自己的想象写。** 两边自洽，所以 498 条全绿；
+真正的契约方（宿主）从来没被引用过一次。修完实现之后这两条断言立刻变红 ——
+它们不是「测到了」，只是「附和了」。
+
+修法是把契约抄进测试（`plugins/ticket-pipeline/src/core/prompt.js` 里也补了
+`ImageAttachmentRef` 的 typedef），断言改成：
+
+```js
+assert.equal(imageBlocks[0].attachment.refId, 'img-1')
+assert.equal(imageBlocks[0].image, undefined, '不能把引用放在 `image` 字段上 —— 宿主读的是 `attachment`')
+```
+
+#### 判据
+
+1. **跨进程边界的结构体，字段名归对面所有。** 我们只负责把值塞进它认的名字里；
+   名字对不对，唯一的权威是宿主的类型声明，不是我们的注释。
+2. **自测里凡是断言「某个外部契约的形状」，必须能从契约本身引证。** 否则那条断言
+   只是在给实现盖章：实现错了它跟着错，还替错误背书。
+3. **「只有带 X 的输入才崩」的 bug，先看有没有一段只在 X 存在时才走的分支。**
+   全绿的自测 + 少数输入崩溃，通常说明测试的输入面比真实输入面窄。
+
+#### 影响面
+
+只有 `src/core/prompt.js` 生产 image 块（`grep "type: 'image'"` 在 `src/` 下仅此一处）；
+消费端只有 `src/adapters/executor-agent/index.js` 的 `buildMessages`，它把 `ctx.content`
+原样交给 `createUserMessage({ content })`，不改形状。其余适配器（`executor-mock`、
+`push-*`）不碰内容块。所以修一处即可，不存在第二份实现。
+
 
 ## 13. 事实来源
 

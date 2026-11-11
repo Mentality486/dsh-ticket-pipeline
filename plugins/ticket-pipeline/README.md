@@ -180,6 +180,13 @@ node scripts/dev-run.mjs
 
 ```bash
 node scripts/chain-smoke.mjs     # 11 项：真扫描 → 定位 → 截图入消息 → 执行器 → 通知
+
+`chain-smoke` 里那条「截图入消息」有个**必须记的形状**：宿主 `@deepseek-ai/dsh-llm` 的 `ImageBlock` 是
+`{ type: 'image', attachment: ImageAttachmentRef }`，读图处处写 `block.attachment.attachmentId`。
+内核渲染时必须把 `saveImage` 返回的 ref 放进 `attachment` 字段 ——
+写成 `image` 会让**带截图的票**在执行阶段崩 `Cannot read properties of undefined (reading 'attachmentId')`，
+没截图的票一切正常（2026-11-11 pms `sh-row-81` 事故，见功能清单 §1.31）。
+
 ```
 
 浏览器端那一半（`lib/client.js`）不进 `dev-run`，有独立两个脚本：
