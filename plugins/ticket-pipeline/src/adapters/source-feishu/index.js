@@ -1243,7 +1243,24 @@ export function createFeishuSource (options = {}) {
    * @returns {Promise<{ kind: 'bitable', appToken: string, tableId: string }>}
    */
   async function resolveBitableTableByIdentity (resolvedAppToken, signal, usePattern = true) {
-    if (tableId) return { kind: 'bitable', appToken: resolvedAppToken, tableId }
+    // 配了 `tableId` 也要问一次 `tables` —— `tableId` 只是配置里的一句话，不是证据。
+    //
+    // 以前这里直接 `return { kind:'bitable', appToken, tableId }`，一个请求都不打。
+    // 那条捷径有个洞：它把「这个 token 到底是不是多维表格」这件事彻底跳过了，
+    // 于是「wiki 里的电子表格 token + 多维表格的 tableId」这种自相矛盾的组合
+    // 会**静默通过定位**，一直拖到 `resolveBitableColumns` 去问 `fields` 才炸，
+    // 报出来的是 `WrongBaseToken`（1254003）—— 一句只有后端看得懂的话。
+    // 更糟的是它把 `shouldTrySheet()` 的降级路也堵死了：降级只在「定位失败」时发生，
+    // 而这里根本没失败（实测 2026-11-11，pms 项目：体检说 sheet、scan 却抛
+    // `internal`/`invalid-input` 的 1254003，用户以为电子表格根本不能用）。
+    //
+    // 现在无论如何都问一次：token 真是多维表格 → 多花一个请求，行为不变；
+    // token 是电子表格 → 这里就失败成 invalid-input，`resolveTable` 照常降级去试 sheet。
+    // 每轮扫描只多打一次，相对翻页读记录可以忽略。
+    if (tableId) {
+      await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 1 }, signal })
+      return { kind: 'bitable', appToken: resolvedAppToken, tableId }
+    }
     const payload = await apiCall(`/open-apis/bitable/v1/apps/${resolvedAppToken}/tables`, { query: { page_size: 100 }, signal })
     const items = Array.isArray(payload?.data?.items) ? payload.data.items : []
     const matched = usePattern && docNamePattern

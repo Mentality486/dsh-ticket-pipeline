@@ -3502,6 +3502,48 @@ function makeFakeCtx ({ domain, registered }) {
     )
   })
 
+  await check('tableId 与 sheetId 同时配：不拦，但要点出「两种表型各自的坐标」这个矛盾', async () => {
+    // 真实事故（2026-11-11，pms 项目）：appToken 是裸 wiki token（背后是电子表格），
+    // 却还留着上一轮多维表格的 tableId，再加上 sheetId。运行期 resolveTable() 按 token
+    // 摸出真实表型这条路本身没坏，但「配了 tableId 就直接按多维表格定位」那条捷径
+    // 曾让分派被抢走 —— scan 抛 WrongBaseToken，而体检说「能读」。
+    // tableId 与 sheetId 不是两套并列的定位方式，而是两种表型各自的坐标，同时留着
+    // 说明配置切换过没清干净。这条用例把「配置层要把它摆出来」钉死。
+    const result = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: {
+          platform: 'feishu',
+          appToken: 'It5gwQ9sMizJh0kdbDhc2rBfnug',
+          tableId: 'tblWhRSGf0osJqrE',
+          sheetId: '3a5d28',
+        },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(result.value, `不该被拦，实际 issues：${JSON.stringify(result.issues ?? [])}`)
+    assert.ok(
+      result.warnings.some((w) => w.includes('tableId') && w.includes('sheetId')),
+      `要有一条点名 tableId 与 sheetId 并存的警告，实际 ${JSON.stringify(result.warnings)}`,
+    )
+    assert.ok(
+      result.warnings.some((w) => w.includes('两种表型各自的坐标')),
+      '警告要解释清楚为什么这两个键不该同时出现（不是「两套方案」而是两种表型的坐标）',
+    )
+    // 只配一套时不该有这条警告，否则每次保存都冒一句无用的提醒。
+    const clean = validateConfig({
+      projects: [{
+        name: 'pms',
+        match: { platform: 'feishu', appToken: 'bascnABCDEFGH', tableId: 'tblWhRSGf0osJqrE' },
+        repo: { path: 'D:/repo' },
+      }],
+    })
+    assert.ok(
+      !(clean.warnings ?? []).some((w) => w.includes('两种表型各自的坐标')),
+      `只配一套 tableId 时不该报这条，实际 ${JSON.stringify(clean.warnings)}`,
+    )
+  })
+
   await check('buildSourceOptions：飞书项目的 recordIds 一路透到适配器', async () => {
     const { SOURCES, buildSourceOptions } = await import('../src/index.js')
     const opts = buildSourceOptions(SOURCES.feishu, {

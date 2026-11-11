@@ -1776,6 +1776,45 @@ export async function runFeishuChecks (check) {
     )
   })
 
+  await check('电子表格：appToken 是 wiki 电子表格 token、同时还留着多维表格的 tableId 时，不能被 tableId 抢走分派', async () => {
+    // 真实事故（2026-11-11，pms 项目）。现场配置同时有：
+    //   appToken: It5gwQ9sMizJh0kdbDhc2rBfnug    ← 裸 wiki token，背后是一张**电子表格**
+    //   tableId:  tblWhRSGf0osJqrE                ← 上一轮用多维表格时留下的 tableId
+    // 裸 token 不以 `wiki` 开头、也不含 `/wiki/`，所以 `isWikiToken()` 认不出来
+    // ⇒ 走「原生 token：先按多维表格试」这条路。
+    // 而旧版 `resolveBitableTableByIdentity` 开头有一句
+    //   `if (tableId) return { kind:'bitable', appToken, tableId }`
+    // —— 一个请求都不打就「定位成功」，于是：
+    //   ① 表型分派被 tableId 直接抢走，永远走不到电子表格分支；
+    //   ② `shouldTrySheet()` 的降级路也堵死了（降级只在**定位失败**时发生，这里没失败）；
+    //   ③ 直到 `resolveBitableColumns` 去问 fields 才炸，报 `WrongBaseToken`（1254003）。
+    // 症状是「体检说能读（探针认表型），scan 却抛一句后端黑话，用户以为电子表格不能用」。
+    // 修法：配了 tableId 也先问一次 `tables` —— token 真是多维表格只是多一个请求，
+    // 是电子表格就在这里失败成 invalid-input，降级照常发生。
+    const server = makeSheetServer({
+      // 拿电子表格 token 问多维表格，飞书回 HTTP 200 + 业务码 1254003（真机实测）。
+      tablesFailCode: 1254003,
+      // 探针也要能认出这是电子表格：get_node 回 obj_type=sheet。
+      wikiNodeType: 'sheet',
+    })
+    const { source } = makeSource(server, {
+      appToken: 'It5gwQ9sMizJh0kdbDhc2rBfnug',
+      tableId: 'tblWhRSGf0osJqrE',
+      sheetId: 'sh1',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.equal(result.created.length, 1, 'tableId 不该让这张电子表格扫不出票')
+    assert.equal(result.created[0].recordId, 'sh-seq-A-1', '走的必须是电子表格那条路（行身份是 sh- 前缀）')
+    assert.ok(
+      server.requests.some((r) => r.url.includes('/sheets/v3/spreadsheets/')),
+      '必须降级到电子表格：分明是电子表格，不能因为 tableId 就只按多维表格读',
+    )
+    assert.ok(
+      !server.requests.some((r) => r.url.includes('/fields')),
+      '既然不是多维表格，就不该去问 fields（那正是旧写法炸出 WrongBaseToken 的地方）',
+    )
+  })
+
   await check('电子表格：spreadsheetToken 填的是整条 wiki 链接时，要抠出 token 再请求（不能把 URL 原样拼进接口）', async () => {
     // 真实事故（2026-11-10）：用户在面板里把 `https://x.feishu.cn/wiki/It5g…?sheet=3a5d28`
     // 整条贴进 spreadsheetToken，适配器 `extractSheetToken` 只认 `/sheets/<token>` 和裸 token，

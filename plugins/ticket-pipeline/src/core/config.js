@@ -599,6 +599,30 @@ function validateProject (raw, index) {
       fail('match', 'feishu 项目必须给①工单表链接/token（多维表格或电子表格都行）②spreadsheetToken ③docNamePattern（按文件名匹配）之一',
         '最省事的做法：在面板的项目卡片里把工单表链接整条贴进「工单表链接」；不想用链接就填「表名匹配」（例如 PMS项目管理系统工单）')
     }
+    // `tableId`（多维表格的表）与 `sheetId`（电子表格的工作表）同时存在 —— 自相矛盾。
+    //
+    // 这两个键不是「两套并列的定位方式」，而是**两种表型各自的坐标**：`tableId` 只有在
+    // appToken 指向多维表格时才有意义，`sheetId` 只有在电子表格里才有意义。同时留着，
+    // 说明配置经历过多轮切换而没清干净。
+    //
+    // 为什么必须点出来（2026-11-11 真实事故，pms 项目）：现场是
+    //   appToken: It5g…（裸 wiki token，背后是一张**电子表格**）
+    //   tableId:  tblWhRSGf0osJqrE（上一轮多维表格留下的）
+    //   sheetId:  3a5d28
+    // 运行期 `resolveTable()` 会按 token 摸出真实表型、这条路最终是对的；但
+    // 「配了 tableId 就直接按多维表格定位」那条捷径曾经让分派被抢走，scan 抛
+    // `WrongBaseToken`，而体检说「能读」——两边口径不一致，人只看到电子表格不能用。
+    // 运行期已改成「配了 tableId 也要先验一次」，配置层则在这里把矛盾摆出来。
+    const rawTableId = typeof match.tableId === 'string' ? match.tableId.trim() : ''
+    const rawSheetId = typeof match.sheetId === 'string' ? match.sheetId.trim() : ''
+    if (rawTableId.length > 0 && rawSheetId.length > 0) {
+      warnings.push(
+        `项目 ${name || `#${index}`} 同时配了 \`tableId\`（多维表格的数据表）和 \`sheetId\`（电子表格的工作表）—— ` +
+        '这两个是两种表型各自的坐标，同时留着说明配置切换过但没清干净。' +
+        '实际按哪套取工单取决于 appToken/spreadsheetToken 指向哪张表。' +
+        '建议把工单表链接重新贴一次「工单表链接」，宿主会顺手清掉另一套。'
+      )
+    }
     // 两套 token 同时存在：以前是静默的，运行期按 `resolveTable()` 的优先级取一个 ——
     // 于是「填了两套、到底用哪套」只能去读源码才知道。这正是用户反馈的
     // 「填来填去都填了，根本不清楚用的那个」。这里不改行为（改行为会悄悄改变
