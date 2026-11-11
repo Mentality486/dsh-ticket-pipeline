@@ -1222,7 +1222,7 @@ function quietTicks () {
  * }} [options]
  */
 /**
- * 等 agent 空闲，但最多等 `pollMs`；到点就先跑一次 `onTick` 再继续等。
+ * 等 agent 空闲，但最多等 `pollMs`。到点就返回，让调用方去检查一次。
  *
  * 为什么不能直接 `await agent.whenIdle()`：它只在一整轮 turn 结束（或彻底空闲）时
  * 才 resolve。而 2026-11-11 的真机形态恰恰是「一轮 turn 连跑 39 分 54 秒，中间一次
@@ -1233,18 +1233,19 @@ function quietTicks () {
  * 丢弃 whenIdle 的 promise 又不管它（会留下未处理的拒绝），所以这里显式挂一个
  * 空的 catch；下一轮循环会重新 `whenIdle()`，语义与原来一致。
  *
+ * 注意它**不做检查、也不催**：检查点只有调用方那句 `checkStall()` 一处。
+ * 曾经这里也调一次 onTick，结果定时器赢的那一轮连催两次 —— 台账上直接写成
+ * 「第 2 次催」，`maxNudges: 2` 的预算瞬间烧光，之后再卡 50 分钟也不会再说一句话。
+ *
  * @param {{ whenIdle: () => Promise<unknown> }} agent
- * @param {() => Promise<void>} onTick 到点时做的检查
  * @param {number} pollMs 最长等多久（毫秒）
  * @param {AbortSignal} [signal]
  * @returns {Promise<void>}
  */
-async function waitForIdleWithStallCheck (agent, onTick, pollMs, signal) {
-  let idled = false
+async function waitForIdleWithStallCheck (agent, pollMs, signal) {
   let failed = null
   const idle = Promise.resolve()
     .then(() => agent.whenIdle())
-    .then(() => { idled = true })
     .catch((error) => { failed = error })
   let timer = null
   const ticked = new Promise((resolve) => {
@@ -1259,9 +1260,10 @@ async function waitForIdleWithStallCheck (agent, onTick, pollMs, signal) {
   }
   if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：被取消')
   if (failed) throw toPipelineError(failed, 'executor-agent：等 agent 空闲时出错')
-  // 定时器赢 = 它还没空闲。此时跑一次检查；到了阈值就会催它动手。
-  // idle 赢的话由主循环那句 `await checkStall()` 负责，这里不重复。
-  if (!idled) await onTick()
+  // 这里**故意不调 onTick**：无论定时器赢还是 whenIdle 赢，都由主循环紧接着那句
+  // `await checkStall()` 统一检查一次。两边都调的话，定时器赢的那一轮会连催两次
+  // （2026-11-11 真机：台账上直接写「第 2 次催」，`maxNudges: 2` 的预算瞬间烧光，
+  // 之后再卡 50 分钟也不会再说一句话）。
   // whenIdle 仍在路上时它可能稍后才拒绝，别让它变成 unhandledRejection。
   idle.catch(() => {})
 }
@@ -1310,6 +1312,11 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     let lastFingerprint = snapshot ? await snapshot() : ''
     let lastProgressAt = now()
     let nudges = 0
+    // 上一次催办的时刻。两次催之间至少要隔 `stallWarnMs`：
+    // 轮询是每几秒/几十秒醒一次，如果催完不设冷却，阈值一到就会按轮询节奏连着催，
+    // `maxNudges: 2` 的预算在 1 分钟内烧光，之后再卡 50 分钟也不会再说一句话。
+    // 设成「再等一个完整阈值」⇒ 8 分钟催第 1 次、16 分钟催第 2 次，节奏才像人。
+    let lastNudgeAt = 0
     /**
      * 每醒来一次就问一遍「这期间有东西真的变了吗」。
      *
@@ -1324,15 +1331,19 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     const checkStall = async () => {
       if (!snapshot || stallWarnMs <= 0) return
       if (now() - lastProgressAt < stallWarnMs) return
+      // 冷却期：距上一次催办还没过一个阈值，就先不说话。否则催办会按轮询节奏连发。
+      if (lastNudgeAt > 0 && now() - lastNudgeAt < stallWarnMs) return
       const fingerprint = await snapshot()
       if (fingerprint !== lastFingerprint) {
         lastFingerprint = fingerprint
         lastProgressAt = now()
         nudges = 0
+        lastNudgeAt = 0
         return
       }
       if (nudges >= maxNudges) return
       nudges += 1
+      lastNudgeAt = now()
       const minutes = Math.max(1, Math.round((now() - lastProgressAt) / 60_000))
       await options.onStall?.({ minutes, nudgeCount: nudges })
       // 催的话术要具体到「现在该做什么」，泛泛的「加油」只会换来一轮空转。
@@ -1355,7 +1366,9 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       // 14:30:06 就收尾失败），那时已经在收尾，催了没用。用「定时器与 whenIdle 竞速」
       // 才能在一轮运行**途中**醒过来看工作区。
       if (pollMs > 0) {
-        await waitForIdleWithStallCheck(agent, checkStall, pollMs, signal)
+        // 竞速版只负责「醒过来」——定时器赢（还没空闲）或 whenIdle 赢（一轮结束）都算
+        // 醒了一次，紧接着的那句 checkStall 才是唯一的检查点。
+        await waitForIdleWithStallCheck(agent, pollMs, signal)
       } else {
         await agent.whenIdle()
       }
