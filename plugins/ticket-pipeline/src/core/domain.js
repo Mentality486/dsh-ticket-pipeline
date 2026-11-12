@@ -52,6 +52,9 @@ export function makeDomainSpec () {
       watermarks: { valueSchema: looseRecord },
       // 票级租约：key = recordId，value = LeaseRow。
       leases: { valueSchema: looseRecord },
+      // 项目级记忆：key = projectId，value = { entries: MemoryEntry[] }。
+      // 「上次这类问题改过哪几个文件」——跨票积累，见 core/ticket-memory.js。
+      memory: { valueSchema: looseRecord },
     },
   }
 }

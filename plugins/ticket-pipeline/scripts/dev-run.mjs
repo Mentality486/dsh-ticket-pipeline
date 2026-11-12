@@ -20,7 +20,7 @@ import assert from 'node:assert/strict'
 import { TicketStore, TABLES, makeDomainRepo, makeMemoryRepo, ticketKey } from '../src/core/store.js'
 import { createScheduler } from '../src/core/scheduler.js'
 import { recoverPending } from '../src/core/recover.js'
-import { createMockSource } from '../src/adapters/source-mock/index.js'
+import { createMockSource, DEFAULT_SEEDS } from '../src/adapters/source-mock/index.js'
 import { createMockExecutor } from '../src/adapters/executor-mock/index.js'
 import { createMockPush } from '../src/adapters/push-mock/index.js'
 import { createTableLocator } from '../src/adapters/locator-table/index.js'
@@ -45,8 +45,11 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
-import { waitForAgentIdle, createNudgeMessage } from '../src/adapters/executor-agent/index.js'
+import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage } from '../src/adapters/executor-agent/index.js'
+import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
+import { renderTicketPrompt } from '../src/core/prompt.js'
+import { describeMemory, extractKeywords, recallMemories, TicketMemory } from '../src/core/ticket-memory.js'
 import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
   comparePluginTrees,
@@ -143,6 +146,8 @@ function harness (options = {}) {
     // 站点心跳同样固定在 60 秒（它只影响「看起来多久没动」的粒度）。
     // 自测要验证心跳合并逻辑，也得能压到毫秒级。
     timelineHeartbeatMsOverride: options.timelineHeartbeatMsOverride,
+    // 跨票记忆：不传就是「这个环境没有记忆」（与生产里 memory 可选一致）。
+    memory: options.memory,
   })
   return { repo, store, source, executor, push, locator, config, scheduler }
 }
@@ -1709,6 +1714,130 @@ async function main () {
     assert.ok(Number(BUILTIN_LIMITS.agentStallWarnMinutes) < 40, '阈值必须小于硬超时，否则它永远轮不到触发')
     assert.ok(Number.isInteger(BUILTIN_LIMITS.agentStallNudges), '催的次数要是整数')
     assert.ok(BUILTIN_LIMITS.agentStallNudges >= 1, '至少要催一次，否则这个机制等于不存在')
+    // 探索预算：按「动作数」而不是「时间」管住「读得飞快但一直在读」这种形态。
+    assert.ok(Number.isInteger(BUILTIN_LIMITS.agentExploreBudget), '探索预算要是整数')
+    assert.ok(BUILTIN_LIMITS.agentExploreBudget >= 5, '太小会把「读几个文件确认上下文」的正常行为也拦下')
+    assert.ok(Number.isInteger(BUILTIN_LIMITS.agentExploreNudges) && BUILTIN_LIMITS.agentExploreNudges >= 1,
+      '至少要催一次，否则预算等于只有文案')
+  })
+
+  await check('探索预算：任务书里写的数字与看门狗数到的数字是同一个配置项', async () => {
+    // 2026-11-11 真机：任务书明写「探索预算 12 次」，那张**跑通**的票实测用了
+    // 109 次 read + 50 次 grep + 10 次 glob = **169 次**。文案是纯文本劝告，
+    // 没有任何东西在数 —— 写「12 次」和写「多读几次也没关系」效果一样。
+    //
+    // 这条用例锁的是「同源」：文案里的数字必须来自 BUILTIN_LIMITS，
+    // 而不是 prompt.js 里另写一个 12。改了一边不改另一边，这里会红。
+    assert.equal(EXPLORE_BUDGET, BUILTIN_LIMITS.agentExploreBudget,
+      `explore-budget.js 的默认值 ${EXPLORE_BUDGET} 与 BUILTIN_LIMITS.agentExploreBudget ${BUILTIN_LIMITS.agentExploreBudget} 必须一致`)
+    const ticket = { projectId: 'p', recordId: 'r', description: 'x'.repeat(40), flow: '项目管理 → 首样测试 → 列表页 → 状态筛选' }
+    const withBudget = renderTicketPrompt(ticket, {}, { exploreBudget: 7 })
+    assert.match(withBudget, /探索预算 7 次/, '任务书里的数字要跟着配置走，不能写死 12')
+    const defaulted = renderTicketPrompt(ticket, {}, {})
+    assert.match(defaulted, new RegExp(`探索预算 ${BUILTIN_LIMITS.agentExploreBudget} 次`), '不传就用 BUILTIN_LIMITS')
+  })
+
+  await check('探索计数：只数 read/grep/glob 这类「只取信息」的调用，不数 edit/write/pwsh', async () => {
+    // 为什么不能数 `tool/call`：那里 `data.name` 恒为 `run_code`，一次 run_code
+    // 里可以塞十几个 read —— 按它数永远是「调用了 8 次工具」，而实际读了 100 个文件。
+    // 2026-11-11 我第一次做性能分析就踩了这个坑，得出「工具调用不多」的错误结论。
+    const events = [
+      { type: 'tool/call', data: { name: 'run_code' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'a:1' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'a:1' } }, // 同一次子调用的重复记录
+      { type: 'tool/ptc-dispatch', data: { name: 'grep', subCallId: 'a:2' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'glob', subCallId: 'a:3' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'edit', subCallId: 'a:4' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'write', subCallId: 'a:5' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'pwsh', subCallId: 'a:6' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'compress', subCallId: 'a:7' } },
+    ]
+    const counted = countExploration(events)
+    assert.equal(counted.total, 3, `只该数 read/grep/glob，实际 ${counted.total}：${JSON.stringify(counted.byTool)}`)
+    assert.equal(counted.byTool.read, 1, '同一个 subCallId 的重复记录只能算一次')
+    assert.equal(counted.byTool.edit, undefined, 'edit 是产出，不是探索')
+    // pwsh 故意不算：它既可能是 git status（信息）也可能是 mvn test（验证），分不开。
+    assert.equal(counted.byTool.pwsh, undefined, 'pwsh 分不清是读还是验证，宁可少算')
+    assert.ok(!EXPLORATION_TOOLS.has('edit') && !EXPLORATION_TOOLS.has('pwsh'), '集合本身也要守住这条')
+    assert.match(describeExploration(counted), /探索 3 次（read 1 次、grep 1 次、glob 1 次）/)
+  })
+
+  await check('探索预算：读超了要催，且催的话术不能假装「你很久没动了」', async () => {
+    // 与停滞催办的区别：那句说「已经 N 分钟没改动文件」，这句的触发条件是
+    // 「读得飞快但一直在读」—— 说分钟数会是**假话**（它一秒都没闲着），
+    // 模型会先去纠正这个事实，白烧一轮。
+    let clock = 0
+    const nudges = []
+    const phases = []
+    const agent = {
+      get status () { return 'idle' },
+      get session () { return { seq: Math.floor(clock / 1000) } },
+      whenIdle: async () => { clock += 60_000 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    // 造 20 次 read：超过预算 12 ⇒ 第 1 轮醒来就该催。
+    const events = []
+    for (let i = 0; i < 20; i += 1) {
+      events.push({ type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: `r:${i}` } })
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      // 工作区一直没变 ⇒ 说明它真的只是在读。
+      worktreeSnapshot: async () => ' M some/unchanged.js\n',
+      // 停滞监控故意关掉（阈值极大），确保催的原因只能是探索超支。
+      stallWarnMs: 60 * 60_000,
+      maxNudges: 0,
+      now: () => clock,
+      exploreBudget: 12,
+      maxExploreNudges: 1,
+      sessionLog: () => events,
+      onExplore: ({ total, budget }) => { phases.push({ total, budget }) },
+      // 故意不传 makeExploreNudgeMessage —— 走兜底分支，和生产路径一模一样
+      // （2026-11-11 的 `createUserMessage is not defined` 就是兜底崩的）。
+    }).catch((error) => {
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    assert.ok(nudges.length >= 1, `读了 20 次、预算 12，必须催一次，实际 ${nudges.length} 次`)
+    assert.equal(phases[0].total, 20, '报给人看的总数要真实')
+    assert.equal(phases[0].budget, 12)
+    const msg = nudges[0]
+    assert.equal(msg.role, 'user', `兜底也要造出宿主能接受的消息形状，实际 role=${msg.role}`)
+    assert.ok(typeof msg.id === 'string' && msg.id.length > 0, '必须带 id')
+    const text = msg.content[0].text
+    assert.match(text, /读了 20 次/, '要用真实数字，模型自己就能算出超了几倍')
+    assert.match(text, /预算是 12 次/)
+    assert.doesNotMatch(text, /分钟/, '这条触发条件是「读得多」，不是「停得久」—— 提分钟数是假话')
+    assert.match(text, /不要硬猜一个改动交上去/, '预算超支的出路是「说清缺什么」，不是「随便改一版」')
+  })
+
+  await check('探索预算：已经开始改文件就不再念预算（读几次代码确认上下文是正经事）', async () => {
+    let clock = 0
+    let snapCount = 0
+    const nudges = []
+    const agent = {
+      get status () { return 'idle' },
+      get session () { return { seq: Math.floor(clock / 1000) } },
+      whenIdle: async () => { clock += 60_000 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    const events = []
+    for (let i = 0; i < 40; i += 1) {
+      events.push({ type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: `r:${i}` } })
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      // 每次快照都不一样 ⇒ 工作区一直在动 ⇒ 它已经在改代码了。
+      worktreeSnapshot: async () => { snapCount += 1; return ` M file${snapCount}.js\n` },
+      stallWarnMs: 60 * 60_000,
+      maxNudges: 0,
+      now: () => clock,
+      exploreBudget: 12,
+      maxExploreNudges: 2,
+      sessionLog: () => events,
+      onExplore: () => { throw new Error('已经在改文件了，不该再念探索预算') },
+      makeExploreNudgeMessage: (input) => ({ kind: 'explore', input }),
+    }).catch((error) => {
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    assert.equal(nudges.length, 0, '工作区一直在变，不该催')
   })
 
   await check('saveImage 什么都没返回时跳过空图块，不塞进 content', async () => {
@@ -6102,6 +6231,180 @@ function makeFakeCtx ({ domain, registered }) {
       !written.some((op) => op.op === 'unset' && op.path.join('.').endsWith('.tableId')),
       `写了新 tableId 就不该再 unset 掉它，实际 ${JSON.stringify(written)}`,
     )
+  })
+
+  section('19. 跨票记忆：跑成功就把「同类问题改过哪几个文件」留下来')
+
+  await check('extractKeywords：模块名、英文标识符、中文短词都抽，不做词干化', () => {
+    const kws = extractKeywords({
+      module: '首样测试',
+      flow: '项目管理-首样测试',
+      description: '并行节点时 PmsProductSampleTestServiceImpl 算错了出差天数',
+    })
+    assert.ok(kws.includes('首样测试'), `模块列必须原样进来：${JSON.stringify(kws)}`)
+    assert.ok(kws.includes('项目管理-首样测试'), 'flow 整串也要（短 flow 它就是个模块名）')
+    assert.ok(kws.includes('PmsProductSampleTestServiceImpl'), '类名是最可靠的检索词')
+    assert.ok(kws.includes('并行节点'), '中文按 2–4 字滑窗抽，「并行节点」这种短词要命中')
+    // 标识符不截断（截一半的类名永远命不中），中文词组仍限 24 字。
+    const chinese = kws.filter((w) => /[\u4e00-\u9fa5]/.test(w))
+    assert.ok(chinese.every((w) => w.length <= 24), `中文词条要截断：${JSON.stringify(chinese.filter((w) => w.length > 24))}`)
+    assert.ok(kws.length <= 40, '上限 40')
+  })
+
+  await check('recallMemories：按命中词数排，平手看复用次数，不相关的不返回', () => {
+    const entries = [
+      { keywords: ['首样测试', '并行节点'], files: ['A.java'], recordId: 'r1', at: 3, hits: 0 },
+      { keywords: ['首样测试'], files: ['B.java'], recordId: 'r2', at: 2, hits: 5 },
+      { keywords: ['完全无关'], files: ['C.java'], recordId: 'r3', at: 1, hits: 9 },
+    ]
+    const hit = recallMemories(entries, ['首样测试', '并行节点'])
+    assert.equal(hit.length, 2, `命中 2 个词的、1 个词的各一条，无关的那条不能进来：${JSON.stringify(hit.map((e) => e.recordId))}`)
+    assert.equal(hit[0].recordId, 'r1', '命中词多的排前面')
+    assert.equal(hit[1].recordId, 'r2')
+    assert.deepEqual(recallMemories(entries, []), [], '没关键词就不召回')
+    assert.deepEqual(recallMemories([], ['首样测试']), [], '没记忆就不召回')
+  })
+
+  await check('describeMemory：措辞必须是「上次 / 可以开始 / 不一定」，不能写成约束', () => {
+    const line = describeMemory({ files: ['a/A.java', 'b/B.vue'], recordId: 'sh-row-81', keywords: [], at: 1, hits: 0 })
+    assert.match(line, /上次处理同类问题/)
+    assert.match(line, /可以从这几个文件开始找/)
+    assert.match(line, /不一定还是它们/, '同一模块的新问题可能在别的文件里 —— 这句不能省')
+    assert.equal(describeMemory({ files: [], recordId: 'x' }), '', '没文件就没话可说，不要渲染半句')
+  })
+
+  await check('TicketMemory：同批文件只留一条（累加 hits），不同批文件各留一条', async () => {
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo, now: () => 1000 })
+    const first = await memory.remember({ projectId: DEMO, recordId: 'r1', keywords: ['首样测试'], files: ['a/A.java', 'b/B.vue'] })
+    assert.equal(first.recordId, 'r1')
+    const again = await memory.remember({ projectId: DEMO, recordId: 'r2', keywords: ['并行节点'], files: ['b/B.vue', 'a/A.java'] })
+    assert.equal(memory.list(DEMO).length, 1, '同一批文件（顺序不同）是同一件事，不该留两条')
+    assert.equal(again.hits, 1)
+    assert.equal(again.recordId, 'r2', 'recordId 更新成最近那张')
+    assert.deepEqual([...again.keywords].sort(), ['并行节点', '首样测试'].sort(), '关键词取并集')
+    await memory.remember({ projectId: DEMO, recordId: 'r3', keywords: ['行程记录'], files: ['c/C.java'] })
+    assert.equal(memory.list(DEMO).length, 2, '改了另一批文件要单独记一条')
+    assert.equal(memory.list(DEMO)[0].recordId, 'r3', '新的排前面')
+    assert.equal(await memory.remember({ projectId: DEMO, recordId: 'r4', keywords: ['x'], files: [] }), undefined, '没改文件的票不产生记忆')
+    assert.equal(memory.list(DEMO).length, 2, '没改文件的那次不该写库')
+  })
+
+  await check('TicketMemory：touch 单独计数，recall 只读不写（重渲任务书不能刷高 hits）', async () => {
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo })
+    const entry = await memory.remember({ projectId: DEMO, recordId: 'r1', keywords: ['首样测试'], files: ['a/A.java'] })
+    assert.equal(entry.hits, 0)
+    const recalled = recallMemories(memory.list(DEMO), ['首样测试'])
+    assert.equal(recalled.length, 1)
+    assert.equal(memory.list(DEMO)[0].hits, 0, 'recall 是纯读，不能顺手写库')
+    await memory.touch(DEMO, recalled)
+    assert.equal(memory.list(DEMO)[0].hits, 1, 'touch 才算复用')
+  })
+
+  await check('TicketMemory：超出上限丢最旧的，不让记忆无限长', async () => {
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo, limit: 3 })
+    for (let i = 0; i < 5; i += 1) {
+      await memory.remember({ projectId: DEMO, recordId: `r${i}`, keywords: [`kw${i}`], files: [`f${i}.js`] })
+    }
+    const entries = memory.list(DEMO)
+    assert.equal(entries.length, 3)
+    assert.equal(entries[0].recordId, 'r4', '最新的排最前')
+    assert.ok(!entries.some((e) => e.recordId === 'r0'), '最旧的被挤掉')
+  })
+
+  await check('跑成功一张票就把改动文件记进记忆，任务书里下一张能看到', async () => {
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo, now: () => 2000 })
+    const source = createMockSource()
+    // 让第一张票改一批具体文件 —— mock 缺省只回 candidatePaths.slice(0,2)（恒为空）。
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: ['pms-server/src/main/java/A.java', 'pms-web/src/views/B.vue'],
+          testOutcome: 'passed',
+          commit: { sha: 'abc1234', branch: 'v2.x', files: ['pms-server/src/main/java/A.java', 'pms-web/src/views/B.vue'] },
+        })
+      },
+    }
+    const first = harness({ source, executor, memory })
+    await first.scheduler.tick()
+    const learned = memory.list(DEMO)
+    assert.equal(learned.length, 1, `跑成功之后必须学一条，实际 ${JSON.stringify(learned)}`)
+    assert.deepEqual(learned[0].files, ['pms-server/src/main/java/A.java', 'pms-web/src/views/B.vue'])
+    assert.equal(learned[0].recordId, 'rec-mock-001')
+    assert.ok(learned[0].keywords.length > 0, '要学会这张票的关键词，否则下次命不中')
+
+    // 第二张票同模块：任务书里要出现记忆段。
+    let seenPrompt = ''
+    const executor2 = {
+      id: 'spy2',
+      async run (ticket, target, ctx) {
+        seenPrompt = ctx.prompt
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', commit: { sha: 'def5678', branch: 'v2.x', files: [] } })
+      },
+    }
+    const source2 = createMockSource({
+      seeds: [{ ...DEFAULT_SEEDS[0], recordId: 'rec-mock-009', description: '列表页排序错了', module: '列表', flow: '列表-筛选' }],
+    })
+    const second = harness({ source: source2, executor: executor2, memory })
+    await second.scheduler.tick()
+    assert.match(seenPrompt, /## 这个项目里同类问题的历史/, `同模块的第二张票要看得到历史：${seenPrompt.slice(0, 400)}`)
+    assert.match(seenPrompt, /pms-server\/src\/main\/java\/A\.java/, '要列出上次改过的文件')
+    assert.match(seenPrompt, /不一定还是它们/, '记忆是线索不是约束，这句话必须在')
+    // 复用计数只在**跑成功之后**补（`touch`）：任务书被渲染一次就记一次复用是自欺，
+    // 那张票后来可能失败，说明这条记忆这次没帮上忙。
+    assert.equal(memory.list(DEMO)[0].hits, 1, '这条记忆被第二张票真用上了，跑成功之后 hits 要 +1')
+  })
+
+  await check('跑失败不动记忆（失败的改动不可信，记住会把下一张票带偏）', async () => {
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo })
+    // 关键：失败票**也要带上改动文件**。用 mock 的 failed 是空数组，`remember` 会因
+    // 「没文件」提前返回 —— 那样这条用例就算把「失败也记忆」的 bug 写回去也照样绿，
+    // 什么也没锁住。真实失败形态恰恰是「改了但没过验证」，有文件。
+    const executor = {
+      id: 'spy-fail',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('failed')
+        return makeExecResult({
+          phase: 'failed',
+          changedFiles: ['pms-server/src/main/java/Broken.java'],
+          testOutcome: 'failed',
+          testDetail: '编译不过',
+          error: { kind: 'internal', message: '改坏了', retryable: false },
+        })
+      },
+    }
+    const { scheduler, store } = harness({ executor, memory })
+    await scheduler.tick()
+    assert.equal(store.getTicket(k('rec-mock-001')).phase, 'failed', '前置：这张票确实失败了')
+    assert.deepEqual(memory.list(DEMO), [], '失败票不该写记忆 —— 那批改动没过验证，不可信')
+  })
+
+  await check('写记忆失败不影响交付：记忆坏了照样 done、照样发通知', async () => {
+    const broken = {
+      list () { return [] },
+      remember () { throw new Error('磁盘满了') },
+      async touch () {},
+    }
+    const { scheduler, store, push } = harness({ memory: broken })
+    const result = await scheduler.tick()
+    assert.equal(result.status, 'ok', `记忆出错不能让整轮失败：${JSON.stringify(result)}`)
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.phase, 'done', '票该是 done')
+    assert.equal(push.messages.length, 1, '该发的通知还是要发')
   })
 
   // ── 收尾 ────────────────────────────────────────────────

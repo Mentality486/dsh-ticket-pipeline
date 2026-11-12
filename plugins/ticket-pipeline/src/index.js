@@ -27,6 +27,7 @@
 import { Config, BUILTIN_LIMITS, readConfigWarnings } from './core/config.js'
 import { makeDomainSpec } from './core/domain.js'
 import { TicketStore, makeDomainRepo } from './core/store.js'
+import { TicketMemory } from './core/ticket-memory.js'
 import { createScheduler } from './core/scheduler.js'
 import { createProjectWorkspaceManager } from './core/workspace.js'
 import { isIsolatedWorktreePath } from './core/worktree-path.js'
@@ -881,6 +882,10 @@ export async function apply (ctx, config) {
   })
   const repo = makeDomainRepo(domain)
   const store = new TicketStore({ repo, log })
+  // 跨票记忆与票据共用同一个 domain 的另一张表（`memory`）。不放票据行上：
+  // `pipeline_forget` 清掉一张票之后，从它身上学到的东西应该留着 —— 那是项目级的
+  // 知识，不是某一票的附属物。
+  const ticketMemory = new TicketMemory({ repo })
 
   // ── 2. 适配器 ─────────────────────────────────────────
   // 这里**绝不能**用 `?? EXECUTORS.mock` 之类的静默兜底：写错一个字母（`Agent` /
@@ -941,11 +946,17 @@ export async function apply (ctx, config) {
     createGitlabClient,
     getSecret: readSecret,
     readFile: makeTextFileReader(ctx, logger),
-    // 停滞判定阈值。放在这里而不是让适配器自己 import：这两个数是「一台机器上的
-    // 经验值」，将来可能要按模型快慢调，组合根是唯一该知道它们的地方。
+    // 停滞判定与探索预算阈值。放在这里而不是让适配器自己 import：这几个数是
+    // 「一台机器上的经验值」，将来可能要按模型快慢调，组合根是唯一该知道它们的地方。
+    //
+    // `agentExploreBudget` 还有第二个用途：任务书里那句「探索预算 N 次」也用它渲染
+    // （见 core/prompt.js）—— 一个配置项同时驱动文案与执行，就不会再出现
+    // 「文案写 12、实测用了 169」这种两边各写一份、谁都没在数的情况。
     limits: {
       agentStallWarnMinutes: BUILTIN_LIMITS.agentStallWarnMinutes,
       agentStallNudges: BUILTIN_LIMITS.agentStallNudges,
+      agentExploreBudget: BUILTIN_LIMITS.agentExploreBudget,
+      agentExploreNudges: BUILTIN_LIMITS.agentExploreNudges,
     },
     log: (message, detail) => logger.info?.(`[ticket-pipeline] ${message}`, detail),
   })
@@ -1177,6 +1188,8 @@ export async function apply (ctx, config) {
     removeWorktree: gitRunner ? removeWorktree : undefined,
     // 只判「目录还在不在」：复用已有工作区之前的那道闸（见 core/scheduler.js 的 isStaleWorkspaceCoords）。
     worktreeExists: gitRunner ? worktreeExists : undefined,
+    // 跨票记忆：「上次同类问题改过哪几个文件」。跑成功后自动积累，任务书里回填提示。
+    memory: ticketMemory,
   })
 
   // 工具 ───────────────────────────────────────────────

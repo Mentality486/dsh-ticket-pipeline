@@ -69,6 +69,7 @@ import {
   statusCodeToAction,
 } from '../../contracts/git-status.js'
 import { agentFailureToPipelineError, watchAgentFailures } from './agent-failure.js'
+import { countExploration, describeExploration, EXPLORE_BUDGET } from './explore-budget.js'
 
 /** 给 `agents.create` 的 sessionId 前缀。sessionId 里不能出现 `/`，所以下面全部替换掉。 */
 const SESSION_PREFIX = 'ticket'
@@ -532,8 +533,8 @@ function flowWorkspaceLabel (ctx) {
  * @param {(ref: string) => Promise<string|undefined>} [options.getSecret] 凭据读取器（默认给 gitlab-client）
  * @param {typeof fetch} [options.fetch] 注入给 gitlab-client（自测用）
  * @param {{ untrustedNotice?: string }} [options.prompts] 内核统一给的反注入提醒，拼在消息最前面
- * @param {{ agentStallWarnMinutes?: number, agentStallNudges?: number }} [options.limits]
- *   停滞判定阈值。缺省从 `core/config.js` 的 `BUILTIN_LIMITS` 取（组合根会传整份 limits 进来）。
+ * @param {{ agentStallWarnMinutes?: number, agentStallNudges?: number, agentExploreBudget?: number, agentExploreNudges?: number }} [options.limits]
+ *   停滞与探索判定阈值。缺省从 `core/config.js` 的 `BUILTIN_LIMITS` 取（组合根会传整份 limits 进来）。
  * @param {() => number} [options.now] 时钟（自测用，缺省 `Date.now`）
  * @param {(msg: string, detail?: unknown) => void} [options.log]
  * @returns {import('../../contracts/work-executor.js').WorkExecutor}
@@ -547,6 +548,14 @@ export function createAgentExecutor (options = {}) {
     : 8
   const stallNudges = Number.isFinite(Number(options.limits?.agentStallNudges))
     ? Math.max(0, Number(options.limits.agentStallNudges))
+    : 2
+  // 探索预算：读文件 + 搜索合计超过这个数就催。与任务书文案同源（见 core/prompt.js
+  // 的 renderTicketPrompt 直接引用这个 limits 值渲染「探索预算 N 次」）。
+  const exploreBudgetLimit = Number(options.limits?.agentExploreBudget) > 0
+    ? Number(options.limits.agentExploreBudget)
+    : EXPLORE_BUDGET
+  const exploreNudgeLimit = Number.isFinite(Number(options.limits?.agentExploreNudges))
+    ? Math.max(0, Number(options.limits.agentExploreNudges))
     : 2
   const now = typeof options.now === 'function' ? options.now : Date.now
 
@@ -757,6 +766,22 @@ export function createAgentExecutor (options = {}) {
           onStall: async ({ minutes, nudgeCount }) => {
             log(`executor-agent：已经 ${minutes} 分钟没有任何文件改动（第 ${nudgeCount} 次催），催它先动手`)
             await ctx.onPhase('editing', `agent 已 ${minutes} 分钟没有改动任何文件，第 ${nudgeCount} 次催它先动手`)
+          },
+          // ── 探索预算 ──────────────────────────────────────
+          //
+          // 光有时间监控不够：这次成功的票读得飞快，8 分钟里能读几十个文件，
+          // 时间监控还在数分钟，它已经翻完半个仓库了。按**动作数**催才管得住「读得
+          // 快但一直在读」这种形态。任务书里写的那个「探索预算 N 次」就是这里的 N ——
+          // 同一个配置项渲染成文案、同一个配置项驱动催办，两边不会各写一份。
+          exploreBudget: exploreBudgetLimit,
+          maxExploreNudges: exploreNudgeLimit,
+          // 事件源：agent 每次工具调用都会 append 到 session.log，这是插件唯一
+          // 能看见「它到底在读什么」的窗口（拿不到工具调用入口，见 explore-budget.js）。
+          sessionLog: () => (Array.isArray(agent.session?.log) ? agent.session.log : []),
+          onExplore: async ({ total, budget, byTool }) => {
+            const detail = describeExploration({ total, byTool })
+            log(`executor-agent：${detail}，超过探索预算 ${budget} 次，催它开始动手`)
+            await ctx.onPhase('editing', `${detail}，已超过探索预算 ${budget} 次，催它先动手`)
           },
         })
 
@@ -1218,6 +1243,10 @@ function quietTicks () {
  *   maxNudges?: number,
  *   onStall?: (input: { minutes: number, nudgeCount: number }) => Promise<void> | void,
  *   makeNudgeMessage?: (minutes: number) => any,
+ *   exploreBudget?: number,
+ *   sessionLog?: () => any[] | undefined,
+ *   onExplore?: (input: { total: number, budget: number, byTool: Record<string, number> }) => Promise<void> | void,
+ *   makeExploreNudgeMessage?: (input: { total: number, budget: number, byTool: Record<string, number> }) => any,
  *   now?: () => number,
  * }} [options]
  */
@@ -1303,12 +1332,6 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     const stallWarnMs = Number(options.stallWarnMs) > 0 ? Number(options.stallWarnMs) : 0
     const maxNudges = Number.isFinite(Number(options.maxNudges)) ? Math.max(0, Number(options.maxNudges)) : 0
     const now = typeof options.now === 'function' ? options.now : Date.now
-    // 多久醒一次去看工作区。只在开了停滞监控时才有意义：没开就退化成原来的
-    // 「一直等到 whenIdle」，多一个定时器纯属浪费。
-    // 取阈值的 1/8 且不超过 60 秒 —— 阈值 8 分钟时每 60 秒看一次，够及时又不吵。
-    const pollMs = stallWarnMs > 0 && snapshot
-      ? Math.max(1000, Math.min(60_000, Math.floor(stallWarnMs / 8)))
-      : 0
     let lastFingerprint = snapshot ? await snapshot() : ''
     let lastProgressAt = now()
     let nudges = 0
@@ -1317,6 +1340,46 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     // `maxNudges: 2` 的预算在 1 分钟内烧光，之后再卡 50 分钟也不会再说一句话。
     // 设成「再等一个完整阈值」⇒ 8 分钟催第 1 次、16 分钟催第 2 次，节奏才像人。
     let lastNudgeAt = 0
+
+    // ── 探索预算 ────────────────────────────────────────────
+    //
+    // 任务书里写着「探索预算 12 次」，但 2026-11-11 那张**跑通**的票实测用了
+    // 109 次 read + 50 次 grep + 10 次 glob = 169 次。写了数字却没人数的规范，
+    // 等于没有规范 —— 所以这里真的数，超了就说话。
+    //
+    // 为什么数次数而不是数时间：停滞监控（上面那套）是按**时间**判断「它有多久没
+    // 动手」，这一套是按**动作数**判断「它读了多少次还没动手」。两者覆盖的是不同
+    // 的坏形态：前者抓「一次读 40 分钟」，后者抓「读得飞快但一直在读」。8 分钟读
+    // 100 个文件时，时间监控还在数分钟，次数监控已经该说话了。
+    const exploreBudget = Number(options.exploreBudget) > 0 ? Number(options.exploreBudget) : 0
+    const maxExploreNudges = Number.isFinite(Number(options.maxExploreNudges))
+      ? Math.max(0, Number(options.maxExploreNudges))
+      : 0
+    const sessionLog = typeof options.sessionLog === 'function' ? options.sessionLog : null
+    /** 这次运行里已经因为超支催过几次。按「每超一个 budget」算一档。 */
+    let exploreNudges = 0
+    /**
+     * 刷新「工作区有没有变」。
+     *
+     * 抽出来是因为现在有两处判断都依赖它（停滞 / 探索），各读一次
+     * `git status` 就是两次子进程；而且**顺序很关键** —— 必须先刷新再判断，
+     * 否则探索监控看到的是上一轮的旧指纹，会把「刚改了文件」误判成「没改」。
+     *
+     * @returns {Promise<boolean>} 这一次刷新是否观察到进展
+     */
+    const refreshProgress = async () => {
+      if (!snapshot) return false
+      const fingerprint = await snapshot()
+      if (fingerprint === lastFingerprint) return false
+      lastFingerprint = fingerprint
+      lastProgressAt = now()
+      // 一有文件改动，说明它已经从「只读」切到「动手」了：两套催办预算都归零，
+      // 后面真的要催的话重新从头数。这不等于放宽标准 —— 它再停 8 分钟照样催。
+      nudges = 0
+      lastNudgeAt = 0
+      exploreNudges = 0
+      return true
+    }
     /**
      * 每醒来一次就问一遍「这期间有东西真的变了吗」。
      *
@@ -1333,14 +1396,6 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       if (now() - lastProgressAt < stallWarnMs) return
       // 冷却期：距上一次催办还没过一个阈值，就先不说话。否则催办会按轮询节奏连发。
       if (lastNudgeAt > 0 && now() - lastNudgeAt < stallWarnMs) return
-      const fingerprint = await snapshot()
-      if (fingerprint !== lastFingerprint) {
-        lastFingerprint = fingerprint
-        lastProgressAt = now()
-        nudges = 0
-        lastNudgeAt = 0
-        return
-      }
       if (nudges >= maxNudges) return
       nudges += 1
       lastNudgeAt = now()
@@ -1358,6 +1413,36 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
         : (mins) => createNudgeMessage(mins, resolveCreateUserMessage(undefined))
       agent.followup(makeNudge(minutes))
     }
+    /**
+     * 探索次数超预算了吗。
+     *
+     * 判据是「读完这么多还没开始改代码」。一动手就说明读的够用了，不再念预算 ——
+     * 否则一个人在改代码的 agent 每读一个文件确认上下文就被催一遍，纯属干扰。
+     *
+     * @param {boolean} justChanged 这一轮醒来时是否观察到工作区有改动
+     * @returns {Promise<void>}
+     */
+    const checkExplore = async (justChanged) => {
+      if (exploreBudget <= 0 || !sessionLog) return
+      if (exploreNudges >= maxExploreNudges) return
+      // 已经在改文件了就别再念预算：读几次代码确认上下文是正经事。
+      if (justChanged) return
+      const counted = countExploration(sessionLog())
+      // 第 1 次在 total >= budget，第 2 次在 total >= budget * 2，依此类推。
+      if (counted.total < exploreBudget * (exploreNudges + 1)) return
+      exploreNudges += 1
+      await options.onExplore?.({ total: counted.total, budget: exploreBudget, byTool: counted.byTool })
+      const makeExploreNudge = typeof options.makeExploreNudgeMessage === 'function'
+        ? options.makeExploreNudgeMessage
+        : (input) => createExploreNudgeMessage(input, resolveCreateUserMessage(undefined))
+      agent.followup(makeExploreNudge({ total: counted.total, budget: exploreBudget, byTool: counted.byTool }))
+    }
+    // 醒来的节奏。停滞监控用它去量「多久没动」，探索监控也借它 —— 否则一轮 turn
+    // 连跑 40 分钟期间根本醒不过来，等 turn 结束时那 169 次探索早就做完了。
+    // 没开停滞监控时用一个固定 60 秒的节拍（探索监控不需要那么密）。
+    const pollMs = stallWarnMs > 0 && snapshot
+      ? Math.max(1000, Math.min(60_000, Math.floor(stallWarnMs / 8)))
+      : (exploreBudget > 0 && sessionLog ? 60_000 : 0)
     for (let guard = 0; guard < 1000; guard += 1) {
       if (signal?.aborted) throw new PipelineError('aborted', 'executor-agent：被取消')
       // 等 agent 空闲，但**不能干等**：`whenIdle()` 只在一整轮 turn 结束时才 resolve，
@@ -1367,12 +1452,16 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       // 才能在一轮运行**途中**醒过来看工作区。
       if (pollMs > 0) {
         // 竞速版只负责「醒过来」——定时器赢（还没空闲）或 whenIdle 赢（一轮结束）都算
-        // 醒了一次，紧接着的那句 checkStall 才是唯一的检查点。
+        // 醒了一次，紧接着的那两句检查才是唯一的检查点。
         await waitForIdleWithStallCheck(agent, pollMs, signal)
       } else {
         await agent.whenIdle()
       }
+      // 先刷新「工作区变了没」，再让两套监控去判断。顺序不能反：探索监控要靠
+      // 这次刷新知道「它是不是已经开始动手了」，读到旧指纹会把刚改的文件当成没改。
+      const justChanged = await refreshProgress()
       await checkStall()
+      await checkExplore(justChanged)
       const idleSeq = agent.session?.seq
       // 宿主版本的 while 里还等子 agent；插件拿不到 `subagents` 服务，
       // 所以这里判的是「连续几次 whenIdle 之间 seq 都没动」。
@@ -1428,6 +1517,54 @@ function createNudgeMessage (minutes, createUserMessage) {
 
 /** 导出给自测：催话术本身也是需要被钉住的东西（见 dev-run 的停滞用例）。 */
 export { createNudgeMessage }
+
+/**
+ * 探索超预算时催它一句。
+ *
+ * 与 `createNudgeMessage` 的区别是**触发条件不同，所以话术不能复用**：
+ * 那句是「你已经 8 分钟没动了」，这句是「你读得很快，但已经读了 20 个文件」——
+ * 后者如果直接说「已经 8 分钟没改动文件」会是假话（它一秒都没闲着），
+ * 模型会先去纠正这个事实，白烧一轮。
+ *
+ * 所以这里只讲两件事：**你读了多少次**（用真实数字，它自己就能算出超支倍数）、
+ * **现在该拿这些读到的信息干什么**（把定位结论落到一个具体文件上就动手）。
+ *
+ * 同样不说「挑最有把握的改」—— 2026-11-11 用户否掉过这个口径。
+ *
+ * @param {{ total: number, budget: number, byTool?: Record<string, number> }} input
+ * @param {(input: { content: unknown, source?: { kind: string } }) => unknown} createUserMessage
+ * @returns {any}
+ */
+function createExploreNudgeMessage (input, createUserMessage) {
+  const read = Number(input?.byTool?.read ?? 0)
+  const grep = Number(input?.byTool?.grep ?? 0)
+  const glob = Number(input?.byTool?.glob ?? 0)
+  const parts = []
+  if (read > 0) parts.push(`read ${read} 次`)
+  if (grep > 0) parts.push(`grep ${grep} 次`)
+  if (glob > 0) parts.push(`glob ${glob} 次`)
+  const breakdown = parts.length > 0 ? `（${parts.join('、')}）` : ''
+  const budget = Number(input?.budget ?? 0)
+  const total = Number(input?.total ?? 0)
+  const text = [
+    `你已经读了 ${total} 次${breakdown}，任务书给的探索预算是 ${budget} 次。`,
+    '读到这里，你手上应该已经有足够信息了 —— 继续读下去不会让答案更清楚。',
+    '',
+    '现在把已经读到的落成一个动作：',
+    '1. 选出**最可能是问题所在的那一个文件**（不是「相关文件」，是你要动手改的那个）。',
+    '2. 说清它哪一行/哪个分支不对，然后 **edit 它**。',
+    '3. 改完跑验证命令，再根据报错补细节 —— 报错比继续读代码更省时间。',
+    '',
+    '如果你读到现在仍然不知道该改哪个文件，说明缺的不是代码细节，是**需求侧的信息**',
+    '（页面上到底该显示什么、操作流程走的是哪条路径、截图对应哪个页面）。',
+    '**这种情况不要硬猜一个改动交上去。** 在最终说明里写清卡在哪、缺哪条信息，',
+    '这会被当成「需要人补信息」，比交一版不确定能修好的改动好。',
+  ].join('\n')
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+/** 导出给自测：探索催话术同样要钉住（尤其「不能提分钟数」这条）。 */
+export { createExploreNudgeMessage }
 
 /**
  * 在宿主 publish 之前把子 agent 装配起来。这是 setup 的全部职责。

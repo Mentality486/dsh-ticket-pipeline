@@ -13,6 +13,7 @@ import { PipelineError, isAbortError, linkSignal, retryPolicy, toPipelineError }
 import { TERMINAL, canTransition, TIMELINE_NODES, phaseLabel } from '../contracts/types.js'
 import { fingerprintChanged, summarize, ticketKey } from './store.js'
 import { BUILTIN_LIMITS } from './config.js'
+import { extractKeywords, recallMemories } from './ticket-memory.js'
 import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { renderTicketContent, renderTicketPrompt } from './prompt.js'
 
@@ -144,7 +145,7 @@ async function isStaleWorkspaceCoords ({ worktreePath, repoPath, currentRepoPath
  *   但那只覆盖 pending 与中间态 —— failed 是终态，人工重开之后仍然会带着陈旧坐标
  *   回到调度器，所以这里必须再判一次。不注入时跳过存在性检查（只比 repoPath）。
  */
-export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists, leaseHeartbeatMsOverride, timelineHeartbeatMsOverride }) {
+export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists, memory, leaseHeartbeatMsOverride, timelineHeartbeatMsOverride }) {
   const logInfo = log ?? (() => {})
   const nowFn = now ?? (() => Date.now())
   const randomFn = random ?? (() => Math.random())
@@ -332,6 +333,27 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     // 但它依然可能是这张票的来源 —— 只有一个源时不存在歧义，直接用它。
     // 不补救的话，截图会静默变成「这轮没有图可带」：票照跑，图丢了。
     const source = sourceByProject.get(projectId) ?? (sources.length === 1 ? sources[0] : undefined)
+
+    // 项目级配置：验证命令就挂在这儿。任务书需要把它渲染进去 ——
+    // 不渲染的话 agent 只知道「要验证」，不知道**跑哪条命令**，会自己去摸索
+    // `mvn` / `npm`（2026-11-11 实测白烧 5.4 分钟），而执行器跑验证时用的是配置里
+    // 那条完全不同的命令。两边信息必须对等。
+    const projectEntry = Array.isArray(config.projects)
+      ? config.projects.find((entry) => entry?.name === projectId)
+      : undefined
+    // 跨票记忆：同类问题上次改过哪几个文件。
+    //
+    // 为什么放在这里读而不是执行器里读：任务书是调度器渲染的，执行器只收字符串。
+    // 而且这一步必须是**纯读** —— `recall` 不改 hits（改 hits 会让「重渲一次任务书」
+    // 这种无害操作也写库），复用计数在跑成功后由 `touch` 统一补。
+    const keywords = extractKeywords(ticket)
+    const recalled = memory ? recallMemories(memory.list(projectId), keywords) : []
+    /** 任务书渲染选项：验证命令 + 探索预算 + 跨票记忆，三处都与执行侧同源。 */
+    const promptOptions = {
+      verify: projectEntry?.verify,
+      exploreBudget: BUILTIN_LIMITS.agentExploreBudget,
+      memories: recalled,
+    }
 
     const handle = linkSignal(undefined)
     activeHandle = handle
@@ -606,8 +628,8 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         workspaceId: ws.workspaceId,
         // prompt 是纯文本，content 是同一份任务书外加截图块。
         // 两个都传：老适配器只认 prompt，新适配器按 content 才能看见图。
-        prompt: renderTicketPrompt(ticket, located),
-        content: renderTicketContent(ticket, located, shots),
+        prompt: renderTicketPrompt(ticket, located, promptOptions),
+        content: renderTicketContent(ticket, located, shots, promptOptions),
         images: shots,
         config,
         log: (msg, detail) => logInfo(msg, detail),
@@ -689,6 +711,34 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             error: '执行器说做完了，但既没有本地提交也没有 MR —— 没有可 review 的改动',
             errorKind: 'internal',
           })
+        }
+      }
+
+      // ── 跨票记忆：学一张，下一次就能少烧 20 分钟 ────────────────
+      //
+      // 只在「真的改完了」时学：failed 的票要么没改文件（学不到东西），要么改了
+      // 但没过验证（那批改动不可信，记住它会把下一张票带偏）。
+      //
+      // 顺序很讲究 —— **先 touch 再 remember**：touch 记的是「上一轮召回的那几条
+      // 这次真的用上了」，remember 可能新建条目；反过来会把刚学的记成「复用过的」，
+      // 让排序权重虚高。
+      if (memory && (finalPhase === 'done' || finalPhase === 'skipped')) {
+        const files = result.changedFiles ?? row.changedFiles ?? []
+        try {
+          if (recalled.length > 0) await memory.touch(projectId, recalled)
+          const learned = await memory.remember({
+            projectId,
+            recordId,
+            keywords,
+            files,
+          })
+          if (learned) {
+            logInfo(`scheduler：记下这张票的定位线索（${learned.files.length} 个文件），下次同类问题会先看它们`)
+          }
+        } catch (error) {
+          // 记忆是增益，不是交付的一部分：写不进去只该让「下次省不了时间」，
+          // 绝不能让一张已经改完、已经提交、已经回填的票因为记笔记失败而变红。
+          logInfo(`scheduler：写跨票记忆失败（不影响这张票的交付）`, { message: error instanceof Error ? error.message : String(error) })
         }
       }
 
