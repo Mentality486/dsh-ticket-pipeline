@@ -618,6 +618,26 @@ export class TicketStore {
   }
 
   /**
+   * 列出所有源的水位（只读快照）。
+   *
+   * 为什么需要这个（2026-11-12）：`lastScanAt` 一直只写在水位里、**没有任何消费方**，
+   * 于是面板回答不了「它上次扫表是什么时候」。水位是唯一跨重启还在的地方，
+   * 所以「上次扫描时间」必须从这里读，不能只靠内存。
+   *
+   * @returns {Array<{ sourceId: string, lastScanAt: number }>}
+   */
+  listWatermarks () {
+    /** @type {Array<{ sourceId: string, lastScanAt: number }>} */
+    const out = []
+    for (const [sourceId, value] of this.repo.entries(TABLES.watermarks)) {
+      if (!value || typeof value !== 'object') continue
+      const lastScanAt = Number(/** @type {any} */ (value).lastScanAt ?? 0)
+      out.push({ sourceId: String(sourceId), lastScanAt: Number.isFinite(lastScanAt) ? lastScanAt : 0 })
+    }
+    return out.sort((a, b) => (a.sourceId < b.sourceId ? -1 : 1))
+  }
+
+  /**
    * @param {string} sourceId
    * @param {{ seen: Record<string, { mtime: number, fingerprint: string, missingScans: number }>, lastScanAt: number }} value
    * @returns {Promise<void>}
@@ -733,11 +753,23 @@ export class TicketStore {
    *
    * 并发恒为 1，所以一次只返回一张。
    *
+   * @param {Object} [options]
+   * @param {string} [options.projectId] 只在这一个项目里挑（面板「只跑这个项目」用）。
+   * @param {string[]} [options.excludeProjects] 这些项目的票不挑（项目级暂停用：
+   *   调度器每轮按活配置算出「现在哪些项目被关着」传进来）。
+   *   不传 = 全部项目一起排队，与以前完全一样。
    * @returns {TicketRecordRow | undefined}
    */
-  pickNext () {
+  pickNext (options = {}) {
     const now = this.now()
+    // 空串当没传：面板传下来的是 `''`（没选项目）时不该变成「只跑 name 为空的项目」。
+    const only = typeof options?.projectId === 'string' && options.projectId.length > 0 ? options.projectId : null
+    // 用「排除谁」而不是「只允许谁」：配置里删掉的项目留下的历史票不该因为
+    // 不在白名单里就永远挑不出来（那会变成一张卡在队列里、谁也跑不了的死票）。
+    const excluded = Array.isArray(options?.excludeProjects) ? new Set(options.excludeProjects) : null
     const candidates = this.listTickets().filter((row) => {
+      if (only !== null && row.projectId !== only) return false
+      if (excluded !== null && excluded.has(row.projectId ?? '')) return false
       if (TERMINAL.includes(row.phase)) return false
       if (row.phase === 'needs-info') return false
       // 只跑排队中的票；中间态留给启动恢复。

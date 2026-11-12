@@ -102,6 +102,9 @@ function makeSchemaEnvelope () {
         pushAdapter: 13,
         qqmail: 4,
         pushplus: 3,
+        // 飞书直发（pushAdapter=feishu）的两个收件人键。缺了这两个节点，
+        // 面板的 feishu 分支就没有字段可露 —— 等于把那条路径测成「隐藏中」。
+        feishuPush: 22,
         notifyOn: 5,
         leaseTtlMinutes: 11,
         branchPrefix: 20,
@@ -141,7 +144,9 @@ function makeSchemaEnvelope () {
       type: 'string',
       meta: {
         label: '通知适配器',
-        enum: ['mock', 'pushplus', 'qqmail'],
+        // 真实枚举是四个（config.js 的 pushAdapter.enum），这里必须一致：
+        // 少写 feishu 就等于在冒烟里假装那条路不存在。
+        enum: ['mock', 'pushplus', 'qqmail', 'feishu'],
         default: 'mock',
         group: '通知',
       },
@@ -150,10 +155,26 @@ function makeSchemaEnvelope () {
     15: { type: 'number', meta: { label: '最大重试次数', default: 2, min: 1, max: 10, group: '行为' } },
     16: { type: 'string', meta: { label: '模型 provider', default: '', group: '行为' } },
     17: { type: 'boolean', meta: { label: '隔离工作区', default: false, group: '行为' } },
-    18: { type: 'boolean', meta: { label: '回填表格', default: true, group: '行为' } },
+    // label 与真实 `src/core/config.js` 对齐：夹具和真配置不一致时，
+    // 断言按「真实面板上的字」写就会在这类地方反复挂（这次就挂在这）。
+    18: { type: 'boolean', meta: { label: '处理完回填表格', default: true, group: '行为' } },
     19: { type: 'string', meta: { label: '回填的状态值', default: '是', group: '行为' } },
     20: { type: 'string', meta: { label: '分支前缀', default: 'ticket-', group: '高级' } },
     21: { type: 'boolean', meta: { label: '失败也写「处理结果」', default: false, group: '行为' } },
+    // 飞书直发的收件人两项（config.js 的 feishuPush.receiveId / receiveIdType）。
+    22: {
+      type: 'object',
+      meta: {},
+      dict: {
+        receiveId: 23,
+        receiveIdType: 24,
+      },
+    },
+    23: { type: 'string', meta: { label: '飞书收件人', default: '', group: '通知' } },
+    24: {
+      type: 'string',
+      meta: { label: '收件人类型', enum: ['open_id', 'email', 'chat_id'], default: 'open_id', group: '通知' },
+    },
   }
   return { uid: 0, refs }
 }
@@ -235,6 +256,7 @@ function makeSettingsResponse () {
             pushAdapter: 'qqmail',
             qqmail: { host: 'smtp.qq.com', encryption: 'tls', user: 'someone@qq.com' },
             pushplus: { channel: 'clawbot', callbackUrl: '' },
+            feishuPush: { receiveId: '', receiveIdType: 'open_id' },
             notifyOn: ['done', 'skipped', 'failed', 'needs-info'],
             leaseTtlMinutes: 10,
             branchPrefix: 'ticket-',
@@ -394,6 +416,8 @@ function makeHost () {
     // 个数是硬校验（`parameters.length`），少传一个就抛 `expected N argument(s)` ——
     // 「点重跑报错」正是这么来的，所以断言必须看得见个数。
     status: 0, statusArgs: [], scan: 0, cancel: 0, reset: [], forget: [],
+    // 「测这张表」（#43）：记下每次传的 index —— 断言要验的是「点的是哪张卡片」。
+    testProject: [],
   }
   // ctx.get(name) 查的「全局服务 store」。
   const services = Object.create(null)
@@ -446,7 +470,7 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到十个描述符', contribution.descriptors.length === 10, String(contribution.descriptors.length))
+      check('$mount 收到十一个描述符', contribution.descriptors.length === 11, String(contribution.descriptors.length))
       check('第三个描述符是 projects',
         contribution.descriptors.some((item) => item.method === 'projects' &&
           item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
@@ -462,12 +486,25 @@ function makeHost () {
           item.parameters.length === 2 &&
           item.parameters.every((param) => param.codec?.mode === 'strict')),
         contribution.descriptors.map((item) => item.method).join(' | '))
-      // 运行页签（#16）依赖的四个方法：scan / cancel 两个无参，status 一个可选参
-      // （includeDone，就是面板上的「显示历史」），reset 一个必填一个可选。
+      // 运行页签（#16）依赖的四个方法：cancel 无参，status 一个可选参
+      // （includeDone，就是面板上的「显示历史」），scan 一个可选参
+      // （projectId，就是「只跑这个项目」），reset 一个必填一个可选。
       // 这里按 method 名字查，不按位置 —— 位置一挪，按位置写的断言会静默失效。
-      check('描述符里有 scan / cancel 两个无参方法',
-        ['scan', 'cancel'].every((name) => contribution.descriptors.some((item) =>
-          item.method === name && item.parameters.length === 0 && item.invocation.kind === 'direct')),
+      check('描述符里有 cancel：完全无参',
+        contribution.descriptors.some((item) =>
+          item.method === 'cancel' && item.parameters.length === 0 && item.invocation.kind === 'direct'),
+        contribution.descriptors.map((item) => item.method).join(' | '))
+      // scan 从「无参」变成「一个可选 projectId」（工单 #39）：面板上那一格下拉
+      // 缺省是「全部项目」，选它时按位置不传（不是传空串），所以必须 acceptsUndefined。
+      check('scan 带一个可选参数 projectId（只跑这个项目）',
+        contribution.descriptors.some((item) => {
+          if (item.method !== 'scan') return false
+          if (item.parameters.length !== 1) return false
+          const [projectId] = item.parameters
+          return projectId.wire === 'projectId' &&
+            projectId.acceptsUndefined === true &&
+            projectId.codec?.mode === 'strict'
+        }),
         contribution.descriptors.map((item) => item.method).join(' | '))
       check('status 带一个可选参数 includeDone（面板「显示历史」开关）',
         contribution.descriptors.some((item) => {
@@ -538,6 +575,24 @@ function makeHost () {
         forget: async function (recordId, projectId) {
           calls.forget.push([recordId, projectId])
           return { ok: true, value: { forgotten: true, reason: 'ok', recordId, projectId: 'pms', phase: 'failed', text: '已删除本地记录。' } }
+        },
+        // 「测这张表」（#43）：缺省回一个「能读」的结论。断言要验的是
+        // 「面板有没有把结论原样渲染出来、红绿有没有分开」，不是「探针判断对不对」
+        // （那是宿主的事，dev-run 里另有针对 testProject 的用例）。
+        testProject: async function (index) {
+          calls.testProject.push(index)
+          return {
+            ok: true,
+            value: {
+              ok: true,
+              project: 'pms',
+              platform: 'feishu',
+              kind: 'bitable',
+              table: 'tblWhx',
+              blockers: [],
+              text: '✅ 认证：能换到 tenant_access_token\n✅ 表：能读到表元数据\n✅ 数据：能读到第一页\n结论：这张表能读、能收到票。改完记得点顶部的「保存」。',
+            },
+          }
         },
       }
       namespaces.set('ticketPipeline', { service })
@@ -941,7 +996,93 @@ async function main () {
     }
   }
 
-  // ── 「删除记录」（2026-11-11 补）──────────────────────────────
+  // ── 运行页的筛选与搜索（工单 #42）──────────────────────────────
+  //
+  // 勾上「显示历史」之后一趟能列几十上百张票，而这一页只回答一个问题 ——
+  // 「有没有要我做事的」。以前只能在五个分组里用肉眼看。
+  // 判据三条：①搜索只留下命中的 ②分组下拉只留下那一组
+  // ③两者相乘（不是互相覆盖），且「筛出 0 张」与「本来就没票」说法不同。
+  {
+    // 先把历史打开，让夹具里三张票（failed / editing / done）都在画面里。
+    const box0 = findInput(tree, (node) => node.props.type === 'checkbox')
+    if (box0 !== undefined && box0.props.checked !== true) {
+      box0.props.onChange({ target: { checked: true } })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      tree = await render(Panel, { view: 'page' })
+    }
+    const runText0 = textOf(tree)
+    check('运行页签有搜索框',
+      findInput(tree, (node) => node.props.type === 'search') !== undefined, runText0.slice(0, 200))
+    check('运行页签有分组下拉',
+      findAll(tree, (node) => node.type === 'select' &&
+        String(node.props['aria-label'] || '') === '只看某一组').length === 1,
+      String(findAll(tree, (node) => node.type === 'select').length))
+    check('没筛选时不显示「筛出 N / M 张」', runText0.indexOf('筛出') < 0, runText0.slice(0, 300))
+
+    const searchBox = findInput(tree, (node) => node.props.type === 'search')
+    if (searchBox !== undefined) {
+      searchBox.props.onChange({ target: { value: '登录页' } })
+      tree = await render(Panel, { view: 'page' })
+      const hitText = textOf(tree)
+      // 不能拿 recordId 判断「没留下」——「下一个：recRunning001」那行队列提示
+      // 里也有 recordId，它不属于票列表。要按那张票的标题判断。
+      check('搜索按标题命中，且只留下命中的那张',
+        hitText.indexOf('recFailed001') >= 0 && hitText.indexOf('列表翻页丢数据') < 0,
+        hitText.slice(0, 400))
+      check('筛选生效时说清「筛出 N / M 张」', hitText.indexOf('筛出 1 / 3 张') >= 0, hitText.slice(0, 400))
+
+      // 搜一个不存在的词：说「当前筛选下没有票」，不能说「本来就没票」。
+      const searchAgain = findInput(tree, (node) => node.props.type === 'search')
+      searchAgain.props.onChange({ target: { value: '绝对不存在的词' } })
+      tree = await render(Panel, { view: 'page' })
+      const noneText = textOf(tree)
+      check('筛出 0 张时说的是「当前筛选下没有票」，不是「队列是空的」',
+        noneText.indexOf('当前筛选下没有票') >= 0 && noneText.indexOf('当前没有未收尾的票') < 0,
+        noneText.slice(0, 400))
+      check('筛出 0 张时给「清掉筛选」的出口', noneText.indexOf('清掉筛选') >= 0, noneText.slice(0, 400))
+
+      // 点「清掉筛选」两根条件一起复位。
+      const clearButton = findButton(tree, '清掉筛选')
+      check('筛出 0 张时有「清掉筛选」按钮', clearButton !== undefined)
+      if (clearButton !== undefined) {
+        clearButton.props.onClick()
+        tree = await render(Panel, { view: 'page' })
+        check('清掉筛选后票全回来了',
+          textOf(tree).indexOf('recRunning001') >= 0, textOf(tree).slice(0, 400))
+      }
+    }
+
+    // 分组下拉：只留「需要你处理」那一组。
+    const groupSelect = findAll(tree, (node) => node.type === 'select' &&
+      String(node.props['aria-label'] || '') === '只看某一组')[0]
+    check('找到分组下拉', groupSelect !== undefined)
+    if (groupSelect !== undefined) {
+      groupSelect.props.onChange({ target: { value: '需要你处理' } })
+      tree = await render(Panel, { view: 'page' })
+      const groupText = textOf(tree)
+      check('只看某一组时其它组的票不出现',
+        groupText.indexOf('recFailed001') >= 0 && groupText.indexOf('列表翻页丢数据') < 0,
+        groupText.slice(0, 400))
+      // **必须复位**：筛选状态留在 state 里，后面的断言（流程带、删除记录…）
+      // 都会看不到「正在跑」的那张票，于是以「界面坏了」的样子红一片。
+      groupSelect.props.onChange({ target: { value: '' } })
+      tree = await render(Panel, { view: 'page' })
+      check('选回「全部分组」后所有票都回来',
+        textOf(tree).indexOf('列表翻页丢数据') >= 0, textOf(tree).slice(0, 400))
+    }
+
+    // **把「显示历史」复位回关**：我这个 block 为了凑三张票把它打开了，
+    // 后面的断言（删除记录只挂在 canForget 的票上、流程带…）都是按
+    // 「只有未收尾的票」那套夹具写的，历史票多出来会让它们莫名地红。
+    const boxBack = findInput(tree, (node) => node.props.type === 'checkbox')
+    if (boxBack !== undefined && boxBack.props.checked === true) {
+      boxBack.props.onChange({ target: { checked: false } })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      tree = await render(Panel, { view: 'page' })
+    }
+  }
+
+
   // 用户原话：「也删除不了」。票据只增不删，历史票以前在界面上没有任何清理入口。
   const forgetButtons = findAll(tree, (node) => node.type === 'button' && textOf(node).indexOf('删除记录') >= 0)
   check('canForget 的票行尾有「删除记录」按钮', forgetButtons.length >= 1, String(forgetButtons.length))
@@ -1072,6 +1213,90 @@ async function main () {
     check('换成 mock 后不显示 PushPlus 字段', mockText.indexOf('PushPlus 渠道') < 0)
     check('换成 mock 后明说「不会真的发通知」',
       mockText.indexOf('不会真的发通知') >= 0, mockText.slice(0, 200))
+  }
+
+  // 飞书直发：这条分支以前在面板上**整个没有**（notifyVisibility 掉进 mock 兜底），
+  // 于是人选了 feishu 之后收件人字段被藏起来、还被告诉「当前是 mock」——
+  // 保存后体检报「缺 feishuPush.receiveId」，界面上却没有任何一格能填。
+  // 这几条断言就是钉住「选飞书要看得见收件人」。
+  if (adapterSelect !== undefined) {
+    adapterSelect.props.onChange({ target: { value: 'feishu' } })
+    tree = await render(Panel, { view: 'page' })
+    tree = await openAllGroups(Panel, tree)
+    const feishuText = textOf(tree)
+    check('选 feishu 时露出收件人两项',
+      feishuText.indexOf('飞书收件人') >= 0 && feishuText.indexOf('收件人类型') >= 0,
+      feishuText.slice(0, 200))
+    check('选 feishu 时不显示 SMTP 字段', feishuText.indexOf('SMTP 主机') < 0)
+    check('选 feishu 时不显示 PushPlus 字段', feishuText.indexOf('PushPlus 渠道') < 0)
+    check('选 feishu 时说明凭据复用已有的飞书应用',
+      feishuText.indexOf('不用另建应用') >= 0, feishuText.slice(0, 300))
+    check('选 feishu 时提示 230013 不是权限问题',
+      feishuText.indexOf('230013') >= 0)
+    check('选 feishu 时**不能**说「当前是 mock」',
+      feishuText.indexOf('当前是 mock') < 0, feishuText.slice(0, 300))
+  }
+
+  // ── 高危配置项的「后果提示」────────────────────────────────
+  //
+  // 面板上每个字段只说「它是什么」，不说「改了会怎样」，于是最危险的开关
+  // 看起来最无害：`writeBack` 关掉只是少一个亮着的滑块，真实后果是表格那行
+  // 永远停在「处理中」、下一轮扫描把同一张票再收一遍。
+  // 判据分两头钉：付代价的那一侧必须有提示，**正常状态必须一条都没有**
+  // （一律挂提示 = 噪音，人一学会忽略黄色，红色就没用了）。
+  {
+    tree = await openAllGroups(Panel, tree)
+    const healthyText = textOf(tree)
+    check('正常状态不挂后果提示（不制造噪音）',
+      healthyText.indexOf('mock 不会改代码') < 0 &&
+      healthyText.indexOf('永远停在「处理中」') < 0 &&
+      healthyText.indexOf('就没有可翻的记录了') < 0,
+      healthyText.slice(0, 300))
+
+    // 执行器切到 mock → 提示「它不会改代码」。假数据里 workExecutor 是 agent。
+    const executorSelect = findAll(tree, (node) => node.type === 'select').find(
+      (node) => textOf(node).indexOf('真的改代码') >= 0)
+    check('找到执行器下拉', executorSelect !== undefined)
+    if (executorSelect !== undefined) {
+      executorSelect.props.onChange({ target: { value: 'mock' } })
+      tree = await render(Panel, { view: 'page' })
+      tree = await openAllGroups(Panel, tree)
+      const mockExecText = textOf(tree)
+      check('执行器选 mock 时说明它不会改代码、不会产生提交',
+        mockExecText.indexOf('mock 不会改代码') >= 0, mockExecText.slice(0, 300))
+      check('后果提示说的是「会发生什么」而不是「不建议」',
+        mockExecText.indexOf('不建议') < 0)
+      executorSelect.props.onChange({ target: { value: 'agent' } })
+      tree = await render(Panel, { view: 'page' })
+      tree = await openAllGroups(Panel, tree)
+      check('切回 agent 后那条提示消失',
+        textOf(tree).indexOf('mock 不会改代码') < 0, textOf(tree).slice(0, 300))
+    }
+
+    // 关掉回填 → 提示「表格那行会永远停在处理中」。
+    const writeBackSwitch = findAll(tree, (node) => node.props &&
+      node.props.role === 'switch' && node.props['aria-label'] === '处理完回填表格')[0]
+    check('找到「处理完回填表格」开关', writeBackSwitch !== undefined)
+    if (writeBackSwitch !== undefined) {
+      writeBackSwitch.props.onClick()
+      tree = await render(Panel, { view: 'page' })
+      tree = await openAllGroups(Panel, tree)
+      const noBackText = textOf(tree)
+      check('关掉回填时说明那行会永远停在「处理中」',
+        noBackText.indexOf('永远停在「处理中」') >= 0, noBackText.slice(0, 300))
+      check('关掉回填时说明会重复收同一张票',
+        noBackText.indexOf('再收进来一遍') >= 0, noBackText.slice(0, 400))
+      // 必须**重新找一次开关**再点：`Switch` 的 onClick 是
+      // `props.onChange(!props.checked)`，手里这个节点还记着上一轮的
+      // `checked = true`，再点一次算出来还是 false —— 会「点了没反应」。
+      const writeBackAgain = findAll(tree, (node) => node.props &&
+        node.props.role === 'switch' && node.props['aria-label'] === '处理完回填表格')[0]
+      if (writeBackAgain !== undefined) writeBackAgain.props.onClick()
+      tree = await render(Panel, { view: 'page' })
+      tree = await openAllGroups(Panel, tree)
+      check('勾回回填后那条提示消失',
+        textOf(tree).indexOf('永远停在「处理中」') < 0, textOf(tree).slice(0, 300))
+    }
   }
 
   // 抽屉式的高级区不该被当成配置分组数进 `findToggles` 里。
@@ -1256,6 +1481,23 @@ async function main () {
       ctx.calls.mutate.every((call) => JSON.stringify(call.ops).indexOf('bascnABCDEFGH') < 0),
       JSON.stringify(ctx.calls.mutate.map((call) => call.ops)))
     check('宿主回话显示在卡片里', textOf(tree).indexOf('已记下这条多维表格的定位信息') >= 0)
+  }
+  // 「测这张表」（#43）：配项目时人是「一边填一边试」的，所以这一格必须
+  // ① 就在链接行里（不是跑到「体检」页），② 点下去只测这一个项目，
+  // ③ 结论红绿分开（能读 vs 读不到）。
+  const testButton = findButton(tree, '测这张表')
+  check('项目卡片里有「测这张表」按钮', testButton !== undefined)
+  if (testButton !== undefined) {
+    testButton.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    tree = await render(Panel, { view: 'page' })
+    check('「测这张表」调的是宿主 testProject(0)（按下标，不是项目名）',
+      ctx.calls.testProject.length === 1 && ctx.calls.testProject[0] === 0,
+      JSON.stringify(ctx.calls.testProject))
+    check('「测这张表」的结论显示在卡片里',
+      textOf(tree).indexOf('这张表能读、能收到票') >= 0, textOf(tree).slice(0, 120))
+    check('「测这张表」结论写在链接行里，不是「体检」页签',
+      textOf(tree).indexOf('只读：连一次飞书') >= 0 || testButton.props.title.indexOf('只读') >= 0)
   }
   check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
   // projects 是结构化数组，必须由 ProjectListCard 画成卡片 —— 要是漏成普通字段，

@@ -42,7 +42,7 @@ src/
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
   tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_forget / pipeline_doctor
                      （每个都导出一个 collect* 纯「算结果」函数，Remote 那边调同一个）
-  remote/            浏览器端可调的 Remote：10 个 direct 方法（见下）
+  remote/            浏览器端可调的 Remote：11 个 direct 方法（见下）
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
 lib/
   client.js          浏览器端 bundle：插件设置页（五个页签：运行 / 项目 / 参数 / 凭据 / 体检）
@@ -55,7 +55,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 
 ## Remote 方法与设置页
 
-`ticketPipeline` 命名空间下 10 个 direct 方法：
+`ticketPipeline` 命名空间下 11 个 direct 方法：
 
 | 方法 | 参数 | 干什么 |
 |---|---|---|
@@ -65,10 +65,11 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 | `branches()` | — | 全部项目的分支候选（`src/core/branches.js`） |
 | `setProjectTable(index, url)` | 2 | 贴整条表格链接 → 宿主解析 → `settings.mutate` 落盘（明文不进浏览器） |
 | `status(includeDone?)` | 1 | 复用 `collectStatus`，`view: 'tickets'`；`includeDone` 对应面板「显示历史」，**只认严格 `true`** |
-| `scan()` | — | 复用 `collectScan`（fire-and-forget） |
+| `scan(projectId?)` | 1 | 复用 `collectScan`（fire-and-forget）。`projectId` = 只跑这一个项目 |
 | `cancel()` | — | 复用 `collectCancel` |
 | `reset(recordId, projectId?)` | 2 | 复用 `collectReset`；`projectId` 是 `acceptsUndefined` |
 | `forget(recordId, projectId?)` | 2 | 复用 `collectForget`：**只删插件本地的票据行**，不碰工单表 / 不回滚代码 / 不删工作区；只对终态与 `needs-info` 生效 |
+| `testProject(index)` | 1 | 「测这张表」（工单 #43）：只把 `projects[index]` 交给体检那份飞书探针，逐层回 ✅/❌。**为什么是下标不是项目名** —— 项目名允许重复（`config.js` 只警告不拦），而下标与面板那张卡片一一对应 |
 
 **可选参数也必须传满位置**：浏览器的 `prepareInvocation` 用 `descriptor.parameters.length`
 校验实参个数，`acceptsUndefined` **只在宿主侧**参与判定。调用侧少传一个就抛
@@ -84,7 +85,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 
 - **五个页签**（运行 / 项目 / 参数 / 凭据 / 体检），**缺省停在「运行」**。一次只画一页（不是藏起来）。
   页签上只在真有未保存 / 待修时才挂数字。
-- **参数页按分组渲染 25 个字段 / 4 个分组**；`enabled` 被提成页面级**主开关**置顶（不在任何分组里）。
+- **参数页按分组渲染 27 个字段 / 4 个分组**；`enabled` 被提成页面级**主开关**置顶（不在任何分组里）。
 - **项目页 `projects[]` 可编辑**：`listProjectDescriptorPaths()` 共 **34 个深层路径**（面板画 **30 个控件**，
   `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框
   —— 定位工单表统一走卡片头上的「工单表链接」，贴整条地址，插件自己认多维表格 / 电子表格 / wiki 表）。
@@ -173,7 +174,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**530 项断言，全绿 exit 0**，共 **32 个小节**（编号到 19，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**548 项断言，全绿 exit 0**，共 **34 个小节**（编号到 19，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 
@@ -210,8 +211,8 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 `src/remote/descriptors.js` 忘了改 `lib/client.js` 会**静默无响应**（点了体检没反应、宿主也不报错）。
 它同时校验 `require()` 白名单（只允许 `react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、
 `dsh.client.platform === 'web'`（写错宿主会静默跳过整个 bundle），以及 descriptor 数字：
-叶子 **27 个 / 4 组**、schema 信封 **75 节点 / 27 叶子**、Remote **10 个方法**、`projects` 可写 **34 字段**、
-面板项目字段 **30 项**。`client-smoke` 真跑一遍 bundle，**228 条**断言。
+叶子 **27 个 / 4 组**、schema 信封 **76 节点 / 27 叶子**、Remote **11 个方法**、`projects` 可写 **35 字段**、
+面板项目字段 **31 项**。`client-smoke` 真跑一遍 bundle，**260 条**断言。
 
 单跑某个适配器（都在 dev-run 里跑过了，单独跑只用于排查）：
 

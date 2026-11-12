@@ -1183,6 +1183,9 @@ export async function apply (ctx, config) {
     push,
     config,
     log,
+    // 一轮最多连跑几张（并发仍是 1，见 BUILTIN_LIMITS 的注释）。
+    // 以前一轮只跑一张，队列排 5 张要等 4 小时才轮到第 5 张。
+    maxTicketsPerTick: BUILTIN_LIMITS.maxTicketsPerTick,
     prepareWorkspace: gitRunner ? prepareWorkspace : undefined,
     saveImage,
     removeWorktree: gitRunner ? removeWorktree : undefined,
@@ -1208,6 +1211,9 @@ export async function apply (ctx, config) {
     getConfig: () => config,
     // 「这次提交改了什么」要读 git：同一个 runner 也给体检用，不另起一份。
     gitRunner,
+    // 「它上次扫表是什么时候、上次为什么没扫成」—— 扫描失败以前只进日志，
+    // 面板因此回答不了「插件到底还在不在跑」。这里把内核的内存快照接进来。
+    getScanState: (nowAt) => scheduler.getScanState(nowAt),
   }))
   // 人工取消：内核的 cancelActive 此前没有调用方，人只能干等超时。
   ctx.tools.register(createPipelineCancelTool({

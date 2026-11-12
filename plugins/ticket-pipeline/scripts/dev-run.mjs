@@ -105,6 +105,25 @@ function section (title) {
 const silent = () => {}
 
 /**
+ * 给一个 mock 源套一层「数一数被扫过几次」的外壳。
+ *
+ * 为什么要这层壳：项目级暂停（工单 #39）的正确性判据是「**根本不该发出那次
+ * 远端请求**」，而不是「扫完了再把结果扔掉」。断言调用次数是唯一能锁住这个区别的办法，
+ * 而 mock 源本身不记这个数。
+ */
+function countingSource (inner) {
+  const wrapped = {
+    ...inner,
+    scanCount: 0,
+    async scan (signal) {
+      wrapped.scanCount += 1
+      return inner.scan(signal)
+    },
+  }
+  return wrapped
+}
+
+/**
  * 造一套跑完整链路的依赖。
  * @param {Object} [options]
  */
@@ -130,12 +149,14 @@ function harness (options = {}) {
 
   const scheduler = createScheduler({
     store,
-    sources: [source],
+    sources: options.sources ?? [source],
     locator,
     executor,
     push,
     config,
     log: silent,
+    // 注入口令时钟：`lastScanAt` / 退避 / 心跳都靠它，不注入就只能拿真实时钟去比。
+    now: options.now,
     saveImage: options.saveImage,
     prepareWorkspace: options.prepareWorkspace,
     removeWorktree: options.removeWorktree,
@@ -143,6 +164,9 @@ function harness (options = {}) {
     // 心跳间隔是内置常量（60 秒）。自测要把它压到毫秒级，走这个注入口而不是配置项
     // —— 配置项已经删掉了，删的理由是「配错会让两个进程同时改同一个 worktree」。
     leaseHeartbeatMsOverride: options.leaseHeartbeatMsOverride,
+    // 一轮最多连跑几张。**缺省不传 = 1（老行为）**：这里有上百处 tick() 只期望
+    // 跑一张，改缺省等于让它们全部变成「一轮跑完整个队列」。
+    maxTicketsPerTick: options.maxTicketsPerTick,
     // 站点心跳同样固定在 60 秒（它只影响「看起来多久没动」的粒度）。
     // 自测要验证心跳合并逻辑，也得能压到毫秒级。
     timelineHeartbeatMsOverride: options.timelineHeartbeatMsOverride,
@@ -293,6 +317,183 @@ async function main () {
     assert.equal(store.getTicket(ticketKey('beta', 'rec-mock-001')).projectId, 'beta')
   })
 
+  section('2c. 项目级开关（enabled）与「只跑这个项目」')
+
+  await check('项目 enabled:false 时既不扫表也不跑它已入队的票', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const alpha = countingSource(createMockSource({ projectId: 'alpha' }))
+    const beta = countingSource(createMockSource({ projectId: 'beta', seeds: [{ ...DEFAULT_SEEDS[0], recordId: 'rec-beta-001' }] }))
+    // beta 先入队一张 pending —— 关掉之后它必须原地不动，而不是「扫完再扔掉」。
+    const betaScan = await beta.scan(new AbortController().signal)
+    await store.enqueue(betaScan.created[0], {})
+    // 上面这次 scan 是**我们自己**发的（为了先把票塞进队列），不算 tick 的行为；
+    // 归零之后下面数的才是「tick 有没有去碰这个被关掉的项目」。
+    beta.scanCount = 0
+    const scheduler = createScheduler({
+      store,
+      sources: [alpha, beta],
+      locator: createTableLocator({ projects: [{ name: 'alpha', repo: { path: 'D:/repo/alpha' } }, { name: 'beta', repo: { path: 'D:/repo/beta' } }] }),
+      executor: createMockExecutor(),
+      push: createMockPush(),
+      config: {
+        enabled: true,
+        maxAttempts: 2,
+        projects: [
+          { name: 'alpha', match: { platform: 'mock' }, repo: { path: 'D:/repo/alpha' } },
+          { name: 'beta', match: { platform: 'mock' }, repo: { path: 'D:/repo/beta' }, enabled: false },
+        ],
+      },
+      log: silent,
+    })
+    const result = await scheduler.tick()
+    assert.equal(result.status, 'ok')
+    // 只扫了 alpha：beta 的 source.scan 根本不该被调用。
+    assert.equal(alpha.scanCount, 1, `开着的项目要照常扫，实际 ${alpha.scanCount}`)
+    assert.equal(beta.scanCount, 0, `关掉的项目连表都不该读，实际扫了 ${beta.scanCount} 次`)
+    // beta 那张票还在原地：不是被跑掉，也不是被删掉。
+    const betaRow = store.getTicket(ticketKey('beta', 'rec-beta-001'))
+    assert.equal(betaRow.phase, 'pending', '关掉的项目里已入队的票必须原地不动')
+    assert.equal(result.ranAll.filter((item) => item.projectId === 'beta').length, 0, '关掉的项目一张都不许跑')
+  })
+
+  await check('项目 enabled:true 或没写这个键时照常跑（缺省启用，老配置零迁移）', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const source = createMockSource({ projectId: DEMO })
+    const scheduler = createScheduler({
+      store,
+      sources: [source],
+      locator: createTableLocator({ projects: [{ name: DEMO, repo: { path: 'D:/repo/demo' } }] }),
+      executor: createMockExecutor(),
+      push: createMockPush(),
+      // 老配置形态：projects[] 里根本没有 enabled 这个键。
+      config: { enabled: true, maxAttempts: 2, projects: [{ name: DEMO, match: { platform: 'mock' }, repo: { path: 'D:/repo/demo' } }] },
+      log: silent,
+    })
+    const result = await scheduler.tick()
+    assert.equal(result.ranAll.length, 1, '不写 enabled 就是启用，票要照跑')
+  })
+
+  await check('pipeline_scan 带 projectId 时只扫那一个项目、只跑它的票', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const alpha = countingSource(createMockSource({ projectId: 'alpha' }))
+    const beta = countingSource(createMockSource({ projectId: 'beta', seeds: [{ ...DEFAULT_SEEDS[0], recordId: 'rec-beta-001' }] }))
+    const scheduler = createScheduler({
+      store,
+      sources: [alpha, beta],
+      locator: createTableLocator({ projects: [{ name: 'alpha', repo: { path: 'D:/repo/alpha' } }, { name: 'beta', repo: { path: 'D:/repo/beta' } }] }),
+      executor: createMockExecutor(),
+      push: createMockPush(),
+      config: { enabled: true, maxAttempts: 2, projects: [{ name: 'alpha', match: { platform: 'mock' }, repo: { path: 'D:/repo/alpha' } }, { name: 'beta', match: { platform: 'mock' }, repo: { path: 'D:/repo/beta' } }] },
+      log: silent,
+    })
+    const result = await scheduler.tick({ projectId: 'beta' })
+    assert.equal(beta.scanCount, 1, '指定的项目要扫')
+    assert.equal(alpha.scanCount, 0, '没指定的项目不该被扫')
+    assert.equal(result.ranAll.length, 1)
+    assert.equal(result.ranAll[0].projectId, 'beta', '只跑指定项目的票')
+  })
+
+  await check('pickNext：excludeProjects 用「排除」而不是「白名单」（删掉的项目不留死票）', async () => {
+    const repo = makeMemoryRepo()
+    const store = new TicketStore({ repo, log: silent })
+    const gone = createMockSource({ projectId: 'removed-project', seeds: [{ ...DEFAULT_SEEDS[0], recordId: 'rec-orphan-001' }] })
+    const scan = await gone.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], {})
+    // 配置里已经没有这个项目了 —— 排除列表只包含「明确关掉的项目」，
+    // 所以这张孤儿票仍然得能被挑出来（否则它会永远卡在队列里谁也跑不了）。
+    const next = store.pickNext({ excludeProjects: [] })
+    assert.equal(next.recordId, 'rec-orphan-001', '配置里删掉的项目留下的票不能被永久跳过')
+    assert.equal(store.pickNext({ projectId: 'other-project' }), undefined, '按项目挑时别的项目一张都没有')
+    assert.equal(store.pickNext({ projectId: 'removed-project' }).recordId, 'rec-orphan-001')
+  })
+
+  section('2d. 事后动作补做挂进 tick（#40）')
+
+  await check('tick 每 30 分钟补做一次：不用重启宿主，回填/通知会自己重试', async () => {
+    // 以前 `replayPendingEffects` 只在 apply() 里调一次 = 只在重启时补做。
+    // 进程连着开一周，那些「回填没写成 / 通知没发出去」的票就一直挂在
+    // 「交付未完成」上，永远等不到自己好起来。
+    let fakeNow = 0
+    const { store, source, push, scheduler } = harness({ now: () => fakeNow })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    const commit = { sha: 'abc1234', branch: 'v2.x', files: ['src/a.js'] }
+    await store.setPhase(key, 'done', {
+      commit,
+      testOutcome: 'passed',
+      pendingEffects: {
+        writeBack: { phase: 'done', commit, changedFiles: ['src/a.js'], verification: { outcome: 'passed' } },
+        notify: true,
+      },
+    }, { force: true })
+
+    // 距上次补做（调度器建好那一刻）还差一分钟：这一轮不该动手。
+    fakeNow = 29 * 60_000
+    const early = await scheduler.tick({ skipScan: true })
+    assert.equal(early.replayed, undefined, `没到点不该补做，实际 ${JSON.stringify(early.replayed)}`)
+    assert.equal(source.writes.length, 0, '没到点不该回填')
+    assert.equal(push.messages.length, 0, '没到点不该发通知')
+    assert.ok(store.getTicket(key).pendingEffects?.writeBack, '没到点时待办要原样留着')
+
+    // 过了 30 分钟：这一轮顺手补做，且不要求人重启。
+    fakeNow = 31 * 60_000
+    const late = await scheduler.tick({ skipScan: true })
+    assert.equal(late.status, 'ok')
+    assert.equal(late.replayed, 2, `回填 + 通知各算一个动作，实际 ${JSON.stringify(late)}`)
+    assert.equal(source.writes.length, 1, '回填要补做')
+    assert.equal(push.messages.length, 1, '通知要补发')
+    assert.equal(store.getTicket(key).pendingEffects, undefined, '补完就清干净')
+    assert.equal(store.getTicket(key).phase, 'done', '补做不能改票态')
+  })
+
+  await check('只跑一个项目时不动别的事后动作（我只想看这个项目，别顺手改别的表）', async () => {
+    let fakeNow = 0
+    const { store, source, scheduler } = harness({ now: () => fakeNow })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    const commit = { sha: 'abc9999', branch: 'v2.x', files: ['src/b.js'] }
+    await store.setPhase(key, 'done', {
+      commit,
+      testOutcome: 'passed',
+      pendingEffects: { writeBack: { phase: 'done', commit, changedFiles: ['src/b.js'], verification: { outcome: 'passed' } } },
+    }, { force: true })
+
+    fakeNow = 31 * 60_000
+    const result = await scheduler.tick({ skipScan: true, projectId: 'other-project' })
+    assert.equal(result.replayed, undefined, '指定项目时不该顺带补做别的项目的待办')
+    assert.equal(source.writes.length, 0, '不该动这张票的回填')
+    assert.ok(store.getTicket(key).pendingEffects?.writeBack, '待办要原样留着')
+  })
+
+  await check('补做自己炸了不影响这一轮的结果（票已经跑完了，这是「事后」）', async () => {
+    let fakeNow = 0
+    const brokenPush = {
+      id: 'broken-push',
+      async send () { throw new PipelineError('network', '推送服务连不上') },
+    }
+    const { store, push, scheduler } = harness({ now: () => fakeNow, push: brokenPush })
+    const [ticket] = (await createMockSource().scan(new AbortController().signal)).created
+    await store.enqueue(ticket)
+    const key = k('rec-mock-001')
+    await store.setPhase(key, 'done', {
+      commit: { sha: 'abc7777', branch: 'v2.x', files: ['src/c.js'] },
+      testOutcome: 'passed',
+      pendingEffects: { notify: true },
+    }, { force: true })
+
+    fakeNow = 31 * 60_000
+    const result = await scheduler.tick({ skipScan: true })
+    assert.equal(result.status, 'ok', `补做失败不该让整轮变成失败：${JSON.stringify(result)}`)
+    assert.equal(store.getTicket(key).phase, 'done', '票态不受影响')
+    // 通知还是没发出去：待办留着，下一个 30 分钟再来一次。
+    assert.ok(store.getTicket(key).pendingEffects?.notify, '没发成的通知要留着待补做')
+  })
+
   section('3. 整轮 tick（mock 全链路）')
   await check('一轮跑完整条链路，票到 done，通知一条', async () => {
     const { scheduler, store, push } = harness()
@@ -328,6 +529,59 @@ async function main () {
     assert.equal(done.length, 2)
   })
 
+  await check('一轮可以连跑多张：队列不再等下一个轮询周期', async () => {
+    // 以前一轮只跑一张，队列排 5 张要等 4 小时才轮到第 5 张。
+    // 装配层传 BUILTIN_LIMITS.maxTicketsPerTick（5），这里用手动注入验证行为。
+    const { scheduler, store } = harness({ maxTicketsPerTick: 5 })
+    const result = await scheduler.tick()
+    const done = store.listTickets().filter((r) => r.phase === 'done')
+    assert.equal(done.length, 3, '一轮把队列里三张全跑完')
+    assert.equal(result.ranAll.length, 3, 'ranAll 要记下全部，不能只记第一张')
+    assert.equal(result.ran.recordId, 'rec-mock-001', 'ran 仍然保留「第一张」的老语义')
+    assert.equal(store.listTickets().filter((r) => r.phase === 'pending').length, 0)
+  })
+
+  await check('连跑多张仍然是串行：任何时刻只有一张在跑', async () => {
+    // 并发恒 1 是结构性的，不是「碰巧没撞上」。这个用例盯的是它的定义：
+    // 同时进入执行器的票数永远不超过 1。
+    let active = 0
+    let peak = 0
+    const base = createMockExecutor()
+    const serial = {
+      id: 'mock-serial',
+      // 执行器的签名是 run(ticket, target, ctx) —— 包一层必须把三个参数都转过去，
+      // 少传一个 target 会让 mock 在 target.candidatePaths 上直接抛。
+      async run (...args) {
+        active += 1
+        peak = Math.max(peak, active)
+        try {
+          return await base.run(...args)
+        } finally {
+          active -= 1
+        }
+      },
+    }
+    const { scheduler, store } = harness({ executor: serial, maxTicketsPerTick: 5 })
+    await scheduler.tick()
+    assert.equal(peak, 1, '同时只有一张票在执行器里跑')
+    assert.equal(store.listTickets().filter((r) => r.phase === 'done').length, 3)
+  })
+
+  await check('连跑多张时取消要立刻止住后面的', async () => {
+    // 取消是逐张生效的：正在跑的那张收尾之后，不能再开始下一张。
+    // 否则人按了取消，还要再看两张票跑完才停。
+    // 给 mock 一点耗时，否则三张票在同一个微任务队列里就全跑完了，取消根本来不及
+    // （那样测的是「取消晚了」，不是「取消会不会止住后面的」）。
+    const { scheduler, store } = harness({ maxTicketsPerTick: 5, executor: createMockExecutor({ stepsDelayMs: 20 }) })
+    const running = scheduler.tick()
+    // 等第一张进入执行器再取消。
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    scheduler.cancelActive()
+    await running
+    const done = store.listTickets().filter((r) => r.phase === 'done').length
+    assert.ok(done < 3, `取消之后不该把三张都跑完（实际 done=${done}）`)
+  })
+
   await check('单飞：tick 重入被拒', async () => {
     const { scheduler } = harness({ executor: createMockExecutor({ stepsDelayMs: 20 }) })
     const first = scheduler.tick()
@@ -349,6 +603,100 @@ async function main () {
     const result = await scheduler.tick()
     assert.equal(result.status, 'scan-failed')
     assert.match(result.error ?? '', /network/)
+  })
+
+  // ── 扫表本身成没成，要能被问出来（2026-11-12）────────────────
+  //
+  // 动机：以前扫描失败只写进插件日志，`tick()` 的返回值除了 pipeline_scan
+  // 没人看。于是 token 过期 / 表被移出协作者 / 断网这三种情况会让插件
+  // **安静地什么都不做**，而运行页的「没有未收尾的票」与「一切正常」长得一模一样。
+  await check('扫表状态：失败要记下原因与连续次数，成功要清零', async () => {
+    const junk = createMockSource({ failScan: true })
+    const { scheduler } = harness({ source: junk })
+    assert.equal(scheduler.getScanState().lastScanAt, 0, '一次都没扫成过时 lastScanAt 必须是 0')
+
+    await scheduler.tick()
+    const bad = scheduler.getScanState()
+    assert.equal(bad.consecutiveFailures, 1, `失败一次要数一次：${JSON.stringify(bad)}`)
+    assert.equal(bad.lastErrorKind, 'network', '要给分类，面板据此选措辞')
+    assert.equal(bad.lastError, 'mock：模拟网络故障', 'lastError 只放人话，不带 kind: 前缀')
+    assert.ok(bad.lastAttemptAt > 0, '失败也要记「尝试过」的时刻，否则面板算不出下次扫描时间')
+
+    // 再失败一次：连续计数要涨（这是「偶发抖动」与「真的坏了」的分界）。
+    await scheduler.tick()
+    assert.equal(scheduler.getScanState().consecutiveFailures, 2)
+
+    // 换一个能扫成功的源：计数清零，lastScanAt 落地。
+    // 「现在几点」必须注入：lastScanAt 是 nowFn() 拍的，不注入就只能拿真实时钟去比。
+    const okSource = createMockSource()
+    const ok = harness({ source: okSource, now: () => 5_000 })
+    await ok.scheduler.tick()
+    const good = ok.scheduler.getScanState()
+    assert.equal(good.consecutiveFailures, 0, '扫成功必须清零，否则红字永远不会消')
+    assert.equal(good.lastError, null)
+    assert.equal(good.lastScanAt, 5_000, 'lastScanAt 取扫成功那一刻')
+  })
+
+  await check('扫表状态：进程刚起来时 lastScanAt 从水位补（跨重启还在）', async () => {
+    // 内存里是新进程（lastScanAt=0），但水位里有上一轮的扫描时刻 ——
+    // 不读水位的话，每次重启后面板都会说「还没扫过」，而实际上一直在扫。
+    const source = createMockSource()
+    const { scheduler, store } = harness({ source })
+    await store.saveWatermark('mock:demo', { seen: {}, lastScanAt: 4_000 })
+    const state = scheduler.getScanState()
+    assert.equal(state.lastScanAt, 4_000, `restart 后要能从水位读回：${JSON.stringify(state)}`)
+    assert.equal(state.lastScanAtFromWatermark, true, '要能区分「这次进程扫的」与「水位里上次的」')
+  })
+
+  await check('pipeline_status：把「上次扫描 / 上次扫失败」写在最上面', async () => {
+    const config = validateConfig({ enabled: true, pollIntervalMinutes: 3 }).value
+    const tool = createPipelineStatusTool({
+      store: { listTickets: () => [] },
+      getConfig: () => config,
+      now: () => 1_000_000,
+      getScanState: () => ({
+        lastScanAt: 940_000,
+        lastAttemptAt: 940_000,
+        lastError: null,
+        lastErrorKind: null,
+        consecutiveFailures: 0,
+        lastScanAtFromWatermark: false,
+      }),
+    })
+    const out = await tool.execute({ view: 'tickets' }, {})
+    // 时钟差 60 秒 / 轮询 3 分钟：两个数字都用 formatDuration 的原生口径写死，
+    // 免得改了 formatDuration 之后这里变成「顺手改断言」。
+    assert.match(out.text, /扫描：上次 1 分 0 秒前/, `要说清多久之前：${out.text.slice(0, 300)}`)
+    assert.match(out.text, /下次约 2 分 0 秒后会再扫/, `要给出下次扫描的大概时间：${out.text.slice(0, 300)}`)
+    // 顺序很重要：这一行必须在票列表之前 —— 排在最后等于没人看。
+    assert.ok(out.text.indexOf('扫描：上次') < out.text.indexOf('全库分布'), '扫表状态要排在票列表之前')
+    assert.equal(out.scan.consecutiveFailures, 0)
+  })
+
+  await check('pipeline_status：扫表连续失败三次以上要升级成「不是偶发」', async () => {
+    const make = (failures) => createPipelineStatusTool({
+      store: { listTickets: () => [] },
+      getConfig: () => validateConfig({}).value,
+      now: () => 1_000_000,
+      getScanState: () => ({
+        lastScanAt: 0,
+        lastAttemptAt: 900_000,
+        lastError: 'access token expired',
+        lastErrorKind: 'auth',
+        consecutiveFailures: failures,
+        lastScanAtFromWatermark: false,
+      }),
+    })
+    const once = await make(1).execute({ view: 'tickets' }, {})
+    assert.match(once.text, /⚠️ 上次扫表失败：access token expired/, `单次失败给一行：${once.text.slice(0, 300)}`)
+    assert.match(once.text, /还没扫过/, '一次都没成功过时必须说「还没扫过」，不能显示 1970 年的时长')
+    assert.ok(!/不是偶发/.test(once.text), '只失败一次不该吓人')
+    assert.equal(once.scan.alarm, false, '一次失败不算告警')
+
+    const many = await make(3).execute({ view: 'tickets' }, {})
+    assert.match(many.text, /已连续失败 3 次/, '连续失败要报次数')
+    assert.match(many.text, /不是偶发/, '三次以上升级措辞')
+    assert.equal(many.scan.alarm, true, '面板据此把灰字变红字，判定口径只在宿主这一处')
   })
 
   await check('截图取不到 → needs-info + 通知，票不 fail', async () => {
@@ -6160,6 +6508,133 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(missing.forgotten, false)
     assert.equal(missing.reason, 'not-found', missing.text)
   })
+
+  await check('remote.testProject()：下标越界时给人话，不抛类型错', async () => {
+    // 项目名允许重复（config 只警告不拦），所以参数是**下标**而不是名字。
+    // 越界最常见于「面板里刚加了项目还没保存，宿主那边没有它」。
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
+    let threw = null
+    try {
+      await remote.testProject(9)
+    } catch (error) {
+      threw = error
+    }
+    assert.ok(threw !== null, '越界必须抛错，不能静默返回 ok:true')
+    assert.match(String(threw?.message ?? ''), /没有第 9 个项目/, String(threw?.message ?? ''))
+    assert.match(String(threw?.message ?? ''), /重新读取/, '要教人怎么把面板和宿主对齐')
+  })
+
+  await check('remote.testProject()：不是飞书表的项目直接说「没表可测」，不算失败', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    env.config.projects = [
+      { name: 'local', match: { platform: 'mock' }, repo: { path: 'D:/repo' } },
+      { name: 'ks', match: { platform: 'wps' }, repo: { path: 'D:/repo' } },
+    ]
+    const remote = new TicketPipelineRemote({ getConfig: () => env.config, doctorOptions: {}, store: env.store })
+
+    const local = await remote.testProject(0)
+    assert.equal(local.ok, true, '非飞书不是错误：本来就没有要连的表')
+    assert.equal(local.skipped, true, JSON.stringify(local))
+    assert.match(local.text, /不走飞书表/, local.text)
+
+    // wps 必须先判：它虽然也不是 feishu，但真实结论是「一张票都拿不到」，
+    // 归进 skipped 会让人以为「这个项目没事」。
+    const wps = await remote.testProject(1)
+    assert.equal(wps.ok, false, `金山源必须报不通过：${JSON.stringify(wps)}`)
+    assert.match(wps.text, /金山/, wps.text)
+    assert.match(wps.text, /feishu/, '要给出路')
+  })
+
+  await check('remote.testProject()：只把这一张表交给探针，并按层报出结论', async () => {
+    // 关键两条：① 只传 projects:[这一个] —— 传全量会变成「体检」，慢且看不出是哪张表；
+    // ② 复用的就是体检那份探针 —— 否则会出现「这里绿了、体检里红」。
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    env.config.projects = [
+      { name: 'pms', match: { platform: 'feishu', appToken: 'basCNOne', tableId: 'tblOne' }, repo: { path: 'D:/repo' } },
+      { name: 'other', match: { platform: 'feishu', appToken: 'basCNTwo', tableId: 'tblTwo' }, repo: { path: 'D:/repo' } },
+    ]
+    /** @type {Array<any>} */
+    const seen = []
+    const remote = new TicketPipelineRemote({
+      getConfig: () => env.config,
+      store: env.store,
+      doctorOptions: {
+        readSecret: (ref) => (ref === 'FEISHU_APP_ID' ? 'cli_demo' : 'secret_demo'),
+        probeFeishu: async (input) => {
+          seen.push(input)
+          return {
+            skipped: false,
+            token: { ok: true, message: '能换到 tenant_access_token' },
+            projects: [{
+              name: 'pms',
+              kind: 'bitable',
+              table: 'tblOne',
+              metadata: { ok: true, message: '能读到表元数据' },
+              records: { ok: true, message: '能读到第一页数据（2 行）' },
+            }],
+          }
+        },
+      },
+    })
+
+    const out = await remote.testProject(0)
+    assert.equal(seen.length, 1, '探针只该被调一次')
+    assert.equal(seen[0].projects.length, 1, `只该传这一个项目，实际传了 ${seen[0].projects.length} 个`)
+    assert.equal(seen[0].projects[0].name, 'pms', '要传被点的那一个，不是第一个')
+    assert.equal(out.ok, true, `这张表能读就该 ok：${JSON.stringify(out)}`)
+    assert.match(out.text, /能换到 tenant_access_token/, out.text)
+    assert.match(out.text, /能读到表元数据/, out.text)
+    assert.match(out.text, /能读到第一页数据/, out.text)
+    assert.match(out.text, /这张表能读、能收到票/, '结尾要有正面结论')
+    assert.match(out.text, /保存/, '要提醒「改完记得保存」')
+
+    // 第二张卡片：探针报读不到数据时，结论必须变成否定，并指到 ❌ 那一行。
+    const failing = new TicketPipelineRemote({
+      getConfig: () => env.config,
+      store: env.store,
+      doctorOptions: {
+        readSecret: (ref) => (ref === 'FEISHU_APP_ID' ? 'cli_demo' : 'secret_demo'),
+        probeFeishu: async () => ({
+          skipped: false,
+          token: { ok: true, message: '能换到 tenant_access_token' },
+          projects: [{
+            name: 'pms',
+            kind: 'bitable',
+            table: 'tblOne',
+            metadata: { ok: true, message: '能读到表元数据' },
+            records: { ok: false, message: '读不到第一页数据（1254043：应用不是协作者）', fix: '把应用加成可编辑协作者' },
+          }],
+        }),
+      },
+    })
+    const bad = await failing.testProject(1)
+    assert.equal(bad.ok, false, JSON.stringify(bad))
+    assert.equal(bad.blockers.length > 0, true, '要有能被机器读的失败项')
+    assert.match(bad.text, /收不到票/, bad.text)
+    assert.match(bad.text, /❌/, '哪一层断了要看得出来')
+  })
+
+  await check('remote.testProject()：没配凭据时说明白去哪配，而不是抛错', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const env = harness()
+    env.config.projects = [
+      { name: 'pms', match: { platform: 'feishu', appToken: 'basCNOne', tableId: 'tblOne' }, repo: { path: 'D:/repo' } },
+    ]
+    const remote = new TicketPipelineRemote({
+      getConfig: () => env.config,
+      store: env.store,
+      doctorOptions: { readSecret: () => '', probeFeishu: async () => ({ skipped: true }) },
+    })
+    const out = await remote.testProject(0)
+    assert.equal(out.ok, false)
+    assert.match(out.text, /FEISHU_APP_ID/, out.text)
+    assert.match(out.text, /凭据/, '要指到「凭据」页签')
+  })
+
 
   await check('remote.setProjectTable()：贴一条不带 ?table= 的链接，必须把旧的 tableId 清掉', async () => {
     // 真实事故（2026-11-11，pms 项目）：配置里 `appToken` 是 wiki 里的电子表格、

@@ -868,6 +868,30 @@ export async function collectStatus (options, args) {
   // 「已多久没动」会差几毫秒，自测也没法写确定值。
   const now = nowFn()
 
+  // ── 扫表本身的成败（2026-11-12）────────────────────────────
+  // 票据状态回答「我要做什么」，这一份回答「它还在不在跑」。以前扫描失败
+  // 只写进插件日志：token 过期 / 表被移出协作者 / 断网时插件安静地什么都不做，
+  // 而运行页的「没有未收尾的票」与「一切正常」长得一模一样。
+  //
+  // `nextScanAt` 在这里算而不是在调度器里算：轮询间隔是**装配层**的知识
+  // （`src/index.js` 的 `ctx.interval`），调度器不该猜自己被多久调一次。
+  const scanState = typeof options.getScanState === 'function' ? options.getScanState(now) : null
+  const pollIntervalMs = Math.max(1, Math.min(60, Number(config?.pollIntervalMinutes) || 3)) * 60 * 1000
+  const scan = scanState === null
+    ? null
+    : {
+        lastScanAt: scanState.lastScanAt > 0 ? scanState.lastScanAt : null,
+        lastAttemptAt: scanState.lastAttemptAt > 0 ? scanState.lastAttemptAt : null,
+        nextScanAt: scanState.lastAttemptAt > 0 ? scanState.lastAttemptAt + pollIntervalMs : null,
+        pollIntervalMs,
+        lastError: scanState.lastError ?? null,
+        lastErrorKind: scanState.lastErrorKind ?? null,
+        consecutiveFailures: Number(scanState.consecutiveFailures ?? 0),
+        // 连续失败 3 次以上就不再是「偶发抖动」——面板据此把提示从灰字变红字。
+        // 阈值写在这里而不是面板：两条判定（工具文案与面板颜色）必须同一口径。
+        alarm: Number(scanState.consecutiveFailures ?? 0) >= 3,
+      }
+
   let rows = options.store.listTickets()
   // 交付口径要按全库算，不受 recordId / includeDone 影响（#08）：
   // 「交付未完成：2 张」说的是整个流水线，不是这一次筛出来的。
@@ -891,6 +915,9 @@ export async function collectStatus (options, args) {
         view,
         projects: [],
         tickets: [],
+        // 扫表状态在早退分支也要给：面板不传 recordId 是常态，但工具会被这样调 ——
+        // 少给一份，"上次扫描"就在最需要它的那条路径上消失了。
+        scan,
         config: describeConfig(config),
         text: `没有这条工单的记录：${safeArgs.recordId}\n`
           + '（插件从没见过它。可能是「是否处理」还不是「处理中」，或者还没扫到。）',
@@ -940,6 +967,38 @@ export async function collectStatus (options, args) {
 
   const lines = []
   lines.push(enabled ? '流水线：已开启' : '流水线：总开关是关的（enabled=false），不会自动扫表')
+
+  /**
+   * 扫表那两行（2026-11-12）。
+   *
+   * 为什么必须写在最上面：排在票列表之后的「它多久没扫了」没有人会看到。
+   * 而它恰恰是「插件看起来没动静」时第一个要排除的原因 ——
+   * 卡住的票有 phaes 可看，扫不动的表则一条线索都没有。
+   *
+   * 三种形态：
+   * - 从没扫过：说清「还没扫过」而不是显示一个 1970 年的时长
+   * - 扫过且没出错：一行「上次扫描 X 前（下次约 Y 后）」
+   * - 有错：单独一行红字，连续 3 次以上再加一句「不是偶发了」
+   */
+  if (scan !== null) {
+    const age = scan.lastScanAt === null ? null : Math.max(0, now - scan.lastScanAt)
+    const nextIn = scan.nextScanAt === null ? null : Math.max(0, scan.nextScanAt - now)
+    const ageText = age === null
+      ? '还没扫过'
+      : (age < 60_000 ? '刚刚' : `${formatDuration(age)}前`)
+    const nextText = nextIn === null || !enabled
+      ? ''
+      : `（下次约 ${nextIn < 60_000 ? '不到 1 分钟' : formatDuration(nextIn)}后会再扫）`
+    lines.push(`扫描：上次 ${ageText}${nextText}`)
+    if (scan.lastError !== null) {
+      const failedFor = scan.consecutiveFailures > 1 ? `（已连续失败 ${scan.consecutiveFailures} 次）` : ''
+      lines.push(`⚠️ 上次扫表失败${failedFor}：${scan.lastError}`)
+      lines.push(`  扫表失败不等于票失败 —— 这段时间里**表里的变化一件都没收进来**。先按体检（pipeline_doctor）给的修法处理，再看这张表。`)
+      if (scan.alarm) {
+        lines.push('  这不是偶发抖动了：连续失败三次以上，通常是凭据过期、表权限被收回、或者网络出口不通。')
+      }
+    }
+  }
 
   /**
    * 把 `{ phase: count }` 按档位渲染成几行人话。
@@ -1178,6 +1237,9 @@ export async function collectStatus (options, args) {
     // 按项目聚合的战报：口径恒为全库，不受 recordId / includeDone / limit 影响。
     // 「每个项目多少张、几张要你动手」以前只能靠人翻完所有票自己数。
     projects: projectSummaries,
+    // 扫表本身的成败（2026-11-12）：与票据状态正交的一份快照。
+    // 面板运行页用它显示「上次扫描 X 前」，并在连续失败时把提示变红。
+    scan,
     // counts = 全库口径（老字段名不变，避免调用方炸）；filteredCounts = 本次筛选口径。
     counts: total,
     filteredCounts: filtered,

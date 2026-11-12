@@ -8,8 +8,8 @@
 > | 数字 | 指什么 | 来源 |
 > |---|---|---|
 > | **27 个键 / 4 个分组** | 顶层配置项（不含 `projects` 数组内部） | `src/core/config.js` 的 `CONFIG_FIELDS` / `CONFIG_GROUPS` |
-> | **34 个字段** | 一个 `projects[]` 元素里可写的深层路径 | `listProjectDescriptorPaths()` |
-> | **30 个字段** | 设置面板「项目」页里画出来的控件数（34 里 `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框：定位工单表只走卡片头上的「工单表链接」） | `src/remote/host.js` 的 `describeProject()` |
+> | **35 个字段** | 一个 `projects[]` 元素里可写的深层路径 | `listProjectDescriptorPaths()` |
+> | **31 个字段** | 设置面板「项目」页里画出来的控件数（35 里 `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框：定位工单表只走卡片头上的「工单表链接」） | `src/remote/host.js` 的 `describeProject()` |
 >
 > 所有缺省值都与 `src/core/config.js` 的 `default` 一一对应。改这一页之前先改代码。
 
@@ -84,7 +84,7 @@
 
 ---
 
-## 2. `projects[]` 每项（34 个字段）
+## 2. `projects[]` 每项（35 个字段）
 
 一个项目 = 一张工单表 + 一个本地仓库。设置面板上的「项目」页把它们分成
 **基本 / 工单表 / 金山文档 / 仓库 / 验证命令** 几个分区，金山那一组只在平台是 `wps` 时出现。
@@ -94,6 +94,7 @@
 | 键 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | string | —（必填） | 项目唯一标识，分支名里会出现：`ticket-pms-xxx-r1` |
+| `enabled` | boolean | `true` | 项目级开关。**只有显式写 `false` 才生效**，不写这个键 = 启用（所以老配置不用改）。关掉 = 不再扫这张表、它已入队的工单也不跑；配置与历史都保留，改回 `true` 立即恢复。注意别写成字符串 `'false'` —— 校验会直接报错（静默当「没关」是最难查的那一类） |
 | `description` | string | `""` | 会进 agent 的定位提示，可留空 |
 
 ### 2.2 工单表定位（`match.*`）

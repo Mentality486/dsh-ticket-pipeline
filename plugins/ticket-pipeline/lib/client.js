@@ -239,13 +239,52 @@ window.__ModuleLoader__.load({
           ],
         },
         {
+          // 「跑一轮」带一个可选的项目名（工单 #39）：面板上那一格下拉缺省是「全部项目」，
+          // 选某一项就只扫它、只跑它的票。参数形状与 status 的 includeDone 同款：
+          // 可选 + acceptsUndefined，不传时浏览器侧根本不会把字段写进 args。
           id: 'ticket-pipeline#ticketPipeline/scan',
           service: 'ticketPipeline',
           namespace: 'ticketPipeline',
           method: 'scan',
           invocation: { kind: 'direct' },
           result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ScanResult', create: function () { return { parse: function (value) { return value } } } },
-          parameters: [],
+          parameters: [
+            {
+              name: 'projectId',
+              wire: 'projectId',
+              description: '只跑这一个项目（配置里的项目名）；不传 = 所有开着的项目',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/scan:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('scan: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/scan:projectId',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('scan: projectId 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
         },
         {
           id: 'ticket-pipeline#ticketPipeline/cancel',
@@ -418,6 +457,56 @@ window.__ModuleLoader__.load({
             },
           ],
         },
+        {
+          // 项目卡片上的「测这张表」（工单 #43）。
+          //
+          // 只有客户端的这一份描述符需要写参数细节：宿主侧那一份在
+          // `src/remote/descriptors.js` 里，两边 typeSymbol 必须逐字对上
+          // （`client-check` 会比对「两端描述符一致」）。
+          // `index` 必填：下标与面板上那张卡片一一对应，不像项目名会重复。
+          id: 'ticket-pipeline#ticketPipeline/testProject',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'testProject',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#ProjectProbeResult', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [
+            {
+              name: 'index',
+              wire: 'index',
+              description: 'projects[] 里的下标（从 0 开始），面板按 projects() 的顺序给',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/testProject:index',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      var number = typeof value === 'number' ? value : Number(String(value).trim())
+                      if (!Number.isInteger(number) || number < 0) throw new TypeError('testProject: index 必须是 ≥0 的整数')
+                      return number
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/testProject:index',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      var number = typeof value === 'number' ? value : Number(String(value).trim())
+                      if (!Number.isInteger(number) || number < 0) throw new TypeError('testProject: index 必须是 ≥0 的整数')
+                      return number
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
+        },
       ],
     }
 
@@ -439,7 +528,15 @@ window.__ModuleLoader__.load({
      */
     var CREDENTIAL_REFS = [
       { ref: 'FEISHU_APP_ID', label: '飞书 App ID', hint: '飞书开放平台 → 开发者后台 → 应用详情 → 凭证与基础信息。' },
-      { ref: 'FEISHU_APP_SECRET', label: '飞书 App Secret', hint: '同上，App Secret。只读工单表需要 bitable:app:readonly 权限。' },
+      {
+        ref: 'FEISHU_APP_SECRET',
+        label: '飞书 App Secret',
+        // 权限口径必须与 #22 之后一致：读票要 readonly，**回填要读写**。
+        // 这里以前只写 bitable:app:readonly，人会照它配完、票跑完了才发现回填被拒。
+        hint: '同上，App Secret。权限：多维表格 `bitable:app`；'
+          + '电子表格 `sheets:spreadsheet`（要**读写**，只读会让回填那一列被拒）。改完记得「创建版本并发布」。'
+          + '这个应用也用来发飞书通知（pushAdapter=feishu），不用另建。',
+      },
       { ref: 'QQMAIL_AUTH_CODE', label: 'QQ 邮箱授权码', hint: 'QQ 邮箱 → 设置 → 账户 → 开启 SMTP 服务后拿到的授权码，不是登录密码。' },
       { ref: 'GITLAB_TOKEN', label: 'GitLab Token', hint: '只在项目打开了「远程 MR（实验性）」时才需要；缺省交付形态是本地提交，你多半不用填。' },
       { ref: 'PUSHPLUS_TOKEN', label: 'PushPlus token', hint: '填这里就行。通知适配器选 PushPlus 时用它，不写进配置文件。' },
@@ -721,6 +818,65 @@ window.__ModuleLoader__.load({
       return ADVANCED_CONFIG_KEYS[key] === true
     }
 
+    // ── 高危项的「后果提示」────────────────────────────────────
+    //
+    // 为什么要有这张表：面板上每个字段都只说「它是什么」，不说「改了会怎样」。
+    // 于是最危险的那几个开关看起来最无害 —— 「处理完回填表格」关了，
+    // 界面上只是少一个亮着的小滑块，而真实后果是表格里那行永远停在「处理中」、
+    // 下一轮扫描把同一张票当新票再收一遍（电子表格尤其，因为它的行身份
+    // 就是「是否处理 = 处理中」）。
+    //
+    // 判定口径：**只在当前值处于「已经开始付代价」的那一侧才提示**。
+    // 一律挂提示会变成噪音（人一学会忽略黄色，红色也就没用了）。
+    //
+    // 文案要求：说清「会发生什么」，不说「不建议」—— 后者不提供任何信息。
+    var RISK_HINTS = {
+      // 总开关不在这里：它被摘出 all leaves 单独画（见 renderMasterSwitch），
+      // 那里本来就有「已关闭：不会扫表、不会建工作区、不会提交」这一行。
+      // 在两个地方各说一遍会让同一件事看起来像两件事。
+      workExecutor: function (value) {
+        if (value !== 'mock') return null
+        return 'mock 不会改代码，也不会产生本地提交 —— 它只走一遍流程给你看界面和通知长什么样。'
+          + '要真干活，切到 agent。'
+      },
+      writeBack: function (value) {
+        if (value !== false) return null
+        return '关掉之后表格里那一行会永远停在「处理中」：下一轮扫描会把同一张票再收进来一遍，'
+          + '一张票会被反复处理（电子表格尤其明显，它的行身份就是「是否处理」。'
+          + '而「是否处理」正是回填要写的那一列）。'
+      },
+      // `pushAdapter` 也不在这里：通知组顶部已经有一句 note（`notifyVisibility`）
+      // 专门说「当前是 mock：不会真的发通知」。同一个组里说两遍等于没说。
+      // `isolateWorktree` 同理不进这张表：它缺省就是 false（就地模式是设计决定，
+      // 不是误配），缺省值天天挂一条橙框会把人训练成忽略橙框。
+      keepSession: function (value) {
+        if (value !== false) return null
+        return '关掉之后跑完就把处理会话收掉，事后想再问「它当时为什么这么改」就没有可翻的记录了。'
+      },
+      writeBackOnFailure: function (value) {
+        if (value !== true) return null
+        return '打开后失败票也会往「处理结果」写一段说明（只写这一列，不动「是否处理」）。'
+          + '好处是失败原因留在表里；代价是表格会被失败信息填满，人要清。'
+      },
+    }
+
+    /**
+     * 某个配置键当前值下的后果提示；没有就返回 null。
+     *
+     * 用键名索引而不是 meta 标记：schema 由宿主下发，宿主不知道哪几个键
+     * 「关掉会有副作用」，只有本插件知道。
+     */
+    function riskHintOf (key, value) {
+      var fn = RISK_HINTS[key]
+      if (typeof fn !== 'function') return null
+      try {
+        var text = fn(value)
+        return typeof text === 'string' && text.length > 0 ? text : null
+      } catch (error) {
+        return null
+      }
+    }
+
     // `enabled` 不归任何分组：它是整页的总开关，置顶单独画。
     //
     // 为什么从组里摘出来：它原来在「杂项」组最底下，而缺省只展开一组 —— 新人装完
@@ -748,9 +904,25 @@ window.__ModuleLoader__.load({
           note: '当前走 PushPlus。token 不在这里填，去「凭据」页填 PUSHPLUS_TOKEN。',
         }
       }
+      // 飞书直发：**这一支以前漏了**，后果不是「少两个字段」，而是这条路根本走不通 ——
+      // 人选了 feishu 之后收件人两个键被藏起来，同时被告知「当前是 mock」，
+      // 保存完体检再报「缺 feishuPush.receiveId」。一个 bug 同时吃掉功能和配置页：
+      // 人在界面上既看不到该填什么，也拿不到「你选的是飞书」这个反馈。
+      //
+      // 凭据复用「凭据」页已有的 FEISHU_APP_ID / FEISHU_APP_SECRET（同一个自建应用），
+      // 所以这里只说收件人，不提 token —— 提了会让人以为要再申请一个应用。
+      if (adapter === 'feishu') {
+        return {
+          keep: ['pushAdapter', 'notifyOn', 'feishuPush.receiveId', 'feishuPush.receiveIdType'],
+          note: '当前用飞书自建应用直接发（不经过第三方）。App ID / App Secret 复用「凭据」页那两个，不用另建应用。'
+            + '收件人填 open_id（ou_…），类型要与下面那一格对上（open_id / email / chat_id）；'
+            + '第一次不知道填什么：把机器人拉进一个群，群设置里能拿到 chat_id。'
+            + '报 230013 不是缺权限，是开放平台「应用功能 → 机器人」的可用范围里没有这个人。',
+        }
+      }
       return {
         keep: ['pushAdapter', 'notifyOn'],
-        note: '当前是 mock：不会真的发通知，只往插件日志里写一行。换成 qqmail / pushplus 才会出现对应字段。',
+        note: '当前是 mock：不会真的发通知，只往插件日志里写一行。换成 feishu / qqmail / pushplus 才会出现对应字段。',
       }
     }
 
@@ -765,6 +937,9 @@ window.__ModuleLoader__.load({
         mock: 'mock（不发真通知）',
         qqmail: 'QQ 邮箱',
         pushplus: 'PushPlus',
+        // 飞书直发是推荐项（不经第三方），下拉里必须说清楚它比其他两个好在哪，
+        // 否则人会因为「已经配了 QQ 邮箱」而不去看它。
+        feishu: '飞书直发（用你自己的自建应用，不经过第三方）',
       },
       'qqmail.encryption': {
         tls: 'tls（465 端口直连加密，推荐）',
@@ -790,6 +965,10 @@ window.__ModuleLoader__.load({
         key: 'basic',
         label: '基本',
         fields: [
+          { path: ['enabled'], from: 'enabled', label: '启用这个项目', kind: 'bool',
+            // 缺省 true（配置里不写这个键 = 启用）。勾掉 = 不再扫它的表、不再跑它已入队的票，
+            // 但配置与历史都留着 —— 这是「暂停」，不是「删除」。
+            hint: '关掉就暂停它：不再扫这张表、它已入队的票也不跑了；配置和历史都保留，勾回来就恢复。缺省是启用。' },
           { path: ['name'], from: 'name', label: '项目名', kind: 'text', required: true, hint: 'projectId，必须唯一；工单里的项目要靠它对上仓库。' },
           { path: ['description'], from: 'description', label: '说明', kind: 'text', advanced: true, hint: '随便写给人看的备注，不参与任何判断；留空也行。' },
           { path: ['match', 'platform'], from: 'platform', label: '平台', kind: 'select', options: PLATFORMS, required: true,
@@ -1132,7 +1311,10 @@ window.__ModuleLoader__.load({
         for (var f = 0; f < fields.length; f += 1) {
           var field = fields[f]
           var isPlatform = field.path.length === 2 && field.path[0] === 'match' && field.path[1] === 'platform'
-          out[field.from] = isPlatform ? 'mock' : (field.kind === 'bool' ? false : '')
+          // 新项目缺省是**启用**的（`enabled` 的缺省值就是 true），所以这一格要给 true
+          // 而不是走通用的 `false` —— 否则新加的项目一出生就是暂停状态，人配完了发现不跑。
+          var isEnabledField = field.path.length === 1 && field.path[0] === 'enabled'
+          out[field.from] = isPlatform ? 'mock' : (isEnabledField ? true : (field.kind === 'bool' ? false : ''))
         }
       }
       out.name = '新项目' + (index + 1)
@@ -1719,6 +1901,12 @@ window.__ModuleLoader__.load({
       '  color:var(--dsw-alias-label-caption,#adb2b8)}',
       '.tp-field-err{margin:0;font-size:12px;color:var(--dsw-alias-state-error-primary,#ec1313)}',
       '.tp-soft{margin:0;font-size:12px;color:var(--dsw-alias-state-warn-primary,#f59e0b)}',
+      // 高危开关的后果提示：左侧一道橙线 + 浅底，和「说明」区分开 ——
+      // 说明是灰字（可以跳过），这个是「你会踩到的事」。
+      '.tp-risk{margin:4px 0 0;font-size:12px;line-height:1.6;padding:5px 8px;',
+      '  border-left:3px solid var(--dsw-alias-state-warn-primary,#f59e0b);',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);border-radius:0 4px 4px 0;',
+      '  color:var(--dsw-alias-label-secondary,#61666b)}',
       '.tp-note{margin:0;font-size:12px;line-height:1.6;',
       '  color:var(--dsw-alias-label-tertiary,#81858c)}',
       '.tp-err{margin:0;font-size:12px;line-height:1.6;',
@@ -1846,6 +2034,11 @@ window.__ModuleLoader__.load({
       '.tp-link-input{display:flex;gap:6px;align-items:center}',
       '.tp-link-input .tp-input{flex:1 1 auto;min-width:0}',
       '.tp-link-input .tp-btn{flex:0 0 auto;white-space:nowrap}',
+      // 「测这张表」那一行：按钮和结论都要紧贴链接输入框，不能让人以为
+      // 测的是另一个项目。
+      '.tp-test-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 0}',
+      '.tp-test-row .tp-btn{flex:0 0 auto;white-space:nowrap}',
+      '.tp-test-row .tp-ok,.tp-test-row .tp-err{flex:1 1 100%;margin:0}',
       // 实验性平台的醒目提示（工单 #20）：背景色 + 左边框，和普通说明文字区分开 ——
       // 这条提示的后果是「配完了什么都没发生」，混在灰字里没人会读。
       '.tp-wps-notice{margin:0 0 10px;padding:8px 10px;border-left:3px solid #d98600;',
@@ -1884,6 +2077,12 @@ window.__ModuleLoader__.load({
       '.tp-run-flow .tp-st-unreached{color:#b0b4ba}',
       '.tp-run-flow .tp-flow-total{margin-left:4px;color:var(--dsw-alias-label-tertiary,#81858c)}',
       '.tp-run-flow.tp-flow-empty{font-family:inherit;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      // 筛选条：一根搜索框 + 一个分组下拉，与票列表同一行高度、可换行。
+      // 不加边框、不加底色 —— 它不是卡片里的另一个区块，只是票列表的标题栏。
+      '.tp-run-filter{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px}',
+      '.tp-run-search{flex:1 1 180px;min-width:120px;font-size:12px;padding:3px 8px}',
+      '.tp-run-filter .tp-select{flex:0 0 auto;font-size:12px;padding:3px 6px}',
+      '.tp-run-filtered{display:flex;align-items:center;gap:6px;flex:0 0 auto}',
       '.tp-run-row:first-child{border-top:0}',
       '.tp-run-row-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.tp-run-toggle{display:flex;align-items:baseline;gap:8px;flex:1 1 auto;min-width:0;',
@@ -2021,6 +2220,10 @@ window.__ModuleLoader__.load({
       var notes = []
       if (help.length > 0) notes.push(h('p', { key: 'help', className: 'tp-help' }, help))
       if (constraint.length > 0) notes.push(h('p', { key: 'constraint', className: 'tp-constraint' }, constraint))
+      // 后果提示排在「说明」之后、「来自 profile 的当前值」之前：它比说明重要，
+      // 但要先知道这个字段是干什么的，才看得懂「改了会怎样」。
+      var risk = riskHintOf(keyOf(leaf), draftValue)
+      if (risk !== null) notes.push(h('p', { key: 'risk', className: 'tp-risk' }, risk))
       if (changed) {
         notes.push(h('p', { key: 'base', className: 'tp-constraint' },
           '来自 profile 的当前值：' + describeBase(props.base)))
@@ -2245,16 +2448,39 @@ window.__ModuleLoader__.load({
     function RunCard (props) {
       var data = props.data
       var tiers = data && Array.isArray(data.tiers) ? data.tiers : []
-      var tickets = data && Array.isArray(data.tickets) ? data.tickets : []
+      var allTickets = data && Array.isArray(data.tickets) ? data.tickets : []
       var enabled = data ? data.enabled === true : false
       var needYou = 0
       for (var i = 0; i < tiers.length; i += 1) {
         if (tiers[i].label === '需要你处理') needYou = tiers[i].count
       }
+      // 「能不能取消」按**未筛选**的票判断：筛掉之后画面里没有正在跑的票，
+      // 不代表宿主里没有 —— 拿筛选结果当判据会让取消按钮莫名变灰。
       var running = false
-      for (var j = 0; j < tickets.length; j += 1) {
-        if (ACTIVE_PHASES.indexOf(tickets[j].phase) >= 0) running = true
+      for (var j = 0; j < allTickets.length; j += 1) {
+        if (ACTIVE_PHASES.indexOf(allTickets[j].phase) >= 0) running = true
       }
+      // 筛选：一句话（搜 recordId / 标题 / 项目名，不分大小写）+ 一个分组。
+      // 两者相乘：既回答「只看失败的」，也回答「在失败的里找 pms 的那张」。
+      var query = String(props.query || '').trim().toLowerCase()
+      var filter = String(props.filter || '')
+      var tickets = allTickets.filter(function (t) {
+        if (filter.length > 0) {
+          var bucket = null
+          for (var gi = 0; gi < RUN_GROUPS.length; gi += 1) {
+            if (RUN_GROUPS[gi].phases.indexOf(t.phase) >= 0) { bucket = RUN_GROUPS[gi].label; break }
+          }
+          if ((bucket || '其它') !== filter) return false
+        }
+        if (query.length === 0) return true
+        var hay = [t.recordId, t.problemSummary, t.projectId, t.phaseLabel, t.lastError]
+        for (var h2 = 0; h2 < hay.length; h2 += 1) {
+          if (hay[h2] !== undefined && hay[h2] !== null &&
+            String(hay[h2]).toLowerCase().indexOf(query) >= 0) return true
+        }
+        return false
+      })
+      var filtered = tickets.length !== allTickets.length
       var tierText = tiers.map(function (t) { return t.label + ' ' + t.count }).join(' · ')
       var queue = data && data.queue ? data.queue : null
       var busyScan = props.busy && props.action === 'scan'
@@ -2370,6 +2596,10 @@ window.__ModuleLoader__.load({
       var emptyText = null
       if (data && !enabled) {
         emptyText = '总开关是关的，插件不会扫表、不会建工作区、不会提交。去「参数」页签把它打开。'
+      } else if (data && filtered && tickets.length === 0) {
+        // 「筛出来是空的」和「本来就没有票」必须分开说：前者要人改筛选条件，
+        // 后者要人去配项目。混成一句会让人以为队列空了。
+        emptyText = '当前筛选下没有票。清掉筛选看看全部 ' + allTickets.length + ' 张。'
       } else if (data && tickets.length === 0) {
         emptyText = props.history
           ? '库里还没有任何票 —— 这个插件的票据只增不删，一张都没跑过就是空的。'
@@ -2414,7 +2644,7 @@ window.__ModuleLoader__.load({
               type: 'button',
               className: 'tp-btn tp-primary',
               disabled: props.busy || !props.available,
-              title: '立刻扫一轮表，最多跑一张票。这一轮不会等它跑完。',
+              title: '立刻扫一轮表，接着把队列里的票跑掉。这一轮不会等它跑完。',
               onClick: props.onScan,
             }, busyScan ? '触发中…' : '跑一轮'))),
         props.available
@@ -2425,6 +2655,37 @@ window.__ModuleLoader__.load({
             '宿主 Remote 没挂上（typert 服务缺席）。命令行里仍然可以跑 pipeline_status 工具。'),
         statusLine,
         data && tierText.length > 0 ? h('p', { className: 'tp-run-tiers' }, '汇总：' + tierText) : null,
+        // 筛选条：只在有票的时候出现。空队列时多两根控件只是噪音。
+        data && allTickets.length > 0
+          ? h('div', { className: 'tp-run-filter' },
+            h('input', {
+              className: 'tp-input tp-run-search',
+              type: 'search',
+              value: props.query || '',
+              placeholder: '搜 recordId / 标题 / 项目',
+              'aria-label': '在票里搜索',
+              onChange: function (event) { props.onQuery(event.target.value) },
+            }),
+            h('select', {
+              className: 'tp-select',
+              value: props.filter || '',
+              'aria-label': '只看某一组',
+              onChange: function (event) { props.onFilter(event.target.value) },
+            },
+            h('option', { key: '', value: '' }, '全部分组'),
+            RUN_GROUPS.map(function (group) {
+              return h('option', { key: group.label, value: group.label }, group.label)
+            })),
+            filtered
+              ? h('span', { className: 'tp-note tp-run-filtered' },
+                '筛出 ' + tickets.length + ' / ' + allTickets.length + ' 张',
+                h('button', {
+                  type: 'button',
+                  className: 'tp-btn tp-sm',
+                  onClick: function () { props.onQuery(''); props.onFilter('') },
+                }, '清掉筛选'))
+              : null)
+          : null,
         data && queue && queue.nextRecordId
           ? h('p', { className: 'tp-run-tiers' },
             '下一个：' + queue.nextRecordId
@@ -2688,6 +2949,25 @@ window.__ModuleLoader__.load({
           '写入时宿主会**把另一套定位字段清掉**（多维表格与电子表格的 token 不会同时留着），所以这里只有一个框。'
           + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'
           + '实在没有链接：可以在高级设置里填「表名匹配」让插件按文件名找表。'),
+        // 「测这张表」：配完当场验一次，不用为了「这张表通不通」跑一遍全量体检。
+        // 位置就在这里（链接行内部、紧贴写入按钮）：人的动作顺序是
+        // 「贴链接 → 保存 → 想确认对不对」，测试按钮必须在那条路的尽头。
+        h('div', { className: 'tp-test-row' },
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: disabled || props.testBusy === true || props.canTest === false,
+            title: props.canTest === false
+              ? '这个项目还没保存 —— 先点顶部「保存」，宿主那边有了它才能测。'
+              : '只读：连一次飞书，看这张表能不能读到数据和状态值（不改任何东西）',
+            onClick: function () { props.onTest(props.index) },
+          }, props.testBusy === true ? '测试中…' : '测这张表')),
+        props.testResult && typeof props.testResult.text === 'string'
+          ? h('p', {
+            className: props.testResult.ok === true ? 'tp-ok' : 'tp-err',
+            style: { whiteSpace: 'pre-line' },
+          }, props.testResult.text)
+          : null,
         props.message ? h('p', { className: 'tp-ok' }, props.message) : null,
         props.error ? h('p', { className: 'tp-err' }, props.error) : null)
     }
@@ -2947,6 +3227,13 @@ window.__ModuleLoader__.load({
           message: props.linkMessage || '',
           error: props.linkError || '',
           onPasteLink: props.onPasteLink,
+          // 「测这张表」（工单 #43）：配完马上验一下这张表能不能读。
+          // 只对**已保存**的项目给：面板里刚加、还没保存的项目宿主那边没有，
+          // 下标也对不上（会测到别人）。这一点在按钮 title 里说明。
+          testBusy: props.testBusy === true,
+          testResult: props.testResult || null,
+          canTest: pending !== true,
+          onTest: props.onTest,
         })
         : null
 
@@ -3042,6 +3329,11 @@ window.__ModuleLoader__.load({
             linkBusy: props.linkBusy === index,
             linkMessage: props.linkMessage && props.linkMessage.index === index ? props.linkMessage.text : '',
             linkError: props.linkError && props.linkError.index === index ? props.linkError.text : '',
+            // 「测这张表」（工单 #43）：答案同样按下标分发 —— 测的是哪一张卡片，
+            // 结论就只出现在哪一张卡片里。
+            testBusy: props.testBusy === index,
+            testResult: props.probeResult ? props.probeResult[index] : null,
+            onTest: props.onTest,
             open: props.isProjectOpen(index),
             showAdvanced: props.showAdvanced,
             onToggle: props.onToggleProject,
@@ -3165,6 +3457,11 @@ window.__ModuleLoader__.load({
       var [linkMessage, setLinkMessage] = useState(null)
       var [linkError, setLinkError] = useState(null)
 
+      // 「测这张表」（工单 #43）的进行中状态与回话，同样按项目下标存。
+      // `probeResult[index]` 是 `{ ok, text }`：ok 决定那句话是绿还是红。
+      var [testBusy, setTestBusy] = useState(-1)
+      var [probeResult, setProbeResult] = useState({})
+
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
       // 当前页签：整页一次只摊开一块，其余收在页签标题里（见 TABS）。
       var [activeTab, setActiveTab] = useState(readTab)
@@ -3205,6 +3502,14 @@ window.__ModuleLoader__.load({
       // 记进 localStorage：这是「我现在想看历史」的一次性意图，但重开面板
       // 又变回空白会让人以为历史没了，所以宁可记住。
       var [runHistory, setRunHistory] = useState(readRunHistory)
+      // 运行页的筛选（工单 #42）：一句搜索词 + 一个分组。
+      //
+      // 为什么需要：勾上「显示历史」之后一趟能列几十上百张票，而这一页要回答的
+      // 只有一个问题 ——「有没有要我做事的」。以前只能靠肉眼在五个分组里滚；
+      // 分组本身又是按 phase 分的，答不了「pms 那个项目现在怎么样」这种问题。
+      // 两个条件相乘而不互相覆盖：既有「只看失败」也有「在失败里找 recXXX」。
+      var [runQuery, setRunQuery] = useState('')
+      var [runFilter, setRunFilter] = useState('')
 
       var isPage = props.view !== 'summary'
 
@@ -3706,7 +4011,67 @@ window.__ModuleLoader__.load({
           })
       }
 
-      function onToggleAdv (label) {        setAdvMap(function (previous) {
+      /**
+       * 「测这张表」：只测这一个项目的表能不能读（工单 #43）。
+       *
+       * 为什么不是「跑一次体检」：体检是一条很长的清单（git、仓库、凭据、通知、
+       * 执行器、插件版本…），为了回答「这张表配对了没有」要读十几行里挑出本项目的
+       * 那几行。配项目时人是**一边填一边试**的，需要三秒内出结论。
+       *
+       * 宿主侧复用同一份飞书探针（`testProject(index)`），所以这里的结论与体检
+       * 里那几行口径一致 —— 不会出现「这里绿了、体检里红」。
+       */
+      function onTestProject (index) {
+        var ns = getNamespace('ticketPipeline')
+        if (!ns || typeof ns.testProject !== 'function') {
+          setProbeResult(function (previous) {
+            var copy = Object.assign({}, previous)
+            copy[index] = { ok: false, text: '宿主 Remote 没挂上「测这张表」通道（typert 缺席或插件版本旧）。刷新页面重试，或直接跑「体检」页签。' }
+            return copy
+          })
+          return
+        }
+        setTestBusy(index)
+        setProbeResult(function (previous) {
+          var copy = Object.assign({}, previous)
+          delete copy[index]
+          return copy
+        })
+        Promise.resolve()
+          .then(function () { return ns.testProject(index) })
+          .then(function (response) {
+            setTestBusy(-1)
+            setProbeResult(function (previous) {
+              var copy = Object.assign({}, previous)
+              if (!response || !response.ok) {
+                var message = response && response.error && response.error.message
+                  ? response.error.message
+                  : '未知错误'
+                copy[index] = { ok: false, text: '没测成：' + message }
+                return copy
+              }
+              var value = response.value || {}
+              copy[index] = {
+                ok: value.ok === true,
+                // `skipped` 时也说一句：人在非飞书平台上点这一格，得知道
+                // 「不是坏了，是这里本来就没表可测」。
+                text: typeof value.text === 'string' ? value.text : '测完了，没拿到结论。',
+              }
+              return copy
+            })
+          }, function (error) {
+            setTestBusy(-1)
+            var message = error && error.message ? error.message : String(error)
+            setProbeResult(function (previous) {
+              var copy = Object.assign({}, previous)
+              copy[index] = { ok: false, text: '没测成：' + message }
+              return copy
+            })
+          })
+      }
+
+      function onToggleAdv (label) {
+        setAdvMap(function (previous) {
           var copy = Object.assign({}, previous)
           copy[label] = !(copy[label] === true)
           try { localStorage.setItem(ADV_OPEN_KEY, JSON.stringify(copy)) } catch (error) {}
@@ -4376,6 +4741,10 @@ window.__ModuleLoader__.load({
             onRefresh: loadRun,
             history: runHistory,
             onHistory: onRunHistory,
+            query: runQuery,
+            filter: runFilter,
+            onQuery: setRunQuery,
+            onFilter: setRunFilter,
           })
         },
         projects: function () {
@@ -4406,6 +4775,9 @@ window.__ModuleLoader__.load({
             linkBusy: linkBusy,
             linkMessage: linkMessage,
             linkError: linkError,
+            testBusy: testBusy,
+            probeResult: probeResult,
+            onTest: onTestProject,
             showAdvanced: showAdvanced,
             onToggleAdvanced: setShowAdvanced,
             isProjectOpen: function (index) { return isProjectOpenOf(projMap, index) },

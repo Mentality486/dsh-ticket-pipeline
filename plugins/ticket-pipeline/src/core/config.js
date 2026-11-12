@@ -355,6 +355,19 @@ export const BUILTIN_LIMITS = Object.freeze({
    * 说明它不是「多读了两眼」而是根本定位不到 —— 交给硬超时，人去看时间线。
    */
   agentExploreNudges: 2,
+  /**
+   * 一轮轮询里最多连跑几张票。
+   *
+   * 为什么需要它（2026-11-12）：以前一轮只 `pickNext` 一张、跑完就 return，
+   * 剩下的等下一个轮询周期。轮询缺省 3 分钟、一张票几十秒到 40 分钟，
+   * 队列排 5 张就要等 4 小时才轮到第 5 张 —— 队列看起来「不动」，
+   * 人只会以为插件卡死了。改成一轮连跑到队列空/预算用尽，**并发仍然是 1**。
+   *
+   * 5 这个数：一张票最快也要十几秒（mock 快、真 agent 慢），连跑 5 张最坏是
+   * 几个小时，再大就会让「按下取消」到真正停下来之间隔太久（取消是逐张生效的）。
+   * 不是配置项：它不是「环境差异」，而是「一处代码的节奏」，用户没有判断依据。
+   */
+  maxTicketsPerTick: 5,
 })
 
 /**
@@ -625,6 +638,13 @@ function validateProject (raw, index) {
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''
   if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）', '填这个项目对应的仓库在你本机的路径，例如 D:/WorkSpace/pms')
 
+  // 项目级开关（`enabled`）：缺省 true。只接受布尔；写成 'false' 这种字符串是
+  // 典型的 YAML 手误，静默当成「没关」会让「我以为我关了」变成最难查的那一类
+  // 问题（票照跑、表照样被回填）。
+  if (p.enabled !== undefined && typeof p.enabled !== 'boolean') {
+    fail('enabled', '必须是 true 或 false', '不想让这个项目再跑就在这里写 enabled: false（注意不要加引号）')
+  }
+
   // feishu 能读两种表：多维表格（appToken+tableId）和电子表格（spreadsheetToken+sheetId/sheetName）。
   // 四选一即可 —— 少给一格就在启动时拦住，别等到扫描时才发现定位不到表：
   //   ① appToken + tableId（多维表格显式绑定）
@@ -735,6 +755,9 @@ function validateProject (raw, index) {
     match: { platform },
     repo: { path: repoPath },
   }
+  // 项目级暂停（工单 #39）：只有显式 `false` 才写盘 —— 缺省 true 意味着
+  // 「不写这个键 = 启用」，老配置不用动，面板上关掉一次才产生这个字段。
+  if (p.enabled === false) value.enabled = false
   if (typeof p.description === 'string' && p.description.length > 0) value.description = p.description
   if (typeof match.appToken === 'string' && match.appToken.length > 0) value.match.appToken = match.appToken
   if (typeof match.tableId === 'string' && match.tableId.length > 0) value.match.tableId = match.tableId
@@ -1496,6 +1519,7 @@ function buildProjectsDescriptor () {
 
   const entry = projectObject({
     name: projectLeaf('string', '项目名', 'projectId，必须唯一；工单里的项目要靠它对上仓库'),
+    enabled: projectLeaf('boolean', '启用这个项目', '关掉 = 不再扫它的表、不再跑它已入队的票，但配置与历史都保留。缺省启用'),
     description: projectLeaf('string', '说明', '会进 agent 的定位提示'),
     match: matchNode,
     repo: repoNode,

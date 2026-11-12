@@ -120,8 +120,34 @@ async function isStaleWorkspaceCoords ({ worktreePath, repoPath, currentRepoPath
  * @property {'ok'|'scan-failed'|'already-running'|'disabled'} status
  * @property {{ created: number, updated: number, disappeared: number, revivals: number }} scan
  * @property {{ projectId: string, recordId: string, phase: Phase, ok: boolean } | null} ran
+ *   本轮**第一张**跑到的票（老调用方与老自测按它断言）。
+ * @property {Array<{ projectId: string, recordId: string, phase: Phase, ok: boolean }>} ranAll
+ *   本轮跑过的**全部**票，按顺序。`maxTicketsPerTick > 1` 时一轮可能跑好几张，
+ *   只看 `ran` 会漏掉后面的（`pipeline_scan` 的文案就用它说「这一轮跑了 3 张」）。
  * @property {boolean} cleaned
+ * @property {number} [replayed]
+ *   这一轮顺手补做了几个「事后动作」（回填 / 通知）。只在距上次补做 ≥ 30 分钟时才有值，
+ *   见 `REPLAY_INTERVAL_MS`；早退分支不带这个字段。
  * @property {string} [error]
+ */
+
+/**
+ * 「扫表这件事本身成没成」——与票据状态正交的一份快照。
+ *
+ * 为什么需要它（2026-11-12）：扫描失败以前只写进插件日志，`tick()` 的返回值
+ * 除了 `pipeline_scan` 没人看。于是 token 过期、表被移出协作者、断网这三种
+ * 情况会让插件**安静地什么都不做**，而面板运行页显示的「没有未收尾的票」
+ * 与「一切正常」长得一模一样 —— 人根本没有线索知道要去查。
+ *
+ * 这份状态必须留在内存里而不是只写日志：面板每 3 秒读一次，读日志要解析文本。
+ * `lastScanAt` 另外还会从水位里读（跨重启还在），两者合并见 `getScanState()`。
+ *
+ * @typedef {Object} ScanState
+ * @property {number} lastScanAt 上一次**扫成功**的时刻（0 = 从没扫成过）
+ * @property {number} lastAttemptAt 上一次**尝试**扫的时刻（成功失败都算）
+ * @property {string | null} lastError 上一次失败的原因（人话，不含 kind 前缀）；成功则 null
+ * @property {string | null} lastErrorKind 失败分类（auth / network / rate-limit / …）
+ * @property {number} consecutiveFailures 连续失败次数（成功清零）
  */
 
 /**
@@ -145,17 +171,94 @@ async function isStaleWorkspaceCoords ({ worktreePath, repoPath, currentRepoPath
  *   但那只覆盖 pending 与中间态 —— failed 是终态，人工重开之后仍然会带着陈旧坐标
  *   回到调度器，所以这里必须再判一次。不注入时跳过存在性检查（只比 repoPath）。
  */
-export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists, memory, leaseHeartbeatMsOverride, timelineHeartbeatMsOverride }) {
+export function createScheduler ({ store, sources, locator, executor, push, config, log, now, random, prepareWorkspace, saveImage, removeWorktree, worktreeExists, memory, leaseHeartbeatMsOverride, timelineHeartbeatMsOverride, maxTicketsPerTick }) {
   const logInfo = log ?? (() => {})
   const nowFn = now ?? (() => Date.now())
   const randomFn = random ?? (() => Math.random())
+  /**
+   * 一轮最多跑几张票。
+   *
+   * 缺省 1 = 老行为（一次 tick 只跑一张），装配层传 `BUILTIN_LIMITS.maxTicketsPerTick`。
+   * **不是并发**：这仍然是一个串行 for 循环，同时只有一张票在跑。
+   * 上限 20 是护栏：配置写错（比如有人传了个 1000）不该让一张轮询回调跑一整天。
+   */
+  const maxPerTick = Math.max(1, Math.min(20, Math.floor(Number(maxTicketsPerTick ?? 1)) || 1))
 
   /** 单飞：防同进程内定时器重入。跨进程靠存储租约。 */
   let running = false
 
+  /**
+   * 扫表本身的成败快照（见 ScanState）。全程只有一个消费者：`collectStatus`
+   * 通过 `options.getScanState` 读它，渲染成运行页状态行。
+   *
+   * 为什么不干脆写进存储：面板每 3 秒读一次，写存储是异步落盘，为了显示
+   * 「上次扫表什么时候」去落盘没有必要；跨重启那一半从水位补（水位本来就存了
+   * `lastScanAt`），两者在 `getScanState()` 里合并。
+   * @type {ScanState}
+   */
+  const scanState = {
+    lastScanAt: 0,
+    lastAttemptAt: 0,
+    lastError: null,
+    lastErrorKind: null,
+    consecutiveFailures: 0,
+  }
+
+  /**
+   * 读出扫表状态。`lastScanAt` 取「内存里这次跑的」与「水位里上次存的」较大者 ——
+   * 进程刚起来时内存是 0，水位才是真相；跑过一轮之后内存更新。
+   *
+   * `nextScanAt` 不由这里算：轮询间隔属于装配层（`src/index.js` 的 `ctx.interval`），
+   * 调度器不该猜自己被多久调一次。装配层会用 `pollIntervalMs` 补上。
+   *
+   * @param {number} [nowAt]
+   * @returns {ScanState & { lastScanAtFromWatermark: boolean }}
+   */
+  function getScanState (nowAt) {
+    void nowAt
+    const base = scanState.lastScanAt
+    let fromWatermark = 0
+    try {
+      const marks = typeof store.listWatermarks === 'function' ? store.listWatermarks() : []
+      for (const mark of marks) {
+        // 水位由工单源自管，key 是 `<platform>:<projectId>`。取最大值：
+        // 多项目时「上次扫表」应该是最近的那一次，不是最旧的那个。
+        if (Number(mark.lastScanAt) > fromWatermark) fromWatermark = Number(mark.lastScanAt)
+      }
+    } catch {
+      // 水位读不出来不该让状态查询整体失败 —— 它只是「更准一点」的补充。
+    }
+    return {
+      lastScanAt: Math.max(base, fromWatermark),
+      lastAttemptAt: scanState.lastAttemptAt,
+      lastError: scanState.lastError,
+      lastErrorKind: scanState.lastErrorKind,
+      consecutiveFailures: scanState.consecutiveFailures,
+      lastScanAtFromWatermark: fromWatermark > base,
+    }
+  }
+
   /** 当前这票的取消句柄，供「人工取消」与卸载时使用。 */
   /** @type {{ abort: (reason?: unknown) => void } | null} */
   let activeHandle = null
+
+  /**
+   * 「事后动作补做」的节流间隔（30 分钟）。
+   *
+   * 为什么需要它（2026-11-12，工单 #40）：`replayPendingEffects()` 以前只在
+   * `apply()` 里调一次 —— 也就是**只在重启时补做**。进程连着开一周，那些
+   * 「回填没写成 / 通知没发出去」的票就一直挂着：面板上明明白白标着
+   * 「（表格未回写）」和「交付未完成」，却永远不会自己再好起来，
+   * 只能靠人去重启宿主。挂进 tick 之后它会自己重试。
+   *
+   * 为什么 30 分钟而不是每轮：补做会真的发通知（人可能再收到一条微信），
+   * 太勤会变成骚扰；而且失败多是凭据/权限这类短时间内不会自己好的原因。
+   * 为什么不是配置项：与 `maxTicketsPerTick` 同理，它是节奏不是环境差异。
+   */
+  const REPLAY_INTERVAL_MS = 30 * 60_000
+  // 初值取「调度器建好的那一刻」：装配层在 apply() 里已经补做过一次了
+  // （src/index.js），第一轮 tick 不必再来一遍。之后每过一个间隔补一次。
+  let lastReplayAt = nowFn()
 
   const leaseTtlMs = Math.max(1, Number(config.leaseTtlMinutes ?? 10)) * 60_000
 
@@ -229,19 +332,44 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
   }
 
   /**
+   * 现在哪些项目被关掉了（`projects[].enabled === false`）。
+   *
+   * 每次调用都重读 `config.projects`，而不是在 `createScheduler()` 时算一次：
+   * 配置改了宿主会重建插件，但「重建之前的那一轮 tick」仍可能拿着老对象跑，
+   * 而人的预期是「我关掉它就别再动了」。多读一次对象属性不花钱。
+   *
+   * @returns {Set<string>}
+   */
+  function pausedProjects () {
+    const out = new Set()
+    if (!Array.isArray(config.projects)) return out
+    for (const entry of config.projects) {
+      if (entry && entry.enabled === false && typeof entry.name === 'string') out.add(entry.name)
+    }
+    return out
+  }
+
+  /**
    * 扫一轮，把变化落进存储。
    *
    * 扫失败**不吞**：返回 `scan-failed`，让 `pipeline_scan` 的调用方看见 ——
    * 「没变化」和「扫失败了」是两件事，混在一起会让人以为流水线是健康的。
    *
    * @param {AbortSignal} signal
+   * @param {string} [onlyProjectId] 只扫这个项目（面板/工具「只跑这个项目」用）
    * @returns {Promise<{ created: number, updated: number, disappeared: number, revivals: number }>}
    */
-  async function scanAndEnqueue (signal) {
+  async function scanAndEnqueue (signal, onlyProjectId) {
     const counters = { created: 0, updated: 0, disappeared: 0, revivals: 0 }
+    const only = typeof onlyProjectId === 'string' && onlyProjectId.length > 0 ? onlyProjectId : null
+    const paused = pausedProjects()
 
     for (const source of sources) {
       const projectId = source.projectId
+      // 项目级暂停（工单 #39）：关掉的项目连表都不去读 —— 不是「读完再扔掉」，
+      // 而是根本不该产生这次远端请求：表被移出协作者的人最不想的就是每轮都失败一次。
+      if (paused.has(projectId ?? '')) continue
+      if (only !== null && projectId !== only) continue
       const result = await source.scan(signal)
 
       for (const ticket of result.created ?? []) {
@@ -1424,7 +1552,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
   // ── 一轮 ────────────────────────────────────────────────
 
   /**
-   * 跑一轮。**一轮最多跑一票、最多清一个工作区**。
+   * 跑一轮。**一轮连跑到「队列空 / 预算用尽 / 被取消」为止，最多清一个工作区**。
+   *
+   * 「跑几张」由 `maxTicketsPerTick` 定（缺省 1，装配层传 `BUILTIN_LIMITS.maxTicketsPerTick`）。
+   * 无论跑几张，**任何时刻只有一张票在跑** —— 那是个串行 for 循环，不是并发。
    *
    * @param {{ skipScan?: boolean, signal?: AbortSignal }} [options]
   *   `signal`：调用方（`pipeline_scan` 工具）的取消信号。取消 = 别再扫、别再动票，
@@ -1433,15 +1564,23 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
    */
   async function tick (options = {}) {
     if (config.enabled === false) {
-      return { status: 'disabled', scan: emptyScan(), ran: null, cleaned: false }
+      return { status: 'disabled', scan: emptyScan(), ran: null, ranAll: [], cleaned: false }
     }
     if (running) {
-      return { status: 'already-running', scan: emptyScan(), ran: null, cleaned: false }
+      return { status: 'already-running', scan: emptyScan(), ran: null, ranAll: [], cleaned: false }
     }
 
     running = true
     /** @type {TickResult} */
-    const result = { status: 'ok', scan: emptyScan(), ran: null, cleaned: false }
+    const result = { status: 'ok', scan: emptyScan(), ran: null, ranAll: [], cleaned: false }
+
+    // 「只跑这一个项目」（工单 #39）：工具参数 / 面板按钮传下来。
+    // 空串当没传，否则 `pickNext({projectId:''})` 会挑不到任何票。
+    const onlyProjectId = typeof options.projectId === 'string' && options.projectId.length > 0 ? options.projectId : null
+    // 关掉的项目这一轮既不扫也不跑。每次 tick 重算（不是建调度器时算一次）：
+    // 配置改了宿主会重建插件，但重建前已经在跑的那一轮仍可能拿着老对象 ——
+    // 人的预期是「我关掉就别再动」，多读一次对象属性不花钱。
+    const paused = pausedProjects()
 
     // 以前这里是 linkSignal(undefined)：工具层的 exec.signal 接不上内核，
     // 人按下取消之后这一轮还在照跑（照样扫表、照样改票），只是结果没人收。
@@ -1451,17 +1590,31 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     try {
       if (!options.skipScan) {
         try {
-          result.scan = await scanAndEnqueue(handle.signal)
+          result.scan = await scanAndEnqueue(handle.signal, onlyProjectId ?? undefined)
+          // 扫成功：清掉失败计数，记下时刻。这个时刻是面板「上次扫描 X 前」的来源，
+          // 也是「它到底还在不在跑」的唯一证据 —— 以前它只写进水位、没人读。
+          scanState.lastScanAt = nowFn()
+          scanState.lastAttemptAt = scanState.lastScanAt
+          scanState.lastError = null
+          scanState.lastErrorKind = null
+          scanState.consecutiveFailures = 0
         } catch (error) {
           const normalized = toPipelineError(error)
+          scanState.lastAttemptAt = nowFn()
           if (isAbortError(normalized)) {
             // 被取消不是「扫失败」：不报错、不重试，直接收摊。
+            // 也不记进 scanState —— 人按了取消，不该在运行页留一条红字。
             aborted = true
             logInfo('扫描被取消', { reason: normalized.message })
           } else {
             result.status = 'scan-failed'
             result.error = `${normalized.kind}: ${normalized.message}`
-            logInfo('扫描失败', { kind: normalized.kind, reason: normalized.message })
+            // 面板要的是人话，所以 message 单独存一份、kind 单独存一份；
+            // 拼成 "auth: xxx" 再让面板剥前缀是错的做法（#08 的教训）。
+            scanState.lastError = normalized.message
+            scanState.lastErrorKind = normalized.kind
+            scanState.consecutiveFailures += 1
+            logInfo('扫描失败', { kind: normalized.kind, reason: normalized.message, consecutiveFailures: scanState.consecutiveFailures })
           }
         }
       }
@@ -1471,28 +1624,73 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       if (aborted && result.status === 'ok') result.status = 'aborted'
 
       if (config.enabled !== false && result.status === 'ok') {
-        const next = store.pickNext()
-        if (next) {
+        // 一轮里连续消费：队列里还有就接着跑，直到「队列空了 / 到了本轮预算 /
+        // 被取消」。**并发仍然是 1** —— 这里是串行 for 循环，不是并行。
+        //
+        // 为什么以前只跑一张（2026-11-12 之前）：tick 一次 `pickNext` 一张、
+        // 跑完就 return，剩下的等下一个轮询周期。轮询间隔缺省 3 分钟、
+        // 一张票要几十秒到 40 分钟，队列里排 5 张就要等 4 个小时才轮到第 5 张
+        // —— 队列看起来「不动」，人只会以为插件卡死了。
+        //
+        // `maxTicketsPerTick` 缺省 1（老行为），装配层（`src/index.js`）传 5。
+        // 缺省不改成 5 是故意的：自测里有上百处 `tick()` 只期望跑一张，
+        // 改缺省等于让它们全部变成「一轮跑完整个队列」，那不是本意。
+        for (let round = 0; round < maxPerTick; round += 1) {
+          // 取消要立刻生效：别再开始下一张。已经在跑的那张由 runOne 自己收尾。
+          if (aborted || handle.signal.aborted) break
+          // 关掉的项目即使还有排着队的票也不再挑（工单 #39）：
+          // 关一个项目的意思是「它的事先别动」，包括已经进了队列的那些。
+          const next = store.pickNext({
+            ...(onlyProjectId === null ? {} : { projectId: onlyProjectId }),
+            excludeProjects: Array.from(paused),
+          })
+          if (!next) break
           const leased = await store.acquireLease(next.key, leaseTtlMs)
-          if (leased) {
-            const fresh = store.getTicket(next.key) ?? next
-            await runOne(fresh)
-            const after = store.getTicket(next.key)
-            result.ran = {
-              projectId: next.projectId ?? '',
-              recordId: next.recordId,
-              phase: after?.phase ?? fresh.phase,
-              ok: after ? TERMINAL.includes(after.phase) : false,
-            }
-          } else {
+          if (!leased) {
             logInfo('租约被别的进程占着，本轮跳过', { projectId: next.projectId, recordId: next.recordId })
+            // 别 break：占着的是这一张，队列里别的还能跑。
+            // 但也不能原地打转 —— pickNext 下次还会挑回同一张，所以退避一轮没用，
+            // 直接结束本轮（下一轮再试）。占租通常意味着另一个进程正在跑整条队列。
+            break
           }
+          const fresh = store.getTicket(next.key) ?? next
+          await runOne(fresh)
+          const after = store.getTicket(next.key)
+          const ran = {
+            projectId: next.projectId ?? '',
+            recordId: next.recordId,
+            phase: after?.phase ?? fresh.phase,
+            ok: after ? TERMINAL.includes(after.phase) : false,
+          }
+          // `ran` 保留「本轮第一张」的语义（老调用方与老自测都按它断言），
+          // 一轮跑了多张时新的消费者读 `ranAll`。
+          if (result.ran === null) result.ran = ran
+          result.ranAll.push(ran)
         }
       }
 
       // 清理本地产物（删过期 worktree）不受取消影响：它不联网、不改票面状态，
       // 而且中途停手会留下半删的目录，比跑完更麻烦。
       result.cleaned = await cleanupExpiredWorktrees()
+
+      // 事后动作补做（工单 #40）：每 30 分钟自动重试一次「回填没写成 / 通知没发出去」。
+      // 以前只在 apply() 里补一次 = 只在重启时补，进程不重启就永远挂着。
+      //
+      // 三条边界：
+      //   1. 被取消就不补 —— 人按了取消，不该在后台继续动远端状态（与回填一致）；
+      //   2. 补做自己炸了不影响 tick 的结果 —— 票已经跑完了，这是「事后」；
+      //   3. 只跑一个项目时也不补 —— 那是「我现在只想看这个项目」，别顺手动别的项目的表。
+      if (!aborted && onlyProjectId === null && nowFn() - lastReplayAt >= REPLAY_INTERVAL_MS) {
+        lastReplayAt = nowFn()
+        try {
+          result.replayed = await replayPendingEffects({ signal: handle.signal })
+        } catch (error) {
+          const normalized = toPipelineError(error)
+          logInfo('事后动作补做失败（不影响本轮结果）', { kind: normalized.kind, reason: normalized.message })
+          result.replayed = 0
+        }
+      }
+
       return result
     } finally {
       handle.dispose()
@@ -1516,6 +1714,8 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     cleanupExpiredWorktrees,
     cancelActive,
     replayPendingEffects,
+    /** 扫表本身的成败（见 ScanState）。面板运行页靠它回答「它还在跑吗」。 */
+    getScanState,
     get isRunning () {
       return running
     },

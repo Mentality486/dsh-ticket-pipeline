@@ -117,6 +117,9 @@ const resetResult = codec('ResetResult', (value) => value)
 /** 删掉本地记录的结果：`{ forgotten, reason, text }`。 */
 const forgetResult = codec('ForgetResult', (value) => value)
 
+/** 「测这张表」的结果：`{ ok, project, platform, text, blockers? }`。 */
+const projectProbeResult = codec('ProjectProbeResult', (value) => value)
+
 /** 一个非空字符串参数。 */
 function requiredString (method, name, description) {
   return parameter(method, name, description, (value) => {
@@ -219,6 +222,31 @@ function status () {
 }
 
 /**
+ * 面板「跑一轮」：`scan(projectId?)`（工单 #39 加的项目过滤）。
+ *
+ * 与工具 `pipeline_scan` 的 `projectId` 同名同义：不传 = 所有开着的项目一起跑。
+ * 为什么参数可选而不是必填：面板上那一格下拉缺省是「全部项目」，
+ * 大部分时候人根本不挑；必填会逼着每次调用都先把项目名自己填一遍。
+ */
+function scan () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/scan`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'scan',
+    invocation: { kind: 'direct' },
+    result: scanResult,
+    parameters: [
+      parameter('scan', 'projectId', '只跑这一个项目（配置里的项目名）；不传 = 所有开着的项目', (value) => {
+        if (value === undefined) return undefined
+        if (typeof value !== 'string') throw new TypeError('scan: projectId 必须是字符串')
+        return value
+      }, true),
+    ],
+  }
+}
+
+/**
  * 面板「运行」页签的「重跑」按钮：`reset(recordId, projectId?)`。
  *
  * 与工具 `pipeline_reset` 的参数表一字不差 —— 少一个可选参数，
@@ -256,6 +284,30 @@ function reset () {
  *
  * 与 `reset` 一样带一个可选的 `projectId`：多项目撞同一个 record_id 时才能定位。
  */
+/**
+ * 项目卡片上的「测这张表」（工单 #43）：`testProject(index)`。
+ *
+ * 只测这一个项目的表能不能读 —— 复用体检那份探针，只把 `projects` 缩成一项。
+ * 为什么不做成「体检的子集开关」：配项目的人是**一边填一边试**的，
+ * 需要在三秒内看到「这张表到底通不通」，而不是在十几行全量结论里找本项目那几行。
+ *
+ * `index` 必填且是下标而不是项目名：项目名允许重复（config 只警告不拦），
+ * 而下标与面板上那张卡片一一对应，不会产生「你说的是哪个同名项目」。
+ */
+function testProject () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/testProject`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'testProject',
+    invocation: { kind: 'direct' },
+    result: projectProbeResult,
+    parameters: [
+      requiredIndex('testProject', 'index', 'projects[] 里的下标（从 0 开始），面板按 projects() 的顺序给'),
+    ],
+  }
+}
+
 function forget () {
   return {
     id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/forget`,
@@ -284,11 +336,14 @@ export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   setProjectTable(),
   // 运行页签（#16）：先 status 拉一屏，再 scan / cancel / reset / forget 四个动作。
   status(),
-  method('scan'),
+  // 跑一轮带一个可选的项目名（工单 #39「只跑这个项目」）。
+  scan(),
   method('cancel'),
   reset(),
   // 删掉本地记录（2026-11-11 补）：票据只增不删，历史票得能清。
   forget(),
+  // 「测这张表」（工单 #43）：配项目时当场验这张表能不能读，不用跑全量体检。
+  testProject(),
 ])
 
 /**

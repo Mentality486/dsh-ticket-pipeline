@@ -893,8 +893,8 @@ draft MR：{url}                ← 只有开了远程出口（repo.gitlab.enabl
 
 用 `export const Config`（standard-schema 形状，见 `src/core/config.js`，不是 schemastery）。
 值存在 profile 的 `cordis.patch.yml` 里本插件那一行，升级不丢。字段清单与默认值
-以 `src/core/config.js` 的 `CONFIG_FIELDS` 为准（**25 个键、4 个分组**，设置页按 `CONFIG_GROUPS`
-分组渲染；`projects` 子树另有 33 个可写字段，不在这 25 个里），下面是概览：
+以 `src/core/config.js` 的 `CONFIG_FIELDS` 为准（**27 个键、4 个分组**，设置页按 `CONFIG_GROUPS`
+分组渲染；`projects` 子树另有 **35 个**可写字段，不在这 27 个里），下面是概览：
 
 ```ts
 export const Config = {
@@ -1152,7 +1152,7 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 
 面板全在 `lib/client.js`（浏览器侧，不碰内核）。宿主 → 浏览器这条链路走自建的 typert Remote，
 描述符在 `plugins/ticket-pipeline/src/remote/descriptors.js`：**不 import 任何宿主包**，所以注册与
-`$mount` 共用同一份纯 JSON，不需要 codegen。**九个 direct 方法**（七个无参，两个带参）：
+`$mount` 共用同一份纯 JSON，不需要 codegen。**十一个 direct 方法**（六个无参，五个带参）：
 
 | 方法 | 返回 | 用途 |
 |---|---|---|
@@ -1162,9 +1162,11 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 | `ticketPipeline.branches()` | 每个项目检出的分支清单 | 给 `repo.baseBranch` / `repo.targetBranch` 当候选（`listBranches()` 跑 `git for-each-ref`）；按项目 index 对齐，某个项目配错只让它自己空着 |
 | `ticketPipeline.setProjectTable(index, url)` | 写入后的项目投影 + 一句人话 | 面板「粘贴工单表链接」**唯一入口**：浏览器只转交整条 URL，**宿主**用 `parseFeishuLink()` 解析出 app_token / spreadsheetToken / tableId / viewId / sheetId，再经 `ctx.get('settings').mutate()` 写进 profile，并**把另一套定位字段清掉**（换表型时 `appToken`/`tableId` 与 `spreadsheetToken`/`sheetId` 不会并存）。这样四个定位键都不用卡片上的输入框，明文也永远不会出现在浏览器内存或请求体里 |
 | `ticketPipeline.status(includeDone?)` | 与 `pipeline_status` **同一份**结果 | 设置页「运行」页签的票列表与汇总行。**不许另写一套算法** —— 工具侧早把「算结果」抽成了模块级 `collectStatus(options, args)`，Remote 直接调它（`view:'tickets'`，面板要明细不要按项目聚合）。`includeDone` 是 `acceptsUndefined` 的可选参数，对应面板上的「显示历史」勾选：不传 = `false`（先回答「还要我做什么」），传 `true` 才把终态票一起拉进来。**只认严格的 `true`** —— 面板把这个方法同时当 `onClick` 处理器用（`onRefresh: loadRun`），那里第一参是事件对象，从别的类型里猜意图会把「点一下刷新」变成「突然看历史」 |
-| `ticketPipeline.scan()` | `{status, text}` | 「跑一轮」（等价 `pipeline_scan`）。同样复用 `collectScan()`；`disabled` / `already-running` 在这里就同步判掉，不叠后台任务 |
+| `ticketPipeline.scan(projectId?)` | `{status, text}` | 「跑一轮」（等价 `pipeline_scan`）。同样复用 `collectScan()`；`disabled` / `already-running` 在这里就同步判掉，不叠后台任务。`projectId` 是「只跑这一个项目」，空串归一成 `undefined`（`pickNext` 传空串会一张都挑不到） |
 | `ticketPipeline.cancel()` | `{cancelled, text}` | 「取消当前」（等价 `pipeline_cancel`），复用 `collectCancel()` |
 | `ticketPipeline.reset(recordId, projectId?)` | `{reset, reason, phase, text}` | 失败票行尾「重跑」（等价 `pipeline_reset`），复用 `collectReset()`。`projectId` 是 `acceptsUndefined` 的可选参数：**浏览器侧只传 1 个实参**，不传 `undefined` 占位（否则参数个数校验对不上） |
+| `ticketPipeline.forget(recordId, projectId?)` | `{forgotten, reason, phase, text}` | 票行尾「删除记录」（等价 `pipeline_forget`）。**只删插件本地的工单行**：不碰工单表、不回滚代码、不删工作区 |
+| `ticketPipeline.testProject(index)` | `{ok, skipped?, project, platform, kind, table, blockers, text}` | 项目卡片上的「**测这张表**」（工单 #43）：只把 `projects[index]` 交给体检那份飞书探针，逐层回 认证 / 表 / 数据 / 状态值 的 ✅❌。**只传这一项** —— 传全量就变成「体检」，既慢又看不出断的是哪张表；**复用同一份探针** —— 否则会出现「这里绿了、体检里红」。参数是**下标不是项目名**（项目名允许重复，`config.js` 只警告不拦；下标与面板卡片一一对应）；平台不是 feishu 时返回 `skipped`（不算失败），金山源 `wps` 必须**先于**「非飞书」判断并报不通过 |
 
 **连线方式：工具与面板共用「算结果」那一层，面板不做第二套口径。** `pipeline-status.js` /
 `pipeline-scan.js` / `pipeline-cancel.js` / `pipeline-reset.js` 各自把 execute 主体抽成模块级的
@@ -1174,7 +1176,7 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 `store` / `scheduler` / `gitRunner` / `log`（全部可选，缺了给人话错误而不是 `TypeError`：
 `dev-run.mjs` 里有只传 `getConfig` + `doctorOptions` 的老用例）。
 
-**`setProjectTable` 与 `reset` 是唯一两个带参的 Remote 方法**，它们的参数形状受两条约束（`@deepseek-ai/dsh-api-gateway`
+**带参的六个方法（`setProjectTable` / `status` / `scan` / `reset` / `forget` / `testProject`）形状受两条约束**（`@deepseek-ai/dsh-api-gateway`
 与 `-typert-registry` 的实际行为）：浏览器侧按 `descriptor.parameters` 的**位置**组装 args、只写
 `value !== undefined` 的项；宿主侧 `assertExactArguments()` 按 `wire` 名字做精确集合比对，多一个少一个都拒。
 所以每个参数都必须显式写 `name` + `wire` + `source:'json'` + `codec` + `strictCodec`（生成代码里
@@ -1191,7 +1193,7 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 **绝不整数组替换** —— 整块替换会把别的项目条目、以及配置文件里手写的 `appToken` 一起抹掉。
 `lib/client.js` 的 `collectOps()` 里守着这条。
 
-项目清单在面板上可编辑（5 个分区 21 个字段，`projects` 子树共 33 个可写字段），
+项目清单在面板上可编辑（6 个分区 31 个控件，`projects` 子树共 **35 个**可写字段 —— 其中 `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 在面板上没有输入框，只经「工单表链接」写入），
 字段约束即时校验（必填 / 数字 min-max / enum / 列表按逗号切分）、脏字段有「已改」徽标与单字段撤销。
 
 面板的**信息密度**由两层折叠 + 一层开关控制，因为一屏 42 个输入框时人和「随便点点」没区别：
@@ -1725,7 +1727,7 @@ fatal: unable to fork
 
 | 项 | 影响 | 何时定 |
 |---|---|---|
-| Web UI 面板 | 设置页已落地（**五个页签：运行 / 项目 / 参数 / 凭据 / 体检**，一次只画一页；运行页 = 队列状态行 + 汇总行 + 票列表 + 「跑一轮 / 取消当前 / 刷新 / 重跑」；25 个字段 / 4 组 + 项目清单可增删可编辑 + 分支下拉 + 两层折叠 + 总开关置顶、「显示全部字段」开关与组内「高级设置」、Label 置顶 + Switch、下划线式页签 + 宿主 `settings-card-*` token、**9 个 Remote 方法**（含带参的 `setProjectTable` 与 `reset`）+ 项目卡片「粘贴工单表链接」）；**队列看板已做（工单 #16）** —— 但刻意只做「看 + 三个动作」，不做图表/趋势、不做 diff 视图（改动摘要够用）、不做实时日志流（direct 没有 stream） | ~~有人真的想看队列时~~ **已完成** |
+| Web UI 面板 | 设置页已落地（**五个页签：运行 / 项目 / 参数 / 凭据 / 体检**，一次只画一页；运行页 = 队列状态行 + 汇总行 + 票列表 + 「跑一轮 / 取消当前 / 刷新 / 重跑」+ 搜索与分组筛选；27 个字段 / 4 组 + 每卡「启用这个项目」开关与「测这张表」 + 项目清单可增删可编辑 + 分支下拉 + 两层折叠 + 总开关置顶、「显示全部字段」开关与组内「高级设置」、Label 置顶 + Switch、下划线式页签 + 宿主 `settings-card-*` token、**11 个 Remote 方法**（含带参的 `setProjectTable` / `status` / `scan` / `reset` / `forget` / `testProject`）+ 项目卡片「粘贴工单表链接」）；**队列看板已做（工单 #16）** —— 但刻意只做「看 + 三个动作」，不做图表/趋势、不做 diff 视图（改动摘要够用）、不做实时日志流（direct 没有 stream） | ~~有人真的想看队列时~~ **已完成** |
 | 多张工单指向同一模块的冲突 | 当前靠串行天然规避，但是「时间换安全」 | 出现真冲突时 |
 | 处理人绑定规则 | 当前不绑（只看 `statusValues`） | 有人抱怨「谁都能被派活」时 |
 | 金山文档的开放平台取数通道 | 现在只能靠 `match.sheetUrl` + 全局 fetch（大概率要登录态），或宿主注入 `fetchSheet` | 要真跑多张金山表时 |
@@ -2035,6 +2037,8 @@ token 缓存到本地，**过期前 60 秒**自动刷新（`expire` 默认 7200 
   （表头行号、序号列名、行身份、读取范围、列名覆盖、强制表型）。面板画出的项目字段从 33 项降到 **30 项**
   （`client-check` 会报出剩下落差的四条：`match.appToken` / `match.tableId` /
   `match.spreadsheetToken` / `match.sheetId` 只能改配置文件或经「工单表链接」写入）。
+  之后又加了项目级开关 `enabled`（工单 #39），可写路径与面板控件各 +1，于是当前是
+  **35 个可写路径 / 31 个面板控件**。
 - **适配器**（`source-feishu/index.js` 的 `extractSheetToken`）：四种写法都认 ——
   `/sheets/<token>` → `/wiki/<token>` → 裸 token → `shtcn…`；带协议头却一个都不匹配时
   **抛 `invalid-input`**，不再「原样返回整串」去拼 404。这就是「电子表格取不到工单」的直接原因：

@@ -30,8 +30,9 @@ export function createPipelineScanTool (options) {
   return defineTool({
     name: 'pipeline_scan',
     description:
-      '立刻让工单流水线扫一轮：拉取工单源的新变化、把新票入队、最多跑一张票、清理过期工作区。'
-      + '注意一轮最多跑一票（并发恒 1），所以连点两次不会加速；正在跑时返回 already-running。'
+      '立刻让工单流水线扫一轮：拉取工单源的新变化、把新票入队、接着把队列里的票跑掉（一轮最多连跑几张由内置常量决定，'
+      + '缺省 5 张；并发恒 1，所以连点两次不会加速）、清理过期工作区。'
+      + '正在跑时返回 already-running。'
       + '总开关 enabled 关着时返回 disabled，本工具不会替你打开它。'
       + '本工具不等待这一轮结束（跑一张票可能几十分钟）：触发后立刻返回，结果用 pipeline_status 查。',
     parameters: {
@@ -39,6 +40,11 @@ export function createPipelineScanTool (options) {
         type: 'boolean',
         description: '只处理已在队列里的票，不去拉工单源。排查执行侧问题时可省掉一次远端请求。',
         default: false,
+      },
+      projectId: {
+        type: 'string',
+        description: '只跑这一个项目（配置里的 projects[].name）。不填 = 所有开着的项目一起跑。'
+          + '项目在配置里 enabled: false 时，它既不会被扫、它已入队的票也不用跑。',
       },
     },
     // 机器可读字段放在返回值里，给人看的文本在 `text` 字段。
@@ -74,7 +80,7 @@ function preflight (options) {
     return {
       status: 'already-running',
       text: '上一轮还没跑完，这次不叠加。\n'
-        + '一轮最多跑一票，连点不会加速；等它结束后再触发，或用 pipeline_status 看它现在停在第几站。',
+        + '并发恒为 1，连点不会加速；等它结束后再触发，或用 pipeline_status 看它现在停在第几站。',
     }
   }
   return null
@@ -87,14 +93,18 @@ function preflight (options) {
  * `signal` 由调用方给：工具拿 `exec.signal`，面板没有取消信号就传 undefined。
  *
  * @param {Object} options
- * @param {(opts?: { skipScan?: boolean, signal?: AbortSignal }) => Promise<any>} options.tick
+ * @param {(opts?: { skipScan?: boolean, projectId?: string, signal?: AbortSignal }) => Promise<any>} options.tick
  * @param {(message: string, detail?: unknown) => void} [options.log]
- * @param {{ skipScan?: unknown }} [args]
+ * @param {{ skipScan?: unknown, projectId?: unknown }} [args]
  * @param {AbortSignal} [signal]
  * @returns {Record<string, unknown>}
  */
 export function collectScan (options, args, signal) {
   const safeArgs = args && typeof args === 'object' ? args : {}
+  // 空串当没填：面板「跑一轮」不传项目时是 `''`，不能变成「只跑 name 为空的项目」。
+  const projectId = typeof safeArgs.projectId === 'string' && safeArgs.projectId.trim().length > 0
+    ? safeArgs.projectId.trim()
+    : undefined
 
   // 先查「已经能确定的那两种结果」：不发后台任务、如实回报。
   const blocked = preflight(options)
@@ -114,7 +124,7 @@ export function collectScan (options, args, signal) {
   // fire-and-forget：tick 里「跑一张票」可能要几十秒到 40 分钟（超时上限），
   // 同步等它会让宿主工具通道超时、报 not lossless JSON（生产实锤过）。
   // 所以这里只触发一轮、立刻返回；跑完的结果用 pipeline_status 查。
-  void options.tick({ skipScan: safeArgs.skipScan === true, signal }).catch((error) => {
+  void options.tick({ skipScan: safeArgs.skipScan === true, ...(projectId === undefined ? {} : { projectId }), signal }).catch((error) => {
     // 后台失败没人接：只静默吞掉等于「点了没反应」，人永远查不出为什么。
     // 工具通道已经返回了，所以这里只能靠日志留痕（不打断调用方）。
     options.log?.('后台一轮流水线失败', { reason: error instanceof Error ? error.message : String(error) })
@@ -126,6 +136,7 @@ export function collectScan (options, args, signal) {
     ran: null,
     cleaned: false,
     text: '已触发一轮流水线，后台执行中。\n'
+      + (projectId === undefined ? '' : `只跑项目 ${projectId}。\n`)
       + '扫描工单源几秒，跑一张票可能几十秒到几十分钟。\n'
       + '稍等片刻用 pipeline_status 查看进度与结果；正在跑时再触发会返回 already-running。',
   }

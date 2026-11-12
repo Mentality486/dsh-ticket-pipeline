@@ -247,10 +247,17 @@ export class TicketPipelineRemote {
    */
   async status (includeDone) {
     requireStore(this.store, 'status')
+    // 扫表状态（2026-11-12）：调度器缺席时（自测里只传 store 的用例）给 null，
+    // 面板会退化成不显示那一行，而不是报错 —— 它是「多知道一点」,
+    // 不该成为「连票都看不了」的理由。
+    const getScanState = this.scheduler && typeof this.scheduler.getScanState === 'function'
+      ? (nowAt) => this.scheduler.getScanState(nowAt)
+      : null
     return collectStatus({
       store: this.store,
       getConfig: this.getConfig,
       gitRunner: this.gitRunner ?? null,
+      ...(getScanState === null ? {} : { getScanState }),
     }, { view: 'tickets', includeDone: includeDone === true })
   }
 
@@ -262,14 +269,17 @@ export class TicketPipelineRemote {
    * `disabled` / `already-running` 这两个「按下那一刻就知道」的结果由
    * collectScan 的 preflight 直接给出，不会白起一个后台任务。
    */
-  async scan () {
+  async scan (projectId) {
     if (!this.scheduler) throw new Error('运行页签没接上调度器（scheduler 缺席），点不了「跑一轮」。')
+    // 空串当没传：面板那一格下拉缺省是「全部项目」，选它时传下来的是 undefined，
+    // 但别的地方（比如命令行手调）可能给 ''。
+    const only = typeof projectId === 'string' && projectId.length > 0 ? projectId : undefined
     return collectScan({
       tick: (opts) => this.scheduler.tick(opts),
       isRunning: () => this.scheduler.isRunning,
       getConfig: this.getConfig,
       log: this.log,
-    }, {}, undefined)
+    }, only === undefined ? {} : { projectId: only }, undefined)
   }
 
   /** 「取消当前」按钮 —— 与 `pipeline_cancel` 工具同一个 `collectCancel()`。 */
@@ -313,6 +323,133 @@ export class TicketPipelineRemote {
     requireStore(this.store, 'forget')
     return collectForget({ store: this.store }, { recordId, projectId })
   }
+
+  /**
+   * 项目卡片上的「测这张表」（工单 #43）：只测**这一个**项目的表能不能读。
+   *
+   * 为什么不复用 `doctor()`：体检是一条很长的清单（git、仓库、凭据、通知、
+   * 执行器、插件版本…），为了回答「这张表配对了没有」要跑十几项、看一眼输出里
+   * 哪几行是本项目的。配项目的时候人是**一边填一边试**的，需要的是三秒内出结论。
+   *
+   * 复用同一份探针（`doctorOptions.probeFeishu` + `readSecret`），只把 `projects`
+   * 缩成一项 —— 结论口径必须与体检一致，否则会出现「这里绿了、体检里红」。
+   *
+   * 只读：不写任何表格、不改配置。缺探针/缺凭据都给一条人话，不是抛错。
+   *
+   * @param {number} index projects[] 里的下标
+   */
+  async testProject (index) {
+    const config = typeof this.getConfig === 'function' ? this.getConfig() : null
+    const projects = Array.isArray(config?.projects) ? config.projects : []
+    const position = Number(index)
+    if (!Number.isInteger(position) || position < 0 || position >= projects.length) {
+      throw new Error(`没有第 ${String(index)} 个项目（当前 ${projects.length} 个）。先点「重新读取」再来。`)
+    }
+    const project = projects[position] ?? {}
+    const name = String(project?.name ?? `项目 #${position + 1}`)
+    const platform = String(project?.match?.platform ?? 'mock')
+
+    // 金山是实验性的（#20）：拿不到票不是配置错，给一句能照着做的话。
+    if (platform === 'wps') {
+      return {
+        ok: false, project: name, platform,
+        text: '金山文档源没有内置取数通道，一张票都拿不到 —— 测不出什么。要收票就把平台改成 feishu。',
+      }
+    }
+    // 其它非飞书平台：这一格没有意义，别装出一副「测过了」的样子。
+    if (platform !== 'feishu') {
+      return {
+        ok: true, skipped: true, project: name, platform,
+        text: `「${name}」的平台是 ${platform}，不走飞书表 —— 没有需要连的表（不会报错，也不会验出什么）。`,
+      }
+    }
+
+    const probeFeishu = this.doctorOptions && typeof this.doctorOptions.probeFeishu === 'function'
+      ? this.doctorOptions.probeFeishu
+      : null
+    const readSecret = this.doctorOptions && typeof this.doctorOptions.readSecret === 'function'
+      ? this.doctorOptions.readSecret
+      : null
+    if (probeFeishu === null || readSecret === null) {
+      return {
+        ok: false, project: name, platform,
+        text: '这次没接上飞书探针（内部接线问题，不影响跑票）。完整的环境检查见「体检」页签。',
+      }
+    }
+
+    let appId = ''
+    let appSecret = ''
+    try {
+      appId = String(await readSecret('FEISHU_APP_ID') ?? '').trim()
+      appSecret = String(await readSecret('FEISHU_APP_SECRET') ?? '').trim()
+    } catch (error) {
+      return {
+        ok: false, project: name, platform,
+        text: `读飞书凭据失败（${error?.message ?? String(error)}）。去「凭据」页签重新填一次。`,
+      }
+    }
+    if (appId.length === 0 || appSecret.length === 0) {
+      return {
+        ok: false, project: name, platform,
+        text: `飞书凭据 ${appId.length === 0 ? 'FEISHU_APP_ID' : 'FEISHU_APP_SECRET'} 没配。去「凭据」页签填上再测。`,
+      }
+    }
+
+    let probe = null
+    try {
+      probe = await probeFeishu({ appId, appSecret, projects: [project] })
+    } catch (error) {
+      return {
+        ok: false, project: name, platform,
+        text: `探测过程出错（${error?.message ?? String(error)}）。这多半是网络问题，不是配置错。`,
+      }
+    }
+    const item = Array.isArray(probe?.projects) ? probe.projects[0] : null
+    const lines = []
+    const blockers = []
+    let ok = probe?.token?.ok === true
+
+    if (probe?.token?.ok === true) {
+      lines.push('✅ 飞书认证：' + String(probe.token.message ?? '通过'))
+    } else {
+      const fix = probe?.token?.fix ? ' —— 修复：' + probe.token.fix : ''
+      lines.push('❌ 飞书认证没过：' + String(probe?.token?.message ?? '原因未记录') + fix)
+      blockers.push('飞书认证没过')
+    }
+    if (item?.metadata?.ok === true) {
+      lines.push('✅ 表：' + String(item.metadata.message ?? '能读到'))
+    } else if (ok) {
+      const fix = item?.metadata?.fix ? ' —— 修复：' + item.metadata.fix : ''
+      lines.push('❌ 表：' + String(item?.metadata?.message ?? '读不到表元数据') + fix)
+      blockers.push('读不到表元数据')
+      ok = false
+    }
+    if (item?.records?.ok === true) {
+      lines.push('✅ 数据：' + String(item.records.message ?? '能读到第一页'))
+    } else if (ok) {
+      const fix = item?.records?.fix ? ' —— 修复：' + item.records.fix : ''
+      lines.push('❌ 数据：' + String(item?.records?.message ?? '读不到数据') + fix)
+      blockers.push('读不到表里的数据')
+      ok = false
+    }
+    if (item?.statusValues?.ok === false) {
+      lines.push('⚠️ 状态值：' + String(item.statusValues.message ?? '对不上'))
+    }
+    if (ok) {
+      lines.push('结论：这张表能读、能收到票。改完记得点顶部的「保存」。')
+    } else {
+      lines.push('结论：这张表现在收不到票。上面带 ❌ 的那一行就是原因，修完再测一次。')
+    }
+    return {
+      ok,
+      project: name,
+      platform,
+      kind: typeof item?.kind === 'string' ? item.kind : 'unknown',
+      table: typeof item?.table === 'string' ? item.table : '',
+      blockers,
+      text: lines.join('\n'),
+    }
+  }
 }
 
 /**
@@ -346,6 +483,9 @@ function describeProject (project, index) {
   const out = {
     index,
     name: String(project?.name ?? ''),
+    // 项目级暂停（工单 #39）：缺省 true。面板要看到「现在是不是开着的」，
+    // 所以这里给的是**求值后**的布尔，而不是「配置里有没有写这个键」。
+    enabled: project?.enabled !== false,
     description: String(project?.description ?? ''),
     platform: String(match.platform ?? ''),
     // feishu
