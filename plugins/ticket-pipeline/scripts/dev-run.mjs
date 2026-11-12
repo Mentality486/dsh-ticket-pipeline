@@ -3579,20 +3579,25 @@ async function main () {
     }
     const rows = [['序号', '问题描述', '是否处理'], ['1', '某某问题', '是'], ['2', '另一个问题', '否']]
 
-    // ① 配置认「处理中」，表里是「是 / 否」→ 必须点出来，并给出修法。
+    // ① 配置认「处理中」，表里是**真配错**的取值（一个闭环取值都没有）→ 必须点出来并给修法。
+    //
+    // 注意这里不能用「是 / 否」当反例了（2026-11-12 修正）：那张表零张待办是稳态，
+    // 见下面「表里都是『已经处理过』的取值」那条用例。真正要报警的是「表里填的值
+    // 既不是配置认的、也不是任何闭环取值」—— 那才是配置写错了。
+    const wrongRows = [['序号', '问题描述', '是否处理'], ['1', '还没人管', '待处理'], ['2', '也没人管', '挂起']]
     const bad = await probeFeishuConnectivity({
       appId: 'cli_app',
       appSecret: 's',
       projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
-      fetch: makeFetch(rows),
+      fetch: makeFetch(wrongRows),
     })
     const badProject = bad.projects[0]
     assert.equal(badProject.metadata.ok, true, '这一层不是权限问题，元数据该是通的')
     assert.equal(badProject.records.ok, true, '数据也读得到')
     assert.equal(badProject.statusValues?.ok, false, `状态值对不上要报出来：${JSON.stringify(badProject)}`)
-    assert.deepEqual(badProject.statusValues.values, ['是', '否'], '要把表里实际出现的值原样摆出来')
+    assert.deepEqual(badProject.statusValues.values, ['待处理', '挂起'], '要把表里实际出现的值原样摆出来')
     assert.ok(badProject.statusValues.message.includes('一张票都收不到'), `要说清后果：${badProject.statusValues.message}`)
-    assert.ok(badProject.statusValues.fix.includes('是'), `修法要给出具体该填什么：${badProject.statusValues.fix}`)
+    assert.ok(badProject.statusValues.fix.includes('待处理'), `修法要给出具体该填什么：${badProject.statusValues.fix}`)
 
     // ② 配对了就该是绿的，并且把「表里出现什么」也带上（人一眼能确认自己没配错）。
     const good = await probeFeishuConnectivity({
@@ -3612,6 +3617,67 @@ async function main () {
       fetch: makeFetch([['序号', '问题描述'], ['1', '某某问题']]),
     })
     assert.equal(noColumn.projects[0].statusValues, undefined, '认不出状态列就不该下结论')
+  })
+  await check('体检：表里都是「已经处理过」的取值时，不算配置错、也不催人改状态值', async () => {
+    // 2026-11-12 真机事故：这张表 74 行「是」+ 6 行「否」、零行「处理中」。
+    // 「处理中」是已经被消费掉的瞬时状态，表长期稳态本来就是「是 / 否」。
+    // 旧文案说「一张票都收不到 —— 修复：把状态值改成「是」」，真照着改会把
+    // 74 张已完成的票全部重收一遍并重跑。这里钉住三点：
+    //   a) 不判红（ok 不是 false）；b) 明说「现在没有待办」；c) 修法必须警告别改配置。
+    const makeFetch = (values) => async (url) => {
+      const u = new URL(String(url))
+      const json = (body) => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      })
+      if (u.pathname.endsWith('/tenant_access_token/internal')) return json({ code: 0, tenant_access_token: 't-1' })
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+        return json({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }] } })
+      }
+      if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+        return json({ code: 0, data: { valueRange: { values } } })
+      }
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404 }), text: async () => '{"code":404}' }
+    }
+    const rows = [['序号', '问题描述', '是否处理'], ['1', '已修好', '是'], ['2', '不做了', '否']]
+    const out = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
+      fetch: makeFetch(rows),
+    })
+    const status = out.projects[0].statusValues
+    assert.equal(status?.ok, true, `稳态表不该判红：${JSON.stringify(status)}`)
+    assert.equal(status?.idle, true, '要标出这是「现在没有待办」而不是「配置错」')
+    assert.deepEqual(status?.values, ['是', '否'], '仍要把表里实际取值摆出来')
+    assert.ok(status?.message.includes('没有待办的票'), `要说清 0 张是对的：${status?.message}`)
+    assert.ok(!status?.message.includes('这样一张票都收不到'), '不能再说那句会把人引去改配置的话')
+    assert.ok(status?.fix.includes('不要'), `修法要警告别为了让体检变绿去改配置：${status?.fix}`)
+    assert.ok(status?.fix.includes('重收'), '要说清改了会怎样（已处理的会被重收一遍）')
+
+    // 用户把回填值改成「已完成」时，它也属于闭环取值 —— 不能因为不认「已完成」又去催人改。
+    const custom = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
+      fetch: makeFetch([['序号', '问题描述', '是否处理'], ['1', '已修好', '已完成']]),
+      closedStatusValues: ['已完成'],
+    })
+    assert.equal(custom.projects[0].statusValues?.idle, true, '配置里的 writeBackStatus 也要算闭环取值')
+
+    // 真配错的形态必须继续报红：表里填的是「待处理」，一个闭环取值都没有。
+    const wrong = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet', statusValues: ['处理中'] } }],
+      fetch: makeFetch([['序号', '问题描述', '是否处理'], ['1', '还没人管', '待处理']]),
+    })
+    assert.equal(wrong.projects[0].statusValues?.ok, false, '真对不上时仍要报出来')
+    assert.ok(wrong.projects[0].statusValues.message.includes('一张票都收不到'), '这句留给真配错的情形')
+    assert.ok(!wrong.projects[0].statusValues.message.includes('没有待办'), '别把配置错说成没待办')
   })
 
   await check('体检：状态值对不上只进提醒，不进阻断（收不到票不等于流水线坏了）', async () => {
@@ -3645,6 +3711,49 @@ async function main () {
     assert.equal(out.ok, true, '这不该让整份体检判定为不可用')
     assert.equal(out.blockers.length, 0, '不该进阻断档')
     assert.ok(out.text.includes('状态值对不上'), `正文也要看得见：${out.text}`)
+  })
+  await check('体检：表里没有待办时说「这是稳态」，而不是催人改配置', async () => {
+    // 真机（2026-11-12）：pms 表 74 行「是」+ 6 行「否」、零行「处理中」。
+    // 旧行为把这条报成提醒「这样一张票都收不到 —— 修复：把状态值改成「是」」，
+    // 照着改会让 74 张已完成的票全部重收并重跑。现在它必须是一行中性说明，
+    // 且**不进提醒档**（提醒是「有东西坏了」，这里什么都没坏）。
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'shtcn', sheetId: 'sh1' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+      probeFeishu: async () => ({
+        skipped: false,
+        token: { ok: true, message: 'token 有效' },
+        projects: [{
+          name: 'pms',
+          kind: 'sheet',
+          table: 'shtcn',
+          metadata: { ok: true, message: '能读到电子表格元数据（1 个工作表）' },
+          records: { ok: true, message: '能读到第一页数据（100 行）' },
+          statusValues: {
+            ok: true,
+            idle: true,
+            values: ['是', '否'],
+            expected: ['处理中'],
+            closed: ['是', '否'],
+            message: '表里现在没有待办的票（状态列只有 「是」 「否」 这类「已经处理过」的取值）—— 收 0 张是对的，不是配置错',
+            fix: '要让票进来，把新写的行「是否处理」填成 「处理中」；不要为了「让体检变绿」去改这个配置。',
+          },
+        }],
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, true, '稳态表不该让体检判定不可用')
+    assert.ok(out.text.includes('表里现在没有待办的票'), `正文要说清它没坏：${out.text}`)
+    assert.ok(!out.text.includes('状态值对不上'), '不能再打警告符号')
+    assert.ok(!out.warnings.some((w) => w.includes('状态值')), `不该进提醒档：${JSON.stringify(out.warnings)}`)
   })
 
   // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
@@ -6618,6 +6727,41 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(bad.text, /❌/, '哪一层断了要看得出来')
   })
 
+  await check('remote.testProject()：表里没有待办时说「读得通但没票可收」，不判失败', async () => {
+    // 真机（2026-11-12）：表里 74 行「是」+ 6 行「否」、零行「处理中」。
+    // 「测这张表」的结果若跟着判红，人会以为配置坏了 —— 和体检同一条口径。
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({ writeBackStatus: '是', projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet' } }] }),
+      doctorOptions: {
+        readSecret: async (name) => (name === 'FEISHU_APP_ID' ? 'cli_app' : 's'),
+        probeFeishu: async () => ({
+          skipped: false,
+          token: { ok: true, message: 'token 有效' },
+          projects: [{
+            name: 'pms',
+            kind: 'sheet',
+            table: 'shtcnSheet',
+            metadata: { ok: true, message: '能读到电子表格元数据（1 个工作表）' },
+            records: { ok: true, message: '能读到第一页数据（100 行）' },
+            statusValues: {
+              ok: true,
+              idle: true,
+              values: ['是', '否'],
+              expected: ['处理中'],
+              closed: ['是', '否'],
+              message: '表里现在没有待办的票（状态列只有 「是」 「否」 这类「已经处理过」的取值）—— 收 0 张是对的，不是配置错',
+            },
+          }],
+        }),
+      },
+    })
+    const out = await remote.testProject(0)
+    assert.equal(out.ok, true, `稳态表不该判失败：${out.text}`)
+    assert.ok(out.text.includes('没有待办的票'), `要说清现在没票可收：${out.text}`)
+    assert.ok(out.text.includes('读得通'), `结论要区分「读得通」与「有票可收」：${out.text}`)
+    assert.ok(!out.text.includes('能收到票'), '别承诺「能收到票」，下次收 0 张会被当成回归')
+  })
   await check('remote.testProject()：没配凭据时说明白去哪配，而不是抛错', async () => {
     const { TicketPipelineRemote } = await import('../src/remote/host.js')
     const env = harness()

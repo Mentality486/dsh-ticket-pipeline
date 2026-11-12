@@ -397,7 +397,14 @@ export class TicketPipelineRemote {
 
     let probe = null
     try {
-      probe = await probeFeishu({ appId, appSecret, projects: [project] })
+      // 闭环取值要与体检同一口径：配置里回填写什么（`writeBackStatus`），
+      // 探针就认那个值 + 缺省的「是 / 否」为「已经处理过」。
+      probe = await probeFeishu({
+        appId,
+        appSecret,
+        projects: [project],
+        closedStatusValues: [String(config?.writeBackStatus ?? '是')],
+      })
     } catch (error) {
       return {
         ok: false, project: name, platform,
@@ -434,9 +441,19 @@ export class TicketPipelineRemote {
     }
     if (item?.statusValues?.ok === false) {
       lines.push('⚠️ 状态值：' + String(item.statusValues.message ?? '对不上'))
+    } else if (item?.statusValues?.idle === true) {
+      // 「表里没有待办」是稳态，不是失败 —— 这张表现在确实一张票都收不到，
+      // 但那是因为活都干完了，不是因为配置错。别让它把「测这张表」也判红。
+      lines.push('ℹ️ ' + String(item.statusValues.message))
     }
     if (ok) {
-      lines.push('结论：这张表能读、能收到票。改完记得点顶部的「保存」。')
+      // 「读得通」与「现在有票可收」是两件事：稳态表里没有待办，这时说
+      // 「能收到票」会让下一次真的收 0 张时被当成回归。
+      if (item?.statusValues?.idle === true) {
+        lines.push('结论：这张表读得通，配置也对；只是它现在没有待办的票（状态列都是「已经处理过」的取值）。要试跑就往表里新写一行、把「是否处理」填成处理中。')
+      } else {
+        lines.push('结论：这张表能读、能收到票。改完记得点顶部的「保存」。')
+      }
     } else {
       lines.push('结论：这张表现在收不到票。上面带 ❌ 的那一行就是原因，修完再测一次。')
     }

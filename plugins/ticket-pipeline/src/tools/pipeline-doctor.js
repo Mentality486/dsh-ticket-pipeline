@@ -445,7 +445,7 @@ if (feishuProjects.length === 0) {
     lines.push(`⚠️ 飞书连通性：读凭据失败（${error?.message ?? String(error)}）`)
   }
   try {
-    const probe = await probeFeishu({ appId, appSecret, projects })
+    const probe = await probeFeishu({ appId, appSecret, projects, closedStatusValues: [String(config?.writeBackStatus ?? '是')] })
     if (probe?.skipped === true) {
       lines.push(`ℹ️ 飞书连通性：${probe.skipReason ?? '跳过'}`)
     } else {
@@ -487,6 +487,12 @@ if (feishuProjects.length === 0) {
           const fix = item.statusValues.fix ? ` —— 修复：${item.statusValues.fix}` : ''
           warnings.push(`飞书项目 ${name}：${item.statusValues.message}${fix}`)
           lines.push(`　⚠️ 状态值对不上：${item.statusValues.message}`)
+        } else if (item?.statusValues?.idle === true) {
+          // 「表里一个待办都没有」不是故障，是这张表的稳态（活都干完了）。
+          // 以前这里也报「一张票都收不到 + 去改状态值」，而真照着改会把已完成的
+          // 行全部重收一遍并重跑 —— 那是把「正常」说成「坏了」，还附送一条引爆指引。
+          lines.push(`　ℹ️ ${item.statusValues.message}`)
+          if (item.statusValues.fix) lines.push(`　　 ${item.statusValues.fix}`)
         } else if (item?.statusValues?.ok === true && item.statusValues.values?.length > 0) {
           lines.push(`　${item.statusValues.message}`)
         }

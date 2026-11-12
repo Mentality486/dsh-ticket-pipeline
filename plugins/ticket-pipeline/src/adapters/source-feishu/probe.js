@@ -36,6 +36,35 @@ const AUTH_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
 export const PROBE_TIMEOUT_MS = 10_000
 
 /**
+ * 状态列的「闭环取值」缺省集：回填写「是」，人手工否掉写「否」。
+ *
+ * 这两个值的共同点是「这一行已经有人做过决断了」—— 表里只有它们时，
+ * 说明这张表当前没有待办，而不是配置写错了（见 `compareStatusValues`）。
+ */
+const DEFAULT_CLOSED_STATUS_VALUES = Object.freeze(['是', '否'])
+
+/**
+ * 把调用方给的闭环取值归一成去重后的非空字符串数组。
+ *
+ * 调用方（体检 /「测这张表」）会把配置里的 `writeBackStatus` 叠进来 ——
+ * 用户在面板上把回填值改成「已完成」时，探针也要认「已完成」是闭环，
+ * 否则又会退回去催人「改状态值」。
+ *
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function normalizeClosedValues (raw) {
+  const extra = Array.isArray(raw) ? raw : (raw === undefined || raw === null ? [] : [raw])
+  const merged = [...DEFAULT_CLOSED_STATUS_VALUES, ...extra]
+  const out = []
+  for (const item of merged) {
+    const text = String(item ?? '').trim()
+    if (text.length > 0 && !out.includes(text)) out.push(text)
+  }
+  return out
+}
+
+/**
  * 这些错误码的意思是「你拿错类型来问我了」，不是故障 —— 值得换另一种表型再试。
  *
  * `1254003 WrongBaseToken` 是最常见的那个：拿电子表格的 token 去问
@@ -294,6 +323,9 @@ function extractSheetToken (raw) {
  */
 async function probeOneProject (input) {
   const match = input.match ?? {}
+  // 闭环取值（回填写进去的「是」+ 人工否掉的「否」+ 用户配的 writeBackStatus）。
+  // 由上层传进来，探针不自查配置 —— 它这里只有 `match`，拿不到全局配置。
+  const closedStatusValues = normalizeClosedValues(input.closedStatusValues)
   const appToken = String(match.appToken ?? '').trim()
   const tableId = String(match.tableId ?? '').trim()
   const spreadsheetToken = String(match.spreadsheetToken ?? '').trim()
@@ -436,11 +468,28 @@ async function probeOneProject (input) {
   //
   // 只报「一个都对不上」，不报「少了一个」：真实表里常有历史脏值（空、错别字），
   // 只要有一个能对上就说明配置没错，剩下的交给 `sheetIdentity` / 过滤逻辑处理。
+  //
+  // 2026-11-12 真机纠正：**「一个都对不上」不等于「配置错了」**。
+  // 「处理中」是已经被消费掉的瞬时状态 —— 一张表长期保持的稳态本来就是「是 / 否」
+  // （有人处理完就写成「是」，否掉就写「否」）。这时插件行为完全正确（收 0 张是对的），
+  // 而原来的文案却在催人「把状态值改成『是』」—— 真照着改，74 张已完成的票会
+  // 全部重收一遍并重跑。那是最危险的一类错建议：听起来像修复，实际是引爆。
+  // 于是分三种情形：
+  //   a) 一个都不命中，但表里出现了**闭环取值**（回填写进去的那些）⇒ 中性说明「现在没有待办」；
+  //   b) 采样里状态列全空 ⇒ 表可能是空的，照旧不算结论；
+  //   c) 一个都不命中**且**没有任何闭环取值 ⇒ 这才是真配置错，保持红 + 修法。
+  //
+  // 闭环取值 = 回填会写进「是否处理」的那些值（`writeBackStatus`，缺省「是」）+ 「否」。
+  // 为什么「否」也算：它是人手工否掉的行留下的事实取值，与「是」同属「已经有人做过决断了」。
 
   /** 采样里最多看多少行。100 行足够看出取值分布，又不会让体检读整张表。 */
   const STATUS_SAMPLE_ROWS = 100
 
-  /** 把一组「表里真实出现的状态值」与「配置里认的状态值」放一起比。 */
+  /**
+   * 把一组「表里真实出现的状态值」与「配置里认的状态值」放一起比。
+   *
+   * @param {string[]} values 采样到的状态列取值
+   */
   const compareStatusValues = (values) => {
     const actual = [...new Set(values.map((text) => String(text ?? '').trim()).filter((text) => text.length > 0))]
     const expected = resolveStatusValues(match.statusValues)
@@ -460,6 +509,25 @@ async function probeOneProject (input) {
       return
     }
     const shown = actual.slice(0, 6).map((text) => `「${text}」`).join(' ')
+    // 闭环取值：回填写的「是」与人工否掉的「否」。命中它们说明这张表**已经被处理过**，
+    // 只是现在没有待办 —— 不是配置错。
+    const closed = closedStatusValues.filter((text) => actual.includes(text))
+    if (closed.length > 0) {
+      const closedShown = closed.map((text) => `「${text}」`).join(' ')
+      base.statusValues = {
+        // ok 仍为 true：这一层不是故障。真正要人注意的是「表格里什么时候会出现待办」。
+        ok: true,
+        idle: true,
+        values: actual,
+        expected,
+        closed,
+        // 只摆「出现了哪些取值」，不说「共 N 行」—— 采样值是去重后的集合，
+        // 去重集合的长度不是行数，写成「共 N 行」会让人以为表里只有两行数据。
+        message: `表里现在没有待办的票（状态列只有 ${closedShown} 这类「已经处理过」的取值）—— 收 0 张是对的，不是配置错`,
+        fix: `要让票进来，把新写的行「是否处理」填成 ${expected.map((t) => `「${t}」`).join(' 或 ')}；不要为了「让体检变绿」去改这个配置 —— 改成 ${closedShown} 会把已经处理完的行全部重收一遍并重跑。`,
+      }
+      return
+    }
     base.statusValues = {
       ok: false,
       values: actual,
@@ -603,6 +671,8 @@ export async function probeFeishuConnectivity (options = {}) {
   const appSecret = String(options.appSecret ?? '').trim()
   const fetchImpl = typeof options.fetch === 'function' ? options.fetch : globalThis.fetch
   const timeoutMs = Number(options.timeoutMs ?? PROBE_TIMEOUT_MS) > 0 ? Number(options.timeoutMs ?? PROBE_TIMEOUT_MS) : PROBE_TIMEOUT_MS
+  // 配置里回填写什么就算「已处理」（缺省「是」）。探针拿不到全局配置，所以由调用方给。
+  const closedStatusValues = normalizeClosedValues(options.closedStatusValues)
 
   /** @type {any[]} */
   const allProjects = Array.isArray(options.projects) ? options.projects : []
@@ -680,6 +750,7 @@ export async function probeFeishuConnectivity (options = {}) {
       accessToken,
       projectName: project.name,
       match: project.match,
+      closedStatusValues,
       fetchImpl,
       timeoutMs,
     })
