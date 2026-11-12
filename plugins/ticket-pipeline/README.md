@@ -25,6 +25,8 @@
 src/
   contracts/         纯接口与数据，不 import 任何具体实现
   core/              scheduler / store / recover / prompt / config / domain / branches / commit-summary
+                     ticket-memory（跨票记忆：关键词 → 改过哪些文件，key = projectId）
+                     plugin-version（安装副本 vs 源码的文件级比对，doctor 第 5 节用）
   adapters/
     source-mock/     内存工单源（离线跑通全链路用，每个项目一个实例）
     source-feishu/   飞书多维表格 + 飞书电子表格（sheets.js 纯函数解析、probe.js 连通性探针）
@@ -32,12 +34,13 @@ src/
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
     executor-agent/  真执行器：拍基线 → 起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交 → 保留会话 → 可选：开 draft MR
+                     explore-budget.js：数 read/grep/glob（认 tool/ptc-dispatch 的 data.name）
     gitlab-client/   GitLab REST 客户端（分支/提交/MR/错误分类）；只在 repo.gitlab.enabled=true 时被调用
     push-mock/       假通知（记内存）
     push-feishu/     飞书直发真实现（im/v1/messages，复用读表那对凭据，不经过第三方）
     push-pushplus/   PushPlus 真实现（中继微信 ClawBot；需实名认证）
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
-  tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_doctor
+  tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_forget / pipeline_doctor
                      （每个都导出一个 collect* 纯「算结果」函数，Remote 那边调同一个）
   remote/            浏览器端可调的 Remote：10 个 direct 方法（见下）
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
@@ -170,7 +173,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**517 项断言，全绿 exit 0**，共 **31 个小节**（编号到 18，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**530 项断言，全绿 exit 0**，共 **32 个小节**（编号到 19，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 
