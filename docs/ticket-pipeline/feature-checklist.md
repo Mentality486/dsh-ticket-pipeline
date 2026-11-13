@@ -2,7 +2,17 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「40 分钟改一个小功能 + 通知换掉付费第三方」的代码与本文同一次提交，上一轮已提交代码为 `fdf8895`（图片块字段名改成 `attachment`）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-13，**新增项目还没保存就贴工单表链接，必然失败** ——
+> 最近一次更新：2026-11-13 傍晚，**「跑一轮」也炸在同一个地方** —— 用户原话「跑一轮失败」，
+> 截图红字 `跑一轮失败: client api: ticketPipeline#ticketPipeline/scan expected 1 argument(s), got 0`。
+> `scan` 加了可选 `projectId`（工单 #39）之后调用点还留着 `ns.scan()`，而浏览器侧
+> `prepareInvocation` 是按 `descriptor.parameters.length` 数位置实参的，`acceptsUndefined` 只有宿主侧认
+> —— 与 11-11 的「重跑」是**同一个机制换了个方法**。修法两件：调用点改成 `ns.scan(undefined)`；
+> 并在 `scripts/client-check.mjs` 加**静态守卫 `checkCallArities`**，把 bundle 里每一处
+> `<xxx>ns.<method>(…)` 的实参个数与描述符声明逐个比对，对不上直接 fail 并报出「期望几个、实际几个」。
+> 守卫本身踩了两个坑并已写进 `architecture.md`：①扫之前要剥注释（否则把自己举的反例当违规）；
+> ②剥注释必须单独识别正则字面量（`/projects["'\]\s]*(is not)/i` 这种体内带引号的写法会把状态机
+> 带偏到文件末尾，于是**守卫把要守的东西遮住、回归测试显示全绿**）。见 §1.42。
+> 同日更早：**新增项目还没保存就贴工单表链接，必然失败** ——
 > 用户原话「我新增加一个项目加不进去」，截图里红字是 `没能写进去: 没有第 1 个项目（当前共 1 个）`。
 > 病灶不在宿主：`FeishuTableLinkRow` 只按平台是飞书就画链接行，而紧挨着的「测这张表」
 > 早就判了 `pending !== true`，**同一张卡片两个动作对「宿主里有没有它」口径不一致**；
@@ -13,7 +23,7 @@
 > 定位依据会被整笔拒（用户当天下午贴回来的就是 `projects[1] … feishu 项目必须给①工单表链接/token…`），
 > 于是「保存后再补写」永远等不到。现在链接**随那一笔一起**塞进 `match.appToken`（三种 URL 形态运行期
 > 各自拆解，浏览器仍不解析），保存后的 `setProjectTable()` 退化成「归一成精确坐标」。
-> `dev-run` 551/551、`client-smoke` 228 → **274** 条。见 §1.41。
+> `dev-run` 551/551、`client-smoke` 228 → **276** 条。见 §1.41。
 > 2026-11-11 更晚，**运行页签三件事一起修** —— 用户原话
 > 「运行页面的历史 重试报错 也删除不了 优化一下显示历史的ui和展现方式。项目页面的重新读取失败」。
 > 三个互不相干的原因：①「重跑」每次都抛 `expected 2 argument(s), got 1` ——
@@ -2605,6 +2615,72 @@ Remote 新增 `testProject(index)`：只把 `projects[index]` 交给体检那份
 一整块」的路径上出现 —— 逐字段提交的路径看着好好的，很容易以为功能本身有问题。
 
 
+### 1.42 「跑一轮」炸在同一个机制上：可选参数也必须传满位置（2026-11-13 傍晚）
+
+用户原话就三个字：「跑一轮失败」。截图红字写得很清楚：
+
+```
+跑一轮失败: client api: ticketPipeline#ticketPipeline/scan expected 1 argument(s), got 0
+```
+
+#### 病灶
+
+`scan` 在工单 #39 加了可选参数 `projectId`（面板上「只跑这个项目」那一格），
+但「跑一轮」的调用点还是老样子 `ns.scan()` —— **声明里可选，调用时干脆不传**。
+浏览器侧 `prepareInvocation` 是按 `descriptor.parameters.length` 数**位置实参**的：
+
+```js
+const expected = descriptor.parameters.length
+if (values.length !== expected && !hasCallerSignal) {
+  throw new Error(`client api: ${endpoint} expected ${expected} argument(s), got ${values.length}`)
+}
+```
+
+`acceptsUndefined: true` **只有宿主侧** `assertExactArguments` 会认（它用它决定
+「缺这个键算不算 missing」），浏览器侧完全不看这个标志。所以「可选」在两端语义不同：
+宿主侧是「可以不传这个字段」，浏览器侧是「必须占住这个位置」。
+
+这与 2026-11-11 修的「重跑」是**同一个机制、换了个方法**（那次是 `reset` 少传
+`projectId`）。一天半之内撞两次，说明这不是「写的时候粗心」能解释的 ——
+它出现在最自然的写法上：既然参数可选，不传不就完了。
+
+#### 修法
+
+1. 调用点改成 `ns.scan(undefined)`。`undefined` 不会写进 `args`
+   （网关那句 `if (value !== void 0) args[wire] = value`），宿主侧再靠
+   `acceptsUndefined` 接住缺席 —— 两头都合法。
+2. **加静态守卫**：`scripts/client-check.mjs` 新增 `checkCallArities()`，
+   从 bundle 里抠出每一处 `<xxx>ns.<method>(…)` 调用点，数顶层实参个数，
+   与 `TICKET_PIPELINE_DESCRIPTORS` 的 `parameters.length` 逐个比对，对不上就 fail：
+
+   ```
+   lib/client.js:4607 调用 `ns.scan()` 传了 0 个实参，但描述符声明了 1 个 ——
+   浏览器侧会直接抛 `client api: … expected 1 argument(s), got 0`。可选参数也要按位置传满（填 undefined）。
+   ```
+
+   顺带补一条运行时断言：`client-smoke` 的假宿主把 `arguments.length` 记进
+   `calls.scanArgs`，断言点「跑一轮」时是 `[1]`，并且界面上不出现
+   `expected 1 argument` / `跑一轮失败`。
+
+#### 给守卫做回归测试，结果险些变成摆设
+
+写完断言我照例把 `ns.scan(undefined)` 改回 `ns.scan()` 看它会不会红 ——
+**它没红，exit 0、全绿**。原因是 `stripComments()` 里「见到引号就进字符串」那条规则
+被正则字面量带偏了：源码中有 `/projects["'\]\s]*(is not|is)/i` 这种**体内带引号**的写法，
+状态机从那里以为进了字符串、一路吞到文件末尾，于是**守卫把自己要守的调用点遮掉了**。
+
+改用通行启发式之后才正常：`/` 的前一位有效字符是 `)`、`]`、标识符或数字时算除号，
+否则算正则开头，正则整体原样跳过（`[...]` 字符类里的 `/` 不算结束）。再跑回归测试，
+exit 1 并精确报出 `lib/client.js:4607`。
+
+**教训（这条比 bug 本身重要）：** 「加了个断言」和「断言真的会拦住」是两件事。
+新加的守卫**必须**用「故意把 bug 放回去」的方式验证它确实变红 ——
+这次如果不做这一步，交付的会是一个看起来更安全、实际一条都拦不住的检查，
+比没有更糟（人会因为「有守卫了」而放松）。
+
+
+
+
 ## 2. 代码清单
 
 `src/` 共 **50 个 .js / 24 084 行**；`scripts/` 共 10 个 .mjs / **16 758 行**（`dev-run.mjs` **7 043 行**）；`lib/client.js` **5 325 行**（浏览器端设置面板）。
@@ -3022,7 +3098,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **551** 项离线断言 + **272** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **551** 项离线断言 + **276** 条面板断言 + **97** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 

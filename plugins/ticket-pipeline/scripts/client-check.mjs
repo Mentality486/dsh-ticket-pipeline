@@ -227,6 +227,155 @@ function checkParameters (label, descriptors) {
 }
 
 /**
+ * 数一段实参文本里「顶层逗号」分隔出的实参个数。
+ *
+ * `()` 里什么都没有算 0 个；其余按顶层逗号切开（忽略括号/中括号/大括号里的逗号，
+ * 以及字符串与注释里的逗号 —— 调用点里确实出现过模板串与注释）。
+ */
+function countArguments (text) {
+  const trimmed = String(text).trim()
+  if (trimmed.length === 0) return 0
+  let count = 1
+  let depth = 0
+  let inString = false
+  let quote = ''
+  let escaped = false
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const ch = trimmed[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) inString = false
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = true; quote = ch; continue }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1
+    else if (ch === ',' && depth === 0) count += 1
+  }
+  return count
+}
+
+/**
+ * 把注释替换成空格（保留换行，行号不变），字符串原样保留。
+ *
+ * 调用点核对要跳过注释：注释里写「以前是 `ns.scan()`、那是错的」这种反例很自然，
+ * 不剥就会把自己的说明当成调用点误报。字符串与正则字面量原样保留 —— 那些是真实数据。
+ *
+ * 正则字面量必须单独认：`/['\]]\s*(is not)/i` 这种里面带引号的写法，按「遇到引号就是
+ * 字符串开头」处理会一路吞到文件末尾，把后面真实的调用点全盖住 —— 那就成了
+ * 「守卫自己把要守的东西遮掉」。判据用通行的上一位字符启发式：`/` 前面是
+ * 标识符或右括号/右方括号时是除号，否则是正则开头。
+ */
+function stripComments (source) {
+  let out = ''
+  let inString = false
+  let inRegex = false
+  let inClass = false
+  let quote = ''
+  let escaped = false
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (inRegex) {
+      out += ch
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '[') inClass = true
+      else if (ch === ']') inClass = false
+      else if (ch === '/' && !inClass) inRegex = false
+      else if (ch === '\n') inRegex = false
+      continue
+    }
+    if (inString) {
+      out += ch
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) inString = false
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = true; quote = ch; out += ch; continue }
+    if (ch === '/' && source[i + 1] === '/') {
+      while (i < source.length && source[i] !== '\n') { out += ' '; i += 1 }
+      if (i < source.length) out += '\n'
+      continue
+    }
+    if (ch === '/' && source[i + 1] === '*') {
+      out += '  '
+      i += 2
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) {
+        out += source[i] === '\n' ? '\n' : ' '
+        i += 1
+      }
+      if (i < source.length) { out += '  '; i += 1 }
+      continue
+    }
+    // 走到这里说明是 `/` 但不是 `//` 或 `/*`。按前一位有效字符判断是除号还是正则
+    // 字面量开头；是正则就整体原样跳过，别让里面的引号把状态机带歪。
+    if (ch === '/') {
+      let j = out.length - 1
+      while (j >= 0 && (out[j] === ' ' || out[j] === '\t' || out[j] === '\n' || out[j] === '\r')) j -= 1
+      const prev = j >= 0 ? out[j] : ''
+      // `)` / `]` / 标识符 / 数字后面是除号；紧跟关键字 return/typeof 等也算除号之前，
+      // 但那种极少数，宁可判成正则也不会误伤（正则体里出现 `ns.xxx(` 的可能更低）。
+      const division = /[\w$)\]]/.test(prev) && prev !== ''
+      if (!division) { inRegex = true; inClass = false; escaped = false }
+      out += ch
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/**
+ * 静态核对**每个调用点传给 Remote 方法的实参个数**。
+ *
+ * 这不是洁癖：浏览器侧的 `prepareInvocation` 用 `descriptor.parameters.length`
+ * 校验实参个数（`acceptsUndefined` 只在宿主侧参与判定），少传一个立刻抛
+ * `client api: ticketPipeline#ticketPipeline/scan expected 1 argument(s), got 0`
+ * —— 界面上只表现为「跑一轮失败」，跟参数内容毫无关系。
+ *
+ * 2026-11-13 一天之内撞了两次（`reset` 少传 `projectId`、`scan` 少传 `projectId`），
+ * 两次都是「声明里是可选的、调用时干脆不传」。这条断言就是让第三次不可能发生：
+ * 调用点必须把位置传满，可选的填 `undefined`。
+ */
+function checkCallArities (rawSource, descriptors) {
+  // 先剥注释再扫：注释里写「以前是 ns.scan()、那是错的」这类反例很自然，
+  // 不剥就会把自己的说明当成调用点误报。
+  const source = stripComments(rawSource)
+  const byMethod = new Map()
+  for (const descriptor of descriptors) {
+    byMethod.set(descriptor.method, Array.isArray(descriptor.parameters) ? descriptor.parameters.length : 0)
+  }
+  // 变量名以 `ns` 结尾的都可能持有命名空间（`ns` / `runNs` / `linkNs`）；
+  // 只认这种拼法，别的对象（`Promise`、`tree`）不会误命中。
+  const pattern = /\b([A-Za-z_$][\w$]*|[A-Za-z_$])\.([A-Za-z_$][\w$]*)\s*\(/g
+  let callCount = 0
+  for (let match = pattern.exec(source); match !== null; match = pattern.exec(source)) {
+    const holder = match[1]
+    const method = match[2]
+    if (!/[Nn]s$/.test(holder)) continue
+    if (!byMethod.has(method)) continue
+    const open = source.indexOf('(', match.index + match[0].length - 1)
+    const inner = sliceBalanced(source, open, '(', ')')
+    if (inner === undefined) continue
+    const actual = countArguments(inner.slice(1, -1))
+    const expected = byMethod.get(method)
+    callCount += 1
+    if (actual !== expected) {
+      const line = source.slice(0, match.index).split('\n').length
+      fail(
+        'lib/client.js:' + String(line) + ' 调用 `' + holder + '.' + method + '()` 传了 ' + String(actual) +
+        ' 个实参，但描述符声明了 ' + String(expected) + ' 个 —— 浏览器侧会直接抛 ' +
+        '`client api: … expected ' + String(expected) + ' argument(s), got ' + String(actual) + '`。' +
+        ' 可选参数也要按位置传满（填 undefined）。',
+      )
+    }
+  }
+  if (callCount > 0) notes.push('浏览器侧 Remote 调用点 ' + String(callCount) + ' 处，实参个数都与描述符一致')
+}
+
+/**
  * 把描述符剥成只含「跨端必须一致」的字段。
  *
  * 函数不能比相等，所以 codec 只比「有没有 create」这个布尔位 —— 但这一位恰恰是
@@ -756,6 +905,10 @@ async function main () {
     if (namespace !== undefined && namespace !== 'ticketPipeline') {
       notes.push('Remote 命名空间是 ' + namespace + '（浏览器侧按 remote.ticketPipeline.* 调用，注意同步）')
     }
+    // 描述符只声明了一半：真正让按钮炸掉的是**调用点**少传实参。
+    // 这里拿描述符的声明个数去核对 bundle 里每一处 `ns.method(...)`。
+    const bundle = await readFile(join(root, 'lib/client.js'), 'utf8')
+    checkCallArities(bundle, host.raw)
   }
 
   for (const note of notes) console.log('· ' + note)

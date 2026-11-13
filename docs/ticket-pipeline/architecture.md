@@ -1168,9 +1168,9 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
 | `ticketPipeline.branches()` | 每个项目检出的分支清单 | 给 `repo.baseBranch` / `repo.targetBranch` 当候选（`listBranches()` 跑 `git for-each-ref`）；按项目 index 对齐，某个项目配错只让它自己空着 |
 | `ticketPipeline.setProjectTable(index, url)` | 写入后的项目投影 + 一句人话 | 面板「粘贴工单表链接」**唯一入口**：浏览器只转交整条 URL，**宿主**用 `parseFeishuLink()` 解析出 app_token / spreadsheetToken / tableId / viewId / sheetId，再经 `ctx.get('settings').mutate()` 写进 profile，并**把另一套定位字段清掉**（换表型时 `appToken`/`tableId` 与 `spreadsheetToken`/`sheetId` 不会并存）。这样四个定位键都不用卡片上的输入框，明文也永远不会出现在浏览器内存或请求体里 |
 | `ticketPipeline.status(includeDone?)` | 与 `pipeline_status` **同一份**结果 | 设置页「运行」页签的票列表与汇总行。**不许另写一套算法** —— 工具侧早把「算结果」抽成了模块级 `collectStatus(options, args)`，Remote 直接调它（`view:'tickets'`，面板要明细不要按项目聚合）。`includeDone` 是 `acceptsUndefined` 的可选参数，对应面板上的「显示历史」勾选：不传 = `false`（先回答「还要我做什么」），传 `true` 才把终态票一起拉进来。**只认严格的 `true`** —— 面板把这个方法同时当 `onClick` 处理器用（`onRefresh: loadRun`），那里第一参是事件对象，从别的类型里猜意图会把「点一下刷新」变成「突然看历史」 |
-| `ticketPipeline.scan(projectId?)` | `{status, text}` | 「跑一轮」（等价 `pipeline_scan`）。同样复用 `collectScan()`；`disabled` / `already-running` 在这里就同步判掉，不叠后台任务。`projectId` 是「只跑这一个项目」，空串归一成 `undefined`（`pickNext` 传空串会一张都挑不到） |
+| `ticketPipeline.scan(projectId?)` | `{status, text}` | 「跑一轮」（等价 `pipeline_scan`）。同样复用 `collectScan()`；`disabled` / `already-running` 在这里就同步判掉，不叠后台任务。`projectId` 是「只跑这一个项目」，空串归一成 `undefined`（`pickNext` 传空串会一张都挑不到）。**调用侧必须传满 1 个位置实参**：`ns.scan(undefined)` —— 见下面「可选参数也必须传满位置」 |
 | `ticketPipeline.cancel()` | `{cancelled, text}` | 「取消当前」（等价 `pipeline_cancel`），复用 `collectCancel()` |
-| `ticketPipeline.reset(recordId, projectId?)` | `{reset, reason, phase, text}` | 失败票行尾「重跑」（等价 `pipeline_reset`），复用 `collectReset()`。`projectId` 是 `acceptsUndefined` 的可选参数：**浏览器侧只传 1 个实参**，不传 `undefined` 占位（否则参数个数校验对不上） |
+| `ticketPipeline.reset(recordId, projectId?)` | `{reset, reason, phase, text}` | 失败票行尾「重跑」（等价 `pipeline_reset`），复用 `collectReset()`。`projectId` 是 `acceptsUndefined` 的可选参数，但**调用侧必须传满 2 个位置实参**：`ns.reset(recordId, undefined)` —— 见下面「可选参数也必须传满位置」 |
 | `ticketPipeline.forget(recordId, projectId?)` | `{forgotten, reason, phase, text}` | 票行尾「删除记录」（等价 `pipeline_forget`）。**只删插件本地的工单行**：不碰工单表、不回滚代码、不删工作区 |
 | `ticketPipeline.testProject(index)` | `{ok, skipped?, project, platform, kind, table, blockers, text}` | 项目卡片上的「**测这张表**」（工单 #43）：只把 `projects[index]` 交给体检那份飞书探针，逐层回 认证 / 表 / 数据 / 状态值 的 ✅❌。**只传这一项** —— 传全量就变成「体检」，既慢又看不出断的是哪张表；**复用同一份探针** —— 否则会出现「这里绿了、体检里红」。参数是**下标不是项目名**（项目名允许重复，`config.js` 只警告不拦；下标与面板卡片一一对应）；平台不是 feishu 时返回 `skipped`（不算失败），金山源 `wps` 必须**先于**「非飞书」判断并报不通过 |
 
@@ -1275,6 +1275,26 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
   （`if (value !== undefined)`），宿主侧再靠 `acceptsUndefined` 接住缺席，两头都合法。
   **这条约束对所有「可选参数」的 Remote 方法都成立**：调用侧必须传满位置，
   不能靠「少传一个」来表达可选。`client-smoke.mjs` 有一条断言专门看实参表长度。
+- **同一个坑第二天又来一次（2026-11-13 修 `scan`）**：`scan` 加了可选的 `projectId`（工单 #39）之后，
+  「跑一轮」的调用点还留着 `ns.scan()`，于是点一下就报
+  `跑一轮失败：client api: ticketPipeline#ticketPipeline/scan expected 1 argument(s), got 0`
+  —— 跟 `reset` 那次是**同一个机制**，只是换了个方法。
+  两次都发生在「声明里是可选的、调用时干脆不传」这种最自然的写法上，所以光靠纪律不够。
+  现在 `scripts/client-check.mjs` 里加了一条**静态断言**（`checkCallArities`）：
+  抠出 bundle 里每一处 `<xxx>ns.<method>(…)` 的调用点，数顶层实参个数，
+  与 `TICKET_PIPELINE_DESCRIPTORS` 声明的 `parameters.length` 逐个比对，
+  对不上就 fail 并直接给出「期望几个、实际几个」。
+  实现上有两处必须小心，否则守卫会变成摆设：
+  ① 扫之前先剥注释（注释里写「以前是 `ns.scan()`、那是错的」是很自然的自我说明，
+     不剥就会把自己举的反例当成违规）；
+  ② 剥注释时**必须单独识别正则字面量** —— 源码里有 `/projects["'\]\s]*(is not|is)/i`
+     这种体内带引号的写法，按「见到引号就进字符串」处理会一路吞到文件末尾，
+     把后面所有真实调用点盖掉。判据用通行的前一位字符启发式（`/` 前是
+     `)`、`]`、标识符或数字时算除号，否则算正则开头）。
+  加这条断言时我第一版就踩了 ②：回归测试（把 `ns.scan(undefined)` 改回 `ns.scan()`）
+  显示「exit 0，全绿」—— 守卫把自己的目标遮住了。改完再测才 exit 1 并精确报出
+  `lib/client.js:4607 调用 ns.scan() 传了 0 个实参`。**给守卫做回归测试时，
+  必须确认它真的会红，而不是「跑过了就算」。**
 - **「可选的第一个参数」是另一个同类坑（2026-11-11 修）**：`loadProjects(target)` 原来写
   `target !== undefined ? target : getNamespace(...)`，而它同时被当 `onClick` 传给「重新读取」
   按钮 —— React 会把 click 事件对象塞进第一参，于是点一下就把事件当 namespace，

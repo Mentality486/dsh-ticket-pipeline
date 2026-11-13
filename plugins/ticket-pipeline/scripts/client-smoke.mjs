@@ -415,7 +415,7 @@ function makeHost () {
     // reset / forget 记的是**整个实参表**（不是第一个）：浏览器侧的位置参数
     // 个数是硬校验（`parameters.length`），少传一个就抛 `expected N argument(s)` ——
     // 「点重跑报错」正是这么来的，所以断言必须看得见个数。
-    status: 0, statusArgs: [], scan: 0, cancel: 0, reset: [], forget: [],
+    status: 0, statusArgs: [], scan: 0, scanArgs: [], cancel: 0, reset: [], forget: [],
     // 「测这张表」（#43）：记下每次传的 index —— 断言要验的是「点的是哪张卡片」。
     testProject: [],
   }
@@ -494,8 +494,11 @@ function makeHost () {
         contribution.descriptors.some((item) =>
           item.method === 'cancel' && item.parameters.length === 0 && item.invocation.kind === 'direct'),
         contribution.descriptors.map((item) => item.method).join(' | '))
-      // scan 从「无参」变成「一个可选 projectId」（工单 #39）：面板上那一格下拉
-      // 缺省是「全部项目」，选它时按位置不传（不是传空串），所以必须 acceptsUndefined。
+      // scan 从「无参」变成「一个可选 projectId」（工单 #39）。
+      // 注意：**可选只在宿主侧可选** —— 浏览器侧按位置数实参个数，
+      // 少传一个就抛 `client api: … expected 1 argument(s), got 0`。
+      // 面板上那一格下拉缺省是「全部项目」，此时要传 `undefined` 而不是不传
+      // （`ns.scan(undefined)`），否则「点跑一轮」直接报错。
       check('scan 带一个可选参数 projectId（只跑这个项目）',
         contribution.descriptors.some((item) => {
           if (item.method !== 'scan') return false
@@ -579,8 +582,12 @@ function makeHost () {
           calls.statusArgs.push(includeDone)
           return { ok: true, value: makeRunSnapshot(includeDone === true) }
         },
-        scan: async () => {
+        scan: async function (projectId) {
           calls.scan += 1
+          // 记实参表：浏览器侧按位置数实参个数，少传一个就抛
+          // `client api: … expected 1 argument(s), got 0` —— 2026-11-13 面板
+          // 「跑一轮」正是这么炸的，所以这条也得能被断言看到。
+          calls.scanArgs.push(arguments.length)
           return { ok: true, value: { status: 'triggered', scan: null, ran: null, cleaned: false, text: '已触发这一轮（不等它跑完）。' } }
         },
         cancel: async () => {
@@ -949,6 +956,16 @@ async function main () {
     await new Promise((resolve) => setTimeout(resolve, 0))
     tree = await render(Panel, { view: 'page' })
     check('点「跑一轮」调的是宿主 scan()', ctx.calls.scan === 1, String(ctx.calls.scan))
+    // 浏览器侧按 `descriptor.parameters.length` 数实参个数：scan 声明了 1 个
+    // 可选的 projectId，不传就抛 `expected 1 argument(s), got 0` —— 用户看到的
+    // 「跑一轮失败：client api: ticketPipeline#ticketPipeline/scan expected 1
+    // argument(s), got 0」正是这个。缺省「全部项目」时要传 `undefined`。
+    check('点「跑一轮」传满 1 个位置实参（缺省全部项目 → undefined）',
+      ctx.calls.scanArgs.length === 1 && ctx.calls.scanArgs[0] === 1,
+      JSON.stringify(ctx.calls.scanArgs))
+    check('跑一轮没有报「expected 1 argument(s)」',
+      (textOf(tree).indexOf('expected 1 argument') < 0 && textOf(tree).indexOf('跑一轮失败') < 0),
+      textOf(tree).slice(0, 300))
   }
 
   const cancelButton = findButton(tree, '取消当前')

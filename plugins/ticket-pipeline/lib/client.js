@@ -239,9 +239,13 @@ window.__ModuleLoader__.load({
           ],
         },
         {
-          // 「跑一轮」带一个可选的项目名（工单 #39）：面板上那一格下拉缺省是「全部项目」，
+          // 「跑一轮」带一个可选的项目名（工单 #39）：缺省「全部项目」，
           // 选某一项就只扫它、只跑它的票。参数形状与 status 的 includeDone 同款：
-          // 可选 + acceptsUndefined，不传时浏览器侧根本不会把字段写进 args。
+          // 可选 + acceptsUndefined。**但「可选」只在宿主侧可选** —— 浏览器侧按
+          // `parameters.length` 数位置实参，少传一个就抛
+          // `client api: … expected 1 argument(s), got 0`（2026-11-13 用户报的
+          // 「跑一轮失败」就是它）。所以调用点写的是 `ns.scan(undefined)`：
+          // 位置传满，而值 `undefined` 不会被写进 args。
           id: 'ticket-pipeline#ticketPipeline/scan',
           service: 'ticketPipeline',
           namespace: 'ticketPipeline',
@@ -4593,7 +4597,14 @@ window.__ModuleLoader__.load({
         setRunAction('scan')
         setRunError('')
         setRunMessage('')
-        ns.scan().then(function (response) {
+        // **必须传满位置实参**：浏览器的 `prepareInvocation` 用 `descriptor.parameters.length`
+        // 校验实参个数，`acceptsUndefined` 只在宿主侧参与判定。少传一个就抛
+        // `client api: …/scan expected 1 argument(s), got 0`，面板上就是「跑一轮失败」。
+        // 传 `undefined` 不会写进 args（`if (value !== undefined)`），宿主侧再接住缺席，
+        // 所以既满足个数校验、又不产生多余的 wire 字段。
+        // 这一类坑 2026-11-13 连撞两次（先是 `reset`，再是 `scan`）—— 现在
+        // `scripts/client-check.mjs` 有一条静态断言把「调用点实参个数 = 声明个数」钉住。
+        ns.scan(undefined).then(function (response) {
           setRunAction('')
           if (!response || !response.ok) {
             setRunError('跑一轮失败：' + ((response && response.error && response.error.message) || '未知错误'))
