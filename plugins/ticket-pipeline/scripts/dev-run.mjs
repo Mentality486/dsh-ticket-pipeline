@@ -3121,6 +3121,96 @@ async function main () {
   // ── 体检扩面：飞书连通性 / 通知完整性 / 三档结论 ──────────────────
   // 这四件事（权限没开、版本没发布、不是协作者、通知通道没填全）在本地完全看不出来，
   // 以前只能等第一张票跑挂才暴露，而那时用户手里一条线索都没有。
+  await check('体检：sheetName 填的是文档标题时，探针要按配置挑工作表而不是一律取第一张', async () => {
+    // 真机（2026-11-13）：`match.sheetName="PMS项目管理系统工单"` 是**文档标题**，
+    // 页签其实叫 `Sheet1`。旧探针 `resolvedSheetId` 为空就取 `sheets[0]`，
+    // 于是体检全绿、扫票一直报「没匹配到任何工作表」—— 同一份配置两份矛盾结论。
+    // 现在探针与扫票共用 `resolveWorksheet`，连「填的是文档标题」那档也一致。
+    const seen = []
+    const fakeFeishu = async (url) => {
+      const u = new URL(String(url))
+      seen.push(u.pathname)
+      const json = (body) => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      })
+      if (u.pathname.endsWith('/tenant_access_token/internal')) return json({ code: 0, tenant_access_token: 't-1' })
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+        return json({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }] } })
+      }
+      if (/\/sheets\/v3\/spreadsheets\/[^/]+$/.test(u.pathname)) {
+        // 文档元数据：标题与配置里的 sheetName 一模一样 —— 降级那一档的触发条件。
+        return json({ code: 0, data: { spreadsheet: { title: 'PMS项目管理系统工单' } } })
+      }
+      if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+        return json({ code: 0, data: { valueRange: { values: [['序号', '问题描述', '是否处理'], ['A-1', 'x', '处理中']] } } })
+      }
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404 }), text: async () => '{}' }
+    }
+
+    // ① 只有一张可见表 ⇒ 降级并说明「你填的是文档标题」，不判失败。
+    const one = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnX', sheetName: 'PMS项目管理系统工单' } }],
+      fetch: fakeFeishu,
+    })
+    assert.equal(one.projects[0].metadata.ok, true, '元数据要读通')
+    assert.ok(one.projects[0].metadata.note, '降级必须给说明，否则人不知道自己配的名字没生效')
+    assert.ok(one.projects[0].metadata.note.includes('是这张文档的标题'), one.projects[0].metadata.note)
+    assert.ok(!one.projects[0].metadata.nameIssue, '降级成功就不该有 nameIssue')
+    assert.equal(one.projects[0].sheet, 'sh1')
+
+    // ② 名字对不上且无法降级 ⇒ 记 nameIssue（体检据此判阻断），但元数据仍算通。
+    seen.length = 0
+    const two = await probeFeishuConnectivity({
+      appId: 'cli_app',
+      appSecret: 's',
+      projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnX', sheetName: '根本不存在的页签' } }],
+      fetch: async (url) => {
+        const u = new URL(String(url))
+        seen.push(u.pathname)
+        if (u.pathname.endsWith('/tenant_access_token/internal')) {
+          return {
+            ok: true, status: 200, headers: { get: () => 'application/json' },
+            json: async () => ({ code: 0, tenant_access_token: 't-1' }),
+            text: async () => '{}',
+          }
+        }
+        if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(u.pathname)) {
+          return {
+            ok: true, status: 200, headers: { get: () => 'application/json' },
+            json: async () => ({ code: 0, data: { sheets: [{ sheet_id: 'sh1', title: 'Sheet1' }, { sheet_id: 'sh2', title: '归档' }] } }),
+            text: async () => '{}',
+          }
+        }
+        if (/\/sheets\/v3\/spreadsheets\/[^/]+$/.test(u.pathname)) {
+          return {
+            ok: true, status: 200, headers: { get: () => 'application/json' },
+            json: async () => ({ code: 0, data: { spreadsheet: { title: 'PMS项目管理系统工单' } } }),
+            text: async () => '{}',
+          }
+        }
+        if (/\/sheets\/v2\/spreadsheets\/[^/]+\/values\//.test(u.pathname)) {
+          return {
+            ok: true, status: 200, headers: { get: () => 'application/json' },
+            json: async () => ({ code: 0, data: { valueRange: { values: [['序号'], ['A-1']] } } }),
+            text: async () => '{}',
+          }
+        }
+        return { ok: false, status: 404, headers: { get: () => 'application/json' }, json: async () => ({ code: 404 }), text: async () => '{}' }
+      },
+    })
+    assert.equal(two.projects[0].metadata.ok, true, '名字不对不等于连不上')
+    assert.ok(two.projects[0].metadata.nameIssue, '必须记下名字对不上')
+    assert.ok(two.projects[0].metadata.nameIssue.includes('Sheet1'), '要列出实际工作表')
+    assert.ok(two.projects[0].metadata.message.includes('工作表名对不上'), '正文要点出来')
+  })
+
+
   await check('体检：飞书 App Secret 填错 → 报「不匹配」+ 具体修法（含错误码）', async () => {
     const tool = createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
@@ -3754,6 +3844,80 @@ async function main () {
     assert.ok(out.text.includes('表里现在没有待办的票'), `正文要说清它没坏：${out.text}`)
     assert.ok(!out.text.includes('状态值对不上'), '不能再打警告符号')
     assert.ok(!out.warnings.some((w) => w.includes('状态值')), `不该进提醒档：${JSON.stringify(out.warnings)}`)
+  })
+
+  await check('体检：工作表名对不上要判阻断，不能体检全绿而扫票失败', async () => {
+    // 2026-11-13 真机事故：`match.sheetName` 填的是**文档标题**
+    // （叫「PMS项目管理系统工单」，页签其实叫 `Sheet1`）。旧体检根本不看
+    // sheetName（一律取第一张），于是体检全绿、扫票一直报「没匹配到任何工作表」——
+    // 同一份配置拿到两份互相矛盾的结论，人不知道信谁。
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'shtcn', sheetName: 'PMS项目管理系统工单' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+      probeFeishu: async () => ({
+        skipped: false,
+        token: { ok: true, message: 'token 有效' },
+        projects: [{
+          name: 'pms',
+          kind: 'sheet',
+          table: 'shtcn',
+          metadata: {
+            ok: true,
+            message: '能读到电子表格元数据（2 个工作表）',
+            nameIssue: 'match.sheetName="PMS项目管理系统工单" 没匹配到任何工作表。现有工作表：Sheet1 [sh1]、归档 [sh2]',
+          },
+          records: { ok: true, message: '能读到第一页数据（100 行）' },
+        }],
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, false, '工作表名对不上会扫不到票，必须算阻断')
+    assert.ok(out.blockers.some((b) => b.includes('工作表名对不上')), `要进阻断档：${JSON.stringify(out.blockers)}`)
+    assert.ok(out.text.includes('工作表名对不上'), '正文也要看得见')
+    assert.ok(out.text.includes('Sheet1'), '要列出实际的工作表名，人才能照着改')
+  })
+
+  await check('体检：工作表名降级取第一张时要说清「你填的是文档标题」（不判红）', async () => {
+    const tool = createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'pms', match: { platform: 'feishu', appToken: 'shtcn', sheetName: 'PMS项目管理系统工单' }, repo: { path: 'D:/repo/pms' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+      readSecret: async () => 'x',
+      probeFeishu: async () => ({
+        skipped: false,
+        token: { ok: true, message: 'token 有效' },
+        projects: [{
+          name: 'pms',
+          kind: 'sheet',
+          table: 'shtcn',
+          metadata: {
+            ok: true,
+            message: '能读到电子表格元数据（1 个工作表）',
+            note: 'match.sheetName="PMS项目管理系统工单" 是这张文档的标题，不是里面工作表（页签）的名字；这张文档只有一张可见工作表，已用「Sheet1」[sh1]。',
+          },
+          records: { ok: true, message: '能读到第一页数据（100 行）' },
+        }],
+      }),
+    })
+    const out = await tool.execute({}, {})
+    assert.equal(out.ok, true, '降级成功就不算失败')
+    assert.ok(!out.blockers.some((b) => b.includes('工作表名')), '不能进阻断档')
+    assert.ok(out.text.includes('是这张文档的标题'), '必须说清填的是文档标题，否则人不知道自己配的名字没生效')
+    assert.ok(out.text.includes('Sheet1'), '要点出实际用的工作表')
   })
 
   // 比对逻辑本身：拿内存假文件系统把每种分支都走一遍（不碰真实磁盘）。
@@ -6761,6 +6925,37 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(out.text.includes('没有待办的票'), `要说清现在没票可收：${out.text}`)
     assert.ok(out.text.includes('读得通'), `结论要区分「读得通」与「有票可收」：${out.text}`)
     assert.ok(!out.text.includes('能收到票'), '别承诺「能收到票」，下次收 0 张会被当成回归')
+  })
+  await check('remote.testProject()：工作表名对不上要判失败，并列出实际工作表', async () => {
+    // 与体检同一条口径：表连得上、数据读得到，但名字配错 ⇒ 扫票必然失败。
+    // 「测这张表」的价值恰恰是提前抓这种「连得上但配错了」。
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({ writeBackStatus: '是', projects: [{ name: 'pms', match: { platform: 'feishu', spreadsheetToken: 'shtcnSheet' } }] }),
+      doctorOptions: {
+        readSecret: async (name) => (name === 'FEISHU_APP_ID' ? 'cli_app' : 's'),
+        probeFeishu: async () => ({
+          skipped: false,
+          token: { ok: true, message: 'token 有效' },
+          projects: [{
+            name: 'pms',
+            kind: 'sheet',
+            table: 'shtcnSheet',
+            metadata: {
+              ok: true,
+              message: '能读到电子表格元数据（2 个工作表）',
+              nameIssue: 'match.sheetName="PMS项目管理系统工单" 没匹配到任何工作表。现有工作表：Sheet1 [sh1]、归档 [sh2]',
+            },
+            records: { ok: true, message: '能读到第一页数据（100 行）' },
+          }],
+        }),
+      },
+    })
+    const out = await remote.testProject(0)
+    assert.equal(out.ok, false, `名字配错必须判失败：${out.text}`)
+    assert.ok(out.blockers.some((b) => b.includes('工作表名')), JSON.stringify(out.blockers))
+    assert.ok(out.text.includes('Sheet1'), '要列出实际的工作表名')
+    assert.ok(out.text.includes('收不到票'), '结论要说明它会收不到票')
   })
   await check('remote.testProject()：没配凭据时说明白去哪配，而不是抛错', async () => {
     const { TicketPipelineRemote } = await import('../src/remote/host.js')

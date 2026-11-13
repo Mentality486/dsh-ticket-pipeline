@@ -478,6 +478,19 @@ if (feishuProjects.length === 0) {
           blockers.push(`飞书项目 ${name}：读不到表里的数据（${item?.records?.message ?? '原因未记录'}）${code}${fix}`)
           lines.push(`　❌ 读不到数据：${item?.records?.message ?? '原因未记录'}${code}`)
         }
+        // 工作表名对不上：元数据通了，但扫票会在 `resolveWorksheet` 那一步失败。
+        // 以前体检根本不做这一步挑选（一律取第一张），于是出现「体检全绿、扫票报错」，
+        // 人拿着两份互相矛盾的结论不知信谁（2026-11-13 真机：match.sheetName 填的是
+        // 文档标题「PMS项目管理系统工单」，页签其实叫 `Sheet1`）。
+        if (item?.metadata?.nameIssue) {
+          blockers.push(
+            `飞书项目 ${name}：工作表名对不上 —— ${item.metadata.nameIssue}`,
+          )
+          lines.push(`　❌ 工作表名对不上：${item.metadata.nameIssue}`)
+        } else if (item?.metadata?.note) {
+          // 降级取第一张：不是错，但必须说出来，否则人不知道自己配的名字没生效。
+          lines.push(`　ℹ️ ${item.metadata.note}`)
+        }
         // 状态值口径：体检以前只查「读不读得到数据」，不查「读到的状态值是不是你要的」。
         // 于是权限、表、数据全绿，却一张票都收不到 —— 缺省只认「处理中」（`IN_PROGRESS_VALUE`），
         // 而这批表实际填的是「是 / 否」（实测 2026-11-10：同一张表 `['处理中']` 收 0 张、

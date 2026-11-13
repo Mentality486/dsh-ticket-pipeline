@@ -354,8 +354,18 @@ export function parseSheetRange (raw) {
  *   有多张可见表时仍按 `index` 取第一张，但会在返回的 `note` 里说明取的是哪张 ——
  *   不静默瞎猜，也不因为「不确定」就拒绝启动（人第一次接入时通常只有一张）。
  *
+ * **`documentTitle`（2026-11-13 真机事故）**：飞书里「文档标题」与「工作表名（页签名）」
+ * 是两个东西 —— 文档叫「PMS项目管理系统工单」，里面那张页签叫 `Sheet1`。人从浏览器
+ * 复制来的名字天然是文档标题，填进 `match.sheetName` 就永远匹配不上，而报错原文
+ * 只说「没匹配到任何工作表」，人根本想不到是「名字取错了层级」。
+ *
+ * 所以这里多一档：**当调用方把文档标题传来、且 `sheetName` 正好等于它**，说明人填的
+ * 是文档名而不是页签名 —— 这不是「猜」，是「已经确认了人指的是哪个名字」，于是
+ * 按「没指定工作表」处理（取第一张可见表）并在 `note` 里说清发生了什么。
+ * 不等于文档标题时仍然报错，只是错误信息里也带上文档标题，好让人自己看出层级搞错了。
+ *
  * @param {any[]} sheets `sheets/query` 返回的 `data.sheets`
- * @param {{ sheetId?: string, sheetName?: string }} [options]
+ * @param {{ sheetId?: string, sheetName?: string, documentTitle?: string }} [options]
  * @returns {{ sheetId: string, title: string, index: number, hidden: boolean, note?: string }}
  */
 export function resolveWorksheet (sheets, options = {}) {
@@ -389,15 +399,35 @@ export function resolveWorksheet (sheets, options = {}) {
   const wantedName = String(options.sheetName ?? '').trim()
   if (wantedName.length > 0) {
     const hits = list.filter((item) => item.title === wantedName)
-    if (hits.length !== 1) {
-      throw new PipelineError(
-        'invalid-input',
-        hits.length === 0
-          ? `match.sheetName="${wantedName}" 没匹配到任何工作表。现有工作表：${describe()}`
-          : `match.sheetName="${wantedName}" 匹配到 ${hits.length} 张同名工作表，请改用 match.sheetId 指定。现有工作表：${describe()}`,
-      )
+    if (hits.length === 1) return hits[0]
+
+    // 人填的是**文档标题**而不是页签名（2026-11-13 真机事故：文档叫「PMS项目管理系统工单」、
+    // 页签叫 `Sheet1`，于是配置怎么看都对、扫表却一直报「没匹配到任何工作表」）。
+    //
+    // 这一档不是猜：只有当那个名字**恰好等于这张文档自己的标题**、而且**这张表里
+    // 恰好只有一张可见工作表**时才降级 —— 两个条件合起来说明「人指的文档里只有一张表，
+    // 不存在挑错的可能」。有多张可见表时仍然报错让人指定，宁可让人改一次配置，
+    // 也不要读错页签把别人的数据当工单。
+    const docTitle = String(options.documentTitle ?? '').trim()
+    const visibleList = list.filter((item) => !item.hidden)
+    if (hits.length === 0 && docTitle.length > 0 && wantedName === docTitle && visibleList.length === 1) {
+      const only = visibleList[0]
+      return {
+        ...only,
+        note: `match.sheetName="${wantedName}" 是这张文档的标题，不是里面工作表（页签）的名字；`
+          + `这张文档只有一张可见工作表，已用「${only.title}」[${only.sheetId}]。`
+          + `这张表里实际的工作表：${describe()}。`
+          + '要更明确，把 match.sheetName 改成页签名（或改用 match.sheetId）。',
+      }
     }
-    return hits[0]
+
+    throw new PipelineError(
+      'invalid-input',
+      hits.length === 0
+        ? `match.sheetName="${wantedName}" 没匹配到任何工作表。现有工作表：${describe()}。`
+          + (docTitle.length > 0 ? `注意：这张电子表格文档的标题是「${docTitle}」——那是文档名，不是工作表（页签）名。` : '')
+        : `match.sheetName="${wantedName}" 匹配到 ${hits.length} 张同名工作表，请改用 match.sheetId 指定。现有工作表：${describe()}`,
+    )
   }
 
   const visible = list.filter((item) => !item.hidden).sort((a, b) => a.index - b.index)

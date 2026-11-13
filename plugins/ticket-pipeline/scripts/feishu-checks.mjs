@@ -174,6 +174,13 @@ function createFakeServer (options = {}) {
     /** @type {any[]} */
     sheets: options.sheets ? [...options.sheets] : [],
     /**
+     * 这张电子表格的**文档标题**（`sheets/v3/spreadsheets/{token}` 回它）。
+     * 缺省空串 = 老桩的行为（适配器于是无法判断「填的是不是文档名」），
+     * 测那条降级路径的用例必须显式传一个和 `sheetName` 相同的标题。
+     * @type {string}
+     */
+    sheetDocTitle: String(options.sheetDocTitle ?? ''),
+    /**
      * 电子表格读值回什么二维数组（`sheets/v2/.../values/{range}` 回它）。
      * @type {any[][]}
      */
@@ -282,6 +289,17 @@ function createFakeServer (options = {}) {
     // token 那一段可能被 encodeURIComponent 过，所以先解码再比。
     if (/\/sheets\/v3\/spreadsheets\/[^/]+\/sheets\/query$/.test(path)) {
       return jsonResponse({ code: 0, data: { sheets: state.sheets } })
+    }
+
+    // —— 电子表格：文档元数据（`sheets/v3/spreadsheets/{token}`），只为拿文档标题 ——
+    // 飞书的「文档标题」与「工作表（页签）名」是两个东西，适配器要靠这个标题才能
+    // 说清「你填的是文档名，不是页签名」（2026-11-13 真机事故）。
+    // 必须放在 `sheets/query` 那条**之后**：两条正则都以 token 结尾，顺序反了会互相抢。
+    if (/\/sheets\/v3\/spreadsheets\/[^/]+$/.test(path)) {
+      return jsonResponse({
+        code: 0,
+        data: { spreadsheet: { title: state.sheetDocTitle, spreadsheet_token: state.sheetDocToken } },
+      })
     }
 
     // —— 电子表格：读值（v2、camelCase）与回填写值（工单 #22）——
@@ -2204,6 +2222,50 @@ export async function runFeishuChecks (check) {
       () => source.scan(new AbortController().signal),
       (error) => error.kind === 'invalid-input' && error.message.includes('sheetId'),
       '同名工作表不能瞎挑一张',
+    )
+  })
+
+  await check('电子表格：sheetName 填的是文档标题、且只有一张可见表时降级用它并说明', async () => {
+    // 2026-11-13 真机事故的回归：文档叫「PMS项目管理系统工单」、页签叫 `Sheet1`，
+    // 人从浏览器复制来的名字天然是文档标题 ⇒ 原来一直报「没匹配到任何工作表」。
+    const server = createFakeServer({
+      sheets: [{ sheet_id: 'sh1', title: 'Sheet1', index: 0, hidden: false }],
+      sheetDocTitle: 'PMS项目管理系统工单',
+      sheetValues: makeSheetValues(),
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetName: 'PMS项目管理系统工单',
+    })
+    const result = await source.scan(new AbortController().signal)
+    assert.ok(result.created.length > 0, '降级之后必须真的扫出票来')
+  })
+
+  await check('电子表格：sheetName 填的是文档标题、但有多张可见表时不许瞎猜', async () => {
+    // 与上一条的区别只有「可见工作表张数」—— 这是那条降级的全部护栏：
+    // 只有一张可见表时不存在挑错的可能；有两张就必须让人指定。
+    const server = createFakeServer({
+      sheets: [
+        { sheet_id: 'sh1', title: 'Sheet1', index: 0, hidden: false },
+        { sheet_id: 'sh2', title: '归档', index: 1, hidden: false },
+      ],
+      sheetDocTitle: 'PMS项目管理系统工单',
+      sheetValues: makeSheetValues(),
+    })
+    const { source } = makeSource(server, {
+      appToken: '',
+      tableId: '',
+      spreadsheetToken: 'shtcnABCDEF',
+      sheetName: 'PMS项目管理系统工单',
+    })
+    await assert.rejects(
+      () => source.scan(new AbortController().signal),
+      (error) => error.kind === 'invalid-input'
+        && error.message.includes('PMS项目管理系统工单')
+        && error.message.includes('文档'),
+      '多张可见表时必须让人指定页签，不能读错页签把别人的数据当工单',
     )
   })
 

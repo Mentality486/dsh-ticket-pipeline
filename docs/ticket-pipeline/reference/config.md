@@ -122,7 +122,7 @@
 | `match.recordIds` | string-array | `[]`（= 整张表） | 只处理这几条工单，收窄用 |
 | `match.allowedImageHosts` | string-array | — | 截图 URL 的放行主机白名单（SSRF 防护） |
 | `match.sheetUrl` | string | — | 金山文档表格的分享链接（`wps` 平台） |
-| `match.sheetName` | string | — | 工作表名。金山用它；飞书电子表格也用它指定工作表 |
+| `match.sheetName` | string | — | **工作表（页签）名**，不是文档标题。金山用它；飞书电子表格也用它指定工作表。⚠️ 从浏览器地址栏/标签页复制来的是**文档标题**（如「PMS项目管理系统工单」），而页签通常叫 `Sheet1` —— 填错层级会报「没匹配到任何工作表」。两种名字都核过时插件会在「文档标题恰好等于它、且这张文档只有一张可见表」的情况下**降级用那一张并提示**；多张可见表就报错不猜。不确定就留空（取第一张）或填 `match.sheetId` |
 | `match.statusColumn` | string | — | 「是否处理」列名（`wps` 平台） |
 | `match.statusValue` | string | — | 在处理中的取值（`wps` 单值形态；飞书用 `statusValues`） |
 | `match.mediaPrefix` | string | — | 截图 fileToken 的前缀（`wps` 平台） |

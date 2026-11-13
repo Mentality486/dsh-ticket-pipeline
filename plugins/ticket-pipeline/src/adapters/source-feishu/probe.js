@@ -27,6 +27,7 @@ import {
   BITABLE_COLUMN_ALIASES,
   mapColumns,
   normalizeHeaderKey,
+  resolveWorksheet,
 } from './sheets.js'
 
 const FEISHU_API_BASE = 'https://open.feishu.cn'
@@ -332,6 +333,11 @@ async function probeOneProject (input) {
   const tableKindOption = String(match.tableKind ?? '').trim()
   const resolvedSheetName = String(match.sheetName ?? '').trim()
   let resolvedSheetId = String(match.sheetId ?? '').trim()
+  // 工作表挑选的附带结论：`pickNote` 是「降级取第一张」的说明（不是错），
+  // `nameIssue` 是「名字真的对不上」的原话（是错，但不判 metadata 失败）。
+  // 两者都要出现在体检正文里 —— 否则「体检全绿、扫票失败」这类矛盾还会再出现。
+  let pickNote = ''
+  let nameIssue = ''
 
   // 表型判定：`spreadsheetToken` 与 `appToken` 谁非空只决定**先试哪条路**，
   // 真正的类型以下面的探测结果为准。
@@ -404,11 +410,37 @@ async function probeOneProject (input) {
     const data = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(sheetToken)}/sheets/query`, {})
     const sheets = Array.isArray(data?.sheets) ? data.sheets : []
     base.metadata = { ok: true, message: `能读到电子表格元数据（${sheets.length} 个工作表）` }
-    if (resolvedSheetId.length === 0) {
-      // 没指定 sheet 时挑第一个：体检只需要「能不能读到数据」，不需要挑对表。
+    // 工作表要**按配置挑**，不能一律取第一张 —— 否则体检会绿、扫票却失败，
+    // 人拿着两份互相矛盾的结论不知信谁（2026-11-13 真机：`match.sheetName` 填的是
+    // 文档标题「PMS项目管理系统工单」，页签其实叫 `Sheet1`；体检取第一张所以全绿，
+    // 扫票走 `resolveWorksheet` 所以一直报错）。
+    //
+    // 这里与扫票共用同一个 `resolveWorksheet`，连「填的是文档标题」那一档也一致。
+    // 它抛错时**不升级成体检失败**：metadata 已经读通了，名字对不上属于「能连上但配错」，
+    // 由下面 `resolveSheetName` 那条给出人话，比把整项目判红更有信息量。
+    let documentTitle = ''
+    if (resolvedSheetName.length > 0) {
+      try {
+        const meta = await call(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(sheetToken)}`, {})
+        documentTitle = String(meta?.spreadsheet?.title ?? '')
+      } catch {
+        documentTitle = ''
+      }
+    }
+    try {
+      const picked = resolveWorksheet(sheets, {
+        sheetId: resolvedSheetId,
+        sheetName: resolvedSheetName,
+        documentTitle,
+      })
+      resolvedSheetId = picked.sheetId
+      pickNote = picked.note ?? ''
+    } catch (error) {
+      nameIssue = error instanceof Error ? error.message : String(error)
+      // 挑不出来就退回第一张，让后面的数据读取仍能进行 —— 体检的职责是
+      // 「分层说清哪一步不对」，不是「名字不对就什么都不查」。
       const first = sheets[0]
       if (first?.sheet_id) resolvedSheetId = String(first.sheet_id)
-      else if (first?.title) resolvedSheetId = String(first.title)
     }
   }
 
@@ -603,6 +635,16 @@ async function probeOneProject (input) {
     base.records = { ok: false, message: '上一步没通，这一步没查' }
     return base
   }
+
+  // 工作表名对不上（比如把文档标题填进了 match.sheetName 又不等于文档标题）：
+  // 元数据是通的，所以不判 metadata 失败，但必须在结论里说出来，否则体检全绿而扫票失败。
+  if (nameIssue.length > 0) {
+    base.metadata.nameIssue = nameIssue
+    base.metadata.message = `${base.metadata.message ?? ''}（但工作表名对不上，扫票会失败）`
+  } else if (pickNote.length > 0) {
+    base.metadata.note = pickNote
+  }
+  base.sheet = resolvedSheetId.length > 0 ? resolvedSheetId : undefined
 
   // ── 第一页数据 ────────────────────────────────────────────
   try {

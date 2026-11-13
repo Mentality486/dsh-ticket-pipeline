@@ -984,7 +984,22 @@ export function createFeishuSource (options = {}) {
     }
     const payload = await apiCall(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(token)}/sheets/query`, { signal })
     const sheets = Array.isArray(payload?.data?.sheets) ? payload.data.sheets : []
-    const sheet = resolveWorksheet(sheets, { sheetId, sheetName })
+    // 配了非空 `sheetName` 时才多问一次文档标题：飞书里「文档标题」与「工作表（页签）名」
+    // 是两个东西，而人从浏览器复制来的名字天然是文档标题（2026-11-13 真机事故：
+    // 文档叫「PMS项目管理系统工单」、页签叫 `Sheet1`，配置怎么看都对、扫表却一直失败）。
+    // 只在需要区分这两种名字时才付这次请求，没配 sheetName 的常见路径不受影响。
+    let documentTitle = ''
+    if (sheetName.length > 0) {
+      try {
+        const meta = await apiCall(`/open-apis/sheets/v3/spreadsheets/${encodeURIComponent(token)}`, { signal })
+        documentTitle = String(meta?.data?.spreadsheet?.title ?? '')
+      } catch (error) {
+        // 拿不到标题不是错：`resolveWorksheet` 没有它也能正常报错，只是少一句提示。
+        if (error instanceof PipelineError && (error.kind === 'aborted' || error.kind === 'auth')) throw error
+        documentTitle = ''
+      }
+    }
+    const sheet = resolveWorksheet(sheets, { sheetId, sheetName, documentTitle })
     if (sheet.note && typeof options.log === 'function') {
       // 没指定工作表时取第一张可见的 —— 这不算错，但必须留下一行日志说明「取了哪张」，
       // 否则人看到扫出票却不知道是从哪个页签读的。

@@ -439,6 +439,15 @@ export class TicketPipelineRemote {
       blockers.push('读不到表里的数据')
       ok = false
     }
+    // 工作表名对不上：表能读通，但扫票会在挑工作表那一步失败。
+    // 必须判红 —— 「测这张表」的价值就是提前发现这种「连得上但配错了」的情况。
+    if (item?.metadata?.nameIssue) {
+      lines.push('❌ 工作表名对不上：' + String(item.metadata.nameIssue))
+      blockers.push('工作表名对不上')
+      ok = false
+    } else if (item?.metadata?.note) {
+      lines.push('ℹ️ ' + String(item.metadata.note))
+    }
     if (item?.statusValues?.ok === false) {
       lines.push('⚠️ 状态值：' + String(item.statusValues.message ?? '对不上'))
     } else if (item?.statusValues?.idle === true) {
