@@ -1643,7 +1643,7 @@ window.__ModuleLoader__.load({
      * 规则照 `src/core/config.js:validateProject` 抄，文案保持一致：
      * 人和 agent 在面板上看到的，应该和启动时校验报出来的是同一句话。
      */
-    function projectIssues (record, index, draft, names) {
+    function projectIssues (record, index, draft, names, linkDraft) {
       var out = {}
       function add (path, level, text) {
         out[projectKey(index, path)] = { level: level, text: text }
@@ -1694,7 +1694,12 @@ window.__ModuleLoader__.load({
         var pattern = read(['match', 'docNamePattern']).trim()
         var hasToken = Boolean(record && record.hasAppToken)
         var sheetToken = read(['match', 'spreadsheetToken']).trim()
-        if (!hasToken && sheetToken.length === 0 && pattern.length === 0) {
+        // 新增项目在保存前，链接只存在于面板草稿里（`linkDraft`）——
+        // 它会在保存时被塞进这一笔的 match.appToken（见 collectOps 里的长注释）。
+        // 不把它算作一条依据的话，卡片会一直挂着「还没绑定任何工单表」的软提示，
+        // 明明已经把链接贴进去了。
+        var draftedLink = linkDraft && linkDraft.index === index ? String(linkDraft.text || '').trim() : ''
+        if (!hasToken && sheetToken.length === 0 && pattern.length === 0 && draftedLink.length === 0) {
           add(['match', 'docNamePattern'], 'soft',
             '这个飞书项目还没绑定任何工单表。把工单表的浏览器地址整条贴进卡片最上面的「工单表链接」——'
             + '多维表格、电子表格、知识库里的表都行，插件自己认表型。'
@@ -1761,7 +1766,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 全部项目的校验结果汇总（含错误计数）。 */
-    function allProjectIssues (list, draft) {
+    function allProjectIssues (list, draft, linkDraft) {
       var names = []
       for (var i = 0; i < list.length; i += 1) {
         var key = projectKey(i, ['name'])
@@ -1770,7 +1775,7 @@ window.__ModuleLoader__.load({
       var byKey = {}
       var errorCount = 0
       for (var j = 0; j < list.length; j += 1) {
-        var one = projectIssues(list[j], j, draft, names)
+        var one = projectIssues(list[j], j, draft, names, linkDraft)
         for (var field in one) {
           if (!hasKey(one, field)) continue
           byKey[field] = one[field]
@@ -3840,8 +3845,10 @@ window.__ModuleLoader__.load({
       var localProjectIssues = useMemo(function () {
         // 校验要覆盖「还没保存的新增」：否则一张空的待保存卡片不会报错，
         // 保存按钮也就不会拦，人点下去才收到宿主的整笔拒绝 —— 又回到原来的坑。
-        return allProjectIssues(renderedProjects.map(function (one) { return one.record }), projDraft)
-      }, [renderedProjects, projDraft])
+        // 第三个参数是「已经贴在卡片上、但还没保存的工单表链接」（`{index, text}`）：
+        // 它算一条定位依据，否则新增卡片会一直挂「还没绑定任何工单表」的软提示。
+        return allProjectIssues(renderedProjects.map(function (one) { return one.record }), projDraft, linkDraft)
+      }, [renderedProjects, projDraft, linkDraft])
 
       // 项目里 error 级的条数：只用来给「项目」页签挂个红点，不拦保存
       // （拦保存统一走 `issues.errorCount`）。
@@ -4199,13 +4206,44 @@ window.__ModuleLoader__.load({
         // 缺 `repo.path` 的半成品，那一笔就会被校验整笔拒掉 —— 正是旧版的老毛病。
         for (var q = 0; q < projPending.length; q += 1) {
           var index = projList.length + q
+          var value = buildProjectValue(projPending[q], index, projDraft)
+          // 「还没保存就贴了工单表链接」时，链接必须**随这一笔一起写进去**。
+          //
+          // 2026-11-13 的真实事故：上一版把链接只存在面板草稿里，等保存成功后再
+          // 用 `setProjectTable()` 补写。可宿主是对**整份配置**做校验的，而这一笔
+          // 推出去的新项目 `match` 里凭 token / spreadsheetToken / docNamePattern
+          // 一个都没有 ⇒ 整笔被拒，人看到的是
+          //   `projects[1] 工单表绑定（match） feishu 项目必须给①工单表链接/token…`
+          // 「补写」永远等不到（保存就没成功），于是「加了项目但存不进去」。
+          //
+          // 解法是让链接先当**定位依据**落进去：`match.appToken` 这一格在配置层与
+          // 适配器层都接受「整条链接」（`config.js` 的这条校验文案就写着「工单表链接/
+          // token（多维表格或电子表格都行）」；运行期 `/base/`、`/wiki/`、`/sheets/`
+          // 三种形态分别由 `normalizeAppToken` / `probeWikiNode` / `extractSheetToken`
+          // 各自拆解）。所以这里**不需要在浏览器里解析它**（那才会让明文泄进浏览器），
+          // 原样塞进去即可。保存成功之后那次 `setProjectTable()` 补写照旧执行，它的
+          // 作用变成「把这条链接归一成 spreadsheetToken+sheetId 之类的精确坐标」，
+          // 而不是「唯一一次写入」—— 它失败也不影响项目已经存住。
+          var linkForValue = linkDraft && linkDraft.index === index ? String(linkDraft.text || '').trim() : ''
+          if (linkForValue.length > 0 && !projectHasLocator(value)) {
+            if (!hasKey(value, 'match') || value.match === null || typeof value.match !== 'object') value.match = { platform: 'mock' }
+            value.match.appToken = linkForValue
+          }
           ops.push({
             op: 'set',
             path: ['projects', String(index)],
-            value: buildProjectValue(projPending[q], index, projDraft),
+            value: value,
           })
         }
         return ops
+      }
+
+      /** 这个项目对象里有没有「工单表在哪」的依据（不用解析内容，只看键在不在）。 */
+      function projectHasLocator (value) {
+        var match = value && value.match && typeof value.match === 'object' ? value.match : {}
+        return String(match.appToken || '').trim().length > 0 ||
+          String(match.spreadsheetToken || '').trim().length > 0 ||
+          String(match.docNamePattern || '').trim().length > 0
       }
 
       function onSave () {

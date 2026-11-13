@@ -1913,6 +1913,20 @@ async function main () {
         check('填完必填项后保存可点', savePending !== undefined && savePending.props.disabled !== true)
         if (savePending !== undefined) savePending.props.onClick()
         tree = await render(Panel, { view: 'page' })
+        // **这一笔必须自带定位依据**：宿主是对整份配置做校验的，新项目的
+        // `match` 里如果凭 token 一个都没有，整笔会被拒（用户 2026-11-13 报的
+        // 「我添加新的项目 保存失败：feishu 项目必须给①工单表链接/token…」），
+        // 而「保存后补写链接」那一步就永远等不到。
+        const lastMutate = ctx.calls.mutate[ctx.calls.mutate.length - 1]
+        const newProjectOp = lastMutate === undefined
+          ? undefined
+          : lastMutate.ops.filter((op) => op.path.length === 2 && op.path[0] === 'projects')
+            .map((op) => op.value)
+            .pop()
+        check('新增项目那一笔自带 match.appToken（原样 URL），不会因为「没定位依据」被整笔拒掉',
+          newProjectOp !== undefined && newProjectOp.match !== undefined &&
+          newProjectOp.match.appToken === pendingUrl,
+          JSON.stringify(newProjectOp === undefined ? null : { match: newProjectOp.match }))
         const linkCalls = ctx.calls.setProjectTable.slice(linkBefore)
         check('保存成功后把记下的链接补写一次（按下标、原样 URL）',
           linkCalls.length === 1 && linkCalls[0].index === expectedIndexOfNew &&
