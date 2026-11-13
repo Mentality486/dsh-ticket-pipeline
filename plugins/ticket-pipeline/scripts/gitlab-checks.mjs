@@ -370,6 +370,10 @@ function makeRunEnv (options = {}) {
   const { agent, state } = createFakeAgent(options)
   /** @type {any[]} */
   const created = []
+  /** @type {any[]} */
+  const resumed = []
+  /** @type {string[]} */
+  const reportedSessionIds = []
   /** @type {string[]} */
   const phases = []
   /** @type {Array<{ message: string, paths: string[] }>} */
@@ -400,6 +404,28 @@ function makeRunEnv (options = {}) {
       }
     },
   }
+  // 续接：宿主里 `agents.resume` 与 `create` 同形（返回 `{agent, dispose}`、同样的
+  // `agentOptions` / `setup`），只是它的身份来自 `resumeSessionId` 而不是 `sessionId`。
+  // 只有用例显式给了 `resumeAvailable` 或 `previousSessionId` 时才挂这个方法
+  // —— 「宿主没有 resume」本身就是要能测的一种降级形态。
+  if (options.resumeAvailable === true || options.previousSessionId !== undefined) {
+    agents.resume = async (input) => {
+      // 先记账再抛：用例要区分「根本没试过续接」和「试了但失败」。
+      resumed.push(input)
+      if (options.resumeFails) throw new Error(options.resumeFails)
+      await input.setup?.(agentCtx, agent)
+      return {
+        agent,
+        dispose: async () => {
+          disposed = true
+          agent.release?.()
+        },
+      }
+    }
+  }
+  // 续接被明确关掉时（`resumeAvailable: false` 且给了 previousSessionId），
+  // 上面那段不会挂 resume —— 正是「宿主版本太老、没有这个接口」的形态。
+  if (options.resumeAvailable === false) delete agents.resume
 
   const git = async (argv, _opts) => {
     gitCalls.push(argv)
@@ -535,9 +561,16 @@ function makeRunEnv (options = {}) {
     config,
     log: (message) => { logs.push(String(message)) },
     onPhase: async (phase) => { phases.push(phase) },
+    // 上一轮的会话 id：只有用例显式给了才传，其余保持「新票、没有上一轮」的形态。
+    ...(options.previousSessionId === undefined ? {} : { sessionId: options.previousSessionId }),
+    // 执行器回传会话 id 的通道（调度器靠它把 id 落库）。用例要验「续接时回传的是
+    // 上一轮那个 id，而不是新造的」就得把它接上。
+    ...(options.trackSessionId === true
+      ? { onSessionId: (id) => { reportedSessionIds.push(id) } }
+      : {}),
   }
 
-  return { executor, ctx, controller, state, agent, created, phases, commits, gitCalls, gitServer, setupState, changes, logs, executorLogs, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, resumed, phases, commits, gitCalls, gitServer, setupState, changes, logs, executorLogs, reportedSessionIds, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -769,6 +802,59 @@ export async function runGitlabChecks (check) {
     await env.executor.run(env.ticket, env.target, env.ctx)
     assert.equal(env.created.length, 1)
     assert.match(env.created[0].sessionId, /^ticket-demo-rec-9-\d+$/)
+  })
+
+  // ── 续接上一轮的会话 ────────────────────────────────────
+  //
+  // 这组用例守的是「同一张票重跑不再从零探索」。现场数据（2026-11-13）：`sh-row-82`
+  // 第二次重跑仍探了 57 次索，其中 5 个文件第一轮刚读过，而它这轮总共才读 11 个。
+  await check('执行器：票上有上一轮的会话就续接它，不再新建（续接能省掉整段重复探索）', async () => {
+    const previousSessionId = 'ticket-demo-rec-9-1794557579214'
+    const env = makeRunEnv({ previousSessionId })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.resumed.length, 1, '有上一轮会话时必须走 agents.resume')
+    assert.equal(env.resumed[0].resumeSessionId, previousSessionId, '续接的必须是票上那个 id')
+    assert.equal(env.created.length, 0, '续接成功时不该再调 agents.create')
+    // resume 与 create 的选项形状不同：resume 没有 sessionId / meta，身份只在 resumeSessionId 上。
+    assert.equal(env.resumed[0].sessionId, undefined, 'resume 不该带 sessionId（宿主会判成身份冲突）')
+    assert.equal(env.resumed[0].meta, undefined, 'resume 的 cwd 来自持久化会话 header，不由这里给')
+    assert.ok(typeof env.resumed[0].setup === 'function', '续接也必须挂 preset，否则 agent 是个没工具的壳')
+  })
+
+  await check('执行器：续接成功时回传给调度器的仍是那个旧 id（否则票上会换成新 id，下次又续不上）', async () => {
+    const previousSessionId = 'ticket-demo-rec-9-1794557579214'
+    const env = makeRunEnv({ previousSessionId, trackSessionId: true })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.deepEqual(env.reportedSessionIds, [previousSessionId], '回传的必须是续接用的那个 id')
+  })
+
+  await check('执行器：续接失败就退回新建，这张票照跑不误（续接失败不是跑票失败的理由）', async () => {
+    // 真机上 resume 会因为「持久化后端没挂」「会话被人删了」「header 坏掉」而失败。
+    // 这些原因一条都不该让票跑不了 —— 最差也只是本轮从零开始探索。
+    const env = makeRunEnv({ previousSessionId: 'ticket-demo-rec-9-gone', resumeFails: 'cannot resume: session persistence is not configured' })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.resumed.length, 1, '先试过续接')
+    assert.equal(env.created.length, 1, '续接失败后必须退回新建')
+    assert.match(env.created[0].sessionId, /^ticket-demo-rec-9-\d+$/)
+    // 降级必须是**可见**的：静默新建会让人以为「它记得」，其实又从零开始了。
+    assert.ok(
+      env.executorLogs.some((line) => line.includes('续接上一轮会话失败')),
+      `降级必须留下日志，实际日志：${env.executorLogs.join(' | ')}`,
+    )
+  })
+
+  await check('执行器：宿主没有 agents.resume 时直接新建（老宿主不该被判失败）', async () => {
+    const env = makeRunEnv({ previousSessionId: 'ticket-demo-rec-9-old', resumeAvailable: false })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.created.length, 1, '没有 resume 就新建')
+    assert.equal(env.resumed.length, 0)
+  })
+
+  await check('执行器：新票（没有上一轮会话）行为与改造前完全一致', async () => {
+    const env = makeRunEnv({ resumeAvailable: true })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.resumed.length, 0, '没有上一轮就不该去 resume（拿空 id 续接会直接抛）')
+    assert.equal(env.created.length, 1)
   })
 
   await check('执行器：会话 cwd 用项目工作区根，改代码目录靠 workingDirectory 钉到 worktree', async () => {

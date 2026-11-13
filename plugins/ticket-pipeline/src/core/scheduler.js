@@ -763,6 +763,12 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 项目工作区：执行器用它决定会话的 cwd 与归属（见 core/workspace.js 的说明）。
         workspacePath: ws.workspacePath,
         workspaceId: ws.workspaceId,
+        // 上一轮这张票用过的会话：执行器拿它去续接（`agents.resume`），续不上再新建。
+        //
+        // 为什么从票据上读而不是自己记：执行器返回不了结果时（抛异常/超时/被取消）
+        // 会话 id 只有 `onSessionId` 那条回调能落库，而重启、人工重开、改表重跑之后
+        // 调度器手上只有库里的这一行 —— 上一轮的会话就挂在这上面。
+        sessionId: typeof row.sessionId === 'string' ? row.sessionId : undefined,
         // prompt 是纯文本，content 是同一份任务书外加截图块。
         // 两个都传：老适配器只认 prompt，新适配器按 content 才能看见图。
         prompt: renderTicketPrompt(ticket, located, promptOptions),

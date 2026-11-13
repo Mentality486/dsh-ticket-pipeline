@@ -617,10 +617,40 @@ export function createAgentExecutor (options = {}) {
       const signal = ctx.signal
       const project = findProject(config, ticket, target)
       const verify = project?.verify ?? {}
-      const sessionId = buildSessionId(ticket, ctx)
+      // 上一轮这张票用过的会话。有就**续接**，没有才新建。
+      //
+      // 为什么值得续接（2026-11-13 实测）：同一张票重跑时，前一轮已经读过的那几十个
+      // 文件、已经摸清的页面位置，全都在那个会话的历史里。不续接的话第二轮从零开始
+      // —— 实测 `sh-row-82` 第二次重跑仍探了 57 次索，其中 5 个文件第一轮刚读过，
+      // 而它这一轮总共才读 11 个。
+      const previousSessionId = typeof ctx?.sessionId === 'string' ? ctx.sessionId.trim() : ''
       const messages = buildMessages(ticket, ctx, options.prompts?.untrustedNotice)
 
-      ctx.log?.(`executor-agent：起 agent（sessionId=${sessionId}，cwd=${sessionCwd}，改动目录=${worktreePath}）`)
+      /** setup 回调里拿到的 agentCtx（收会话要用它的 `sessions` 服务）。 */
+      let runtimeAgentCtx
+
+      /** 给宿主 `setup` 用的回调工厂：续接与新建复用同一份挂载逻辑。 */
+      const makeSetup = (useSessionId) => (agentCtx, agent) => {
+        runtimeAgentCtx = agentCtx
+        return setupAgent(options, {
+          agentCtx,
+          agent,
+          worktreePath,
+          workspacePath,
+          workspaceId: ctx?.workspaceId,
+          // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
+          workspaceRegistry: options.workspaceRegistry,
+          presetId: config.agentPreset,
+          signal,
+          sessionId: useSessionId,
+          // GUI 会话列表里显示的那一行。不传就只有 sessionId 那串
+          // `ticket-pms-sh-row-84-1794559390983`，同一张票重跑几次认不出谁是谁。
+          title: buildSessionTitle(ticket),
+          log,
+        })
+      }
+
+      ctx.log?.(`executor-agent：起 agent（${previousSessionId.length > 0 ? `尝试续接 ${previousSessionId}` : '新建会话'}，cwd=${sessionCwd}，改动目录=${worktreePath}）`)
 
       // 模型参数：配置优先，缺的用宿主当前默认补齐。缺了 model 宿主会在
       // {{model}} 模板上崩，票全变成「没有产生任何文件改动」。
@@ -629,75 +659,86 @@ export function createAgentExecutor (options = {}) {
       // **真正下发**的 provider/model：配一次真正下发一次，时间线上必须一致。
       const agentOptions = resolveAgentOptions(config, { agentDefaultModel: options.agentDefaultModel, log })
 
-      /** setup 回调里拿到的 agentCtx（收会话要用它的 `sessions` 服务）。 */
-      let runtimeAgentCtx
-
-      // ── 1. 起 agent ─────────────────────────────────────
+      // ── 1. 起 agent（先试续接，再退新建）───────────────
+      //
+      // 分两步而不是「有旧 id 就只走 resume」：resume 是**外部状态**在说话
+      // （持久化后端可能没挂、会话可能被人删了、header 可能坏掉），失败原因
+      // 一律不该让这张票跑不了。续接失败就当成「没有上一轮」，照常新建。
       let created
-      try {
-        created = await agents.create({
-          sessionId,
-          // cwd = 项目工作区根：会话要能挂到工作区名下（见上面 sessionCwd 的说明）。
-          // 真正的改代码目录由 setup 里的 workingDirectory.set 钉到 worktree ——
-          // agent 的读写工具按那个目录解析相对路径，指错了就会在人的主检出里改代码。
-          meta: { cwd: sessionCwd },
-          agentOptions,
-          // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
-          // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
-          // 起来是个没有任何工具的壳，改不出任何文件。
-          //
-          // 顺手把 agentCtx 存下来：收尾时要靠它弱取 `sessions` 服务
-          // （`keepSession=false` 才用得上；默认保留，见 finally 里的说明）。
-          setup: (agentCtx, agent) => {
-            runtimeAgentCtx = agentCtx
-            return setupAgent(options, {
-              agentCtx,
-              agent,
-              worktreePath,
-              workspacePath,
-              workspaceId: ctx?.workspaceId,
-              // 组合根注入的 registry 优先：agentCtx 里未必挂得上它（宿主只在 web-app 层挂）。
-              workspaceRegistry: options.workspaceRegistry,
-              presetId: config.agentPreset,
-              signal,
-              sessionId,
-              // GUI 会话列表里显示的那一行。不传就只有 sessionId 那串
-              // `ticket-pms-sh-row-84-1794559390983`，同一张票重跑几次认不出谁是谁。
-              title: buildSessionTitle(ticket),
-              log,
-            })
-          },
-        })
-      } catch (error) {
-        // 会话根本没建起来也要在时间线上留一条：否则人只看到「卡住」，不知道
-        // 卡在「创建会话」这一站，还是卡在后面处理工单。错误照原样抛出，行为不变。
-        await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
-          `会话没起来：${error?.message ?? String(error)}`,
-          `模型 ${describeModel(agentOptions)}`,
-          `分支 ${flowBranch(ctx)}`,
-          `工作目录 ${sessionCwd}`,
-          flowWorkspaceLabel(ctx),
-        ].filter(Boolean).join('，'), false)
-        throw error
+      /** 这一轮实际用的会话 id 与它的来源。 */
+      let sessionId = ''
+      let resumed = false
+      if (previousSessionId.length > 0 && typeof agents.resume === 'function') {
+        try {
+          created = await agents.resume({
+            resumeSessionId: previousSessionId,
+            agentOptions,
+            setup: makeSetup(previousSessionId),
+            signal,
+          })
+          sessionId = previousSessionId
+          resumed = true
+          log('executor-agent：续接上了上一轮的会话（前一轮读过的东西它还记着）', { sessionId })
+        } catch (error) {
+          // 降级必须是**可见**的：静默新建会让人以为「它记得」，其实又从零开始。
+          log('executor-agent：续接上一轮会话失败，改为新建（本轮从零开始探索）', {
+            resumeSessionId: previousSessionId,
+            reason: String(error?.message ?? error),
+          })
+          created = undefined
+        }
+      }
+      if (!created) {
+        // 新建才需要算 id 与 cwd：续接的 cwd 来自持久化会话的 header，不由这里定。
+        sessionId = buildSessionId(ticket, ctx)
+        try {
+          created = await agents.create({
+            sessionId,
+            // cwd = 项目工作区根：会话要能挂到工作区名下（见上面 sessionCwd 的说明）。
+            // 真正的改代码目录由 setup 里的 workingDirectory.set 钉到 worktree ——
+            // agent 的读写工具按那个目录解析相对路径，指错了就会在人的主检出里改代码。
+            meta: { cwd: sessionCwd },
+            agentOptions,
+            // setup 是宿主在 publish 之前给的唯一挂载窗口：挂 preset（= 工具矩阵）、
+            // 记一条本会话的沙箱/审批策略、把 cwd 钉到 worktree。少了这段，agent
+            // 起来是个没有任何工具的壳，改不出任何文件。
+            //
+            // 顺手把 agentCtx 存下来：收尾时要靠它弱取 `sessions` 服务
+            // （`keepSession=false` 才用得上；默认保留，见 finally 里的说明）。
+            setup: makeSetup(sessionId),
+          })
+        } catch (error) {
+          // 会话根本没建起来也要在时间线上留一条：否则人只看到「卡住」，不知道
+          // 卡在「创建会话」这一站，还是卡在后面处理工单。错误照原样抛出，行为不变。
+          await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+            `会话没起来：${error?.message ?? String(error)}`,
+            `模型 ${describeModel(agentOptions)}`,
+            `分支 ${flowBranch(ctx)}`,
+            `工作目录 ${sessionCwd}`,
+            flowWorkspaceLabel(ctx),
+          ].filter(Boolean).join('，'), false)
+          throw error
+        }
       }
       const agent = created?.agent
       if (!agent || typeof agent.followup !== 'function') {
         await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
-          '会话没起来：agents.create 没有返回可用的 agent（缺 followup）',
+          `会话没起来：${resumed ? 'agents.resume' : 'agents.create'} 没有返回可用的 agent（缺 followup）`,
           `会话 ${sessionId}`,
           `模型 ${describeModel(agentOptions)}`,
           `分支 ${flowBranch(ctx)}`,
           `工作目录 ${sessionCwd}`,
           flowWorkspaceLabel(ctx),
         ].filter(Boolean).join('，'), false)
-        throw new PipelineError('internal', 'agents.create 没有返回可用的 agent（缺 followup）')
+        throw new PipelineError('internal', `${resumed ? 'agents.resume' : 'agents.create'} 没有返回可用的 agent（缺 followup）`)
       }
 
       // 会话真的建起来了：这一刻 sessionId、provider/model、cwd 都已经定下来，
       // 外面（调度器）看不见这些，只有这里知道 —— 所以「创建会话（分支+模型）」
-      // 这一站由执行器自己记。
+      // 这一站由执行器自己记。续接与新建要分开说：时间线上写「续接」人就知道
+      // 这一轮是接着上一轮的记忆跑的，不会纳闷「为什么它一上来就直奔某个文件」。
       await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
-        `会话 ${sessionId}`,
+        `会话 ${sessionId}${resumed ? '（续接上一轮）' : ''}`,
         `模型 ${describeModel(agentOptions)}`,
         `分支 ${flowBranch(ctx)}`,
         `工作目录 ${sessionCwd}`,

@@ -5341,6 +5341,46 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(out.tickets[0].sessionId, 'ticket-demo-rec-session-1', '返回体也要带 sessionId')
   })
 
+  await check('调度器把票据上的 sessionId 交给执行器（续接靠这条路，不传等于永远只能新建）', async () => {
+    // 续接的另一半：执行器只能从 ExecCtx 里知道「上一轮用的是哪个会话」。票上的
+    // `row.sessionId` 停在库里，调度器不往下传，续接这一整条就是死代码。
+    //
+    // 形态按真机走：第一轮票上已经有旧的 sessionId（上次跑完/上次失败落下的），
+    // 这一轮 tick 进到执行器时 ctx.sessionId 必须正是它。
+    /** @type {string[]} */
+    const seen = []
+    const probe = {
+      id: 'session-passthrough',
+      async run (ticket, target, ctx) {
+        seen.push(ctx.sessionId)
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({
+          phase: 'done',
+          changedFiles: [],
+          testOutcome: 'passed',
+          commit: { sha: 'mockpass1', branch: ctx.branch ?? '', files: [] },
+          sessionId: ctx.sessionId ?? 'fresh-session',
+        })
+      },
+    }
+    const { scheduler, store } = harness({ executor: probe })
+    // 先让这张票被收进来（第一轮用「没有上一轮」的形态跑完）。
+    await scheduler.tick()
+    const key = k('rec-mock-001')
+    const first = store.getTicket(key)
+    assert.equal(seen[0], undefined, `第一轮票上还没有会话 id，不该凭空给一个：${seen[0]}`)
+    assert.equal(first.sessionId, 'fresh-session', '第一轮结束时落库')
+
+    // 第二轮：把票拨回待跑的状态，票上留着上一轮的 sessionId。
+    await store.setPhase(key, 'failed', { lastError: '模拟重跑' }, { force: true })
+    await store.resetByHuman(key)
+    seen.length = 0
+    await scheduler.tick()
+    assert.deepEqual(seen, ['fresh-session'], `重跑时执行器必须拿到上一轮的会话 id，实际拿到：${JSON.stringify(seen)}`)
+  })
+
   await check('pipeline_status：回填结果成功/失败都要能一眼看到', async () => {
     const rows = [
       { key: k('r-ok'), projectId: DEMO, recordId: 'r-ok', phase: 'done', attempt: 0, writeBack: { written: true, fields: ['是否处理', '处理结果', '处理日期'], at: 1 } },

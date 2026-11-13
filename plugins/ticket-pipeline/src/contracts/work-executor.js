@@ -27,6 +27,12 @@
  *   否则 `Workspace.attachSession` 会拒绝（它要求会话 header 的规范 cwd 等于工作区路径），
  *   人在 GUI 里也就看不到这张票的会话属于哪个项目。缺省时退化成用 `worktreePath` 当 cwd。
  * @property {string} [workspaceId] 宿主的 WorkspaceId，用于把会话显式归属到工作区（headless 下为空）
+ * @property {string} [sessionId] 这张票**上一轮**用过的会话 id。执行器拿到它就该尝试续接
+ *   （宿主 `agents.resume({resumeSessionId})`），续不上再新建。
+ *   为什么要续：同一张票重跑时，前一轮读过的文件、摸清的页面位置都在那个会话的历史里；
+ *   从零开始意味着把同一段探索再走一遍（2026-11-13 实测：`sh-row-82` 第二轮仍探了 57 次，
+ *   其中 5 个文件第一轮刚读过，而第二轮总共才读 11 个）。
+ *   可选 —— 新票没有上一轮，老调用方不传就是「每次都新建」的老行为。
  * @property {string} prompt 已经渲染好的任务书（纯文本）
  * @property {(sessionId: string) => void | Promise<void>} [onSessionId] 会话一起来就把 id 交给调度器。
  *   为什么要单独一个回调：票失败（抛异常）、超时、被取消时执行器根本**返回不了结果**，
