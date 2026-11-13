@@ -1358,6 +1358,26 @@ window.__ModuleLoader__.load({
             if (normalized.length > 0) put(field.path, normalized)
             continue
           }
+          // 列名覆盖（`match.sheetColumns` / `match.columns`）要写成**对象**，
+          // 不能走下面那句 `String(...)`。
+          //
+          // 2026-11-13 的真实事故：新增项目时面板发出去的那一笔里，
+          // `match.sheetColumns` 变成了字符串 `"[object Object]"` ——
+          // `projectRawValue()` 明明已经把一行文本 `a=b, c=d` 解析成了对象，
+          // 这里却把它 String() 一遍，宿主校验自然回
+          //   `projects[1] 列名覆盖（match.sheetColumns） 必须是对象 …`
+          // 已有项目的单字段通道不走这个函数（那里直接把 `projectRawValue` 的结果
+          // 发出去），所以只有「新增项目」这条整对象通道会踩到 —— 这正是用户
+          // 「加个新项目就报这两个字段的错」的原因，跟那两格填了什么无关。
+          //
+          // 空对象不写：宿主那边「键存在但不是对象」会报错，而空串会被当成
+          // 「人想覆盖但没填」—— 一律按「没配」处理，让它走缺省列名。
+          if (field.kind === 'columns') {
+            if (normalized && typeof normalized === 'object' && Object.keys(normalized).length > 0) {
+              put(field.path, normalized)
+            }
+            continue
+          }
           var text = String(normalized === undefined || normalized === null ? '' : normalized).trim()
           if (text.length > 0) put(field.path, text)
         }

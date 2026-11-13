@@ -1927,6 +1927,22 @@ async function main () {
           newProjectOp !== undefined && newProjectOp.match !== undefined &&
           newProjectOp.match.appToken === pendingUrl,
           JSON.stringify(newProjectOp === undefined ? null : { match: newProjectOp.match }))
+        // 列名覆盖这两格**只要不是对象就会被宿主整笔拒掉**：
+        //   `projects[1] 列名覆盖（match.sheetColumns） 必须是对象，形如 {…}`
+        //   `projects[1] 列名覆盖（多维表格）（match.columns） 必须是对象，形如 {…}`
+        // 用户 2026-11-13 报的第二个错就是这个 —— 他一个新项目什么都没填也报，
+        // 因为 `buildProjectValue` 把 `parseColumnsDraft('')` 得到的 `{}` 又
+        // `String()` 成 `"[object Object]"` 写了进去。所以断言要钉「没填就不该有
+        // 这个键，填了就必须是对象」，而不是钉某个具体内容。
+        const emittedColumns = newProjectOp === undefined ? undefined : newProjectOp.match
+        check('新增项目没填列名覆盖时，match 里不带 sheetColumns / columns（更不会写成字符串）',
+          emittedColumns !== undefined &&
+          !Object.hasOwn(emittedColumns, 'sheetColumns') &&
+          !Object.hasOwn(emittedColumns, 'columns'),
+          JSON.stringify(emittedColumns))
+        check('新增项目那一笔里不许出现 "[object Object]"（对象被 String() 一遍的痕迹）',
+          newProjectOp !== undefined && JSON.stringify(newProjectOp).indexOf('[object Object]') < 0,
+          JSON.stringify(newProjectOp))
         const linkCalls = ctx.calls.setProjectTable.slice(linkBefore)
         check('保存成功后把记下的链接补写一次（按下标、原样 URL）',
           linkCalls.length === 1 && linkCalls[0].index === expectedIndexOfNew &&

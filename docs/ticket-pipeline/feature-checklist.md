@@ -13,7 +13,7 @@
 > 定位依据会被整笔拒（用户当天下午贴回来的就是 `projects[1] … feishu 项目必须给①工单表链接/token…`），
 > 于是「保存后再补写」永远等不到。现在链接**随那一笔一起**塞进 `match.appToken`（三种 URL 形态运行期
 > 各自拆解，浏览器仍不解析），保存后的 `setProjectTable()` 退化成「归一成精确坐标」。
-> `dev-run` 551/551、`client-smoke` 228 → **272** 条。见 §1.41。
+> `dev-run` 551/551、`client-smoke` 228 → **274** 条。见 §1.41。
 > 2026-11-11 更晚，**运行页签三件事一起修** —— 用户原话
 > 「运行页面的历史 重试报错 也删除不了 优化一下显示历史的ui和展现方式。项目页面的重新读取失败」。
 > 三个互不相干的原因：①「重跑」每次都抛 `expected 2 argument(s), got 1` ——
@@ -2513,7 +2513,7 @@ Remote 新增 `testProject(index)`：只把 `projects[index]` 交给体检那份
    改成从 mutate 里出现的最大 `['projects','N']` 推期望值才稳。
    顺手还发现夹具的第二个项目与第一个**同名**（`projectIssues` 会判重名），一并改掉。
 
-`dev-run` 551/551、`client-smoke` **272** 条、`client-check` ✅（Remote **11** 方法）。
+`dev-run` 551/551、`client-smoke` **274** 条、`client-check` ✅（Remote **11** 方法）。
 
 **教训**：凡是「面板上的动作要写宿主」的地方，先问一句「宿主那边此刻有没有这个东西」。
 `pending` 是面板自己的状态，宿主完全不知道它存在 —— 这类动作要么延后到保存之后，
@@ -2559,19 +2559,64 @@ Remote 新增 `testProject(index)`：只把 `projects[index]` 交给体检那份
 **教训（比上一条更靠前一步）：** 「先 A 后 B」的两步链里，**A 那一笔也必须自身合法**。
 把合法性寄托在「等 B 补上」，等于假设 A 能通过一个它其实通不过的校验。
 
+#### 再补记（当天傍晚）：整对象通道里每个 `kind` 都得逐类处理，不能一律 `String()`
+
+链接的事修好之后，用户又撞回第三条：
+
+```
+有 2 项没通过校验，已在下方标红。
+保存失败：invalid config:
+  - projects[1] 列名覆盖（match.sheetColumns） 必须是对象，形如 { "description": "问题描述", "status": "是否处理" }
+  - projects[1] 列名覆盖（多维表格）（match.columns） 必须是对象，形如 { "description": "缺陷描述", "status": "处理状态" }
+```
+
+他一个新项目**什么都没填**也报这两条。病灶在 `buildProjectValue()`：它给所有普通字段
+走的是一句 `String(normalized).trim()`，而 `projectRawValue()` 对 `kind === 'columns'`
+**已经把「一行文本 `a=b, c=d`」解析成了对象**（`parseColumnsDraft('')` 回 `{}`）——
+于是 `String({})` 得到 `"[object Object]"` 被原样写进这两个键，宿主当然说「必须是对象」。
+
+**只有「新增项目」这条通道会踩到**：已有项目的改动走单字段路径，那里直接把
+`projectRawValue()` 的结果发出去，不经过这个函数。所以症状是「只有加新项目才报、
+而且跟那两格填了什么无关」—— 空着也报。
+
+修法是在 `kind === 'list'` 分支之后单独处理 `kind === 'columns'`：是对象且非空就
+原样 `put()`，否则整格不写。空对象**不能**写进去 —— 宿主那边「键存在但不是对象」
+会报错，空串又会被当成「人想覆盖但没填」；一律按「没配」处理，让它走缺省列名。
+
+顺手回答用户同时问的「这两个字段有什么用，没用到可以去掉吗」——**有用，别去**：
+
+- `match.sheetColumns`（电子表格）归一后喂给 `locateSheetHeader`（`source-feishu/index.js:375`、`:1673`），
+  表头叫法跟插件不一样时靠它把实际文字映射到 13 个语义字段名；回填报错时也会指路这一格（`:1736`）。
+- `match.columns`（多维表格，工单 #21）走同一个 `resolveSheetColumns()` 归一、喂给
+  `mapColumns(overrides)`（`index.js:379`、`:1330`）。
+- 分成两个键而不是共用一个，是因为两种表型「认识哪些字段名」不完全一样，
+  分开才能让校验给出准确的白名单提示（`config.js:877-881`）。
+- 两格都留空就是走缺省别名表（`DEFAULT_COLUMN_ALIASES` / `BITABLE_COLUMN_ALIASES`），
+  表面本来就跟插件认知一致的项目根本不用碰它们；面板上也都是 `advanced`（缺省收起）。
+
+自测加两条：`client-smoke` 断言「没填这两格时，新增项目那一笔的 `match` 里
+不带这两个键」以及「那一笔里不许出现 `"[object Object]"`」。另用探针
+`.scratch/_probe-columns-save.mjs` 拿真 `validateConfig` 对照新旧实现 —— 旧的在
+「什么都不填」与「填了一项」两种输入下都报 2 条（正是用户看到的两行），新的都是 0 条。
+
+**教训（第三条，和上面两条串成一条线）：** 「整对象提交」这条通道上，字段的类型
+必须**逐类处理**（bool / list / object / 字符串各走各的），一律 `String()` 会把对象
+变成 `[object Object]`、把布尔变成 `"false"` 却仍为真值。而这类 bug 只在「一次提交
+一整块」的路径上出现 —— 逐字段提交的路径看着好好的，很容易以为功能本身有问题。
+
 
 ## 2. 代码清单
 
-`src/` 共 **50 个 .js / 24 085 行**；`scripts/` 共 10 个 .mjs / **16 744 行**（`dev-run.mjs` **7 043 行**）；`lib/client.js` **5 305 行**（浏览器端设置面板）。
+`src/` 共 **50 个 .js / 24 084 行**；`scripts/` 共 10 个 .mjs / **16 758 行**（`dev-run.mjs` **7 043 行**）；`lib/client.js` **5 325 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 658（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 6 543（14 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 10 651（17 个 .js） | 见下表 |
-| `src/tools/` | 2 890（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
-| `src/remote/` | 938（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
-| 根 | 1 360（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| `src/contracts/` | 1 649（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 6 529（14 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 10 705（17 个 .js） | 见下表 |
+| `src/tools/` | 2 889（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
+| `src/remote/` | 953（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
+| 根 | 1 359（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
