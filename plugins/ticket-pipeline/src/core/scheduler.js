@@ -692,12 +692,21 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         })
       }
 
+      // `workspaceId` 也要检查。真实事故（pms|sh-row-83、pms|sh-row-84，2026-11-13）：
+      // 某一轮 `prepareWorkspace` 只回了 `workspacePath`、没回 `workspaceId`
+      // （登记降级：本机没有 workspaceRegistry 服务 / create 抛错被吞 / create 返回空），
+      // 于是票上「路径有值、id 空」。旧守卫只看路径，此后每轮都判「坐标仍然有效，
+      // 直接复用」，永远不再补登记 ⇒ 那两张票的会话在 GUI 里始终是「未分组」，
+      // 而且**不会自愈**。缺 id 时必须再跑一次准备（`resolveByPath` 会把既有工作区认回来）。
+      const missingWorkspaceId = typeof ws.workspaceId !== 'string' || ws.workspaceId.length === 0
       const workspaceAction = staleCoords
         ? '票据上的工作区坐标已失效，重新准备'
         : (!row.worktreePath || !ws.workspacePath)
           ? '票据上还没有工作区，新建/登记一个'
-          : '票据上的工作区坐标仍然有效，直接复用'
-      if ((!row.worktreePath || !ws.workspacePath || staleCoords) && typeof prepareWorkspace === 'function') {
+          : missingWorkspaceId
+            ? '票据上有工作区路径但没有工作区 id（上次登记降级了），这次补登记'
+            : '票据上的工作区坐标仍然有效，直接复用'
+      if ((!row.worktreePath || !ws.workspacePath || missingWorkspaceId || staleCoords) && typeof prepareWorkspace === 'function') {
         const prepared = await prepareWorkspace({
           ticket,
           located,

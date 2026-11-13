@@ -9,14 +9,15 @@
  * 但下一张同模块的票进来时，一切从零开始 —— 同样的 grep、同样的 250+ 处「首样」命中、
  * 同样的路径猜错再 glob 找回。
  *
- * 插件里原本完全没有记忆：「跨票」这个词在 `src/` 里只命中测试替身
- * `makeMemoryRepo()`（一个内存 KV 表，与业务无关）。
+ * 2026-11-13 实测：`sh-row-82` 第一次跑 49 分钟、探索 84 次、**一个文件没改**；
+ * 第二次重跑又探索了 57 次才动手，其中 5 个文件是第一次已经读过的（第二次总共才读 11 个）。
+ * 这些重复阅读全是「上一轮明明已经知道」的东西。
  *
  * ## 记什么、不记什么
  *
- * 只记**可验证的事实**：一张票跑成功后，把它最终的 `changedFiles` 与从工单里
- * 抽出来的关键词绑在一起。不记「模型觉得哪里可能有问题」这种推测 ——
- * 推测会累积成噪音，而「上次改这个模块动过这三个文件」是硬事实。
+ * 只记**可验证的事实**：一张票跑成功后，把它最终的 `changedFiles` 与从工单的
+ * **结构化字段**里抽出来的关键词绑在一起。不记「模型觉得哪里可能有问题」这种推测 ——
+ * 推测会累积成噪音，而「上次改这个页面动过这三个文件」是硬事实。
  *
  * ## 为什么按项目分表
  *
@@ -26,7 +27,7 @@
  * ## 这是**提示**，不是**约束**
  *
  * 记忆只出现在任务书的「补充」里，措辞必须让人（和模型）明白「上次是这几个文件，
- * 但这次不一定是」。写死了会变成误导 —— 同一个模块的新问题完全可能在另一个文件里。
+ * 但这次不一定是」。写死了会变成误导 —— 同一个页面的新问题完全可能在另一个文件里。
  */
 
 /** 记忆表名。与 `core/domain.js` 里声明的表对应。 */
@@ -34,6 +35,23 @@ export const MEMORY_TABLE = 'memory'
 
 /** 一个项目最多记多少条。多了会撑大任务书，也会让「上次」变得没有区分度。 */
 export const MEMORY_LIMIT = 20
+
+/**
+ * 关键词抽取算法的版本。
+ *
+ * v1（2026-11-12）用中文 2–4 字**滑动窗口**从问题描述里抽词，结果是
+ * `作台中的` / `台中的全` / `全据项` / `侧列表` 这种碎片，真正该用的 `工作台-全据项目报告`
+ * 反被稀释。实测 `sh-row-82`（首样测试）召回的是 `sh-row-83`（上门服务）—— 两张完全不同的页面。
+ *
+ * v2（2026-11-13）只收**结构化字段**：模块列、操作流程列按 `-` 切出来的每一段、
+ * 以及描述里的英文标识符。理由见 `extractKeywords` 的注释。
+ *
+ * 库里 v1 学到的条目**不做迁移**：它们的碎片词几乎不可能与本版本的抽取结果逐字相等
+ * （本版本产出的全是 `项目管理` / `首样测试` 这类整段词），所以不会造成新的误召回；
+ * 而那些条目本来也只会被同项目的票重新学到时覆盖掉。`kwv` 只用于将来排查「这条记忆是
+ * 哪套算法抽的词」。
+ */
+export const MEMORY_KEYWORD_VERSION = 2
 
 /**
  * 一条记忆。
@@ -44,18 +62,40 @@ export const MEMORY_LIMIT = 20
  * @property {string} recordId 来源票（人能从它追到原始工单）
  * @property {number} at 学到这条记忆的时刻（epoch ms）
  * @property {number} hits 这条记忆被复用了几次（复用过说明它有用，排序要靠它）
+ * @property {number} [kwv] 抽词算法版本（见 `MEMORY_KEYWORD_VERSION`）
  */
+
+/**
+ * 操作流程列的段分隔符。
+ *
+ * 真实数据里这一列长这样：`项目管理-首样测试-审批按钮`、`工作台-全据项目报告`、
+ * `产品方案配置-需求列表-需求详情`。它本来就是**人写的页面路径**，`-` 是天然的
+ * 切分点 —— 这比任何分词都可靠，因为切出来的每一段都是用户自己命名的页面名。
+ *
+ * @type {RegExp}
+ */
+const FLOW_SEPARATOR = /[-–—/\\>»·、，,|；;：:]/
 
 /**
  * 从一张工单里抽出用于检索的关键词。
  *
- * 抽的都是**用户自己写下来的字**，不做任何分词或同义词扩展：
- * - `module`（模块列，如「首样测试」）；
- * - `flow`（操作流程列，短的时候它就是个模块名）；
- * - 问题描述里出现的、长度 ≥ 2 的英文标识符与中文词组片段。
+ * ## 只收结构化字段，不从问题描述里切中文
  *
- * 为什么不去停用词、不做词干化：抽错一个词的代价是「任务书里多一行不相干提示」，
- * 抽漏一个词的代价是「记忆永远命不中」。前者便宜得多，所以宁可多抽。
+ * 三个来源：
+ * 1. `module`（模块列，如「工作台」）；
+ * 2. `flow`（操作流程列）按 `-` 切出来的**每一段**，例如
+ *    `项目管理-首样测试-审批按钮` ⇒ `项目管理` / `首样测试` / `审批按钮`。
+ *    切段还顺带解决了「精确比较永远不相等」的问题：`项目管理-首样测试` 与
+ *    `项目管理-首样测试-审批按钮` 是两张票的 flow，整串比是一个都不等，
+ *    切成段之后它们共享 `首样测试`，这正是「同一个页面」的信号。
+ * 3. 问题描述里的**英文标识符**（类名、字段名、路由名），这类词最可靠且不会误命中。
+ *
+ * **中文一律不从问题描述里抽**，这是 v2 的关键改动。理由：描述写的是「哪里不对」，
+ * 而两张票碰巧同一个页面时，措辞几乎一定不同；反过来，两张票措辞相同（都提「列表」
+ * 「排序」「筛选」）却完全可能是八竿子打不着的两个页面。按描述的中文匹配，命中的
+ * 大多是巧合。
+ *
+ * 而「哪几个文件」这件事，只跟**页面**有关 —— 页面就在 module + flow 里。
  *
  * @param {{ module?: string, flow?: string, description?: string }} ticket
  * @returns {string[]}
@@ -70,40 +110,61 @@ export function extractKeywords (ticket) {
   const add = (raw, isIdentifier = false) => {
     const text = String(raw ?? '').trim()
     if (text.length < 2) return
-    // 一段中文/一句话只留前 24 个字：整句话当关键词既占位置又几乎不可能命中。
+    // 一段中文只留前 24 个字：整句话当关键词既占位置又几乎不可能命中。
     // 但标识符不截断 —— `PmsProductSampleTestServiceImpl` 33 个字，截一半就再也命不中，
     // 而它恰恰是这类记忆里最值钱的那个词。
     const limit = isIdentifier ? 120 : 24
     out.add(text.length > limit ? text.slice(0, limit) : text)
   }
   add(ticket?.module)
+  // flow 既留整串（人回看时能认出是哪条路径），也切段（检索用的就是段）。
   add(ticket?.flow)
+  const flowSegments = String(ticket?.flow ?? '').split(FLOW_SEPARATOR)
+  for (const segment of flowSegments) add(segment)
   const description = String(ticket?.description ?? '')
   // 英文标识符（驼峰类名、snake_case 字段名、路由名）是最可靠的检索词。
   for (const match of description.matchAll(/[A-Za-z][A-Za-z0-9_.-]{2,}/g)) add(match[0], true)
-  // 中文按 2–4 字的滑动窗口抽，覆盖「并行节点」「进度条」这类短词。
-  for (const run of description.matchAll(/[\u4e00-\u9fa5]{2,}/g)) {
-    const text = run[0]
-    for (let size = Math.min(4, text.length); size >= 2; size -= 1) {
-      for (let i = 0; i + size <= text.length && i < 8; i += 1) add(text.slice(i, i + size))
-    }
+  return [...out]
+}
+
+/**
+ * 每条关键词出现在多少条记忆里。
+ *
+ * 用来滤掉「没有区分度」的词：一个词如果**每条记忆都有**，它就不能用来判断
+ * 「这次该找哪一条」。实测例子：pms 项目里 `项目管理` 几乎出现在每条记忆里，
+ * 只靠它命中就会把「首样测试」的票引到「上门服务」的改动上去 —— 2026-11-13
+ * 现场就发生过这一次（`sh-row-82` 召回到 `sh-row-83`）。
+ *
+ * 判据用「所有记忆都有」而不是「超过一半」，理由是前者不需要调阈值、
+ * 也不会在小样本下（n=2、n=3）把有用的词误杀：n=1 时一条记忆身上的任何词都算数，
+ * n=2 时只有两条共有的词被滤掉。
+ *
+ * @param {MemoryEntry[]} entries
+ * @returns {Map<string, number>}
+ */
+function documentFrequency (entries) {
+  /** @type {Map<string, number>} */
+  const df = new Map()
+  for (const entry of entries) {
+    const words = Array.isArray(entry?.keywords) ? entry.keywords : []
+    for (const word of new Set(words)) df.set(word, (df.get(word) ?? 0) + 1)
   }
-  return [...out].slice(0, 40)
+  return df
 }
 
 /**
  * 算一次「这张工单与这条记忆有多相关」。
  *
- * 用命中关键词个数而不是布尔匹配：命 1 个词和命 4 个词的记忆可信度差很多，
- * 平手时再按 `hits`（历史复用次数）排 —— 被证明有用的记忆优先。
+ * 用命中关键词个数而不是布尔匹配：命 1 个词和命 4 个词的记忆可信度差很多。
+ * 只数**有区分度**的词（见 `documentFrequency`）。
  *
- * @param {string[]} keywords
+ * @param {string[]} distinctive
  * @param {MemoryEntry} entry
  * @returns {number}
  */
-function scoreOf (keywords, entry) {
+function scoreOf (distinctive, entry) {
   let score = 0
-  for (const word of keywords) {
+  for (const word of distinctive) {
     if (entry.keywords?.includes(word)) score += 1
   }
   return score
@@ -120,8 +181,27 @@ function scoreOf (keywords, entry) {
 export function recallMemories (entries, keywords, limit = 3) {
   if (!Array.isArray(entries) || entries.length === 0) return []
   if (!Array.isArray(keywords) || keywords.length === 0) return []
-  return entries
-    .map((entry) => ({ entry, score: scoreOf(keywords, entry), hits: Number(entry?.hits ?? 0) }))
+  // 跳过用旧算法抽词的条目：v1 的词表是「作台中的 / 侧列表排」这类 2–4 字碎片，
+  // v2 查询词是「首样测试 / 审批按钮」这类整段词。两套词表之间做子串以外的匹配
+  // 只会产生巧合命中 —— 实测 v1 数据下 `sh-row-82`（首样测试）召回到
+  // `sh-row-83`（上门服务），两张完全不同的页面。旧条目留着不动，
+  // 等同一个页面再有票跑成功时自然被覆盖、或被新条目挤出 20 条上限。
+  const usable = entries.filter((entry) => entry?.kwv === MEMORY_KEYWORD_VERSION)
+  if (usable.length === 0) return []
+  const df = documentFrequency(usable)
+  // 区分度必须在**可用条目**上算，而且后面的遍历也只在可用条目上做 ——
+  // 两处都漏一处，旧条目就会原样混回来（自测抓过：把 `entries` 写在 `.map` 上，
+  // 结果三条全召回）。
+  //
+  // 只剩一条记忆时不滤：那一条的每个词 df 都等于 1 = 条目数，按「每条都有」的判据
+  // 会被整条滤空 —— 于是项目里第二张票永远看不到第一张学到的东西，记忆功能等于没开。
+  // 「所有记忆都有」这个判据本来就需要至少两条才有意义。
+  const distinctive = usable.length === 1
+    ? [...keywords]
+    : keywords.filter((word) => (df.get(word) ?? 0) < usable.length)
+  if (distinctive.length === 0) return []
+  return usable
+    .map((entry) => ({ entry, score: scoreOf(distinctive, entry), hits: Number(entry?.hits ?? 0) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => (b.score - a.score) || (b.hits - a.hits) || (b.entry.at - a.entry.at))
     .slice(0, Math.max(1, limit))
@@ -133,7 +213,7 @@ export function recallMemories (entries, keywords, limit = 3) {
  *
  * 措辞的三条要求（都是防止把提示写成约束）：
  * 1. 说清「上次」—— 这是历史，不是这次的事实；
- * 2. 说清「不一定」—— 同一模块的新问题可能在别的文件里；
+ * 2. 说清「不一定」—— 同一个页面的新问题可能在别的文件里；
  * 3. 给出可执行的动作 —— 「从这里开始找」而不是「照这个改」。
  *
  * @param {MemoryEntry} entry
@@ -180,8 +260,8 @@ export class TicketMemory {
   /**
    * 记一条：这张票改了这些文件。
    *
-   * 去重规则：**同一批文件 + 有重叠关键词**视为同一条，只累加 `hits` 并更新
-   * `recordId`。不去重的话，同一个模块连续十张票会留下十条几乎一样的记忆，
+   * 去重规则：**同一批文件**视为同一条，只累加 `hits` 并更新 `recordId`。
+   * 不去重的话，同一个页面连续十张票会留下十条几乎一样的记忆，
    * 把真正不同的那几条挤出去（限制是 20 条）。
    *
    * @param {{ projectId: string, recordId: string, keywords: string[], files: string[] }} input
@@ -201,19 +281,26 @@ export class TicketMemory {
       existing.hits = Number(existing.hits ?? 0) + 1
       existing.at = this.now()
       existing.recordId = recordId
-      // 关键词取并集：同一批文件可能被不同措辞的工单命中，并集让检索面更宽。
-      const merged = new Set([...(existing.keywords ?? []), ...(keywords ?? [])])
-      existing.keywords = [...merged].slice(0, 40)
+      // 关键词：同一批文件可能被不同措辞的工单命中，所以正常情况取并集让检索面更宽。
+      // **但旧算法（kwv !== 当前版本）的条目不能并** —— 它那批词是中文碎片，
+      // 并进来就等于把已经确认没用的噪音永久留在库里。这种情况整批换成新词。
+      const fromOldVersion = existing.kwv !== MEMORY_KEYWORD_VERSION
+      const merged = fromOldVersion
+        ? new Set(keywords ?? [])
+        : new Set([...(existing.keywords ?? []), ...(keywords ?? [])])
+      existing.keywords = [...merged]
+      existing.kwv = MEMORY_KEYWORD_VERSION
       await this.save(projectId, entries)
       return existing
     }
     /** @type {MemoryEntry} */
     const entry = {
-      keywords: [...new Set(keywords ?? [])].slice(0, 40),
+      keywords: [...new Set(keywords ?? [])],
       files: cleaned,
       recordId,
       at: this.now(),
       hits: 0,
+      kwv: MEMORY_KEYWORD_VERSION,
     }
     // 新的排前面，超出上限就丢最旧的。
     const next = [entry, ...entries].slice(0, this.limit)

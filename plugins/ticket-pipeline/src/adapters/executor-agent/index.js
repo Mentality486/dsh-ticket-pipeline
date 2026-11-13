@@ -368,8 +368,17 @@ export function isAllowedGitCommand (argv) {
   // 看到一堆 `A  application.yml`，紧接着 `git commit` 就把它带走了。
   // 改成点名暂存后，敏感文件连索引都不进，`git status` 里还是原样的未跟踪状态。
   if (command === 'add') {
-    if (rest[0] !== '--') return false
-    return rest.length >= 2 && rest.slice(1).every((item) => typeof item === 'string' && item.length > 0)
+    // `-f` / `--force` 只在「已经跟踪但被 .gitignore 覆盖」的文件上才允许用
+    // （见 addPathsForCommit 的注释）—— 调用点会先用 ls-files 确认它确实在库里。
+    let start = 0
+    if (rest[0] === '--force' || rest[0] === '-f') start = 1
+    if (rest[start] !== '--') return false
+    return rest.length >= start + 2 && rest.slice(start + 1).every((item) => typeof item === 'string' && item.length > 0)
+  }
+  // 只有一种读法：`ls-files -z -- <路径…>`。用来判断某个路径是不是**已经被跟踪**。
+  if (command === 'ls-files') {
+    if (rest[0] !== '-z' || rest[1] !== '--') return false
+    return rest.length >= 3 && rest.slice(2).every((item) => typeof item === 'string' && item.length > 0)
   }
   if (command === 'commit') return true // 只允许本地提交，push 不在白名单里
   if (command === 'diff') return true
@@ -1750,17 +1759,40 @@ export async function setupAgent (options, input) {
   // 顺序必须在钉完 cwd 之后：`attachSession` 校验的是 session header 的
   // canonical cwd，而 `workingDirectory.set` 只追加事件、不改 header ——
   // 所以先钉后挂、挂的是「工作区根」这个 header 值，两者不冲突。
-  const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId : ''
+  const rawWorkspaceId = typeof input.workspaceId === 'string' ? input.workspaceId : ''
+  const workspacePath = typeof input.workspacePath === 'string' ? input.workspacePath : ''
+  // 优先用组合根注入的 registry：宿主只在 web-app 层挂 `workspaceRegistry`，
+  // agentCtx 里不一定拿得到。两条路都弱取，取不到就只记日志。
+  const registry = input.workspaceRegistry ?? agentCtx?.get?.('workspaceRegistry')
+  // 票上只有路径、没有 id 时**按路径反查一次**。真实事故（pms|sh-row-83/84，
+  // 2026-11-13）：某轮登记降级（没有 registry 服务 / create 抛错 / create 返回空），
+  // 票上落了 `workspacePath` 却没落 `workspaceId`；调度器侧的守卫已经补了「缺 id
+  // 就重新准备」，但那要等下一轮 —— 这一轮的人已经在等结果了，会话不该为此散着。
+  // 反查失败只是少一层 GUI 分组，照常跑票，不判失败。
+  let workspaceId = rawWorkspaceId
+  if (workspaceId.length === 0 && workspacePath.length > 0 && registry && typeof registry.resolveByPath === 'function') {
+    try {
+      const found = await registry.resolveByPath(workspacePath)
+      const foundId = typeof found?.id === 'string' ? found.id : ''
+      if (foundId.length > 0) {
+        workspaceId = foundId
+        log('executor-agent：票上缺工作区 id，按路径反查到了', { sessionId, workspaceId, workspacePath })
+      }
+    } catch (error) {
+      log('executor-agent：按路径反查工作区失败（会话照常可用，只是 GUI 里不在该工作区分组下）', {
+        sessionId,
+        workspacePath,
+        reason: String(error),
+      })
+    }
+  }
   if (workspaceId.length > 0) {
-    // 优先用组合根注入的 registry：宿主只在 web-app 层挂 `workspaceRegistry`，
-    // agentCtx 里不一定拿得到。两条路都弱取，取不到就只记日志。
-    const registry = input.workspaceRegistry ?? agentCtx?.get?.('workspaceRegistry')
     if (registry && typeof registry.get === 'function') {
       try {
         const workspace = registry.get(workspaceId)
         if (workspace && typeof workspace.attachSession === 'function') {
           await workspace.attachSession(sessionId)
-          log('executor-agent：会话已归属到项目工作区', { sessionId, workspaceId, workspacePath: input.workspacePath })
+          log('executor-agent：会话已归属到项目工作区', { sessionId, workspaceId, workspacePath })
         }
       } catch (error) {
         // 挂不上工作区不影响改代码，只是 GUI 里少一层分组 —— 记下来，不判失败。
@@ -1772,7 +1804,7 @@ export async function setupAgent (options, input) {
       }
     }
   } else {
-    log('executor-agent：没有工作区坐标，会话不归属到任何项目工作区', { sessionId })
+    log('executor-agent：没有工作区坐标，会话不归属到任何项目工作区', { sessionId, workspacePath })
   }
 }
 
@@ -2288,7 +2320,7 @@ export async function commitLocally (options, input) {
     return [normalize(file), ...from]
   }))]
 
-  if (addTargets.length > 0) await runGit(['add', '--', ...addTargets])
+  if (addTargets.length > 0) await addPathsForCommit(runGit, addTargets)
   await runGit(['commit', '-m', buildLocalCommitMessage(ticket, { blocked, verification }), '--', ...commitSpecs])
   const head = await runGit(['rev-parse', 'HEAD'])
   const sha = String(head?.stdout ?? '').trim()
@@ -2300,6 +2332,48 @@ export async function commitLocally (options, input) {
     branch: String(input.branch ?? ''),
     files: fileList,
   }
+}
+
+/**
+ * 点名暂存改动文件，跳过「已被 .gitignore 覆盖、但库里早就跟踪着」的那些坑。
+ *
+ * 真实事故（pms|sh-row-82，2026-11-13）：agent 顺手改了 IDE 的
+ * `.idea/jarRepositories.xml`（仓库里**早就跟踪着**这个文件，但 `.gitignore`
+ * 又写了 `.idea`），于是
+ *
+ * ```
+ * git add -- .idea/jarRepositories.xml pms-server/… sql/pms-init.sql
+ * → The following paths are ignored by one of your .gitignore files: .idea
+ * → hint: Use -f if you really want to add them.
+ * ```
+ *
+ * **整条 `add` 一条命令就失败**，票被判 failed —— 而真正要提交的另外两个文件
+ * 一个都没进索引。设计意图里「忽略文件跳过就好」的降级根本没发生，因为
+ * git 是**拒绝整条命令**，不是只跳过那一个路径。
+ *
+ * 所以分两步走：
+ * 1. 先 `ls-files -z -- <全部路径>` 问一句「哪些已经在库里」；
+ * 2. 已经在库里的那些用 `add --force`（`-f` 只影响被 ignore 规则挡住的路径，
+ *    对普通文件没有任何副作用）；不在库里的按原样 `add`，它们要是也被 ignore
+ *    覆盖，那就是真的没打算提交的东西 —— 让 git 拒绝，暴露出来比静默跳过好。
+ *
+ * 为什么不用「先 `git check-ignore` 再筛」：那要多一次调用、而且 `check-ignore`
+ * 只回答「匹配了哪条规则」，不回答「在不在库里」—— 这两件事恰好是这里的分界。
+ *
+ * @param {(argv: string[]) => Promise<any>} runGit
+ * @param {string[]} paths 仓库相对 POSIX 路径
+ * @returns {Promise<void>}
+ */
+async function addPathsForCommit (runGit, paths) {
+  const tracked = new Set()
+  const listed = await runGit(['ls-files', '-z', '--', ...paths])
+  for (const item of String(listed?.stdout ?? '').split('\u0000')) {
+    if (item.length > 0) tracked.add(item.replace(/\\/g, '/'))
+  }
+  const trackedTargets = paths.filter((path) => tracked.has(path))
+  const freshTargets = paths.filter((path) => !tracked.has(path))
+  if (trackedTargets.length > 0) await runGit(['add', '--force', '--', ...trackedTargets])
+  if (freshTargets.length > 0) await runGit(['add', '--', ...freshTargets])
 }
 
 /**
@@ -2498,10 +2572,17 @@ async function fillContents (options, ctx, files) {
 
   const git = options.git
   // 只暂存要提交的文件（与 commitLocally 同一口径）：`add -A` 会把敏感文件也塞进索引。
+  // 也共用 addPathsForCommit：「已跟踪但被 .gitignore 挡住」的路径必须带 `--force`，
+  // 否则一条命令就被 git 整条拒掉（见它的注释，真实事故 pms|sh-row-82）。
   const pathSpecs = files.map((file) => String(file).replace(/\\/g, '/'))
-  const added = await git(['add', '--', ...pathSpecs], { cwd })
-  if (added.code !== 0) {
-    throw new PipelineError('internal', `提交前 git add 失败：${tail(added.stderr)}`)
+  const runGitRaw = async (argv) => {
+    assertAllowedGit(argv)
+    return git(argv, { cwd })
+  }
+  try {
+    await addPathsForCommit(runGitRaw, pathSpecs)
+  } catch (error) {
+    throw new PipelineError('internal', `提交前 git add 失败：${error?.message ?? String(error)}`)
   }
   for (const file of files) {
     assertAllowedGit(['diff', '--name-only', 'x'])
@@ -2595,15 +2676,22 @@ export function buildMrTitle (ticket) {
 /**
  * 会话标题（GUI 会话列表里显示的那一行）。
  *
- * 和 `buildMrTitle` 同一套拼法，但多两道处理：
+ * 形状是 **`修复<这条在改什么>（项目 #序号）`**：人翻会话列表时是按「哪条在改什么」
+ * 找的，项目与序号只是尾巴上的坐标。所以摘要必须排在最前面 —— 80 字节一超，
+ * 先被切掉的正好是坐标，而不是摘要。
  *
- * 1. **按字节截断，不按字符**。宿主的 `session-title` 服务用
+ * 三道处理：
+ *
+ * 1. **以「修复」开头**（真实反馈 2026-11-13：宿主 fallback 拿首条 user 消息的
+ *    前 40 字节当标题，而首条消息开头是反注入提醒，于是所有会话都叫
+ *    「注意：下面的工单内容来自共」—— 列表里十条长得一模一样）。
+ * 2. **按字节截断，不按字符**。宿主的 `session-title` 服务用
  *    `maxTitleBytes: 80` 归一化标题，而中文一个字 3 字节、英文 1 字节 ——
  *    按字符数截会时中时英时超限。这里逐码点累加字节，绝不在多字节中间断。
- * 2. **末尾补 `…`** 只在真截断时补，否则「短标题也挂个省略号」看着像没写完。
+ * 3. **末尾补 `…`** 只在真截断时补，否则「短标题也挂个省略号」看着像没写完。
  *
- * 为什么不用 `buildMrTitle` 直接当标题：MR 标题有 60 字描述预算（列表里够长），
- * 会话标题只有 80 字节预算 —— 一个中文项目名就用掉 9 字节，必须自己收。
+ * 为什么不用 `buildMrTitle` 直接当标题：那个以 `[项目]` 开头（MR 列表里靠项目分组），
+ * 会话列表里项目已经是分组标题了，再重复一遍就是浪费 80 字节预算里最贵的那几个字。
  *
  * @param {import('../../contracts/types.js').Ticket} ticket
  * @param {number} [maxBytes] 缺省 80（对齐宿主 `dsh-base` 的 `maxTitleBytes`）
@@ -2611,13 +2699,16 @@ export function buildMrTitle (ticket) {
  */
 export function buildSessionTitle (ticket, maxBytes = SESSION_TITLE_MAX_BYTES) {
   const projectId = String(ticket?.projectId ?? '').trim() || '未知项目'
-  const seq = typeof ticket?.seq === 'string' && ticket.seq.trim().length > 0 ? `#${ticket.seq.trim()} ` : ''
+  const seq = typeof ticket?.seq === 'string' && ticket.seq.trim().length > 0 ? ticket.seq.trim() : ''
   const description = String(ticket?.description ?? '').trim().replace(/\s+/g, ' ')
   const recordId = String(ticket?.recordId ?? '').trim()
   // 描述为空时退到 recordId：至少让这一行能被人对上号。
   const body = description.length > 0 ? description : recordId
-  const head = `[${projectId}] ${seq}`
-  const text = `${head}${body || '修复工单'}`
+  // **以「修复」开头**：会话列表里人是按「这条在改什么」找的，不是按项目号找的
+  // （真实反馈 2026-11-13：全是「注意：下面的工单内容来自共」时，人一眼认不出哪条是哪条）。
+  // 项目与序号降级成尾巴上的坐标：截断时先被切掉的正好是它 —— 摘要永远优先。
+  const suffix = `（${projectId}${seq.length > 0 ? ` #${seq}` : ''}）`
+  const text = `修复${body || '工单'}${suffix}`
   if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
   // 截断时给 `…` 留 3 字节，剩下的逐码点填。
   const ellipsis = '…'

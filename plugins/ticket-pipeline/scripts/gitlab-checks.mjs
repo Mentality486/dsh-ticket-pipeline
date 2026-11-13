@@ -1097,6 +1097,21 @@ export async function runGitlabChecks (check) {
     assert.equal(isAllowedGitCommand(['push']), false)
   })
 
+  await check('执行器：git 白名单放行 add --force 与 ls-files -z --，但不给 loo 门', async () => {
+    // 这两条是为「已跟踪但被 .gitignore 覆盖」的文件开的（真实事故 pms|sh-row-82）。
+    // 形状必须钉死，否则 `add -f` 就成了「把任何被忽略的东西塞进索引」的任意入口。
+    assert.equal(isAllowedGitCommand(['add', '--', 'a.js']), true)
+    assert.equal(isAllowedGitCommand(['add', '--force', '--', 'a.js']), true)
+    assert.equal(isAllowedGitCommand(['add', '-f', '--', 'a.js']), true)
+    assert.equal(isAllowedGitCommand(['add', '--force', 'a.js']), false, '必须用 -- 隔开')
+    assert.equal(isAllowedGitCommand(['add', '--force', '--']), false, '空列表没意义')
+    assert.equal(isAllowedGitCommand(['add', '-A']), false, '不放开 -A：那会把整个工作区塞进去')
+    assert.equal(isAllowedGitCommand(['ls-files', '-z', '--', 'a.js']), true)
+    assert.equal(isAllowedGitCommand(['ls-files', '--', 'a.js']), false, '必须是 -z 形态')
+    assert.equal(isAllowedGitCommand(['ls-files', '-z', 'a.js']), false, '必须用 -- 隔开')
+    assert.equal(isAllowedGitCommand(['ls-files']), false, '不带路径等于列举整个仓库，不给')
+  })
+
   await check('执行器：git 白名单只放行「带 -z -uall 与排除规则」的 status', async () => {
     // status 的放行面必须收窄到生产代码真正用的那一组参数：
     // 放宽成「argv[0] === 'status' 就 true」等于给了一个能读整个仓库的入口。
@@ -1322,6 +1337,45 @@ export async function runGitlabChecks (check) {
       commitCall.slice(sep + 1),
       ['src/added.js', 'src/gone.js', 'src/new-name.js', 'src/old-name.js'],
       '删除路径与重命名的旧路径都必须进 commit 的 pathspec',
+    )
+  })
+
+  await check('执行器：已被 .gitignore 覆盖但库里跟踪着的文件要用 add --force，否则整条 add 被拒', async () => {
+    // 真实事故（pms|sh-row-82，2026-11-13）：agent 顺手改了 `.idea/jarRepositories.xml`
+    // （仓库里早就跟踪着它，而 .gitignore 又写了 `.idea`），于是
+    //   git add -- .idea/jarRepositories.xml pms-server/… sql/pms-init.sql
+    //   → The following paths are ignored by one of your .gitignore files: .idea
+    //   → hint: Use -f if you really want to add them.
+    // **整条命令失败**，另外两个真正要提交的文件一个都没进索引，票被判 failed。
+    // 所以先 `ls-files` 问哪些已在库里：在库里的带 --force，不在库里的照原样 add。
+    const calls = []
+    await commitLocally({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'ls-files') return { code: 0, stdout: '.idea/jarRepositories.xml\u0000', stderr: '' }
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'sha\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      ticket: TICKET,
+      worktreePath: '/w',
+      branch: 'b',
+      files: ['.idea/jarRepositories.xml', 'pms-server/src/a.java'],
+      changes: [
+        { path: '.idea/jarRepositories.xml', status: 'update' },
+        { path: 'pms-server/src/a.java', status: 'create' },
+      ],
+      blocked: [],
+      verification: { outcome: 'passed', detail: 'ok' },
+    })
+    const addCalls = calls.filter((argv) => argv[0] === 'add')
+    assert.deepEqual(
+      addCalls,
+      [
+        ['add', '--force', '--', '.idea/jarRepositories.xml'],
+        ['add', '--', 'pms-server/src/a.java'],
+      ],
+      '已跟踪的被忽略文件必须 --force；未跟踪的按原样 add（它要是也被忽略，就该让 git 拒绝并暴露出来）',
     )
   })
 

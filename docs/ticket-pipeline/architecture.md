@@ -50,6 +50,7 @@
     - [12.20 面板上的动作要写宿主之前，先问「宿主那边此刻有没有这个东西」](#1220-面板上的动作要写宿主之前先问宿主那边此刻有没有这个东西2026-11-13)
     - [12.21 「文档标题」和「工作表名」是两个东西](#1221-文档标题和工作表名是两个东西2026-11-13)
     - [12.22 会话名要能认人：`session/title` 由插件钉，不指望自动生成](#1222-会话名要能认人sessiontitle-由插件钉不指望自动生成2026-11-13)
+- [12.23 三个静默降级：会话名被 fallback 抢、工作区归属只认 id、`git add` 是「全有或全无」](#1223-三个静默降级会话名被-fallback-抢工作区归属只认-idgit-add-是全有或全无)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -2859,9 +2860,11 @@ await checkExplore(justChanged)               // 判断要用刷新结果
 
 **做法**（`plugins/ticket-pipeline/src/adapters/executor-agent/index.js`）：
 
-1. 新增 `buildSessionTitle(ticket, maxBytes = SESSION_TITLE_MAX_BYTES)`，拼法复用 `buildMrTitle`
-   的 `[项目] #序号 问题描述`：`[pms] #84 列表翻页丢数据`。没有 `description` 时退到 `recordId`，
-   全空退到 `修复工单` —— **标题不能是空串**，空串会被服务判 `SessionTitleInvalidError`。
+1. 新增 `buildSessionTitle(ticket, maxBytes = SESSION_TITLE_MAX_BYTES)`，**以「修复」开头**：
+   `修复<问题描述>（项目 #序号）` ⇒ `修复列表翻页丢数据（pms #84）`。没有 `description` 时退到
+   `recordId`，全空退到 `修复工单` —— **标题不能是空串**，空串会被服务判 `SessionTitleInvalidError`。
+   （第一版是 `[项目] #序号 描述`，上线当天改掉：会话列表里项目已经是分组标题，再重复一遍
+   是浪费 80 字节里最贵的几个字，见 §12.23。）
 2. **按 UTF-8 字节截，不按字符数截**。服务侧 `maxTitleBytes` 是 80（`dsh-base/cordis.patch.yml`）；
    中文一个字 3 字节、英文 1 字节，按字符数截必然超限，按字节 `slice` 又会在汉字中间断开
    （得到 `\uFFFD`）。所以逐码点累加 `Buffer.byteLength(character, 'utf8')`，预算按
@@ -2888,6 +2891,47 @@ await checkExplore(justChanged)               // 判断要用刷新结果
 **自测**（`dev-run` 557 → **562**）：标题拼法的三段退路、UTF-8 截断不切汉字（`byteLength <= 80` +
 逐码点 round-trip + 不含 `\uFFFD`）、`setupAgent` 写出 `source.kind === 'user'` 且不吞掉沙箱/审批
 事件、标题写失败只记日志。
+
+### 12.23 三个静默降级：会话名被 fallback 抢、工作区归属只认 id、`git add` 是「全有或全无」
+
+§12.22 上线当天用户报了三件事，现场看都像「插件没干活」，实际是三条互不相干的静默降级。
+
+**一、会话名全变成「注意：下面的工单内容来自共」。** §12.22 钉的标题没生效 —— 因为**宿主没重启**，
+跑的还是旧副本；于是命中的是宿主 fallback：`fallbackSessionTitle(首条 user 消息, maxWords 5,
+maxBytes 40)`，而首条 user 消息第一块是反注入提醒。提醒位置不能挪（挪到正文之后会被正文里
+「忽略以上要求」盖掉，见 `buildMessages` 注释），所以**唯一的路是插件自己钉标题**。
+教训不是「标题要写对」，而是：**改了代码没重启 = 改了跟没改一样，而症状会伪装成「新功能没生效」**。
+
+**二、两张票的会话不在项目工作区分组下。** 票上 `workspacePath` 有值、`workspaceId` 是 `undefined`，
+而归属只认 id（`if (workspaceId.length > 0) … else log('没有工作区坐标')`）。根因是
+`core/scheduler.js` 的工作区守卫**只检查路径**：
+
+```js
+if ((!row.worktreePath || !ws.workspacePath || staleCoords) && typeof prepareWorkspace === 'function')
+```
+
+一旦某轮 `prepareWorkspace` 只回路径没回 id（三个登记降级分支都只记日志、不报错），此后每轮都判
+「坐标仍然有效，直接复用」，**永远不再补登记、也永远不会自愈**。修法两条：守卫补
+`missingWorkspaceId`（缺 id 就再准备一次，`resolveByPath` 会把既有工作区认回来）；执行器侧当
+id 空但路径有值时用 `registry.resolveByPath(workspacePath)` 反查后再 `attachSession`
+（调度器那条要等下一轮，人已经在等这一轮的结果了）。
+
+**三、`git add` 撞上「已跟踪但被 .gitignore 覆盖」的文件 ⇒ 整条命令失败。** 实测 git 2.45.1：
+`git add -- .idea/jarRepositories.xml …` 直接 exit 1（不是跳过那一个文件），另外两个真正要提交的
+文件一个都没进索引。修法 `addPathsForCommit`：先 `ls-files -z -- <全部路径>` 分两批，
+在库里的 `add --force`、不在库里的按原样 `add`。**不用 `git check-ignore` 筛** —— 它只回答
+「匹配了哪条规则」，不回答「在不在库里」。git 白名单同步放行 `add --force/-f` 与
+`ls-files -z --`，形状钉死（不放 `-A`、不放不带路径的 `ls-files`）。
+
+**判据**（三条都可以推广到别处）：
+
+1. **静默降级必须能被下一次尝试纠正** —— 降级本身可以接受，但降级留下的状态不能让后续轮次
+   误判成「已经是好的」。
+2. **守卫检查的字段要和下游消费的字段一致** —— 下游只认 `workspaceId`，守卫只看 `workspacePath`。
+3. **`git add` 是「全有或全无」** —— 一条坏路径能让整批暂存失败，所以必须先分类再分批。
+
+**自测**：`dev-run` 562 → **569**（会话标题 4 条改写成「修复…」形状 + 缺 `workspaceId` 必须补登记 1 条
++ `add --force` 分批 1 条 + git 白名单形状 1 条）。
 
 ## 13. 事实来源
 

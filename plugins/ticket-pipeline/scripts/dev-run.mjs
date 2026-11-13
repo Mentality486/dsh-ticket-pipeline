@@ -49,7 +49,7 @@ import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, buildS
 import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { renderTicketPrompt } from '../src/core/prompt.js'
-import { describeMemory, extractKeywords, recallMemories, TicketMemory } from '../src/core/ticket-memory.js'
+import { describeMemory, extractKeywords, MEMORY_KEYWORD_VERSION, MEMORY_TABLE, recallMemories, TicketMemory } from '../src/core/ticket-memory.js'
 import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
   comparePluginTrees,
@@ -2343,6 +2343,57 @@ async function main () {
     assert.equal(seenCtx.worktreePath, 'D:/wt/ready')
     assert.equal(seenCtx.workspacePath, 'D:/WorkSpace/demo-repo', '执行器必须拿到项目工作区路径（会话 cwd 用它）')
     assert.equal(seenCtx.workspaceId, 'ws-42', '工作区 id 要透传，执行器要用它 attach 会话')
+  })
+
+  // 真实事故 pms|sh-row-83 与 pms|sh-row-84（2026-11-13）：票据上 `workspacePath` 有值、
+  // `workspaceId` 空（上一轮登记降级了：本机没有 workspaceRegistry 服务 / create 抛错被吞 /
+  // create 返回空）。旧守卫只看路径 ⇒ 之后每轮都判「坐标仍然有效，直接复用」，
+  // 永远不再补登记，那两张票的会话在 GUI 里一直是「未分组」，而且**不会自愈**。
+  await check('票据上有工作区路径但没有 id：必须再补登记一次，不能永远跳过', async () => {
+    let prepares = 0
+    const seenOpts = []
+    const holder = {}
+    const spyExecutor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        holder.ctx = ctx
+        await ctx.onPhase('editing')
+        await ctx.onPhase('testing')
+        await ctx.onPhase('mr-opening')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed', mr: { iid: 1, url: 'mock://mr/1', draft: true } })
+      },
+    }
+    const { scheduler, store } = harness({
+      executor: spyExecutor,
+      prepareWorkspace: async (opts) => {
+        prepares += 1
+        seenOpts.push(opts)
+        // 这一次登记成功了：返回带 id 的坐标
+        return { path: 'D:/wt/ready', branch: 'b-ready', baseCommit: 'c4', repoPath: 'D:/WorkSpace/demo-repo', workspacePath: 'D:/WorkSpace/demo-repo', workspaceId: 'ws-recovered' }
+      },
+    })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'worktree-ready' })
+    await store.setPhase(k('rec-mock-001'), 'planning', {
+      worktreePath: 'D:/wt/ready',
+      branch: 'b-ready',
+      baseCommit: 'c4',
+      repoPath: 'D:/WorkSpace/demo-repo',
+      workspacePath: 'D:/WorkSpace/demo-repo',
+      // 关键：没有 workspaceId
+    })
+    await store.setPhase(k('rec-mock-001'), 'pending')
+    await scheduler.tick()
+    assert.equal(prepares, 1, '缺 id 就要补一次登记，否则会话永远挂不上项目工作区')
+    assert.equal(seenOpts[0].worktreePath, 'D:/wt/ready', '补登记不能重建 worktree，得把已有路径传下去')
+    assert.equal(holder.ctx.workspaceId, 'ws-recovered', '补到的 id 要透传给执行器')
+    const row = store.getTicket(k('rec-mock-001'))
+    assert.equal(row.workspaceId, 'ws-recovered', '新 id 要落库 —— 下一轮才会判「坐标有效」不再重复准备')
+    assert.ok(
+      !(row.timeline ?? []).some((item) => String(item.detail ?? '').includes('坐标仍然有效')),
+      '这一轮的动作必须是「补登记」，不能嘴上说坐标有效却去调了 prepareWorkspace',
+    )
   })
 
   // 这一组用例对应真实事故 pms|reczz28VWNWVbpgL（2026-11-06）：票据上 worktreePath 与
@@ -7049,34 +7100,83 @@ function makeFakeCtx ({ domain, registered }) {
 
   section('19. 跨票记忆：跑成功就把「同类问题改过哪几个文件」留下来')
 
-  await check('extractKeywords：模块名、英文标识符、中文短词都抽，不做词干化', () => {
+  await check('extractKeywords：模块名与操作流程切段都抽，问题描述里的中文一律不抽', () => {
     const kws = extractKeywords({
-      module: '首样测试',
-      flow: '项目管理-首样测试',
-      description: '并行节点时 PmsProductSampleTestServiceImpl 算错了出差天数',
+      module: '项目管理',
+      flow: '项目管理-首样测试-审批按钮',
+      description: '并行节点时 PmsProductSampleTestServiceImpl 算错了出差天数，审批通过后没通知下一个流程节点',
     })
-    assert.ok(kws.includes('首样测试'), `模块列必须原样进来：${JSON.stringify(kws)}`)
-    assert.ok(kws.includes('项目管理-首样测试'), 'flow 整串也要（短 flow 它就是个模块名）')
-    assert.ok(kws.includes('PmsProductSampleTestServiceImpl'), '类名是最可靠的检索词')
-    assert.ok(kws.includes('并行节点'), '中文按 2–4 字滑窗抽，「并行节点」这种短词要命中')
-    // 标识符不截断（截一半的类名永远命不中），中文词组仍限 24 字。
-    const chinese = kws.filter((w) => /[\u4e00-\u9fa5]/.test(w))
-    assert.ok(chinese.every((w) => w.length <= 24), `中文词条要截断：${JSON.stringify(chinese.filter((w) => w.length > 24))}`)
+    assert.ok(kws.includes('项目管理'), `模块列必须原样进来：${JSON.stringify(kws)}`)
+    assert.ok(kws.includes('项目管理-首样测试-审批按钮'), 'flow 整串也要（人回看时认得出是哪条路径）')
+    // 切段是 v2 的关键：两张票的 flow 一个是「项目管理-首样测试」、
+    // 一个是「项目管理-首样测试-审批按钮」，整串比永远不相等，切成段才共享「首样测试」。
+    assert.ok(kws.includes('首样测试'), `flow 要按 - 切段：${JSON.stringify(kws)}`)
+    assert.ok(kws.includes('审批按钮'), '最后一段也要')
+    assert.ok(kws.includes('PmsProductSampleTestServiceImpl'), '类名是最可靠的检索词，且不截断（33 个字截一半就永远命不中）')
+    // 反向断言：中文不再从问题描述里抽。v1 用 2–4 字滑窗，抽出来的是
+    // 「作台中的 / 台中的全 / 全据项 / 侧列表」这种碎片，实测把「首样测试」的票
+    // 召回到「上门服务」的改动上。描述里的中文整词（「并行节点」）也不抽 ——
+    // 两张票撞同一个页面时措辞几乎一定不同，撞同一个措辞时页面几乎一定不同。
+    assert.ok(!kws.includes('并行节点'), `问题描述里的中文不该进关键词：${JSON.stringify(kws)}`)
+    // 中文词条只应来自 module / flow，逐条对一遍全集：多一个都说明又去描述里捞了。
+    const chinese = kws.filter((w) => /[\u4e00-\u9fa5]/.test(w)).sort()
+    assert.deepEqual(chinese, ['审批按钮', '项目管理', '项目管理-首样测试-审批按钮', '首样测试'].sort(),
+      `中文只该来自 module 与 flow 的切段，实际 ${JSON.stringify(chinese)}`)
     assert.ok(kws.length <= 40, '上限 40')
+  })
+
+  await check('extractKeywords：flow 只有一段（没有 - ）时也只抽那一段，不凭空造词', () => {
+    const kws = extractKeywords({ module: '工作台', flow: '工作台', description: '图表颜色不对' })
+    assert.ok(kws.includes('工作台'), `实际 ${JSON.stringify(kws)}`)
+    assert.ok(kws.length <= 2, `flow 与 module 相同时不该重复计数：${JSON.stringify(kws)}`)
   })
 
   await check('recallMemories：按命中词数排，平手看复用次数，不相关的不返回', () => {
     const entries = [
-      { keywords: ['首样测试', '并行节点'], files: ['A.java'], recordId: 'r1', at: 3, hits: 0 },
-      { keywords: ['首样测试'], files: ['B.java'], recordId: 'r2', at: 2, hits: 5 },
-      { keywords: ['完全无关'], files: ['C.java'], recordId: 'r3', at: 1, hits: 9 },
+      { keywords: ['首样测试', '审批按钮'], files: ['A.java'], recordId: 'r1', at: 3, hits: 0, kwv: MEMORY_KEYWORD_VERSION },
+      { keywords: ['首样测试'], files: ['B.java'], recordId: 'r2', at: 2, hits: 5, kwv: MEMORY_KEYWORD_VERSION },
+      { keywords: ['完全无关'], files: ['C.java'], recordId: 'r3', at: 1, hits: 9, kwv: MEMORY_KEYWORD_VERSION },
     ]
-    const hit = recallMemories(entries, ['首样测试', '并行节点'])
+    const hit = recallMemories(entries, ['首样测试', '审批按钮'])
     assert.equal(hit.length, 2, `命中 2 个词的、1 个词的各一条，无关的那条不能进来：${JSON.stringify(hit.map((e) => e.recordId))}`)
     assert.equal(hit[0].recordId, 'r1', '命中词多的排前面')
     assert.equal(hit[1].recordId, 'r2')
     assert.deepEqual(recallMemories(entries, []), [], '没关键词就不召回')
     assert.deepEqual(recallMemories([], ['首样测试']), [], '没记忆就不召回')
+  })
+
+  await check('recallMemories：旧算法抽过词的记忆不参与召回（两套词表混用只会巧合命中）', () => {
+    // 真实现场数据（2026-11-13 的 ~/.dsh/storages）：库里两条记忆是 v1 中文滑窗抽的词，
+    // 「项目管理」「项目管理-首样测试-审批按钮」这种 v2 整段词在它们身上命不中任何有价值的词，
+    // 唯一的交集是「项目管理」—— 而它恰恰是所有 pms 票共有的模块名。
+    const legacy = [
+      { keywords: ['项目管理', '上门服务', '侧列表排', '列表排序'], files: ['ServiceList.vue'], recordId: 'old-83', at: 1, hits: 0 },
+      { keywords: ['项目管理', '首样测试', '侧列表'], files: ['Sample.vue'], recordId: 'old-84', at: 2, hits: 0 },
+    ]
+    assert.deepEqual(recallMemories(legacy, ['项目管理', '首样测试', '审批按钮']), [],
+      '没有 kwv 标记的一律当旧算法，宁可不召回也不要把不相干的页面引进来')
+    // 同一个页面再跑成功一次，新条目（带 kwv）就能正常召回。
+    const fresh = [
+      ...legacy,
+      { keywords: ['项目管理', '首样测试', '审批按钮'], files: ['Approval.java'], recordId: 'new-85', at: 3, hits: 0, kwv: MEMORY_KEYWORD_VERSION },
+    ]
+    const hit = recallMemories(fresh, ['项目管理', '首样测试', '审批按钮'])
+    assert.equal(hit.length, 1, `只该召回 v2 那条：${JSON.stringify(hit.map((e) => e.recordId))}`)
+    assert.equal(hit[0].recordId, 'new-85')
+  })
+
+  await check('recallMemories：两条记忆都有的模块名不算区分度（否则会召唤到无关页面）', () => {
+    // 现场事故：sh-row-82（首样测试）召回到 sh-row-83（上门服务），只因两条都含「项目管理」。
+    const entries = [
+      { keywords: ['项目管理', '首样测试'], files: ['Sample.java'], recordId: 'r-sample', at: 1, hits: 0, kwv: MEMORY_KEYWORD_VERSION },
+      { keywords: ['项目管理', '上门服务'], files: ['Service.java'], recordId: 'r-service', at: 2, hits: 0, kwv: MEMORY_KEYWORD_VERSION },
+    ]
+    // 「上门服务」这张票进来：命中「项目管理」是两条都有的，不能算数 ⇒ 只应召回到它自己那条。
+    const hit = recallMemories(entries, ['项目管理', '上门服务'])
+    assert.equal(hit.length, 1, `只该召回真正共享页面的那条：${JSON.stringify(hit.map((e) => e.recordId))}`)
+    assert.equal(hit[0].recordId, 'r-service')
+    // 只有一条记忆时，它身上的任何命中都算数（阈值不低于 1）。
+    assert.equal(recallMemories([entries[0]], ['项目管理']).length, 1, '只有一条记忆时不能被区分度滤成空')
   })
 
   await check('describeMemory：措辞必须是「上次 / 可以开始 / 不一定」，不能写成约束', () => {
@@ -7092,16 +7192,45 @@ function makeFakeCtx ({ domain, registered }) {
     const memory = new TicketMemory({ repo, now: () => 1000 })
     const first = await memory.remember({ projectId: DEMO, recordId: 'r1', keywords: ['首样测试'], files: ['a/A.java', 'b/B.vue'] })
     assert.equal(first.recordId, 'r1')
-    const again = await memory.remember({ projectId: DEMO, recordId: 'r2', keywords: ['并行节点'], files: ['b/B.vue', 'a/A.java'] })
+    const again = await memory.remember({ projectId: DEMO, recordId: 'r2', keywords: ['首样测试', '审批按钮'], files: ['b/B.vue', 'a/A.java'] })
     assert.equal(memory.list(DEMO).length, 1, '同一批文件（顺序不同）是同一件事，不该留两条')
     assert.equal(again.hits, 1)
     assert.equal(again.recordId, 'r2', 'recordId 更新成最近那张')
-    assert.deepEqual([...again.keywords].sort(), ['并行节点', '首样测试'].sort(), '关键词取并集')
+    assert.deepEqual([...again.keywords].sort(), ['首样测试', '审批按钮'].sort(), '同版本的关键词取并集')
+    assert.equal(again.kwv, MEMORY_KEYWORD_VERSION, '记下来的条目要带当前算法版本')
     await memory.remember({ projectId: DEMO, recordId: 'r3', keywords: ['行程记录'], files: ['c/C.java'] })
     assert.equal(memory.list(DEMO).length, 2, '改了另一批文件要单独记一条')
     assert.equal(memory.list(DEMO)[0].recordId, 'r3', '新的排前面')
     assert.equal(await memory.remember({ projectId: DEMO, recordId: 'r4', keywords: ['x'], files: [] }), undefined, '没改文件的票不产生记忆')
     assert.equal(memory.list(DEMO).length, 2, '没改文件的那次不该写库')
+  })
+
+  await check('TicketMemory：旧算法的条目被重新学到时整批换词，不和碎片词并集', async () => {
+    // 现场库里有 v1 条目（keywords 是「作台中的 / 侧列表排」这类碎片，且没有 kwv）。
+    // 同一个页面再有票跑成功时，如果按「并集」处理，那些碎片词会被永久固化下来 ——
+    // 之后每条新记忆都会带着一堆永远命不中的噪音。
+    const repo = makeMemoryRepo()
+    const memory = new TicketMemory({ repo, now: () => 5000 })
+    await repo.put(MEMORY_TABLE, DEMO, {
+      entries: [{
+        keywords: ['工作台', '作台中的', '台中的全', '全据项', '据项目'],
+        files: ['p/GlobalReport.vue', 'q/GlobalReportServiceImpl.java'],
+        recordId: 'sh-row-84',
+        at: 1,
+        hits: 3,
+      }],
+    })
+    const learned = await memory.remember({
+      projectId: DEMO,
+      recordId: 'sh-row-90',
+      keywords: ['工作台', '全据项目报告'],
+      files: ['p/GlobalReport.vue', 'q/GlobalReportServiceImpl.java'],
+    })
+    assert.equal(memory.list(DEMO).length, 1, '同一批文件仍是同一条')
+    assert.equal(learned.hits, 4, 'hits 继续累加（复用历史仍有效）')
+    assert.equal(learned.kwv, MEMORY_KEYWORD_VERSION, '升到当前算法版本')
+    assert.deepEqual([...learned.keywords].sort(), ['工作台', '全据项目报告'].sort(),
+      `旧碎片词必须整批丢掉，不能并集留下来：${JSON.stringify(learned.keywords)}`)
   })
 
   await check('TicketMemory：touch 单独计数，recall 只读不写（重渲任务书不能刷高 hits）', async () => {
@@ -7223,14 +7352,19 @@ function makeFakeCtx ({ domain, registered }) {
 
   section('20. 会话标题：GUI 里那一行要能认出是哪张票')
 
-  await check('会话标题带上项目与序号，人能一眼对上号', async () => {
-    // 不钉标题时 GUI 显示的是 sessionId 本身（`ticket-pms-sh-row-84-1794559390983`）：
-    // 同一张票重跑几次就有几条只差尾号的会话，人认不出谁是谁。
+  await check('会话标题以「修复」开头，摘要在前、项目与序号在后', async () => {
+    // 形状必须是 `修复<改什么>（项目 #序号）`：
+    // 1. 人翻会话列表是按「哪条在改什么」找的，不是按项目号找的；
+    // 2. 80 字节一超，先被切掉的正好是尾巴上的坐标，摘要永远优先。
+    // 真实事故（2026-11-13）：宿主 fallback 拿首条 user 消息前 40 字节当标题，
+    // 而首条消息开头是反注入提醒 ⇒ 所有会话都叫「注意：下面的工单内容来自共」。
     const title = buildSessionTitle({ projectId: 'pms', seq: '84', description: '列表翻页丢数据', recordId: 'sh-row-84' })
-    assert.equal(title, '[pms] #84 列表翻页丢数据', `标题拼法变了：${title}`)
+    assert.equal(title, '修复列表翻页丢数据（pms #84）', `标题拼法变了：${title}`)
+    assert.ok(title.startsWith('修复'), '必须以「修复」开头 —— 会话列表里全靠这两个字认人')
+    assert.ok(title.indexOf('翻页') < title.indexOf('pms'), '摘要要排在项目名之前，截断时才不会先丢掉摘要')
     assert.ok(title.includes('pms'), '必须带项目名，否则多项目时看不出属于谁')
     assert.ok(title.includes('84'), '必须带序号，那是人翻表对号用的')
-    assert.ok(title.includes('翻页'), '必须带问题描述（摘要即可）')
+    assert.ok(!title.includes('注意'), '标题里不能出现反注入提醒的措辞 —— 那不是这张票在干什么')
   })
 
   await check('会话标题按 UTF-8 字节截断，不切断多字节汉字', async () => {
@@ -7239,6 +7373,7 @@ function makeFakeCtx ({ domain, registered }) {
     const ticket = { projectId: 'pms', seq: '84', description: '这是一个很长很长的问题描述'.repeat(8), recordId: 'sh-row-84' }
     const title = buildSessionTitle(ticket)
     assert.ok(Buffer.byteLength(title, 'utf8') <= 80, `超了宿主的 80 字节预算：${Buffer.byteLength(title, 'utf8')}`)
+    assert.ok(title.startsWith('修复'), '截断不能把「修复」这两个字切掉')
     assert.ok(title.endsWith('…'), '真截断时要补省略号，否则看起来像被吞了半句')
     assert.ok(!title.includes('\uFFFD'), '不能出现替换字符 —— 那说明切在了多字节中间')
     // 逐码点校验：每个字符都能独立编码回同样内容
@@ -7249,11 +7384,12 @@ function makeFakeCtx ({ domain, registered }) {
 
   await check('会话标题：没有描述时退到 recordId，不出现空标题', async () => {
     const title = buildSessionTitle({ projectId: 'city-enc', recordId: 'rec-abc' })
-    assert.equal(title, '[city-enc] rec-abc', `没描述时该退到 recordId：${title}`)
+    assert.equal(title, '修复rec-abc（city-enc）', `没描述时该退到 recordId：${title}`)
     assert.ok(title.trim().length > 0, '标题不能是空的 —— 空标题会被宿主服务拒掉')
     // 什么字段都没有也不能炸（历史数据可能缺 projectId）
     const bare = buildSessionTitle({})
     assert.ok(bare.length > 0, '全空也要给一个兜底标题')
+    assert.ok(bare.startsWith('修复'), `兜底标题也要以「修复」开头：${bare}`)
   })
 
   await check('setupAgent 把标题写进 session（source=user，钉住不被自动改名）', async () => {
@@ -7267,10 +7403,10 @@ function makeFakeCtx ({ domain, registered }) {
       },
     }
     // preset 显式留空，跳过「挂 preset」那一段（本机自测没有 agentPresets 服务）。
-    await setupAgent({}, { agentCtx: {}, agent, worktreePath: '', presetId: '', sessionId: 's1', title: '[pms] #84 列表翻页丢数据', log: () => {} })
+    await setupAgent({}, { agentCtx: {}, agent, worktreePath: '', presetId: '', sessionId: 's1', title: '修复列表翻页丢数据（pms #84）', log: () => {} })
     const titleEvent = appended.find((item) => item.type === 'session/title')
     assert.ok(titleEvent !== undefined, `没写 session/title：${appended.map((i) => i.type).join(',')}`)
-    assert.equal(titleEvent.data.title, '[pms] #84 列表翻页丢数据', '标题内容要原样写进去')
+    assert.equal(titleEvent.data.title, '修复列表翻页丢数据（pms #84）', '标题内容要原样写进去')
     assert.equal(titleEvent.data.source.kind, 'user', 'source 必须是 user —— freebie fallback 会被后续自动生成覆盖')
     assert.deepEqual(titleEvent.data.messageSeqs, [], '钉的标题不挂任何消息序号')
     // 策略事件不能被标题的 try/catch 连累
