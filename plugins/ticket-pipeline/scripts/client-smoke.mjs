@@ -537,7 +537,27 @@ function makeHost () {
         config: async () => ({ ok: true, value: { config: {}, projects: 1 } }),
         projects: async () => {
           calls.projects += 1
-          return { ok: true, value: { count: 1, projects: [makeProjectRecord(0)] } }
+          // 保存过「新增项目」之后宿主那边就真有它了 —— 夹具必须跟着变，
+          // 否则「保存后按新下标补写链接」这条路上的卡片根本不存在，
+          // 回话也无处可落（断言会红得莫名其妙）。
+          // 按 mutate 里出现过的最大 `['projects','N']` 下标推真实条目数。
+          let maxIndex = 0
+          for (const call of calls.mutate) {
+            for (const op of call.ops) {
+              if (op.path.length === 2 && op.path[0] === 'projects') {
+                const n = Number(op.path[1])
+                if (Number.isFinite(n) && n > maxIndex) maxIndex = n
+              }
+            }
+          }
+          const list = []
+          for (let i = 0; i <= maxIndex; i += 1) {
+            const record = makeProjectRecord(i)
+            // 项目名必须唯一（`projectIssues` 会查重），所以第 2 个起换个名字。
+            if (i > 0) record.name = 'proj-' + (i + 1)
+            list.push(record)
+          }
+          return { ok: true, value: { count: list.length, projects: list } }
         },
         // 「粘贴工单表链接」：宿主解析并落盘。缺省成功，`calls.setProjectTable`
         // 记下每次的 (index, url) —— 断言要验的是「面板有没有把原样字符串发出去」，
@@ -1810,6 +1830,98 @@ async function main () {
       addOp !== undefined && addOp.value.match !== undefined && typeof addOp.value.match.platform === 'string',
       JSON.stringify(addOp && addOp.value && addOp.value.match))
     check('保存成功后「未保存」徽标消失', textOf(tree).indexOf('未保存') < 0, textOf(tree).slice(0, 240))
+  }
+
+  // ⑧ 新增项目在**保存之前**贴工单表链接。
+  //
+  // 这是用户报的「我新增加一个项目加不进去」：新卡片顶着「未保存」，可链接行
+  // 照样把 `index` 发给宿主，而宿主里那个下标根本不存在 —— 只会回一句
+  // `没有第 1 个项目（当前共 1 个）`，人看到红字就以为「加不进去」。
+  // 正确行为：链接先记在面板上（草稿），等保存把项目建出来之后再按新下标补写。
+  //
+  // 这里刻意**重新走一遍**「+ 添加项目」，不复用上面那张卡：上面已经保存过了，
+  // 拿它验不到「未保存状态」这条分支。
+  resetRender()
+  tree = await render(Panel, { view: 'page' })
+  const linkBefore = ctx.calls.setProjectTable.length
+  findButton(tree, '+ 添加项目').props.onClick()
+  tree = await render(Panel, { view: 'page' })
+  const pendingCards = findAll(tree, (node) => node.type === 'div' &&
+    /^tp-proj( tp-collapsed)?$/.test(String(node.props.className || '')))
+  const pendingCard = pendingCards[pendingCards.length - 1]
+  // 上面的用例已经保存过一个新增项目（mutate 里留了 ['projects','1']），
+  // 夹具按 mutate 推真实条目数 ⇒ 这里卡片数不是固定的 2。断言只钉「最后一张
+  // 就是刚加的那张、而且它还顶着「未保存」」，不钉绝对张数。
+  const expectedIndexOfNew = ctx.calls.mutate.reduce((max, call) => call.ops.reduce(
+    (inner, op) => (op.path.length === 2 && op.path[0] === 'projects'
+      ? Math.max(inner, Number(op.path[1]) + 1)
+      : inner), max), 0)
+  check('新加的项目卡片是最后一张', pendingCard !== undefined &&
+    textOf(pendingCard).indexOf('未保存') >= 0, String(pendingCards.length))
+  // 新卡片缺省平台是 mock（`blankProjectRecord`），链接行只在飞书项目上画 ——
+  // 先把它切成 feishu，模拟用户「加一个飞书项目」的真实顺序。
+  const pendingPlatformSelect = findAll(pendingCard, (node) => node.type === 'select' &&
+    Array.isArray(node.props.children) &&
+    node.props.children.some((option) => option.props && option.props.value === 'feishu'))[0]
+  check('新项目卡片能选平台', pendingPlatformSelect !== undefined)
+  if (pendingPlatformSelect !== undefined) {
+    pendingPlatformSelect.props.onChange({ target: { value: 'feishu' } })
+    tree = await render(Panel, { view: 'page' })
+    const cardsAfter = findAll(tree, (node) => node.type === 'div' &&
+      /^tp-proj( tp-collapsed)?$/.test(String(node.props.className || '')))
+    const pendingNow = cardsAfter[cardsAfter.length - 1]
+    const pendingLinkInput = findInput(pendingNow, (node) =>
+      typeof node.props.placeholder === 'string' &&
+      node.props.placeholder.indexOf('feishu.cn') >= 0)
+    check('新项目卡片上也有「工单表链接」输入框', pendingLinkInput !== undefined)
+    check('新项目卡片的按钮是「记下这条链接」而不是「用这条链接」',
+      findButton(pendingNow, '记下这条链接') !== undefined &&
+      findButton(pendingNow, '用这条链接') === undefined)
+    if (pendingLinkInput !== undefined) {
+      const pendingUrl = 'https://vcn6ijgss3oy.feishu.cn/wiki/LjZSwM0RJim5IykCGSlc2cVcnvh'
+      pendingLinkInput.props.onChange({ target: { value: pendingUrl } })
+      tree = await render(Panel, { view: 'page' })
+      const remember = findButton(tree, '记下这条链接')
+      check('贴了链接后「记下这条链接」可点',
+        remember !== undefined && remember.props.disabled !== true)
+      if (remember !== undefined) remember.props.onClick()
+      tree = await render(Panel, { view: 'page' })
+      check('未保存的项目贴链接**不发** setProjectTable（宿主里还没有它）',
+        ctx.calls.setProjectTable.length === linkBefore,
+        JSON.stringify(ctx.calls.setProjectTable.slice(linkBefore)))
+      check('未保存的项目贴链接会说明「保存时一起写进配置」',
+        textOf(tree).indexOf('时它会连同这个项目一起写进配置') >= 0, textOf(tree).slice(0, 400))
+      // 保存 → 先建项目（整对象 op），再按同一个下标补写链接。
+      // 找输入框必须**限定在最后一张卡片里**：pms 那张也有「仓库」组，
+      // 全树搜 `[0]` 会拿到 pms 的路径框（它有值，反而不满足 `value === ''`）。
+      const newestCard = findAll(tree, (node) => node.type === 'div' &&
+        /^tp-proj( tp-collapsed)?$/.test(String(node.props.className || ''))).pop()
+      const pendingRepoSection = newestCard === undefined
+        ? undefined
+        : findAll(newestCard, (node) => node.type === 'div' &&
+          typeof node.props.className === 'string' &&
+          node.props.className.indexOf('tp-group') >= 0 &&
+          textOf(node).indexOf('仓库仓库路径') >= 0)[0]
+      const pendingRepoInput = pendingRepoSection === undefined
+        ? undefined
+        : findInput(pendingRepoSection, (node) => node.type === 'input' && node.props.value === '')
+      check('找到新卡片的仓库路径输入框（保存前）', pendingRepoInput !== undefined)
+      if (pendingRepoInput !== undefined) {
+        pendingRepoInput.props.onChange({ target: { value: 'D:/WorkSpace/.repos/city-enc' } })
+        tree = await render(Panel, { view: 'page' })
+        const savePending = findButton(tree, '保存', 'tp-primary')
+        check('填完必填项后保存可点', savePending !== undefined && savePending.props.disabled !== true)
+        if (savePending !== undefined) savePending.props.onClick()
+        tree = await render(Panel, { view: 'page' })
+        const linkCalls = ctx.calls.setProjectTable.slice(linkBefore)
+        check('保存成功后把记下的链接补写一次（按下标、原样 URL）',
+          linkCalls.length === 1 && linkCalls[0].index === expectedIndexOfNew &&
+          linkCalls[0].url === pendingUrl,
+          JSON.stringify({ linkCalls, expectedIndexOfNew }))
+        check('补写成功后回话落在卡片里',
+          textOf(tree).indexOf('已记下这条多维表格的定位信息') >= 0, textOf(tree).slice(0, 400))
+      }
+    }
   }
 
   // ⑦ 飞书表格读取参数（ADR-0005）与「选择目录」。

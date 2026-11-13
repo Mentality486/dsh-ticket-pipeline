@@ -2911,7 +2911,15 @@ window.__ModuleLoader__.load({
      *   · 手填 token —— 别人只给了 token 时
      */
     function FeishuTableLinkRow (props) {
-      var [text, setText] = useState('')
+      // 新增但还没保存的项目：这一行**不写宿主**，只把链接记进草稿，随「保存」一起走。
+      // 以前这里没分岔 —— 卡片明明顶着「未保存」徽标、旁边的「测这张表」也知道
+      // 「宿主那边还没有它」，唯独这一行照样把 index 发给宿主，于是必然收到
+      // `没有第 1 个项目（当前共 1 个）`：宿主里只有 1 个项目，面板上这张是第 2 张。
+      var pending = props.pending === true
+      // 记进草稿的链接要能回显：保存失败重进页面时人得看见自己贴过什么，
+      // 否则会以为没记住、再贴一遍。
+      var [text, setText] = useState(
+        typeof props.initialText === 'string' ? props.initialText : '')
       var busy = props.busy === true
       var disabled = props.disabled === true || busy
       var canSubmit = !disabled && text.trim().length > 0
@@ -2923,8 +2931,11 @@ window.__ModuleLoader__.load({
         // 所以说明要写清「你不用先分辨表型，插件自己认」—— 这正是以前三个入口
         // 并存时最大的困惑（填了两处，不知道哪处生效）。
         h('p', { className: 'tp-help' },
-          '把工单表的浏览器地址整条贴进来，**不用管它是多维表格还是电子表格** —— 插件自己认表型并取出工单。'
-          + '多维表格 /base/…?table=…、电子表格 /sheets/…、知识库 /wiki/… 都行；也可以只贴 token。'),
+          pending
+            ? '这个项目还没保存 —— 先把链接贴进来，点「记下这条链接」存在面板上；'
+              + '点顶部「保存」时它会连同项目本身一起写进配置（顺序是：先建项目，再由宿主解析这条链接）。'
+            : '把工单表的浏览器地址整条贴进来，**不用管它是多维表格还是电子表格** —— 插件自己认表型并取出工单。'
+              + '多维表格 /base/…?table=…、电子表格 /sheets/…、知识库 /wiki/… 都行；也可以只贴 token。'),
         h('div', { className: 'tp-link-input' },
           h('input', {
             className: 'tp-input',
@@ -2942,13 +2953,18 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'tp-btn tp-sm',
             disabled: !canSubmit,
-            title: '交给宿主解析并写进配置（浏览器不接触明文 token）',
+            title: pending
+              ? '先记在面板上，保存时连同项目一起写进配置'
+              : '交给宿主解析并写进配置（浏览器不接触明文 token）',
             onClick: function () { props.onPasteLink(props.index, text.trim()) },
-          }, busy ? '写入中…' : '用这条链接')),
+          }, busy ? '写入中…' : (pending ? '记下这条链接' : '用这条链接'))),
         h('p', { className: 'tp-help' },
-          '写入时宿主会**把另一套定位字段清掉**（多维表格与电子表格的 token 不会同时留着），所以这里只有一个框。'
-          + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'
-          + '实在没有链接：可以在高级设置里填「表名匹配」让插件按文件名找表。'),
+          pending
+            ? '面板不会解析这条链接（解析出 token 等于让明文进浏览器）—— 只有宿主进程才知道怎么拆它。'
+              + '所以这里只负责「记住」，真正的绑定是保存之后由宿主做的。'
+            : '写入时宿主会**把另一套定位字段清掉**（多维表格与电子表格的 token 不会同时留着），所以这里只有一个框。'
+              + '面板永远不会显示完整 token —— 宿主只回「已配置（前 4 位…后 4 位）」。'
+              + '实在没有链接：可以在高级设置里填「表名匹配」让插件按文件名找表。'),
         // 「测这张表」：配完当场验一次，不用为了「这张表通不通」跑一遍全量体检。
         // 位置就在这里（链接行内部、紧贴写入按钮）：人的动作顺序是
         // 「贴链接 → 保存 → 想确认对不对」，测试按钮必须在那条路的尽头。
@@ -3226,6 +3242,11 @@ window.__ModuleLoader__.load({
           busy: props.linkBusy === true,
           message: props.linkMessage || '',
           error: props.linkError || '',
+          // 新增但还没保存的项目：这一行只把链接记进草稿（`pending`），
+          // 因为它发给宿主的 `index` 在宿主里根本不存在 —— 宿主只会回
+          // 「没有第 N 个项目（当前共 M 个）」。真正的绑定发生在保存成功之后。
+          pending: pending,
+          initialText: props.linkDraft || '',
           onPasteLink: props.onPasteLink,
           // 「测这张表」（工单 #43）：配完马上验一下这张表能不能读。
           // 只对**已保存**的项目给：面板里刚加、还没保存的项目宿主那边没有，
@@ -3329,6 +3350,9 @@ window.__ModuleLoader__.load({
             linkBusy: props.linkBusy === index,
             linkMessage: props.linkMessage && props.linkMessage.index === index ? props.linkMessage.text : '',
             linkError: props.linkError && props.linkError.index === index ? props.linkError.text : '',
+            // 新增项目在保存前贴的链接只存在面板上（宿主里还没有这个项目），
+            // 所以要按下标把它回传给那张卡片，否则人重进页面就看不见自己贴过什么。
+            linkDraft: props.linkDraft && props.linkDraft.index === index ? props.linkDraft.text : '',
             // 「测这张表」（工单 #43）：答案同样按下标分发 —— 测的是哪一张卡片，
             // 结论就只出现在哪一张卡片里。
             testBusy: props.testBusy === index,
@@ -3456,6 +3480,11 @@ window.__ModuleLoader__.load({
       var [linkBusy, setLinkBusy] = useState(-1)
       var [linkMessage, setLinkMessage] = useState(null)
       var [linkError, setLinkError] = useState(null)
+      // 新增但还没保存的项目，在面板上贴的工单表链接先存这里（`{index, text}`）。
+      // 为什么不能立刻写宿主：那个项目在宿主配置里还不存在，`setProjectTable(index)`
+      // 会直接回「没有第 N 个项目（当前共 M 个）」；而 `setProjectTable` 只认下标、
+      // 不认「刚建好的那一张」，所以只能等保存成功、拿到真清单之后按新下标补写。
+      var [linkDraft, setLinkDraft] = useState(null)
 
       // 「测这张表」（工单 #43）的进行中状态与回话，同样按项目下标存。
       // `probeResult[index]` 是 `{ ok, text }`：ok 决定那句话是绿还是红。
@@ -3895,6 +3924,8 @@ window.__ModuleLoader__.load({
         setProjDraft(Object.assign({}, projInitial))
         // 「放弃改动」连「还没保存的新增」一起放弃：否则点完像是什么都没发生。
         setProjPending([])
+        // 新增项目上贴的链接也是草稿的一部分 —— 项目都放弃了，链接不该留着。
+        setLinkDraft(null)
         setServerIssues({})
         setSaveMessage('')
         setSaveError('')
@@ -3980,6 +4011,17 @@ window.__ModuleLoader__.load({
        * （网关的 `invokePrepared` 直接 rethrow 业务异常），message 就是我们要显示的那句。
        */
       function onPasteLink (index, url) {
+        // 新增项目（还没保存）：宿主里没有它，写不下去 —— 只记在面板上，
+        // 等 `onSave` 把项目建出来之后再按新下标补写这条链接。
+        if (index >= projList.length) {
+          setLinkDraft({ index: index, text: url })
+          setLinkError(null)
+          setLinkMessage({
+            index: index,
+            text: '已记下这条链接 —— 点顶部「保存」时它会连同这个项目一起写进配置。',
+          })
+          return
+        }
         var ns = getNamespace('ticketPipeline')
         if (!ns || typeof ns.setProjectTable !== 'function') {
           setLinkError({ index: index, text: '宿主 Remote 没挂上「粘贴链接」通道（typert 缺席或插件版本旧）。可以手动填 app_token，或刷新页面重试。' })
@@ -4258,7 +4300,48 @@ window.__ModuleLoader__.load({
           // 新增的项目已经落进宿主，本地那份「待保存」清单必须清掉，
           // 否则 `loadProjects()` 回来的真项目会和它们叠成两份卡片。
           setProjPending([])
-          return loadSettings().then(function () { return loadProjects() })
+          return loadSettings().then(function () { return loadProjects() }).then(function () {
+            // 新增项目在保存前贴的链接，现在才能补写：宿主那边刚有这个项目。
+            // 下标不用重算 —— `linkDraft.index` 就是它在渲染清单里的位置，
+            // 而新增项目一律追加在末尾、顺序不变，所以保存前后是同一个下标。
+            var draftLink = linkDraft
+            if (!draftLink || typeof draftLink.text !== 'string' || draftLink.text.length === 0) return
+            setLinkDraft(null)
+            var linkNs = getNamespace('ticketPipeline')
+            if (!linkNs || typeof linkNs.setProjectTable !== 'function') {
+              setLinkError({
+                index: draftLink.index,
+                text: '项目保存好了，但没人能写这条链接：宿主 Remote 没挂上「粘贴链接」通道。请手动改配置文件，或刷新页面重试。',
+              })
+              return
+            }
+            setLinkBusy(draftLink.index)
+            return Promise.resolve().then(function () {
+              return linkNs.setProjectTable(draftLink.index, draftLink.text)
+            }).then(function (response) {
+              setLinkBusy(-1)
+              if (!response || !response.ok) {
+                var message = response && response.error && response.error.message
+                  ? response.error.message
+                  : '未知错误'
+                // 项目本身已经建好了 —— 这句必须说清，否则人会以为整个保存失败、又点一遍保存。
+                setLinkError({
+                  index: draftLink.index,
+                  text: '项目保存好了，但链接没写进去：' + message,
+                })
+                return
+              }
+              var value = response.value || {}
+              setLinkMessage({ index: draftLink.index, text: value.note || '项目与工单表链接都已保存。' })
+              return loadProjects()
+            }, function (error) {
+              setLinkBusy(-1)
+              setLinkError({
+                index: draftLink.index,
+                text: '项目保存好了，但链接没写进去：' + (error && error.message ? error.message : String(error)),
+              })
+            })
+          })
         }, function (error) {
           setSaving(false)
           setSaveError('保存失败：' + (error && error.message ? error.message : String(error)))
@@ -4359,6 +4442,15 @@ window.__ModuleLoader__.load({
           setProjError('')
           setSaveMessage('')
           setSaveError('')
+          // 撤掉的这张可能刚贴过链接 —— 链接草稿跟着一起作废，否则保存时会
+          // 拿着一个已经不存在的新项目下标去 `setProjectTable`。
+          // 撤的是更靠前的那张时要顺移：它后面 pending 卡片的下标都前移了一位。
+          setLinkDraft(function (previous) {
+            if (!previous) return previous
+            if (previous.index === index) return null
+            if (previous.index > index) return { index: previous.index - 1, text: previous.text }
+            return previous
+          })
           return
         }
         var ns = getNamespace('settings')
@@ -4775,6 +4867,9 @@ window.__ModuleLoader__.load({
             linkBusy: linkBusy,
             linkMessage: linkMessage,
             linkError: linkError,
+            // 新增项目在保存前贴的链接只活在面板上（见 onPasteLink），
+            // 按下标回传给那张卡片做回显。
+            linkDraft: linkDraft,
             testBusy: testBusy,
             probeResult: probeResult,
             onTest: onTestProject,
