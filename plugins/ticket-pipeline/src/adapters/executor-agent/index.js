@@ -75,6 +75,15 @@ import { countExploration, describeExploration, EXPLORE_BUDGET } from './explore
 const SESSION_PREFIX = 'ticket'
 
 /**
+ * 会话标题的字节预算。
+ *
+ * 对齐宿主 `dsh-base/cordis.patch.yml` 里 `session-title` 服务的
+ * `maxTitleBytes: 80` —— 超过会被服务按 UTF-8 码点截断（那是对的），
+ * 但我们宁可自己先截并补省略号，也不要让它先截成半句话。
+ */
+const SESSION_TITLE_MAX_BYTES = 80
+
+/**
  * 没配 `agentPreset` 时挂哪个 preset。
  *
  * 取 `ptc` 是因为它是本仓 profile 的 `agent-preset-registry.selectedDefault`
@@ -643,6 +652,9 @@ export function createAgentExecutor (options = {}) {
               presetId: config.agentPreset,
               signal,
               sessionId,
+              // GUI 会话列表里显示的那一行。不传就只有 sessionId 那串
+              // `ticket-pms-sh-row-84-1794559390983`，同一张票重跑几次认不出谁是谁。
+              title: buildSessionTitle(ticket),
               log,
             })
           },
@@ -1596,6 +1608,7 @@ export { createExploreNudgeMessage }
  *   presetId?: string,
  *   signal?: AbortSignal,
  *   sessionId: string,
+ *   title?: string,
  *   log: (msg: string, detail?: unknown) => void,
  * }} input
  * @returns {Promise<void>}
@@ -1645,6 +1658,35 @@ export async function setupAgent (options, input) {
   // ── 2. 会话策略：沙箱模式 + 审批策略 ─────────────────
   // 这两个是「本会话」的策略，写进 session 事件，宿主按它解析每次受限调用。
   const session = agent?.session
+
+  // ── 2a. 会话标题（可读名）─────────────────────────────
+  //
+  // 不钉的话，GUI 里这一轮会话显示的就是 sessionId 本身
+  // （`ticket-pms-sh-row-84-1794559390983`）—— 同一张票重跑几次就多出几条
+  // 只差尾号、长得一模一样的会话，人根本认不出哪条是哪张票。
+  //
+  // 用 `session/title` + `source:{kind:'user'}` 而不是指望宿主的自动生成：
+  // 自动生成（`dsh-session-title` + first-prompt provider）的条件是
+  // 「session 没被 seed、首条消息来自 user、且当前没有标题」—— 定时跑票这条链路上
+  // 这几条随时可能不成立，测出来就是「有时候有名字、有时候没有」。
+  // 显式钉成 user 标题还会**胜过后面的自动生成**（服务里 `source.kind === 'user'`
+  // 时不再自动改名），正是我们要的稳定性。
+  //
+  // 单独一个 try/catch：标题纯属给人看的，改不动不能连累下面那两条策略事件
+  // —— 策略没写上，agent 才会真的改不动 worktree。
+  const title = typeof input.title === 'string' ? input.title.trim() : ''
+  if (session && typeof session.append === 'function' && title.length > 0) {
+    try {
+      session.append('session/title', { title, messageSeqs: [], source: { kind: 'user' } })
+      log('executor-agent：会话标题已钉', { sessionId, title })
+    } catch (error) {
+      log('executor-agent：写会话标题失败（不影响跑票，只是 GUI 里显示的还是 id）', {
+        sessionId,
+        reason: String(error?.message ?? error),
+      })
+    }
+  }
+
   if (session && typeof session.append === 'function') {
     try {
       session.append('sandbox/mode', { mode: 'danger-full-access' })
@@ -2548,6 +2590,47 @@ export function buildMrTitle (ticket) {
   const description = String(ticket?.description ?? '').trim().replace(/\s+/g, ' ')
   const short = description.length > 60 ? `${description.slice(0, 60)}…` : description
   return `[${ticket?.projectId ?? '未知项目'}] ${seq}${short || ticket?.recordId || '修复工单'}`
+}
+
+/**
+ * 会话标题（GUI 会话列表里显示的那一行）。
+ *
+ * 和 `buildMrTitle` 同一套拼法，但多两道处理：
+ *
+ * 1. **按字节截断，不按字符**。宿主的 `session-title` 服务用
+ *    `maxTitleBytes: 80` 归一化标题，而中文一个字 3 字节、英文 1 字节 ——
+ *    按字符数截会时中时英时超限。这里逐码点累加字节，绝不在多字节中间断。
+ * 2. **末尾补 `…`** 只在真截断时补，否则「短标题也挂个省略号」看着像没写完。
+ *
+ * 为什么不用 `buildMrTitle` 直接当标题：MR 标题有 60 字描述预算（列表里够长），
+ * 会话标题只有 80 字节预算 —— 一个中文项目名就用掉 9 字节，必须自己收。
+ *
+ * @param {import('../../contracts/types.js').Ticket} ticket
+ * @param {number} [maxBytes] 缺省 80（对齐宿主 `dsh-base` 的 `maxTitleBytes`）
+ * @returns {string}
+ */
+export function buildSessionTitle (ticket, maxBytes = SESSION_TITLE_MAX_BYTES) {
+  const projectId = String(ticket?.projectId ?? '').trim() || '未知项目'
+  const seq = typeof ticket?.seq === 'string' && ticket.seq.trim().length > 0 ? `#${ticket.seq.trim()} ` : ''
+  const description = String(ticket?.description ?? '').trim().replace(/\s+/g, ' ')
+  const recordId = String(ticket?.recordId ?? '').trim()
+  // 描述为空时退到 recordId：至少让这一行能被人对上号。
+  const body = description.length > 0 ? description : recordId
+  const head = `[${projectId}] ${seq}`
+  const text = `${head}${body || '修复工单'}`
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  // 截断时给 `…` 留 3 字节，剩下的逐码点填。
+  const ellipsis = '…'
+  const budget = Math.max(1, maxBytes - Buffer.byteLength(ellipsis, 'utf8'))
+  let used = 0
+  let out = ''
+  for (const character of text) {
+    const size = Buffer.byteLength(character, 'utf8')
+    if (used + size > budget) break
+    out += character
+    used += size
+  }
+  return `${out.trimEnd()}${ellipsis}`
 }
 
 /**

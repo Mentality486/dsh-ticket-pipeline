@@ -45,7 +45,7 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
-import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage } from '../src/adapters/executor-agent/index.js'
+import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, buildSessionTitle, setupAgent } from '../src/adapters/executor-agent/index.js'
 import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { renderTicketPrompt } from '../src/core/prompt.js'
@@ -7219,6 +7219,88 @@ function makeFakeCtx ({ domain, registered }) {
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'done', '票该是 done')
     assert.equal(push.messages.length, 1, '该发的通知还是要发')
+  })
+
+  section('20. 会话标题：GUI 里那一行要能认出是哪张票')
+
+  await check('会话标题带上项目与序号，人能一眼对上号', async () => {
+    // 不钉标题时 GUI 显示的是 sessionId 本身（`ticket-pms-sh-row-84-1794559390983`）：
+    // 同一张票重跑几次就有几条只差尾号的会话，人认不出谁是谁。
+    const title = buildSessionTitle({ projectId: 'pms', seq: '84', description: '列表翻页丢数据', recordId: 'sh-row-84' })
+    assert.equal(title, '[pms] #84 列表翻页丢数据', `标题拼法变了：${title}`)
+    assert.ok(title.includes('pms'), '必须带项目名，否则多项目时看不出属于谁')
+    assert.ok(title.includes('84'), '必须带序号，那是人翻表对号用的')
+    assert.ok(title.includes('翻页'), '必须带问题描述（摘要即可）')
+  })
+
+  await check('会话标题按 UTF-8 字节截断，不切断多字节汉字', async () => {
+    // 宿主 session-title 服务按 maxTitleBytes: 80 归一化。中文一个字 3 字节 ——
+    // 按字符数截必然超限，按字节切又可能在汉字中间断。这里逐码点累加。
+    const ticket = { projectId: 'pms', seq: '84', description: '这是一个很长很长的问题描述'.repeat(8), recordId: 'sh-row-84' }
+    const title = buildSessionTitle(ticket)
+    assert.ok(Buffer.byteLength(title, 'utf8') <= 80, `超了宿主的 80 字节预算：${Buffer.byteLength(title, 'utf8')}`)
+    assert.ok(title.endsWith('…'), '真截断时要补省略号，否则看起来像被吞了半句')
+    assert.ok(!title.includes('\uFFFD'), '不能出现替换字符 —— 那说明切在了多字节中间')
+    // 逐码点校验：每个字符都能独立编码回同样内容
+    for (const character of title) {
+      assert.equal(Buffer.from(character, 'utf8').toString('utf8'), character, `有字符被切坏了：${character}`)
+    }
+  })
+
+  await check('会话标题：没有描述时退到 recordId，不出现空标题', async () => {
+    const title = buildSessionTitle({ projectId: 'city-enc', recordId: 'rec-abc' })
+    assert.equal(title, '[city-enc] rec-abc', `没描述时该退到 recordId：${title}`)
+    assert.ok(title.trim().length > 0, '标题不能是空的 —— 空标题会被宿主服务拒掉')
+    // 什么字段都没有也不能炸（历史数据可能缺 projectId）
+    const bare = buildSessionTitle({})
+    assert.ok(bare.length > 0, '全空也要给一个兜底标题')
+  })
+
+  await check('setupAgent 把标题写进 session（source=user，钉住不被自动改名）', async () => {
+    // 为什么必须是 source.kind === 'user'：宿主的自动标题只在
+    // 「session 没被 seed、首条消息来自 user、当前没有标题」时才跑，
+    // 而且 user 标题会胜过后面的自动生成 —— 这才是「每次都一样」的那条路。
+    const appended = []
+    const agent = {
+      session: {
+        append (type, data) { appended.push({ type, data }) },
+      },
+    }
+    // preset 显式留空，跳过「挂 preset」那一段（本机自测没有 agentPresets 服务）。
+    await setupAgent({}, { agentCtx: {}, agent, worktreePath: '', presetId: '', sessionId: 's1', title: '[pms] #84 列表翻页丢数据', log: () => {} })
+    const titleEvent = appended.find((item) => item.type === 'session/title')
+    assert.ok(titleEvent !== undefined, `没写 session/title：${appended.map((i) => i.type).join(',')}`)
+    assert.equal(titleEvent.data.title, '[pms] #84 列表翻页丢数据', '标题内容要原样写进去')
+    assert.equal(titleEvent.data.source.kind, 'user', 'source 必须是 user —— freebie fallback 会被后续自动生成覆盖')
+    assert.deepEqual(titleEvent.data.messageSeqs, [], '钉的标题不挂任何消息序号')
+    // 策略事件不能被标题的 try/catch 连累
+    assert.ok(appended.some((i) => i.type === 'sandbox/mode'), '沙箱模式那一条还得写上')
+    assert.ok(appended.some((i) => i.type === 'approval/policy'), '审批策略那一条还得写上')
+  })
+
+  await check('会话标题写失败也不能连累跑票（只是 GUI 里显示 id）', async () => {
+    const appended = []
+    const agent = {
+      session: {
+        append (type, data) {
+          // 只有 session/title 这一条炸，其它照常
+          if (type === 'session/title') throw new Error('fake: 事件类型不认识')
+          appended.push({ type, data })
+        },
+      },
+    }
+    const logs = []
+    await setupAgent({}, {
+      agentCtx: {},
+      agent,
+      worktreePath: '',
+      presetId: '',
+      sessionId: 's2',
+      title: '[pms] #84 x',
+      log: (msg) => logs.push(msg),
+    })
+    assert.ok(logs.some((line) => line.includes('写会话标题失败')), '要把失败记进日志，否则「为什么没名字」查不到')
+    assert.ok(appended.some((i) => i.type === 'sandbox/mode'), '标题失败不能让沙箱模式也丢掉')
   })
 
   // ── 收尾 ────────────────────────────────────────────────
