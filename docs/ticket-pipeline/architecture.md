@@ -1323,6 +1323,31 @@ export const PUSHES    = { mock: createMockPush, pushplus: createPushplusPush, q
   报出「宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）」这句冤枉话。
   判定改成「它到底像不像一个 namespace」（`target && typeof target.projects === 'function'`）。
   `loadRun` 早先已用「只认布尔」防住同一类问题，这里补上同类修法。
+- **同一件事的第三次，这次补上了守卫（2026-11-16）**：前面两次（`reset`/`scan` 少传实参、
+  `loadProjects` 把事件当 namespace）都只靠「记住这个坑」，而记性不是机制 ——
+  三次事故说明「面板 ↔ Remote / DOM 的边界」是这类插件的**结构性塌方点**，得用静态断言兜。
+  这次在 `client-check.mjs` 里加了 `checkEventArgConfusion()`，判据刻意不维护任何名单：
+
+  1. 扫出组件函数（`function Xxx (props) {…}`）内部**把 `props.Y` 直接挂在 DOM 事件属性上**
+     的地方（`onClick: props.onReload` 这种）—— DOM 会把事件对象当第一个实参递进去；
+  2. 再看外层 `h(Xxx, { onReload: 裸标识符 })` 里那个裸标识符是不是**声明了形参**的本地函数。
+
+  两条同时成立即 fail，并给出「第一个实参会是 React 的事件对象，不是 <形参名>」。
+  写成 `onReload: function () { loadProjects() }` 就不命中 —— 这正是修复形态，不该被误报；
+  所以守卫同时也在**指导**写法：能透传的地方包一层，把「谁传什么」在调用点说清。
+
+  实跑抓到 2 处（`<RunCard> onRefresh: loadRun`、`<ProjectListCard> onReload: loadProjects`），
+  两个调用点都已改成包一层。函数内部那个「像不像 namespace」「只认布尔」的判断**保留**
+  —— 它是兜底，不是入口；但入口不该依赖兜底。
+
+  实现上复用 `stripComments()` 与新的 `findMatchingBrace()`（都要单独认正则字面量，
+  理由同 `checkCallArities`：体内带引号的正则会把「数花括号」的状态机带歪）。
+  **这条守卫也做了回归测试**：把 `onReload` 改回裸传 + 把内部判定退回 `target !== undefined`，
+  `client-check` exit 1 并精确指向 `lib/client.js:4917`；恢复后 exit 0。
+  `client-smoke.mjs` 另有一条运行时断言：真的拿一个事件对象（`{ target: {}, nativeEvent: {} }`）
+  去点「重新读取」，断言不出现那句「宿主还没提供 projects()」且 `projects()` 被再调一次。
+  静态 + 动态两条一起守，因为静态那条只能认「裸传」这一种写法，
+  写成 `onClick: function (e) { loadProjects(e) }` 照样能把事件递进去。
 - **「删除记录」（2026-11-11 补）**：票据只增不删，跑久了运行页签里全是早验收完的票却清不掉，
   用户原话「也删除不了」。新增 `store.forgetTicket(key)` + 工具 `pipeline_forget` +
   Remote `forget(recordId, projectId?)` + 面板按钮。

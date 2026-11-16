@@ -1537,6 +1537,26 @@ async function main () {
       textOf(tree).indexOf('只读：连一次飞书') >= 0 || testButton.props.title.indexOf('只读') >= 0)
   }
   check('调用了 ticketPipeline.projects', ctx.calls.projects >= 1, String(ctx.calls.projects))
+  // 「重新读取」按钮的 onClick 会被 React 递进一个事件对象。`loadProjects` 的首参
+  // 本来是「刚拿到的 namespace」，上一版直接裸传，于是点一下按钮就把事件对象当
+  // namespace，报出「宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）」
+  // 这句冤枉话 —— 宿主明明好好的。这里显式传一个事件对象去点它。
+  {
+    const before = ctx.calls.projects
+    const reload = findButton(tree, '重新读取')
+    check('项目清单有「重新读取」按钮', reload !== undefined)
+    if (reload !== undefined) {
+      reload.props.onClick({ target: {}, nativeEvent: {}, type: 'click' })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      tree = await render(Panel, { view: 'page' })
+      check('点「重新读取」（带事件对象）不会报「宿主还没提供 projects()」',
+        textOf(tree).indexOf('宿主还没提供 ticketPipeline.projects()') < 0,
+        textOf(tree).slice(0, 200))
+      check('点「重新读取」真的又读了一遍', ctx.calls.projects === before + 1,
+        String(before) + ' -> ' + String(ctx.calls.projects))
+      check('点「重新读取」后项目卡片还在', textOf(tree).indexOf('pms') >= 0)
+    }
+  }
   // projects 是结构化数组，必须由 ProjectListCard 画成卡片 —— 要是漏成普通字段，
   // draftValueOf 会把对象数组 join 成 '[object Object], [object Object]'。
   check('项目清单没有被渲染成字符串',

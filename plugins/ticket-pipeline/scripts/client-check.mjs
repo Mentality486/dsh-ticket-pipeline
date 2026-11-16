@@ -376,6 +376,149 @@ function checkCallArities (rawSource, descriptors) {
 }
 
 /**
+ * 从 `openIndex` 处的 `{` 找到配平的 `}`，返回它的下标（找不到回 -1）。
+ *
+ * 不能直接数 `{`/`}`：字符串、模板串、正则字面量里都可能出现花括号
+ * （这个 bundle 里就有 `/projects["'\]\s]*(is not|is)/i` 这种）。
+ * 正则判定沿用 `stripComments()` 里那套「前一位有效字符」启发式。
+ */
+function findMatchingBrace (source, openIndex) {
+  let depth = 0
+  let inString = false
+  let inRegex = false
+  let inClass = false
+  let quote = ''
+  let escaped = false
+  for (let i = openIndex; i < source.length; i += 1) {
+    const ch = source[i]
+    if (inRegex) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '[') inClass = true
+      else if (ch === ']') inClass = false
+      else if (ch === '/' && !inClass) inRegex = false
+      else if (ch === '\n') inRegex = false
+      continue
+    }
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) inString = false
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = true; quote = ch; continue }
+    if (ch === '/' && source[i + 1] === '/') { while (i < source.length && source[i] !== '\n') i += 1; continue }
+    if (ch === '/' && source[i + 1] === '*') {
+      i += 2
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i += 1
+      i += 1
+      continue
+    }
+    if (ch === '/') {
+      let j = i - 1
+      while (j >= 0 && (source[j] === ' ' || source[j] === '\t' || source[j] === '\n' || source[j] === '\r')) j -= 1
+      const prev = j >= 0 ? source[j] : ''
+      if (prev !== '' && !/[\w$)\]]/.test(prev)) { inRegex = true; inClass = false; escaped = false }
+      continue
+    }
+    if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+/**
+ * 静态核对「**裸函数名透传给 DOM 事件属性**」这一种塌方。
+ *
+ * 2026-11-13 的第三次同类事故比前两次隐蔽：`loadProjects(target)` 的首参是
+ * 「刚拿到的 namespace」，但它同时被当 `onClick` 传给「重新读取」按钮。
+ * React 会把 click 事件对象当第一个实参递进去，于是 `target` 是个事件、
+ * `typeof ns.projects !== 'function'` 成立，界面上报的是
+ * 「宿主还没提供 ticketPipeline.projects()（Remote 版本比面板旧）」——
+ * 一句和真因毫无关系的话，人只会去怀疑宿主版本。
+ *
+ * `checkCallArities()` 抓不到这种：它只数 `ns.method(...)` 的实参个数。
+ * 这里换一条判据：**组件内部把 `props.X` 直接挂在 onClick/onChange 上
+ * （DOM 会递事件），而外层又把这个 prop 赋成一个声明了形参的裸函数名** ——
+ * 两者同时成立就是同一种病，跟参数名叫什么无关，所以不需要维护名单。
+ *
+ * 判据刻意只看「裸标识符」：写成 `onReload: function () { loadProjects() }`
+ * 就没事（事件对象进不来），这正是修复的形态，不该被误报。
+ */
+function checkEventArgConfusion (rawSource) {
+  const source = stripComments(rawSource)
+
+  // ① 组件内部：哪些 prop 被直接挂在 DOM 事件属性上。
+  //    只认大写开头（React 组件约定），`h('button', { onClick: props.onX })`
+  //    这种小写标签没有 props 可言，不会命中。
+  const domProps = new Map()
+  const compPattern = /\bfunction\s+([A-Z][\w$]*)\s*\([^)]*\)\s*\{/g
+  for (let match = compPattern.exec(source); match !== null; match = compPattern.exec(source)) {
+    const name = match[1]
+    const open = source.indexOf('{', match.index + match[0].length - 1)
+    const close = findMatchingBrace(source, open)
+    if (close < 0) continue
+    const body = source.slice(open, close + 1)
+    const handlerPattern = /\bon(?:Click|Change|Submit|Input|Blur|Focus|KeyDown|KeyUp|KeyPress)\s*:\s*props\.([A-Za-z_$][\w$]*)/g
+    const props = new Set()
+    for (let hit = handlerPattern.exec(body); hit !== null; hit = handlerPattern.exec(body)) props.add(hit[1])
+    if (props.size > 0) domProps.set(name, props)
+  }
+
+  // ② 本地声明的函数：名字 → 形参表。
+  const declared = new Map()
+  const declarePatterns = [
+    /\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*useCallback\(\s*(?:async\s+)?function\s*\(([^)]*)\)/g,
+    /\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function\s*\(([^)]*)\)/g,
+    /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/g,
+  ]
+  for (const pattern of declarePatterns) {
+    for (let match = pattern.exec(source); match !== null; match = pattern.exec(source)) {
+      if (declared.has(match[1])) continue
+      declared.set(match[1], match[2].split(',').map((one) => one.trim()).filter((one) => one.length > 0))
+    }
+  }
+
+  // ③ 实例化处：`h(Component, { prop: 裸函数名 })`。
+  let siteCount = 0
+  let badCount = 0
+  const instPattern = /\bh\(\s*([A-Z][\w$]*)\s*,\s*\{/g
+  for (let match = instPattern.exec(source); match !== null; match = instPattern.exec(source)) {
+    const component = match[1]
+    const handlers = domProps.get(component)
+    if (handlers === undefined) continue
+    const open = source.indexOf('{', match.index + match[0].length - 1)
+    const close = findMatchingBrace(source, open)
+    if (close < 0) continue
+    const propsText = source.slice(open, close + 1)
+    for (const handler of handlers) {
+      const re = new RegExp('\\b' + handler + '\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]', 'g')
+      const hit = re.exec(propsText)
+      if (hit === null) continue
+      siteCount += 1
+      const callee = hit[1]
+      const args = declared.get(callee)
+      if (args === undefined || args.length === 0) continue
+      badCount += 1
+      const line = source.slice(0, match.index).split('\n').length
+      fail(
+        'lib/client.js:' + String(line) + ' 把 `' + callee + '(' + args.join(', ') + ')` 裸传给了 <' +
+        component + '> 的 `' + handler + '`，而 <' + component + '> 把它直接挂在 DOM 事件上 —— ' +
+        '第一个实参会是 React 的事件对象，不是 ' + args[0] + '。' +
+        ' 要透传就在外面包一层：`' + handler + ': function () { ' + callee + '() }`，' +
+        ' 或者让 ' + callee + ' 自己按类型判断首参（`typeof 首参 === "boolean"` 这种）。',
+      )
+    }
+  }
+  if (siteCount > 0) {
+    notes.push('DOM 事件属性透传 ' + String(siteCount) + ' 处，其中裸函数名 ' + String(badCount) + ' 处（会收到事件对象）')
+  }
+}
+
+/**
  * 把描述符剥成只含「跨端必须一致」的字段。
  *
  * 函数不能比相等，所以 codec 只比「有没有 create」这个布尔位 —— 但这一位恰恰是
@@ -910,6 +1053,9 @@ async function main () {
     const bundle = await readFile(join(root, 'lib/client.js'), 'utf8')
     checkCallArities(bundle, host.raw)
   }
+
+  // 这条不依赖描述符，也不依赖宿主：面板自己的 DOM 事件接线。
+  checkEventArgConfusion(await readFile(join(root, 'lib/client.js'), 'utf8'))
 
   for (const note of notes) console.log('· ' + note)
   if (problems.length === 0) {

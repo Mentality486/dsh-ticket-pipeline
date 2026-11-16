@@ -4899,7 +4899,12 @@ window.__ModuleLoader__.load({
             onCancel: onRunCancel,
             onRerun: onRunRerun,
             onForget: onRunForget,
-            onRefresh: loadRun,
+            // 包一层再传：`loadRun` 的首参是「刚点完开关时要覆盖的历史开关值」，
+            // 裸传的话第一个实参是 React 的 click 事件对象（它在函数内部靠
+            // `typeof === 'boolean'` 兜住了，但兜住等于每次都要靠那个判断兜底；
+            // 包一层是让「谁传什么」在调用点就说清）。client-check 的
+            // checkEventArgConfusion 会拦住裸传。
+            onRefresh: function () { return loadRun() },
             history: runHistory,
             onHistory: onRunHistory,
             query: runQuery,
@@ -4919,7 +4924,12 @@ window.__ModuleLoader__.load({
             message: '',
             saveError: '',
             dirty: projectDirty,
-            onReload: loadProjects,
+            // 同样包一层：「重新读取」按钮的 onClick 会把点击事件递进来，
+            // 而 `loadProjects` 的首参是「刚拿到的 namespace」——裸传时事件对象
+            // 会被当成 namespace，报出「宿主还没提供 ticketPipeline.projects()」
+            // 这句冤枉话（2026-11-13 的实际故障）。函数内部那个「像不像 namespace」
+            // 的判断是兜底，不是入口；调用点这里就该说清什么都不传。
+            onReload: function () { return loadProjects() },
             onAdd: onAddProject,
             onRemove: onRemoveProject,
             onEdit: onProjectEdit,

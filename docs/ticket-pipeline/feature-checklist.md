@@ -2,7 +2,28 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「40 分钟改一个小功能 + 通知换掉付费第三方」的代码与本文同一次提交，上一轮已提交代码为 `fdf8895`（图片块字段名改成 `attachment`）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-13 傍晚，**「跑一轮」也炸在同一个地方** —— 用户原话「跑一轮失败」，
+> 最近一次更新：2026-11-16，**「修复说明的不足」** —— 用户原话「修复说明的不足」，指的是前一天
+> 我向他列的「八条优势 + 五条不足」里站不住的地方。查出两处，一处是**错的**、一处是**缺守卫**：
+> ①`pipeline_doctor` 对任何 `platform: 'wps'` 的项目都报**阻断**，理由写的是「取数通道是注入式的，
+> 主装配没注入」—— 这句是错的，`wpsOptionsFromMatch()` 明明有「配了 `match.sheetUrl` 就装内置下载器」
+> 那一档，真正的 `MISSING_FETCH_SHEET` 只发生在「选了 wps、没填链接、也没人注入」这一种配置上。
+> 体检改成按「有没有内置通道」分档（没链接 → `blockers`；有链接 → `warnings` 说清「共享链接常需登录态」）。
+> ②面板 ↔ Remote/DOM 的边界已连撞三次（`reset` 少传实参、`scan` 少传实参、`loadProjects` 把 click 事件
+> 当 namespace），前两次靠 `checkCallArities` 兜住，第三次纯靠「记住这个坑」。现在补了第二条静态守卫
+> `checkEventArgConfusion`：先用 `findMatchingBrace` 切出组件函数体、找出「把 `props.Y` 直接挂在 DOM
+> 事件属性上」的地方，再看外层 `h(组件, { Y: 裸标识符 })` 里那个函数有没有声明形参 —— 两条同时成立即 fail。
+> 判据刻意不维护名单，而且**写成 `onReload: function () { loadProjects() }` 就命中不了**，所以它也在指导写法。
+> 实跑抓到 2 处并已改成包一层；函数内部那两个类型判断保留为兜底（兜底不是入口）。
+> 两条守卫都做了回归测试，确认真的会红（`client-check` exit 1 并精确指到 `lib/client.js:4917`），
+> `client-smoke` 另加一条运行时断言：真拿一个事件对象去点「重新读取」，不许出现那句冤枉话。
+> **教训：「说明」也是要被核对的代码** —— 那次核对 16 条说法，15 条成立、1 条是自曝不足，
+> 而错掉的那条已经写进了 `pipeline_doctor` 的输出，会主动误导人去改一个没坏的配置。
+> 见 §1.49。`dev-run` **577/577**、`client-smoke` **280** 条。
+> 同日更早：**新增项目时两格「列名覆盖」被写成 `"[object Object]"`，整笔保存被拒** ——
+> `buildProjectValue()` 的通用分支是 `String(normalized)`，而 `projectRawValue()` 对 `kind === 'columns'`
+> 已经解析成对象了。只有「新增项目」这条整对象通道会踩（已有项目走单字段通道），所以两格空着也报。
+> 改成逐 kind 处理：对象非空才写，否则整格不写。见 §1.41 的再补记。
+> 2026-11-13 傍晚，**「跑一轮」也炸在同一个地方** —— 用户原话「跑一轮失败」，
 > 截图红字 `跑一轮失败: client api: ticketPipeline#ticketPipeline/scan expected 1 argument(s), got 0`。
 > `scan` 加了可选 `projectId`（工单 #39）之后调用点还留着 `ns.scan()`，而浏览器侧
 > `prepareInvocation` 是按 `descriptor.parameters.length` 数位置实参的，`acceptsUndefined` 只有宿主侧认
@@ -3059,16 +3080,105 @@ for (const m of description.matchAll(/[A-Za-z][A-Za-z0-9_.-]{2,}/g)) add(m[0], t
 `pms-server/` / `pms-web/`、不含盘符路径）；并把两条老断言从「要写『要进一步修改』」
 反转为「不许再写」，失败票那条加了「记录号必在」「不许出现『改代码目录』」。
 
+### 1.49 「说明」也要被核对：一条写进产品输出的错误说法，和一个缺了三次的守卫（2026-11-16）
+
+#### 现场
+
+用户原话：「修复说明的不足」。前一天我刚向他列过「八条优势 + 五条不足」，
+所以这次要修的不是代码，是**说明书里站不住的地方**。
+
+做法是先把八条优势逐条对代码核（`.scratch/_audit-claims.mjs`）：16 条核对，15 条成立，
+1 条是刻意自曝的不足（日志无落盘 sink）。但五条不足里有一条不只是「不好用」，是**说错了**。
+
+#### 错在哪
+
+`pipeline_doctor` 对**任何** `platform: 'wps'` 的项目都报**阻断**，行文案是
+`❌ 金山文档源：… —— 取数通道未接，一张票都拿不到`，注释理由是「取数通道是注入式的，
+主装配里没有注入」。
+
+而 `src/adapters/source-wps/index.js` 的 `wpsOptionsFromMatch()` 里明明有：
+
+```js
+const sheetUrl = String(m.sheetUrl ?? '')
+if (sheetUrl) {
+  options.sheetUrl = sheetUrl
+  options.fetchSheet = async (signal) => downloadSheetLimited(fetch, sheetUrl, { signal })
+}
+```
+
+⇒ **配了「表格链接」就有取数通道**（内置下载器，超时 / 取消 / 字节上限 / 逐跳重定向校验都是它）。
+真正的 `MISSING_FETCH_SHEET` 只发生在「选了 wps、又没填链接、也没人注入 `fetchSheet`」这一种配置上。
+
+探针 `.scratch/_probe-wps-fetchsheet.mjs` 跑三档确认：配了 `sheetUrl` → `fetchSheet` 是函数；
+没配 → `undefined`；**配了空串 `'   '` → 仍是函数**（`String(...)` 后非空，`if (sheetUrl)` 为真 ——
+这一档我原以为应该没有，实测是「有」）。再给真 URL + 已 abort 的 signal，抛
+`kind=aborted` / `msg=取表被取消`，证明它真的会走下载逻辑而不是空壳。
+
+#### 改法
+
+判据从「platform 是不是 wps」换成「有没有内置通道」：
+
+- **没配表格链接** → `blockers`：`既没配「表格链接」也没有注入 fetchSheet —— 这些项目一张票都拿不到`
+- **配了表格链接** → `warnings`：`这条路能跑，但共享链接通常要登录态 —— 如果扫描报 HTTP 403/401 或超时，就是这里缺授权，不是插件坏了`
+- 「`recordId` 用行号 ⇒ 插行会让票换身份」这条限制挪到分档之外，两档都看得到。
+
+自测里那条「选了金山就报阻断」保留（它测的是没配链接那一档，仍成立），新增一条
+`体检：金山项目配了表格链接就不算阻断 —— 内置下载通道是存在的`。
+
+#### 第二件事：一个缺了三次的守卫
+
+「面板 ↔ Remote / DOM 的边界脆弱」这条不足，当时只是列出来。核的时候发现它已经撞了三次：
+
+| # | 症状 | 真因 |
+| --- | --- | --- |
+| 1 | 点「重跑」报 `expected 2 argument(s), got 1` | `ns.reset(recordId)` 少传可选 `projectId` |
+| 2 | 点「跑一轮」报 `expected 1 argument(s), got 0` | `ns.scan()` 少传可选 `projectId` |
+| 3 | 点「重新读取」报「宿主还没提供 `projects()`」 | `loadProjects(target)` 的首参被 click 事件顶掉 |
+
+①② 已有 `checkCallArities` 兜住（比「实参个数」）。③ 一直只靠「记住这个坑」——
+而**记性不是机制**。现在补第二条静态守卫 `checkEventArgConfusion()`，判据刻意不维护任何名单：
+
+1. 用 `findMatchingBrace()` 切出每个组件函数体，扫出 **把 `props.Y` 直接挂在 DOM 事件属性上**
+   的地方（`onClick: props.onReload` 这种）—— DOM 会把事件对象当第一实参递进去；
+2. 再看外层 `h(组件, { onReload: 裸标识符 })` 里那个标识符是不是**声明了形参**的本地函数。
+
+两条同时成立即 fail，并直接说「第一个实参会是 React 的事件对象，不是 `<形参名>`」。
+写成 `onReload: function () { loadProjects() }` 就不命中 —— 这既是修复形态，也说明守卫在**指导**写法：
+能透传就在调用点包一层，把「谁传什么」说清。
+
+实跑抓到 2 处（`<RunCard> onRefresh: loadRun`、`<ProjectListCard> onReload: loadProjects`），
+都已改成包一层；函数内部那两个类型判断**保留为兜底**（兜底不是入口，但入口不该依赖兜底）。
+
+#### 判据
+
+1. **「说明」也是要被核对的代码**：那条错误说法已经写进 `pipeline_doctor` 的输出，会主动
+   误导人去改一个没坏的配置 —— 错误说法的代价不是「不够准确」，是**让人做错事**。
+2. **同一个坑撞到第三次就该上守卫**：前两次都是「记住了」，第三次证明记住不管用。
+   守卫的判据要能从代码里推出来（不维护名单），否则名单本身会腐。
+3. **守卫顺手把正确写法也定义了**：`checkEventArgConfusion` 只认「裸标识符」，
+   所以它同时在教「这里该包一层」。一条只能拦、不能引导的守卫，会被人当成噪音绕过。
+4. **守卫必须做回归测试，且手动确认它会红** —— 这条在 §1.42 已经付过一次学费
+   （第一版 `stripComments` 把自己的目标遮住，回归测试显示全绿）。
+
+#### 自测
+
+- `dev-run` 576 → **577**（新增金山源分档 1 条）。
+- `client-check` 新增输出：`· DOM 事件属性透传 4 处，其中裸函数名 0 处（会收到事件对象）`。
+- `client-smoke` 276 → **280**（「重新读取」带事件对象不报错 / 真的又读一遍 / 卡片还在 / 有按钮）。
+- 两条守卫都做了回归测试：`onReload` 改回裸传 → `client-check` exit 1 并精确报
+  `lib/client.js:4917 把 loadProjects(target) 裸传给了 <ProjectListCard> 的 onReload…`；恢复后 exit 0。
+  `client-smoke` 侧同时退回裸传 + 内部判定退回 `target !== undefined` 也会红。
+
 ## 2. 代码清单
 
-`src/` 共 **50 个 .js / 24 517 行**；`scripts/` 共 10 个 .mjs / **17 585 行**（`dev-run.mjs` **7 496 行**）；`lib/client.js` **5 336 行**（浏览器端设置面板）。
+`src/` 共 **50 个 .js / 24 557 行**；`scripts/` 共 10 个 .mjs / **17 817 行**（`dev-run.mjs` **7 564 行**）；`lib/client.js` **5 346 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 655（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 6 631（14 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 11 008（17 个 .js） | 见下表 |
-| `src/tools/` | 2 902（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
+| `src/core/` | 6 653（14 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 11 007（17 个 .js） | 见下表 |
+| `src/tools/` | 2 921（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
 | `src/remote/` | 962（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
 | 根 | 1 359（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
@@ -3335,9 +3445,9 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **577** | 通过 577，失败 0（2026-11-13 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36），**514**（停滞看门狗的 2 条，见 §1.37），**517**（运行页签三件事：删除记录 / 重跑实参 / canReset+canForget 3 条，见 §1.38），**521**（探索预算强制执行 4 条，见 §1.39），**530**（跨票记忆 9 条，见 §1.39），**544**（项目级开关 4 条 + 补做挂进 tick 3 条），**548**（「测这张表」4 条），**551**（体检把「表里没有待办」误报成配置错 3 条，见 §1.41），**557**（工作表名对不上：适配器降级 2 条 + 体检 2 条 + 探针 2 条 + `testProject` 1 条，见 §1.42），**562**（会话标题 5 条，见 §1.44）、**569**（会话标题改成「修复…」开头 + 缺 workspaceId 的票补登记 + `git add` 撞上已跟踪的被忽略文件 7 条，见 §1.45）、**575**（同一张票重跑接着上一轮的会话继续 6 条，见 §1.46；跨票记忆抽词口径订正，见 §1.47）、**576**（回填单元格只留「人下一步要用的」1 条，见 §1.48）、**577**（2026-11-16 纠正金山源「取数通道未接」这个错误说法：体检改成按「有没有配表格链接」分档，1 条）—— 见 §1.40。这 576 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 99 条（见 §1.26 与 §1.23 注） |
+| `node scripts/dev-run.mjs` | **577** | 通过 577，失败 0（2026-11-13 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36），**514**（停滞看门狗的 2 条，见 §1.37），**517**（运行页签三件事：删除记录 / 重跑实参 / canReset+canForget 3 条，见 §1.38），**521**（探索预算强制执行 4 条，见 §1.39），**530**（跨票记忆 9 条，见 §1.39），**544**（项目级开关 4 条 + 补做挂进 tick 3 条），**548**（「测这张表」4 条），**551**（体检把「表里没有待办」误报成配置错 3 条，见 §1.41），**557**（工作表名对不上：适配器降级 2 条 + 体检 2 条 + 探针 2 条 + `testProject` 1 条，见 §1.42），**562**（会话标题 5 条，见 §1.44）、**569**（会话标题改成「修复…」开头 + 缺 workspaceId 的票补登记 + `git add` 撞上已跟踪的被忽略文件 7 条，见 §1.45）、**575**（同一张票重跑接着上一轮的会话继续 6 条，见 §1.46；跨票记忆抽词口径订正，见 §1.47）、**576**（回填单元格只留「人下一步要用的」1 条，见 §1.48）、**577**（2026-11-16 纠正金山源「取数通道未接」这个错误说法：体检改成按「有没有配表格链接」分档，1 条；同日补 `checkEventArgConfusion` 静态守卫与 2 个调用点包一层，不新增 `dev-run` 断言，只加 `client-check` / `client-smoke`，见 §1.49）—— 见 §1.40。这 576 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 99 条（见 §1.26 与 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
-| `node scripts/client-smoke.mjs` | **276** | 通过 276（215 → 219：§1.29；→ 240 左右：运行页签筛选/搜索与后果提示；→ 260：飞书通知分支 6 条 + 「测这张表」4 条 + 描述符 11 个；→ 276：面板四处保存/实参 bug 的回归，见 §1.41 之后那四个 commit） |
+| `node scripts/client-smoke.mjs` | **280** | 通过 280（215 → 219：§1.29；→ 240 左右：运行页签筛选/搜索与后果提示；→ 260：飞书通知分支 6 条 + 「测这张表」4 条 + 描述符 11 个；→ 276：面板四处保存/实参 bug 的回归，见 §1.41 之后那四个 commit；→ 280：「重新读取」带事件对象不报错的运行时断言 4 条，见 §1.49） |
 
 `dev-run.mjs` 分 35 个小节：
 
@@ -3385,7 +3495,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 脏工作区只提交 agent 改的 | ✅ 真 git 端到端验过：有基线时人的改动一个都不出现；用户 `git add` 进索引的改动同样被排除 |
 | 回填工单表（新） | ⚠️ 代码与自测全绿（`dev-run.mjs` 第 16 节 10 条断言）；真实表待应用拿到**编辑**权限后端到端复跑 |
 | 保留会话（新） | ✅ `pipeline_status` 与回填进表格「处理结果」列的正文都能看到 `处理会话：<sessionId>`（**通知正文里没有这一行**）；agent 实例在 `finally` 里无条件释放 |
-| 设置面板（新） | ✅ `client-check.mjs`：descriptor 27 叶子 / 4 组、schema 信封 76 节点 27 叶子、**Remote 11 个方法**（含带参 `setProjectTable`、`status`、`scan`、`reset`、`forget` 与 `testProject`）、`projects` 可写 35 字段、面板项目字段 31 项；`client-smoke.mjs` 全过（页签式布局见 §1.17，「添加项目」见 §1.18，运行页签见 §1.22，「显示历史」见 §1.27，删除记录 / 分组 / 流程带见 §1.38） |
+| 设置面板（新） | ✅ `client-check.mjs`：descriptor 27 叶子 / 4 组、schema 信封 76 节点 27 叶子、**Remote 11 个方法**（含带参 `setProjectTable`、`status`、`scan`、`reset`、`forget` 与 `testProject`）、`projects` 可写 35 字段、面板项目字段 31 项；另有两道静态守卫：`checkCallArities` 比对每个 `ns.<method>(…)` 的实参个数（10 处全对）、`checkEventArgConfusion` 拦「把声明了形参的函数裸传给 DOM 事件属性」（4 处透传、裸函数名 0 处，见 §1.49）；`client-smoke.mjs` 280 条全过（页签式布局见 §1.17，「添加项目」见 §1.18，运行页签见 §1.22，「显示历史」见 §1.27，删除记录 / 分组 / 流程带见 §1.38） |
 | 上线加固（新，2026-11-06） | ✅ 代码与自测全绿：`dev-run` 累计 **376/376**（该轮 363/363，第 16b 节 14 条；补 appToken 链接解析 2 条后现为 482/482）、`gitlab-checks` 86、`wps-checks` 34、`workspace-checks` 19；敏感名单 41 条实测 BLOCK/PASS 清单符合预期（`src/env.js` / `docs/credentials.md` / `.environment.md` 不误伤） |
 | 关键节点流程日志（新，2026-11-06） | ✅ 票据 `timeline` 逐站打点（17 节点表 / 9 主站 ①–⑨）、`pipeline_status` 排成时间线并写「现在停在第 N 站，已 X 分 Y 秒没动」、`dev-run` 第 **16c** 节 13 条断言全绿、返回体带 `timeline`/`station`/`stalledForMs`/`lastNodeOk` |
 | appToken 贴整条表格链接（新，2026-11-09） | ✅ `parseBitableUrl`（`src/contracts/types.js`）被配置校验与飞书适配器共用：`?table=` → `table_id`、`?view=` → `view_id`，显式 `tableId` 仍优先；`feishu-checks` 58 → **60** 条、`dev-run` 加 2 条配置校验断言（那是当轮的值；现为 **482/482** 与 **93** 条） |
