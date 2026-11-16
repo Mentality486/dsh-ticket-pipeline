@@ -48,41 +48,115 @@ export const EXPLORATION_TOOLS = new Set([
 /**
  * 任务书里承诺的预算（次）。
  *
- * 与 `core/prompt.js` 里那段文案是**同一个数**：文案说「12 次」，这里也必须数到 12
+ * 与 `core/prompt.js` 里那段文案是**同一个数**：文案说「25 次」，这里也必须数到 25
  * 就说话，否则又是一份「写着玩的规范」。改这里要同时改文案，自测会盯着。
+ *
+ * ## 为什么从 12 改到 25（2026-11-16）
+ *
+ * 12 是一次**猜**出来的数字，装上真机后实测：8 个会话里 8 个都超了 —— 包括那个
+ * 只读了 23 次就动手、一把成功的。也就是说这条催办在 100% 的票上都会响，
+ * 它已经从「信号」退化成「背景噪音」，而噪音说过一次就没人再听了。
+ *
+ * 定 25 的依据是「不同目标数」的分布（见下 `countExploration` 为什么不再数调用次数）：
+ * 6 个跑到动手的会话，不同目标数是 13 / 20 / 22 / 24 / 26 / 43，中位数 24。
+ * 取 25 意味着**约一半的票会被提醒一次**，而不是全部。
+ *
+ * 「按需求难度分级」是个很自然但**数据不支持**的想法，这里记下来免得再被提一次：
+ * 拿票的静态特征（flow 长度、flow 段数、描述长度、截图数）去拟合「首写前探索量」，
+ * 相关系数是 0.038 / 0.019 / −0.490 / 无区分度 —— 没有任何预测力。最硬的反证是
+ * 同一张票跑两次：`sh-row-82` 84 次 vs 57 次，`sh-row-85` 11 次 vs 39 次，
+ * 差 3–4 倍。差异来自模型当轮的状态，不来自需求本身。所以预算只能按**项目**配
+ * （仓库大小、技术栈是稳定因素），不能按票配。
+ *
+ * 项目级覆盖见 `ProjectEntry.exploreBudget`。
  */
-export const EXPLORE_BUDGET = 12
+export const EXPLORE_BUDGET = 25
+
+/**
+ * 一次探索调用的「目标」是什么 —— 决定两次调用算不算在查同一件事。
+ *
+ * 这是本模块 2026-11-16 改法的核心：**同样的文件读第二遍不该消耗预算**。
+ * 实测重复率 55–82%（`sh-row-81` 探索 82 次、真实目标只有 22 个），而这些
+ * 重复恰恰是最该被催的那部分。按调用次数计，等于把「读 82 个不同文件」
+ * 和「把同一个文件读 4 遍」当成同一件事。
+ *
+ * 只读参数对象里那几个定位字段，不碰参数里的其它键：`grep` 的 pattern 加不加
+ * `-i`、`glob` 的 path 是相对还是绝对，都可能让同一次搜索看起来不同 —— 所以
+ * 目标只取「查的是什么」，不取「怎么查的」。
+ *
+ * @param {string} name 工具名
+ * @param {any} args 该次调用的参数（`tool/ptc-dispatch` 的 `data.arguments`）
+ * @returns {string} 空串表示认不出目标（调用方会退回按调用计）
+ */
+export function explorationTarget (name, args) {
+  const a = args && typeof args === 'object' ? args : {}
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = a[key]
+      if (typeof value === 'string' && value.trim().length > 0) return value.trim()
+    }
+    return ''
+  }
+  if (name === 'read') return pick('file_path', 'path')
+  if (name === 'grep') return pick('pattern', 'query')
+  if (name === 'glob') return pick('pattern')
+  if (name === 'search_context') return pick('query')
+  if (name === 'list_files') return pick('path', 'dir')
+  return pick('file_path', 'path', 'pattern', 'query')
+}
 
 /**
  * 数出会话事件里有多少次探索调用。
  *
- * 按 `subCallId` 去重：同一次子调用在日志里可能出现多条（`-start` 与完成的
- * `tool/ptc-dispatch`），重复计会让预算提早触发。拿不到 id 的就不去重 ——
- * 那种事件形状没见过，宁可多算一次也别漏掉一条。
+ * ## 两个去重层次，别混在一起
+ *
+ * 1. **同一次调用的多条事件**（按 `subCallId`）：日志里 `-start` 与完成的
+ *    `tool/ptc-dispatch` 都会落一条，重复计会让预算提早触发。
+ * 2. **不同调用查了同一个目标**（按 `explorationTarget`）：这才是 2026-11-16
+ *    加的那层 —— 见上面的实测。
+ *
+ * 返回的 `total` 是**不同目标的数量**，`calls` 是原始调用次数。两者之差就是
+ * 「原地打转」的量，`describeExploration` 会把它说出来。
+ *
+ * 认不出目标时（参数里没有可用的定位字段）退回按调用计 —— 宁可多算一次，
+ * 也别让一条看不见的调用漏掉。
  *
  * @param {any[]} events `agent.session.log`（宿主的事件数组）
- * @returns {{ total: number, byTool: Record<string, number> }}
+ * @returns {{ total: number, calls: number, distinct: number, repeated: number, byTool: Record<string, number> }}
  */
 export function countExploration (events) {
   /** @type {Record<string, number>} */
   const byTool = {}
-  if (!Array.isArray(events)) return { total: 0, byTool }
+  if (!Array.isArray(events)) return { total: 0, calls: 0, distinct: 0, repeated: 0, byTool }
   /** @type {Set<string>} */
-  const seen = new Set()
-  let total = 0
+  const seenIds = new Set()
+  /** @type {Set<string>} */
+  const seenTargets = new Set()
+  let calls = 0
+  let distinct = 0
   for (const event of events) {
     if (event?.type !== 'tool/ptc-dispatch') continue
     const name = String(event?.data?.name ?? '')
     if (!EXPLORATION_TOOLS.has(name)) continue
     const id = event?.data?.subCallId
     if (typeof id === 'string' && id.length > 0) {
-      if (seen.has(id)) continue
-      seen.add(id)
+      if (seenIds.has(id)) continue
+      seenIds.add(id)
     }
+    calls += 1
     byTool[name] = (byTool[name] ?? 0) + 1
-    total += 1
+    const target = explorationTarget(name, event?.data?.arguments)
+    if (target.length === 0) {
+      // 认不出目标：当成一次「独立目标」，用调用序号占位，避免被误当成重复。
+      distinct += 1
+      continue
+    }
+    const key = `${name}\u0000${target}`
+    if (seenTargets.has(key)) continue
+    seenTargets.add(key)
+    distinct += 1
   }
-  return { total, byTool }
+  return { total: distinct, calls, distinct, repeated: calls - distinct, byTool }
 }
 
 /**
@@ -90,13 +164,20 @@ export function countExploration (events) {
  *
  * 只列真的出现过的工具：写「读 0 次、搜 3 次」纯属噪音。
  *
- * @param {{ total: number, byTool: Record<string, number> }} counted
+ * 有重复时说清「总共调了几次、其中多少是不同的目标」——「探索 82 次」和
+ * 「探索 82 次（只有 22 个不同目标）」给人的判断完全不同，后者直接指出问题在哪。
+ *
+ * @param {{ total: number, calls?: number, repeated?: number, byTool: Record<string, number> }} counted
  * @returns {string}
  */
 export function describeExploration (counted) {
   const parts = Object.entries(counted.byTool ?? {})
     .filter(([, count]) => Number(count) > 0)
     .map(([name, count]) => `${name} ${count} 次`)
-  if (parts.length === 0) return `探索 ${counted.total} 次`
-  return `探索 ${counted.total} 次（${parts.join('、')}）`
+  const detail = parts.length > 0 ? `（${parts.join('、')}）` : ''
+  const repeated = Number(counted.repeated ?? 0)
+  if (repeated > 0) {
+    return `探索 ${counted.total} 次${detail}，其中 ${repeated} 次是在重看同一处`
+  }
+  return `探索 ${counted.total} 次${detail}`
 }

@@ -226,6 +226,8 @@ function makeProjectRecord (index) {
     gitlabProjectId: 'platform/pms',
     verifyBuild: 'pnpm build',
     verifyTest: 'pnpm test',
+    // 项目级探索预算（2026-11-16）：宿主只透出「人配了没有」，空串 = 用全局缺省。
+    exploreBudget: '40',
   }
 }
 
@@ -1595,6 +1597,12 @@ async function main () {
     const glBase = findAll(tree, (node) => node.type === 'input' &&
       node.props.value === 'https://gitlab.example.com')[0]
     check('GitLab 站点能带出宿主下发的当前值（不是空框）', glBase !== undefined)
+    // 项目级探索预算（2026-11-16）：宿主只透出「配了没有」，面板得能把它带出来、
+    // 也能留空（留空 = 用全局缺省，而不是把 25 写死进配置）。
+    check('勾上后能看到项目的「探索预算」', textOf(tree).indexOf('探索预算') >= 0)
+    const budgetInput = findAll(tree, (node) => node.type === 'input' &&
+      node.props.value === '40')[0]
+    check('项目的探索预算能带出宿主下发的当前值', budgetInput !== undefined)
   }
 
   // 工单 #20：金山源是实验性的。下拉里就得写出来，切过去还要在卡片顶部给一条醒目提示 ——

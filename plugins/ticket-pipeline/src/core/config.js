@@ -66,6 +66,12 @@ const BITABLE_COLUMN_FIELDS = FEISHU_SEMANTIC_FIELD_NAMES
  * @property {ProjectMatch} match 工单表怎么定位（显式 appToken/tableId 或文件名模糊匹配）
  * @property {ProjectRepo} repo 这个项目对应哪个仓库、从哪切、MR 到哪
  * @property {ProjectVerify} [verify] 验证命令；缺省则跳过验证直接开 draft MR
+ * @property {number} [exploreBudget] 这个项目的探索预算（次，按「不同目标」算）。
+ *   缺省取 `BUILTIN_LIMITS.agentExploreBudget`（25）。大仓（多模块 Java）可以放宽到
+ *   40–60，小仓（单包）可以收到 15。
+ *   为什么是项目级而不是票级：拿票的特征去预测「要读多少」实测没有预测力
+ *   （见 `adapters/executor-agent/explore-budget.js` 的 `EXPLORE_BUDGET` 注释），
+ *   而仓库大小、技术栈是稳定因素 —— 同一个项目里每张票的合理探索量本来就差不多。
  */
 
 /**
@@ -336,22 +342,35 @@ export const BUILTIN_LIMITS = Object.freeze({
    */
   agentStallNudges: 2,
   /**
-   * 探索预算（次）：读文件 + 搜索 + glob 合计读这么多次还没开始改代码，就该催了。
+   * 探索预算（次）：查过这么多处**不同的**东西还没开始改代码，就该催了。
    *
-   * **这个数同时是任务书里那句话的数字来源**（`core/prompt.js` 直接引用它渲染
+   * **这个数同时是任务书里那句话的数字来源**（`core/prompt.js` 引用它渲染
    * 「探索预算 N 次」），所以文案与执行永远同一个值 —— 2026-11-11 之前文案写 12、
    * 实测用了 169 次，就是因为两边各写一份、谁都没在数。
    *
-   * 12 这个数不是拍的：跑通那张票的前 45 次调用里，真正定位到页面所需的读取
-   * （`ProductSampleTestList.vue` + `PmsProductSampleTestServiceImpl.java` +
-   * 两个 ApprovalEngine 相关文件 + 一次 grep）大约 6–8 次，留一倍余量。
+   * **数的是「不同目标」不是「调用次数」**（2026-11-16 改）：同一个文件读第二遍、
+   * 同一个 pattern 再搜一遍都不加数。实测重复率 55–82%，按调用计等于把「读 82 个
+   * 不同文件」和「把一个文件读 4 遍」当成同一件事，而后者正是该被催的那个。
+   *
+   * ## 为什么从 12 改成 25
+   *
+   * 12 是一次**猜**出来的数（当初按跑通那张票需要的 6–8 次读留一倍余量）。装上真机后
+   * 实测 8 个会话 8 个都超了，包括那个只读 23 次就动手、一把成功的 —— 这条催办在
+   * 100% 的票上都响过，已经从「信号」退化成「背景噪音」。
+   *
+   * 25 的依据是「不同目标数」的实测分布：6 个跑到动手的会话是 13 / 20 / 22 / 24 / 26 / 43，
+   * 中位数 24。取 25 意味着约一半的票会被提醒一次，而不是全部。
+   *
+   * 「按需求难度分级」这个想法数据不支持（详见 `adapters/executor-agent/explore-budget.js`
+   * 的注释）：同一张票跑两次能差 3–4 倍，差异来自模型当轮状态而非需求。
+   * 真要分，只能按**项目**分（仓库大小、技术栈是稳定因素）—— 见 `ProjectEntry.exploreBudget`。
    */
-  agentExploreBudget: 12,
+  agentExploreBudget: 25,
   /**
    * 探索超支最多催几次。
    *
    * 与停滞催办共用「只催不杀」的哲学，但节奏不同：停滞按时间催（8 分钟一次），
-   * 探索按次数催（12 次、24 次各一次）。催到第 2 次（24 次探索）还不改代码，
+   * 探索按不同目标数催（25 次、50 次各一次）。催到第 2 次（50 个不同目标）还不改代码，
    * 说明它不是「多读了两眼」而是根本定位不到 —— 交给硬超时，人去看时间线。
    */
   agentExploreNudges: 2,
@@ -933,6 +952,19 @@ function validateProject (raw, index) {
     if (typeof p.verify.build === 'string' && p.verify.build.length > 0) verify.build = p.verify.build
     if (typeof p.verify.test === 'string' && p.verify.test.length > 0) verify.test = p.verify.test
     if (Object.keys(verify).length > 0) value.verify = verify
+  }
+
+  // 项目级探索预算（2026-11-16）。只接受正整数：0 / 负数 / 字符串在这里都是
+  // 配置错误而不是「关掉它」—— 关掉监控应当由全局的 `agentExploreBudget: 0`
+  // 表达，写在项目上会让人以为「这一项关了、别的还开着」，而实际下发的是一个
+  // 会被 `Number(x) > 0` 判成 falsy 后回落到全局值的空配置。
+  if (p.exploreBudget !== undefined && p.exploreBudget !== null) {
+    const n = Number(p.exploreBudget)
+    if (!Number.isInteger(n) || n <= 0) {
+      fail('exploreBudget', '必须是正整数（探索预算，按「不同目标」计）', '例如 40。不想限制这个项目就把这个键删掉，它会用全局值')
+    } else {
+      value.exploreBudget = n
+    }
   }
 
   return { value, issues, warnings }
@@ -1521,6 +1553,10 @@ function buildProjectsDescriptor () {
     name: projectLeaf('string', '项目名', 'projectId，必须唯一；工单里的项目要靠它对上仓库'),
     enabled: projectLeaf('boolean', '启用这个项目', '关掉 = 不再扫它的表、不再跑它已入队的票，但配置与历史都保留。缺省启用'),
     description: projectLeaf('string', '说明', '会进 agent 的定位提示'),
+    // 项目级探索预算（2026-11-16）。放在项目条目顶层而不是 match/verify 里：
+    // 它管的是「这张票开工前允许查多少处」，与收票和验证都无关。
+    // 留空/不写 = 用全局 `BUILTIN_LIMITS.agentExploreBudget`。
+    exploreBudget: projectLeaf('number', '探索预算', '开工前最多查多少处不同的东西（同文件读第二遍不加数）。留空用全局 25；大仓 40–60、小仓 15。只催不杀'),
     match: matchNode,
     repo: repoNode,
     verify: verifyNode,

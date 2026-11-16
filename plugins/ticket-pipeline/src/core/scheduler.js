@@ -476,10 +476,19 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     // 这种无害操作也写库），复用计数在跑成功后由 `touch` 统一补。
     const keywords = extractKeywords(ticket)
     const recalled = memory ? recallMemories(memory.list(projectId), keywords) : []
+    // 探索预算：项目级优先，缺省回落到全局。
+    //
+    // 两处读者必须拿到**同一个数**：任务书里那句「探索预算 N 次」（模型照着它判断
+    // 自己该不该动手）与执行器里那个计数器（超了才催）。两边各算一次的话，会出现
+    // 「任务书说 25、实际在 12 就催」这种自相矛盾 —— 模型会先花一轮去纠正这个事实。
+    // 2026-11-16 加项目级覆盖时，这里就是把它们钉在一起的地方。
+    const exploreBudget = Number(projectEntry?.exploreBudget) > 0
+      ? Number(projectEntry.exploreBudget)
+      : BUILTIN_LIMITS.agentExploreBudget
     /** 任务书渲染选项：验证命令 + 探索预算 + 跨票记忆，三处都与执行侧同源。 */
     const promptOptions = {
       verify: projectEntry?.verify,
-      exploreBudget: BUILTIN_LIMITS.agentExploreBudget,
+      exploreBudget,
       memories: recalled,
     }
 
@@ -774,6 +783,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         prompt: renderTicketPrompt(ticket, located, promptOptions),
         content: renderTicketContent(ticket, located, shots, promptOptions),
         images: shots,
+        // 任务书里那句「探索预算 N 次」用的就是这个数；执行器的计数器也用它。
+        // 从同一个变量下发，项目级覆盖才不会只在一边生效。
+        exploreBudget,
         config,
         log: (msg, detail) => logInfo(msg, detail),
         onPhase,

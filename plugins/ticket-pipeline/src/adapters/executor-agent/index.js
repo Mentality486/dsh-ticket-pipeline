@@ -569,6 +569,9 @@ export function createAgentExecutor (options = {}) {
     : 2
   // 探索预算：读文件 + 搜索合计超过这个数就催。与任务书文案同源（见 core/prompt.js
   // 的 renderTicketPrompt 直接引用这个 limits 值渲染「探索预算 N 次」）。
+  //
+  // 这里是**全局缺省**。项目级覆盖走 `ctx.exploreBudget`（由 core/scheduler.js 算好
+  // 传进来，与渲染任务书用的是同一个变量），下面的 `run()` 里再落一次。
   const exploreBudgetLimit = Number(options.limits?.agentExploreBudget) > 0
     ? Number(options.limits.agentExploreBudget)
     : EXPLORE_BUDGET
@@ -617,6 +620,15 @@ export function createAgentExecutor (options = {}) {
       const signal = ctx.signal
       const project = findProject(config, ticket, target)
       const verify = project?.verify ?? {}
+      // 这一票实际生效的探索预算：调度器算好的项目级值优先，没有再回落到全局缺省。
+      //
+      // 为什么由调度器传进来而不是这里自己算：任务书里那句「探索预算 N 次」也是调度器
+      // 渲染的（见 core/scheduler.js 的 promptOptions）。两边各算一次，只要有一边的
+      // 取数口径变了（比如项目级覆盖只在一边生效），模型看到的数就和真正催它的数不一样
+      // —— 2026-11-16 之前正是这样：文案写 12、实测用掉 169。
+      const exploreBudget = Number(ctx?.exploreBudget) > 0
+        ? Number(ctx.exploreBudget)
+        : exploreBudgetLimit
       // 上一轮这张票用过的会话。有就**续接**，没有才新建。
       //
       // 为什么值得续接（2026-11-13 实测）：同一张票重跑时，前一轮已经读过的那几十个
@@ -834,14 +846,18 @@ export function createAgentExecutor (options = {}) {
           // 光有时间监控不够：这次成功的票读得飞快，8 分钟里能读几十个文件，
           // 时间监控还在数分钟，它已经翻完半个仓库了。按**动作数**催才管得住「读得
           // 快但一直在读」这种形态。任务书里写的那个「探索预算 N 次」就是这里的 N ——
-          // 同一个配置项渲染成文案、同一个配置项驱动催办，两边不会各写一份。
-          exploreBudget: exploreBudgetLimit,
+          // 同一个变量渲染成文案、同一个变量驱动催办，两边不会各写一份。
+          //
+          // 数的不是调用次数，是**不同目标数**（同一文件读第二遍不加数）：
+          // 实测重复率 55–82%，按调用计等于把「读 82 个不同文件」和「把一个文件读 4 遍」
+          // 当成同一件事，而后者正是该被催的那个。见 explore-budget.js。
+          exploreBudget,
           maxExploreNudges: exploreNudgeLimit,
           // 事件源：agent 每次工具调用都会 append 到 session.log，这是插件唯一
           // 能看见「它到底在读什么」的窗口（拿不到工具调用入口，见 explore-budget.js）。
           sessionLog: () => (Array.isArray(agent.session?.log) ? agent.session.log : []),
-          onExplore: async ({ total, budget, byTool }) => {
-            const detail = describeExploration({ total, byTool })
+          onExplore: async ({ total, calls, repeated, budget, byTool }) => {
+            const detail = describeExploration({ total, calls, repeated, byTool })
             log(`executor-agent：${detail}，超过探索预算 ${budget} 次，催它开始动手`)
             await ctx.onPhase('editing', `${detail}，已超过探索预算 ${budget} 次，催它先动手`)
           },
@@ -1491,13 +1507,23 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       if (justChanged) return
       const counted = countExploration(sessionLog())
       // 第 1 次在 total >= budget，第 2 次在 total >= budget * 2，依此类推。
+      //
+      // `total` 是**不同目标数**，不是调用次数 —— 所以「把同一个文件读 4 遍」这种
+      // 原地打转不再能把预算烧光，而它恰恰是最该被催的那种。见 explore-budget.js。
       if (counted.total < exploreBudget * (exploreNudges + 1)) return
       exploreNudges += 1
-      await options.onExplore?.({ total: counted.total, budget: exploreBudget, byTool: counted.byTool })
+      const payload = {
+        total: counted.total,
+        calls: counted.calls,
+        repeated: counted.repeated,
+        budget: exploreBudget,
+        byTool: counted.byTool,
+      }
+      await options.onExplore?.(payload)
       const makeExploreNudge = typeof options.makeExploreNudgeMessage === 'function'
         ? options.makeExploreNudgeMessage
         : (input) => createExploreNudgeMessage(input, resolveCreateUserMessage(undefined))
-      agent.followup(makeExploreNudge({ total: counted.total, budget: exploreBudget, byTool: counted.byTool }))
+      agent.followup(makeExploreNudge(payload))
     }
     // 醒来的节奏。停滞监控用它去量「多久没动」，探索监控也借它 —— 否则一轮 turn
     // 连跑 40 分钟期间根本醒不过来，等 turn 结束时那 169 次探索早就做完了。
@@ -1593,7 +1619,7 @@ export { createNudgeMessage }
  *
  * 同样不说「挑最有把握的改」—— 2026-11-11 用户否掉过这个口径。
  *
- * @param {{ total: number, budget: number, byTool?: Record<string, number> }} input
+ * @param {{ total: number, calls?: number, repeated?: number, budget: number, byTool?: Record<string, number> }} input
  * @param {(input: { content: unknown, source?: { kind: string } }) => unknown} createUserMessage
  * @returns {any}
  */
@@ -1608,8 +1634,12 @@ function createExploreNudgeMessage (input, createUserMessage) {
   const breakdown = parts.length > 0 ? `（${parts.join('、')}）` : ''
   const budget = Number(input?.budget ?? 0)
   const total = Number(input?.total ?? 0)
+  const repeated = Number(input?.repeated ?? 0)
+  // 「其中 N 次是在重看同一处」这句话很重要：它把「我读了很多」翻译成
+  // 「你在原地打转」，模型据此才会去改「查什么」而不是「怎么查得更快」。
+  const repeatNote = repeated > 0 ? `，其中 ${repeated} 次是在重看同一处` : ''
   const text = [
-    `你已经读了 ${total} 次${breakdown}，任务书给的探索预算是 ${budget} 次。`,
+    `你已经查了 ${total} 处不同的东西${breakdown}${repeatNote}，任务书给的探索预算是 ${budget} 次。`,
     '读到这里，你手上应该已经有足够信息了 —— 继续读下去不会让答案更清楚。',
     '',
     '现在把已经读到的落成一个动作：',

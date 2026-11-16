@@ -173,7 +173,8 @@ function keyLinesOf (memories) {
  * @returns {string}
  */
 export function renderTicketPrompt (ticket, located, options = {}) {
-  // 探索预算的数字来自配置，不再是硬编码的 12 —— 文案与看门狗用同一个数，
+  // 探索预算的数字来自配置（项目级优先），不再是硬编码的 12 —— 文案与看门狗用同一个数，
+  // 见 core/scheduler.js 的 promptOptions 与 adapters/executor-agent 的 ctx.exploreBudget。
   // 否则又会重演「写着 12 次、实测 169 次」。
   const exploreBudget = Number(options.exploreBudget) > 0
     ? Number(options.exploreBudget)
@@ -237,8 +238,15 @@ export function renderTicketPrompt (ticket, located, options = {}) {
   lines.push('')
   lines.push('- **先动手，再补细节**：读到能说出「要改哪个文件的哪一段、改成什么」就开始改第一版，')
   lines.push('  不要等把整个仓库读完 —— 剩下的细节靠跑验证来收敛，比继续阅读快。')
-  lines.push(`- **探索预算 ${exploreBudget} 次**（读文件 + 搜索合计）：这个数字是用来**逼你瞄准**的，`)
-  lines.push('  不是「读满就停下来」。真到了还没定位到，说明**线索不够**，')
+  // 探索预算：数字来自配置（项目级优先），不再是硬编码 —— 文案与看门狗用同一个数。
+  //
+  // 「按不同目标计」这半句是 2026-11-16 加的：计数器数的不是调用次数，是「查过多少处
+  // **不同的**东西」（同一文件读第二遍、同一 pattern 再搜一次都不加数）。不说清楚的话，
+  // 模型会以为读满 N 次就触线，于是读到第 N-1 次时宁可不动手也不敢再查 —— 而它真正该
+  // 在意的恰恰是「别再查同一处」。
+  lines.push(`- **探索预算 ${exploreBudget} 次**（按**不同目标**计 —— 同一个文件读第二遍、`)
+  lines.push('  同一个关键词再搜一遍都不加数，它数的是你查过多少处**不同的**东西）：')
+  lines.push('  这个数字是用来**逼你瞄准**的，不是「读满就停下来」。真到了还没定位到，说明**线索不够**，')
   lines.push('  这时应当停下来说明「还缺哪一条信息才能定位」（例如操作流程没写是哪个页面、')
   lines.push('  截图看不清、问题描述有歧义），把它当成「需要人补信息」。')
   lines.push('  **绝对不要交一版自己都不确定能修好的改动。**')

@@ -35,7 +35,9 @@ src/
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
     executor-agent/  真执行器：拍基线 → 起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交 → 保留会话 → 可选：开 draft MR
-                     explore-budget.js：数 read/grep/glob（认 tool/ptc-dispatch 的 data.name）
+                     explore-budget.js：数 read/grep/glob（认 tool/ptc-dispatch 的 data.name）；
+                     预算是「不同目标数」而不是调用次数（同文件读第二遍不加数），缺省 25，
+                     项目可用 exploreBudget 覆盖
                      重跑同一张票时先 agents.resume 续接上一轮会话（选项是 resumeSessionId 而非 sessionId），续不上再 create
     gitlab-client/   GitLab REST 客户端（分支/提交/MR/错误分类）；只在 repo.gitlab.enabled=true 时被调用
     push-mock/       假通知（记内存）
@@ -176,7 +178,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**576 项断言，全绿 exit 0**，共 **35 个小节**（编号到 20，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**580 项断言，全绿 exit 0**，共 **35 个小节**（编号到 20，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 

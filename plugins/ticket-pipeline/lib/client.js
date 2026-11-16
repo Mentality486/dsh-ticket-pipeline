@@ -980,6 +980,16 @@ window.__ModuleLoader__.load({
             // 否则人选了它、配完、开开关，然后永远等不到票 —— 而且不知道该怪谁。
             optionLabels: { wps: 'wps 金山文档（实验性，需自行注入取数通道）' },
             hint: '决定用哪个 ticket-source 适配器收票。wps 是实验性的：当前版本没有内置取数通道，选它会拿不到票。' },
+          // 项目级探索预算。刻意收在高级里：它是个「大仓不够用才动」的旋钮，
+          // 摆在第一屏会让人以为必须为每个项目都算一个数。
+          //
+          // 用 text 而不是 number：面板没有 number 这一种 kind，而数字校验本来就该由
+          // 宿主 `validateProject()` 做（那边已经会回「必须是正整数」并指向这个键）。
+          // 留空 = 用全局缺省（`BUILTIN_LIMITS.agentExploreBudget`，25）。
+          // 宿主 `describeProject()` 只透出「人配了没有」，不透出求值后的数 ——
+          // 否则「没配」和「配成全局值」在界面上长得一样，人改不了主意。
+          { path: ['exploreBudget'], from: 'exploreBudget', label: '探索预算', kind: 'text', advanced: true,
+            hint: '这张票开工前最多查多少处不同的东西（同一个文件读第二遍不加数）。留空用全局值 25；大仓可填 40–60，小仓 15。只催不杀 —— 超了它会收到一句「别再漫游」，照样把票跑完。' },
         ],
       },
       {

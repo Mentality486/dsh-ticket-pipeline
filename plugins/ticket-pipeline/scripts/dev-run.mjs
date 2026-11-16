@@ -1825,7 +1825,9 @@ async function main () {
     await scheduler.tick()
     assert.match(seenCtx.prompt, /## 工作方式/, '任务书里要有一节专门讲怎么干活')
     assert.match(seenCtx.prompt, /先动手，再补细节/, '必须明说先改一版再补细节')
-    assert.match(seenCtx.prompt, /探索预算 12 次/, '预算要是一个具体数字，不能只说「别读太多」')
+    assert.match(seenCtx.prompt, new RegExp(`探索预算 ${BUILTIN_LIMITS.agentExploreBudget} 次`),
+      '预算要是一个具体数字，不能只说「别读太多」；数字来自 BUILTIN_LIMITS，不许写死')
+    assert.match(seenCtx.prompt, /按\*\*不同目标\*\*计/, '口径要说清是「不同目标」不是调用次数（2026-11-16 改）')
     assert.match(seenCtx.prompt, /同一类信息只查一次/, '重复读同一个文件是最常见的浪费时间')
     // 质量底线：预算超支 ≠ 允许交半成品。这两句必须同时在场，
     // 把「改成什么样」和「实在改不了怎么办」分开讲死。
@@ -2110,6 +2112,99 @@ async function main () {
     assert.match(describeExploration(counted), /探索 3 次（read 1 次、grep 1 次、glob 1 次）/)
   })
 
+  await check('探索计数：同一个文件读第二遍不加数，换个文件才加（2026-11-16 改成按「不同目标」算）', async () => {
+    // 为什么改：实测重复率 55–82%（`sh-row-81` 探索 82 次、真实目标只有 22 个）。
+    // 按调用次数计，等于把「读 82 个不同文件」和「把一个文件读 4 遍」当成同一件事，
+    // 而后者恰恰是最该被催的那种 —— 预算是用来逼它瞄准的，不是逼它少读几遍。
+    const events = [
+      // 同一个文件读三遍：只算 1 个目标
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'r:1', arguments: { file_path: '/repo/A.java' } } },
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'r:2', arguments: { file_path: '/repo/A.java' } } },
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'r:3', arguments: { file_path: '/repo/A.java' } } },
+      // 换一个文件：算新的
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'r:4', arguments: { file_path: '/repo/B.java' } } },
+      // 同一个关键词搜两遍：只算 1 个目标（参数里的额外键不影响判定）
+      { type: 'tool/ptc-dispatch', data: { name: 'grep', subCallId: 'g:1', arguments: { pattern: '首样', '-i': true } } },
+      { type: 'tool/ptc-dispatch', data: { name: 'grep', subCallId: 'g:2', arguments: { pattern: '首样', path: '/repo' } } },
+    ]
+    const counted = countExploration(events)
+    assert.equal(counted.calls, 6, `原始调用次数应当是 6，实际 ${counted.calls}`)
+    assert.equal(counted.total, 3, `不同目标数应当是 3（A.java / B.java / 「首样」），实际 ${counted.total}`)
+    assert.equal(counted.repeated, 3, `重复数量应当是 3，实际 ${counted.repeated}`)
+    assert.match(describeExploration(counted), /其中 3 次是在重看同一处/,
+      '有重复时要说出来 —— 「探索 3 次」和「探索 3 次，其中 3 次在重看同一处」给人的判断完全不同')
+    // 认不出目标时不能吞掉调用：拿不到 arguments 的老形状，宁可多算也别漏。
+    const blind = countExploration([
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'x:1' } },
+      { type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: 'x:2' } },
+    ])
+    assert.equal(blind.total, 2, '没有 arguments 时退回按调用计，不能因为认不出目标就把两次算成一次')
+    assert.equal(blind.repeated, 0)
+  })
+
+  await check('探索预算：项目可以覆盖全局值，而任务书里写的必须是覆盖后的那个数', async () => {
+    // 用户 2026-11-16 问「12 次是不是太少了，能不能按需求给不同预算」。
+    // 「按票分级」被数据否掉了（同一张票跑两次差 3–4 倍），但「按项目分」站得住：
+    // 大仓和多模块 Java 的合理探索量本来就和小单包不一样，那是稳定因素。
+    //
+    // 走 validateConfig 而不是 validateProject：后者不是公开导出，而且校验链路的
+    // 真实入口就是 validateConfig —— 测导出边界之外的东西容易测到「另一条路」。
+    const base = { name: 'p', match: { platform: 'mock' }, repo: { path: 'D:/x' } }
+    // validateConfig 成功时回 `{ value, warnings }`、失败时回 `{ issues, warnings }`
+    // —— 不要按 `{ config }` 取，那是 describeConfig 的形状。
+    const ok = validateConfig({ projects: [{ ...base, exploreBudget: 40 }] })
+    assert.equal(ok.issues, undefined, `合法值不该报错：${JSON.stringify(ok.issues)}`)
+    assert.equal(ok.value.projects[0].exploreBudget, 40, '项目级覆盖必须被透传下去，否则调度器读不到')
+    // 不写就不产生这个键 —— 老配置一个字节都不用动。
+    const absent = validateConfig({ projects: [{ ...base }] })
+    assert.equal(absent.value.projects[0].exploreBudget, undefined, '不配就用全局值，不能凭空塞一个数进去')
+    // 0 / 负数 / 非整数 / 字符串都是配置错误：想关掉监控应当改全局的 agentExploreBudget，
+    // 写在项目上会被 `Number(x) > 0` 判成假值后静默回落到全局，人以为关了这一项。
+    for (const bad of [0, -1, 2.5, 'abc']) {
+      const out = validateConfig({ projects: [{ ...base, exploreBudget: bad }] })
+      assert.ok(
+        out.issues.some((issue) => (issue.path ?? []).includes('exploreBudget')),
+        `exploreBudget=${JSON.stringify(bad)} 必须被拦下，实际 issues：${JSON.stringify(out.issues)}`,
+      )
+    }
+  })
+
+  await check('探索预算：项目级覆盖会一层层传到任务书与执行器（不许只在文案那边生效）', async () => {
+    // 这条锁的是「同源」的传递链：项目配置 → scheduler 的 promptOptions → 任务书文案，
+    // 以及项目配置 → scheduler → ctx.exploreBudget → 执行器的计数器。
+    // 2026-11-16 之前 scheduler 写死 `BUILTIN_LIMITS.agentExploreBudget`，
+    // 于是「项目级覆盖」只在任务书里生效、催办仍按全局值 —— 两边又开始各写一份。
+    const ticket = { projectId: 'p', recordId: 'r', description: 'x'.repeat(40), flow: '项目管理 → 首样测试 → 列表页' }
+    const overridden = renderTicketPrompt(ticket, {}, { exploreBudget: 40 })
+    assert.match(overridden, /探索预算 40 次/, '项目级值必须进任务书')
+    assert.ok(!overridden.includes(`探索预算 ${BUILTIN_LIMITS.agentExploreBudget} 次`),
+      '覆盖生效时不该还出现全局值 —— 两个数同时出现会让模型不知道该信哪个')
+    // 文案必须讲清「按不同目标计」，否则模型会以为读满 N 次就触线而不敢再查。
+    assert.match(overridden, /按\*\*不同目标\*\*计/, '预算口径要说清是「不同目标」不是「调用次数」')
+
+    // 另一半：执行器真的从 ctx 里拿到了这个数（而不是仍然用工厂闭包里的全局缺省）。
+    // 用假执行器看不出这条 —— 必须走真实 scheduler + 间谍执行器读 ctx.exploreBudget。
+    const source = createMockSource()
+    let seenCtx = null
+    const executor = {
+      id: 'spy',
+      async run (ticket, target, ctx) {
+        seenCtx = ctx
+        await ctx.onPhase('editing')
+        return makeExecResult({ phase: 'done', changedFiles: [], testOutcome: 'passed' })
+      },
+    }
+    const { scheduler } = harness({
+      source,
+      executor,
+      config: { projects: [{ name: DEMO, match: { platform: 'mock' }, repo: { path: 'D:/repo/demo' }, exploreBudget: 40 }] },
+    })
+    await scheduler.tick()
+    assert.equal(seenCtx.exploreBudget, 40,
+      `项目级 40 必须原样交给执行器，实际 ${seenCtx.exploreBudget}（写死成全局值就会在这里露馅）`)
+    assert.match(seenCtx.prompt, /探索预算 40 次/, '任务书与执行器必须是同一个数，不能一边 40 一边 25')
+  })
+
   await check('探索预算：读超了要催，且催的话术不能假装「你很久没动了」', async () => {
     // 与停滞催办的区别：那句说「已经 N 分钟没改动文件」，这句的触发条件是
     // 「读得飞快但一直在读」—— 说分钟数会是**假话**（它一秒都没闲着），
@@ -2144,14 +2239,15 @@ async function main () {
     }).catch((error) => {
       assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
     })
-    assert.ok(nudges.length >= 1, `读了 20 次、预算 12，必须催一次，实际 ${nudges.length} 次`)
+    assert.ok(nudges.length >= 1, `读了 20 处、预算 12，必须催一次，实际 ${nudges.length} 次`)
     assert.equal(phases[0].total, 20, '报给人看的总数要真实')
     assert.equal(phases[0].budget, 12)
     const msg = nudges[0]
     assert.equal(msg.role, 'user', `兜底也要造出宿主能接受的消息形状，实际 role=${msg.role}`)
     assert.ok(typeof msg.id === 'string' && msg.id.length > 0, '必须带 id')
     const text = msg.content[0].text
-    assert.match(text, /读了 20 次/, '要用真实数字，模型自己就能算出超了几倍')
+    // 2026-11-16 起口径改成「查了多少处不同的东西」：数的不是调用次数。
+    assert.match(text, /已经查了 20 处不同的东西/, '要用真实数字，模型自己就能算出超了几倍')
     assert.match(text, /预算是 12 次/)
     assert.doesNotMatch(text, /分钟/, '这条触发条件是「读得多」，不是「停得久」—— 提分钟数是假话')
     assert.match(text, /不要硬猜一个改动交上去/, '预算超支的出路是「说清缺什么」，不是「随便改一版」')

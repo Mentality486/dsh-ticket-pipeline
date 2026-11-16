@@ -576,6 +576,9 @@ function describeProject (project, index) {
     // 验证
     verifyBuild: String(verify.build ?? ''),
     verifyTest: String(verify.test ?? ''),
+    // 项目级探索预算（2026-11-16）：不配就给空串，面板上留空 = 用全局缺省。
+    // 给的是**求值后**的值会让「没配」和「配成全局值」看起来一样，人改不了主意。
+    exploreBudget: Number.isInteger(project?.exploreBudget) ? String(project.exploreBudget) : '',
   }
   return out
 }
