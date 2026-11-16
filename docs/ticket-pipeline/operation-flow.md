@@ -256,7 +256,7 @@ flowchart LR
 
 | # | 卡点 | 类型 | 现状 |
 | --- | --- | --- | --- |
-| P0-3 | 金山无开放平台取数通道 | 取数缺口 | **待接**。只有 `match.sheetUrl` + 全局 fetch（大概率要登录态）或宿主注入 `fetchSheet` |
+| P0-3 | 金山无开放平台取数通道 | 取数缺口 | **部分可用（2026-11-16 纠正）**。`match.sheetUrl` 非空时 `wpsOptionsFromMatch()` 会装**内置下载器**（超时 / 字节上限 / 逐跳校验都有），不需要注入；共享链接大概率要登录态，配了链接下不下来只有运行期才知道。真正「取数通道未接」的只是「没填表格链接也没注入 `fetchSheet`」这一种配置（`MISSING_FETCH_SHEET`）。`pipeline_doctor` 已按这两档分开说 |
 | P0-6 | 真实飞书表截图是 url 形态，白名单缺省为空 | 配置缺口 | **已能配**（`match.allowedImageHosts`），但要对这张表放开仍需显式填域名 |
 | P1-12 | 金山 recordId 用行号 `'r'+rowIndex` | 健壮性 | **已知代价**，未改（插行会让票换身份，代码注释已声明） |
 | P1-13 | `pushplus.token` 明文配置 | 安全 | **待改**（QQ 邮箱那条走 `QQMAIL_AUTH_CODE` 凭据，不落配置） |

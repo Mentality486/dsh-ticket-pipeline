@@ -163,22 +163,41 @@ for (const warning of configWarnings) {
   lines.push(`⚠️ 配置：${warning}`)
 }
 
-// ── 2c. 实验性工单源：选了也拿不到票 ──────────────────
+// ── 2c. 金山文档源：说清它到底能不能拿到票 ──────────
 //
-// 为什么算**阻断**不是提醒：金山源 `platform: 'wps'` 的取数通道是注入式的，而主装配里
-// 没有注入（`src/adapters/source-wps/index.js` 的 MISSING_FETCH_SHEET）。选了它的项目
-// 每次扫描都会抛错、一张票都收不到。这种「配好了但永远没反应」比报错难查得多 ——
-// 必须在这张体检单上直接说「这条路现在不通」，别让人去猜是网络、凭据还是权限。
+// **2026-11-16 纠正**：这里原来对**任何** platform==='wps' 的项目都报阻断，理由是
+// 「主装配没有注入 fetchSheet」。这句是错的 —— `wpsOptionsFromMatch()` 在 `match.sheetUrl`
+// 非空时就会装一个内置下载器（`options.fetchSheet = (signal) => downloadSheetLimited(...)`），
+// 也就是**配了表格链接就有取数通道**，只是共享链接大概率要登录态、可能下不下来。
+// 一份配置被体检判成「这条路完全不通」、而扫描其实会去真下载，等于给出了互相矛盾的结论 ——
+// 人会先去查体检是不是坏了，而不是去看那张表要不要登录。
+//
+// 所以按「有没有内置通道」分开说：
+//   没配 sheetUrl → 真的没有通道，阻断（createWpsSource 直接抛 MISSING_FETCH_SHEET）；
+//   配了 sheetUrl → 通道在，判断降级成提醒（下载可能因登录态失败，那是运行期才知道的事）。
 const wpsProjects = projects.filter((project) => String(project?.match?.platform ?? '') === 'wps')
 if (wpsProjects.length > 0) {
-  const names = wpsProjects.map((project) => String(project?.name ?? '(未命名)')).join('、')
-  blockers.push(
-    `项目 ${names} 用的是金山文档源（platform: wps），而当前版本没有内置取数通道 —— `
-    + '这些项目一张票都拿不到。两条出路：① 把平台改成 feishu（多维表格或电子表格都能用）；'
-    + '② 确实要接金山就自行注入 fetchSheet()，见 src/adapters/source-wps/index.js 模块注释。',
-  )
-  lines.push(`❌ 金山文档源（实验性）：${names} —— 没有内置取数通道，拿不到票`)
-  lines.push('　　（金山源还有第二个已知限制：recordId 用行号，在表里插行/删行会让票换身份。）')
+  const withUrl = wpsProjects.filter((project) => String(project?.match?.sheetUrl ?? '').trim().length > 0)
+  const withoutUrl = wpsProjects.filter((project) => String(project?.match?.sheetUrl ?? '').trim().length === 0)
+  if (withoutUrl.length > 0) {
+    const names = withoutUrl.map((project) => String(project?.name ?? '(未命名)')).join('、')
+    blockers.push(
+      `项目 ${names} 用的是金山文档源（platform: wps），既没配「表格链接」也没有注入 fetchSheet —— `
+      + '这些项目一张票都拿不到。两条出路：① 把平台改成 feishu（多维表格或电子表格都能用）；'
+      + '② 留在金山就在项目卡片里填「表格链接」，或自行注入 fetchSheet()，见 src/adapters/source-wps/index.js 模块注释。',
+    )
+    lines.push(`❌ 金山文档源：${names} —— 既没配表格链接也没有取数通道，拿不到票`)
+  }
+  if (withUrl.length > 0) {
+    const names = withUrl.map((project) => String(project?.name ?? '(未命名)')).join('、')
+    warnings.push(
+      `项目 ${names} 用的是金山文档源（platform: wps）：配了「表格链接」，插件会用全局 fetch 下载整份 xlsx 自行解析。`
+      + '这条路能跑，但共享链接通常要登录态 —— 如果扫描报 HTTP 403/401 或超时，就是这里缺授权，'
+      + '不是插件坏了。要稳定请改平台 feishu，或自行注入 fetchSheet()。',
+    )
+    lines.push(`⚠️ 金山文档源：${names} —— 有内置下载通道（靠「表格链接」），但共享链接常需登录态，可能下不下来`)
+  }
+  lines.push('　　（金山源的第二个已知限制对所有 wps 项目都成立：recordId 用行号，在表里插行/删行会让票换身份。）')
 }
 
 for (const project of projects) {

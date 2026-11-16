@@ -30,7 +30,8 @@ src/
   adapters/
     source-mock/     内存工单源（离线跑通全链路用，每个项目一个实例）
     source-feishu/   飞书多维表格 + 飞书电子表格（sheets.js 纯函数解析、probe.js 连通性探针）
-    source-wps/      金山文档共享 Excel（解析已实现；取数需注入 fetchSheet，开放平台通道待接）
+    source-wps/      金山文档共享 Excel（解析已实现；配了 match.sheetUrl 就有内置下载器，
+                     共享链接常需登录态；要稳定可注入 fetchSheet，开放平台通道待接）
     locator-table/   通用仓库定位器：拿 projectId 查 projects[]（不做模块→代码推断）
     executor-mock/   假执行器（离线跑通用）
     executor-agent/  真执行器：拍基线 → 起 agent 改码 → 过滤敏感文件 → 点名暂存 + 本地提交 → 保留会话 → 可选：开 draft MR

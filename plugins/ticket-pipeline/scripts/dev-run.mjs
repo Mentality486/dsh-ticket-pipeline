@@ -3460,7 +3460,8 @@ async function main () {
   })
 
   await check('体检：选了金山文档源就报阻断，并说清「一张票都拿不到」', async () => {
-    // 工单 #20：wps 源的取数通道是注入式的，主装配没注入 ⇒ 选了它票永远是 0。
+    // 工单 #20：wps 源的取数通道是注入式的。**没配 sheetUrl 时**主装配确实不注入
+    // （`wpsOptionsFromMatch` 只在 `match.sheetUrl` 非空时才装内置下载器）⇒ 选了它票永远是 0。
     // 这种「配完了什么都没发生」必须在这里拦，否则人只会以为插件坏了。
     const out = await createPipelineDoctorTool({
       ...NO_VERSION_CHECK,
@@ -3480,6 +3481,47 @@ async function main () {
     )
     assert.ok(out.text.includes('拿不到票'), '要说清后果（一张票都拿不到）')
     assert.ok(out.text.includes('feishu'), '要给出出路（改成 feishu）')
+  })
+
+  await check('体检：金山项目配了表格链接就不算阻断 —— 内置下载通道是存在的', async () => {
+    // 2026-11-16 纠正：这里原来对**任何** wps 项目都报阻断，理由是「主装配没有注入
+    // fetchSheet」。这句是错的 —— `wpsOptionsFromMatch()` 在 `match.sheetUrl` 非空时
+    // 就装 `options.fetchSheet = (signal) => downloadSheetLimited(fetch, sheetUrl, {signal})`。
+    // 一份「体检说完全不通、扫描其实会真下载」的配置会让人去查体检是不是坏了。
+    // 判据改成「有没有内置通道」：没配链接 → 阻断；配了 → 提醒（可能因登录态下不下来）。
+    const makeTool = (match) => createPipelineDoctorTool({
+      ...NO_VERSION_CHECK,
+      gitRunner: async (argv) => ({ code: 0, stdout: argv[0] === '--version' ? 'git version 2.45.1' : (argv[0] === 'status' ? '' : 'true'), stderr: '' }),
+      getConfig: () => ({
+        enabled: true,
+        projects: [{ name: 'wps1', match, repo: { path: 'D:/repo/wps1' } }],
+        workExecutor: 'agent',
+        pushAdapter: 'mock',
+      }),
+      credentials: { describe: async () => ({ configured: true }) },
+    })
+
+    const withUrl = await makeTool({
+      platform: 'wps',
+      sheetUrl: 'https://www.kdocs.cn/l/abcdef',
+      sheetName: '问题记录表',
+    }).execute({}, {})
+    assert.ok(
+      !withUrl.blockers.some((b) => b.includes('金山')),
+      `配了链接不该进 blockers：${JSON.stringify(withUrl.blockers)}`,
+    )
+    assert.ok(
+      withUrl.warnings.some((w) => w.includes('金山') && w.includes('登录态')),
+      `要进 warnings 并点明登录态：${JSON.stringify(withUrl.warnings)}`,
+    )
+    assert.ok(withUrl.text.includes('有内置下载通道'), `要说清通道在：${withUrl.text}`)
+
+    // 反例：同样没有 fetchSheet 注入，但正因为**没填链接**才该阻断。
+    const withoutUrl = await makeTool({ platform: 'wps' }).execute({}, {})
+    assert.ok(
+      withoutUrl.blockers.some((b) => b.includes('金山')),
+      `没配链接仍要阻断：${JSON.stringify(withoutUrl.blockers)}`,
+    )
   })
 
   await check('体检：飞书连接失败都被归一成人话（码表 / 未知码 / 网络错 / 超时）', async () => {
