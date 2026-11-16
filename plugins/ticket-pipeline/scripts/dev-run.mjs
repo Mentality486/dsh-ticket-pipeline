@@ -5242,7 +5242,13 @@ function makeFakeCtx ({ domain, registered }) {
     assert.ok(Number.isFinite(write.handledAt) && write.handledAt > 0, '「处理日期」要是毫秒时间戳')
     assert.ok(write.result.includes('已按工单改完并提交'), `处理结果要说清做了什么：${write.result}`)
     assert.ok(write.result.includes('本地提交：'), '处理结果里要写提交在哪')
-    assert.ok(write.result.includes('要进一步修改'), '要告诉人怎么重跑')
+    // 用户 2026-11-16 的口径：单元格只留「人下一步用的」那几条，记录号必须在。
+    assert.ok(write.result.includes('记录号：rec-mock-001'), `记录号必须逐字出现在单元格里（重跑要靠它）：${write.result}`)
+    assert.ok(write.result.includes('pipeline_reset'), '要告诉人怎么重跑')
+    // 反向断言：长文件清单与长段说明都不许再进单元格 —— 它们把记录号挤出屏幕。
+    assert.equal(write.result.includes('改动 6 个文件'), false, `不该再列文件清单：${write.result}`)
+    assert.equal(/^\s*- /m.test(write.result), false, `不该再出现文件条目行：${write.result}`)
+    assert.equal(write.result.includes('要进一步修改'), false, `不该再写长段重跑说明：${write.result}`)
 
     assert.equal(row.writeBack?.written, true, '票据上要记下回填成功')
     assert.ok(Array.isArray(row.writeBack.fields) && row.writeBack.fields.length === 3, '要记下写了哪三列')
@@ -5538,7 +5544,24 @@ function makeFakeCtx ({ domain, registered }) {
     assert.deepEqual(lines, [], 'failed 票不该多出空行或「取不到」噪音')
   })
 
-  await check('skipped 的回填首句要说「待人工验证」，不能写成已完成', async () => {    // skipped 是「提交做了、验证没通过」。回填如果写成「已改完」，
+  await check('处理结果单元格只留关键信息：记录号必在，文件清单与长段说明都不进', async () => {
+    // 用户 2026-11-16：「回填处理结果时 只记录重要的信息 如 recordId 等」。
+    // 真机上 6 个 Java 全路径把「记录号」挤到了屏幕外 —— 而那才是人下一步唯一要复制的。
+    const { scheduler, source } = harness()
+    await scheduler.tick()
+    const text = source.writes[0].result
+
+    assert.match(text, /^记录号：rec-mock-001/m, `记录号要单独成行、可整行复制：${text}`)
+    assert.ok(text.length < 300, `单元格要保持一屏可读，实际 ${text.length} 字：${text}`)
+    assert.ok(text.split('\n').length <= 6, `行数也要克制，实际 ${text.split('\n').length} 行：${text}`)
+    // 长路径清单是这次被删掉的主要东西：哪怕只有一条也不该出现。
+    assert.equal(/pms-server\/|pms-web\//.test(text), false, `不该再列改动文件：${text}`)
+    // 工作区路径同理：pipeline_status 里查得到，且它把记录号挤到屏幕外。
+    assert.equal(text.includes('D:\\') || text.includes('D:/'), false, `不该再写工作区路径：${text}`)
+  })
+
+  await check('skipped 的回填首句要说「待人工验证」，不能写成已完成', async () => {
+    // skipped 是「提交做了、验证没通过」。回填如果写成「已改完」，
     // 人看到表里那行「是」就不会再去看验证报告了。
     // 也不能写成「没跑通」这种否定式收尾（#01）——它是交付成功、待人工验证。
     const { scheduler, source } = harness({ executor: createMockExecutor({ outcome: 'skipped' }) })
@@ -5743,7 +5766,10 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(write.status, undefined, '「是否处理」不能写 —— 写了就等于说处理完了')
     assert.equal(write.handledAt, undefined, '「处理日期」是人的字段，不能写')
     assert.match(write.result, /\[流水线\] 失败：/, `结果列要说清这是失败：${write.result}`)
+    assert.match(write.result, /记录号：rec-mock-001/, `失败票的单元格也要有记录号（不然没法重跑）：${write.result}`)
     assert.match(write.result, /pipeline_reset/, '要告诉人怎么重跑')
+    // 反向断言：工作区路径不进单元格（pipeline_status 里查得到，且它把记录号挤下去）。
+    assert.equal(write.result.includes('改代码目录'), false, `不该再写工作区路径：${write.result}`)
 
     const row = store.getTicket(k('rec-mock-001'))
     assert.equal(row.phase, 'failed', '回填不改票态')

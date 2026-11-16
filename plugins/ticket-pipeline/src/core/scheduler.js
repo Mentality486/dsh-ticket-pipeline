@@ -1897,10 +1897,19 @@ function renderNotifyBody (ticket, row, phase) {
 /**
  * 回填进「处理结果」列的那段话。
  *
- * 写给人看的，不是写日志的：人打开表格只想知道「这票到底动了什么、能不能合」。
- * 所以顺序按人的关心程度排：改了什么 → 验证过没有 → 提交在哪 → 怎么继续追问。
+ * 写给人看的，不是写日志的。**只留「人下一步要用的那几条」**（用户 2026-11-16 明确要求：
+ * 「回填处理结果时只记录重要的信息，如 recordId 等」）：
  *
- * 长度控制在一屏内（飞书单元格塞几千字会很难读），最多列 8 个文件。
+ * - `记录号`（recordId）：没有它就没法 `pipeline_reset` 重跑，也没有别的办法从表格
+ *   反查回插件里那张票。这是**唯一必须逐字出现在单元格里**的东西。
+ * - 提交在哪（sha / 分支）：人要去检出里 review 就靠它。
+ * - 验证结论：决定「能不能合」。
+ * - 处理会话：想追问当时怎么想的，直接点进去。
+ *
+ * 刻意**不写**：改动文件清单（真机上 6 行、每行是 40–80 字的 Java 全路径，把关键信息挤到
+ * 屏幕外；文件清单 `pipeline_status` 里有，检出里 `git show <sha>` 也有）、重跑步骤的长段
+ * 说明（一句「要重跑用 pipeline_reset 带记录号」已经够，且记录号就在上一行）、
+ * 完整 diff、编译输出、错误栈。
  *
  * @param {Ticket} ticket
  * @param {{
@@ -1909,8 +1918,8 @@ function renderNotifyBody (ticket, row, phase) {
  *   result: import('../contracts/work-executor.js').ExecResult,
  *   commit?: { sha: string, branch: string, files: string[] },
  *   mr?: { iid: number, url: string, draft: boolean },
- *   changedFiles?: string[],
- *   worktreePath?: string,
+ *   changedFiles?: string[],   // 不再进正文（文件清单在 pipeline_status 与 git show 里）
+ *   worktreePath?: string,     // 不再进正文（路径太长，且能从记录号反查到）
  *   sessionId?: string,
  *   verification?: { outcome?: string, detail?: string },
  * }} input
@@ -1918,37 +1927,27 @@ function renderNotifyBody (ticket, row, phase) {
  */
 function renderWriteBackResult (ticket, input) {
   const lines = []
-  const files = Array.isArray(input.changedFiles) ? input.changedFiles : []
-  const where = input.worktreePath ? `（${input.worktreePath}）` : ''
 
   if (input.phase === 'skipped') {
-    lines.push('已按工单改完并提交到工作区检出，待人工验证（验证命令没通过）。')
+    // skipped 是「提交做了、验证没通过」。首句必须点出「待人工验证」——
+    // 表里这一行会被写成「是」，人看到「是」就不会再翻验证报告了。
+    lines.push('已按工单改完并提交，验证没通过，待人工验证。')
   } else {
     lines.push('已按工单改完并提交。')
   }
 
-  if (files.length > 0) {
-    lines.push(`改动 ${files.length} 个文件：`)
-    for (const file of files.slice(0, 8)) lines.push(`- ${file}`)
-    if (files.length > 8) lines.push(`- …还有 ${files.length - 8} 个`)
-  } else {
-    lines.push('改动文件：无（见下方提交说明）')
-  }
-
   const outcome = normalizeTestOutcome(input.verification?.outcome)
-  if (outcome === 'passed') lines.push('验证：通过（build/test 退出码 0）')
+  if (outcome === 'passed') lines.push('验证：通过')
   else if (outcome === 'failed') lines.push('验证：未通过')
   else if (outcome === 'not-run') lines.push(`验证：未跑成 —— ${input.verification?.detail ?? '原因未记录'}`)
 
   if (input.commit?.sha) {
-    lines.push(`本地提交：${String(input.commit.sha).slice(0, 12)}${input.commit.branch ? ` @ ${input.commit.branch}` : ''}${where}`)
+    lines.push(`本地提交：${String(input.commit.sha).slice(0, 12)}${input.commit.branch ? ` @ ${input.commit.branch}` : ''}`)
   }
   if (input.mr?.url) lines.push(`draft MR：${input.mr.url}`)
-  if (input.sessionId) {
-    lines.push(`处理会话：${input.sessionId}（保留在项目工作区名下，可在 GUI 里点进去继续追问）`)
-  }
-  lines.push('', '要进一步修改，先把这个单元格清空，再用 pipeline_reset 带上这张票的 recordId 重跑。'
-    + '（也可以把「是否处理」拨回「处理中」，但那会整票重做一遍并覆盖这次的回填。）')
+  if (input.sessionId) lines.push(`处理会话：${input.sessionId}`)
+  // 记录号放最后一行且单独成行：它是人下一步唯一要复制的东西（重跑 / 反查）。
+  lines.push(`记录号：${ticket.recordId}（要重跑就用 pipeline_reset 带上它）`)
 
   return lines.join('\n')
 }
@@ -1960,6 +1959,12 @@ function renderWriteBackResult (ticket, input) {
  * 失败的票人看重「为什么没成、还能不能救、下一步做什么」。所以这里只写这几件事，
  * 多一句都是噪音。
  *
+ * 同样只留下一步要用的：失败原因（要截断，错误里常带整段堆栈）→ 改了哪几轮 →
+ * 记录号（重跑要复制它）→ 处理会话（点进去看它那一轮做了什么）。
+ * **不写工作区路径**：`D:\WorkSpace\mgiot-pms` 这种路径 `pipeline_status` 里查得到，
+ * 而且它本来就不是人下一步要复制的东西 —— 占三行位置换来「知道去哪看」，
+ * 而重跑根本不需要它。
+ *
  * 不写「是否处理」与「处理日期」：那两列在飞书表里是「处理完了」的信号，
  * 一张没成的票填上它们，看板会说谎。
  *
@@ -1967,7 +1972,7 @@ function renderWriteBackResult (ticket, input) {
  * @param {{
  *   phase: Phase,
  *   lastError?: string,
- *   worktreePath?: string,
+ *   worktreePath?: string,   // 不再进正文（pipeline_status 里有）
  *   sessionId?: string,
  *   attempt?: number,
  * }} input
@@ -1976,13 +1981,30 @@ function renderWriteBackResult (ticket, input) {
 function renderFailureWriteBack (ticket, input) {
   const lines = []
   const label = phaseLabel({ phase: input.phase })
-  lines.push(`[流水线] ${label}：${input.lastError ?? '原因未记录'}`)
+  lines.push(`[流水线] ${label}：${truncateError(input.lastError)}`)
   if (input.attempt && input.attempt > 1) lines.push(`已尝试 ${input.attempt} 次。`)
-  if (input.worktreePath) lines.push(`改代码目录：${input.worktreePath}（工作区还留着，可以去看看改到哪了）`)
-  if (input.sessionId) lines.push(`处理会话：${input.sessionId}（点进去能看它那一轮到底做了什么）`)
-  lines.push('', `要重来：用 pipeline_reset 带上这张票的 recordId（${ticket.recordId}）。`)
+  if (input.sessionId) lines.push(`处理会话：${input.sessionId}`)
+  lines.push(`记录号：${ticket.recordId}（要重跑就用 pipeline_reset 带上它）`)
 
   return lines.join('\n')
+}
+
+/**
+ * 把错误压成一行能塞进表格的短句。
+ *
+ * 真机上 `lastError` 经常是这样的：
+ * `internal: 飞书接口报错 800074911：ConnectorSyncTableActionForbidden, [status_code: 800004105 ...]`
+ * —— 有用的只有开头那半句。截断而不是原样写，是因为单元格里后面半截会把
+ * 「记录号」那一行挤出屏幕。
+ *
+ * @param {string | undefined} lastError
+ * @param {number} [max]
+ * @returns {string}
+ */
+function truncateError (lastError, max = 120) {
+  const text = String(lastError ?? '原因未记录').replace(/\s+/g, ' ').trim()
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}…`
 }
 
 /**
