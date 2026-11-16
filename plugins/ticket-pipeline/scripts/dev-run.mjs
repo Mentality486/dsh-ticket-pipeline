@@ -2284,6 +2284,63 @@ async function main () {
     assert.equal(nudges.length, 0, '工作区一直在变，不该催')
   })
 
+  await check('探索预算：改一会儿、读一会儿，不许反复催（2026-11-16「一直催」的真因）', async () => {
+    // 用户报「这个一直催，会重复发好多次」。真机形态是 agent 在
+    //   「改代码 → 读几次确认 → 再改」之间来回。
+    //
+    // 旧实现的两层毛病：
+    //   ① 只看瞬时的 justChanged —— 它一停下来读代码，保护就没了；
+    //   ② refreshProgress() 一看到文件改动就把 exploreNudges 归零，而
+    //      counted.total 是累计只增的 —— 于是下一轮判据 `total < budget * 1`
+    //      立刻又成立，改一次代码催一次，直到 maxExploreNudges 烧光。
+    //
+    // 这里把快照序列写死，明确造出「改完之后又停下来读」的那几轮：
+    //   S0 → S0（纯读，触发第 1 次催）→ S1（改了）→ S1（停下来读！）→ S1 → …
+    // 正确的行为是只催那一次，之后彻底退休。
+    let clock = 0
+    let round = 0
+    const nudges = []
+    const agent = {
+      // 前 5 轮表现成「还在干活」（status 不是 idle），循环才会继续转下去 ——
+      // 否则 whenIdle 立刻返回 + seq 不动，两轮就到 quietTicks 退出了，
+      // 根本走不到「改完之后又停下来读」那个窗口。
+      get status () { return round < 5 ? 'running' : 'idle' },
+      get session () { return { seq: Math.floor(clock / 1000) } },
+      whenIdle: async () => { clock += 60_000; round += 1 },
+      followup: (msg) => { nudges.push(msg) },
+    }
+    // 基线快照在循环之前取一次（S0），之后每醒来一次取一个：
+    //   第 1 轮 S0（没改，纯读）→ 第 2 轮 S1（改了！）→ 第 3 轮起 S1（停下来读）…
+    // 第 3 轮就是旧代码反复催的窗口：exploreNudges 已被归零，而 total 累计不会变少。
+    const shots = ['S0', 'S0', 'S1', 'S1', 'S1', 'S1', 'S1', 'S1']
+    let shotIndex = 0
+    // 一直只有这 40 处探索（累计口径不会变少）。
+    const events = []
+    for (let i = 0; i < 40; i += 1) {
+      events.push({ type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: `r:${i}` } })
+    }
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      worktreeSnapshot: async () => {
+        const value = shots[Math.min(shotIndex, shots.length - 1)]
+        shotIndex += 1
+        return ` M ${value}.js\n`
+      },
+      stallWarnMs: 60 * 60_000,
+      maxNudges: 0,
+      now: () => clock,
+      exploreBudget: 12,
+      maxExploreNudges: 3,
+      sessionLog: () => events,
+      onExplore: () => {},
+      makeExploreNudgeMessage: (input) => ({ kind: 'explore', input }),
+    }).catch((error) => {
+      assert.equal(error.kind, 'internal', `不该是别的错：${error.message}`)
+    })
+    // 40 处不同目标 / 预算 12 ⇒ 光按倍数算够催 3 次，但**一旦开始改文件就该彻底停**。
+    assert.equal(nudges.length, 1,
+      `只该在第 1 轮纯读时催一次；改过代码之后再停下来读也不许念。实际催了 ${nudges.length} 次`)
+  })
+
   await check('saveImage 什么都没返回时跳过空图块，不塞进 content', async () => {
     // 离线 mock 的 saveImage 就是返回 undefined：空引用塞进 content 会让适配器组装消息时炸掉。
     const source = createMockSource()

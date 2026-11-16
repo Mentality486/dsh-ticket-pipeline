@@ -1437,6 +1437,23 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     /** 这次运行里已经因为超支催过几次。按「每超一个 budget」算一档。 */
     let exploreNudges = 0
     /**
+     * 它有没有**已经开始改文件**。
+     *
+     * 一旦为真，探索预算就**永久退休**：这条催办的前提是「读了这么多还没动手」，
+     * 前提没了它就没有信息量。读几次代码确认上下文是正经事。
+     *
+     * 为什么不用「这一轮醒来的 justChanged」代替：那只是一个瞬时快照。走查
+     * 2026-11-16 真机日志暴露了后果 —— 见下面 `checkExplore` 的注释。
+     */
+    let editingStarted = false
+    /**
+     * 上一次催办时的 `counted.total`（累计的不同目标数）。
+     *
+     * 单调门坎：`counted.total` 只增不减，所以「同一批探索」永远催不出第二句话。
+     * 这是三道保险里唯一不依赖任何可重置状态的 —— 见 `checkExplore`。
+     */
+    let lastNudgedTotal = 0
+    /**
      * 刷新「工作区有没有变」。
      *
      * 抽出来是因为现在有两处判断都依赖它（停滞 / 探索），各读一次
@@ -1456,6 +1473,9 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       nudges = 0
       lastNudgeAt = 0
       exploreNudges = 0
+      // 但「已经开始改文件」这件事是**一次性**的，它一旦为真就不该再被任何
+      // 计数归零抹掉（见 checkExplore 的长注释：2026-11-16 的反复催就出在这里）。
+      editingStarted = true
       return true
     }
     /**
@@ -1494,24 +1514,54 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
     /**
      * 探索次数超预算了吗。
      *
-     * 判据是「读完这么多还没开始改代码」。一动手就说明读的够用了，不再念预算 ——
-     * 否则一个人在改代码的 agent 每读一个文件确认上下文就被催一遍，纯属干扰。
+     * 判据是「读完这么多还没开始改代码」。**一动手就永久退休**，不再念预算 ——
+     * 否则一个人在改代码的 agent 每读几个文件确认上下文就被催一遍，纯属干扰。
+     *
+     * ## 2026-11-16：用户报「这个一直催，会重复发好多次」
+     *
+     * 真机上同一张票收到了好几条一模一样的「你已经读了 N 次……预算是 25 次」。
+     * 两层原因，第二层才是根：
+     *
+     * 1. **只看瞬时 `justChanged`。** 旧判据是「这一轮醒来恰好看到工作区变了就不念」。
+     *    可 agent 是「改一会儿 → 再读一会儿确认 → 再改」的节奏，那些「没在改」的
+     *    醒来瞬间都不再受保护，于是它每回到只读状态就被念一次。
+     *
+     * 2. **阈值会跟着计数一起倒退。** 这一层是真正让它无限重复的原因：
+     *    `exploreNudges` 是**催过几次**，而 `counted.total` 是**累计读了多少处**，
+     *    只增不减。`refreshProgress()` 一看到文件改动就把 `exploreNudges` 归零
+     *    （本意是「它已经动手了，重新给预算」），下一轮判据变成
+     *    `total < budget * (0 + 1)` —— 而 `total` 早就越过 `budget` 了，于是**立刻再催**。
+     *    改一次代码催一次，循环到把 maxExploreNudges 烧光为止。
+     *
+     * 修法：把「已经开始改文件」提成一次性的 `editingStarted`，一旦置真就再也不催。
+     * 两套预算的「归零」语义本来就不该一样 —— 停滞监控的 `nudges` 归零是对的
+     * （它再停 8 分钟该重新催），探索监控的**不该**（读过的量不会变少）。
      *
      * @param {boolean} justChanged 这一轮醒来时是否观察到工作区有改动
      * @returns {Promise<void>}
      */
     const checkExplore = async (justChanged) => {
       if (exploreBudget <= 0 || !sessionLog) return
-      if (exploreNudges >= maxExploreNudges) return
       // 已经在改文件了就别再念预算：读几次代码确认上下文是正经事。
-      if (justChanged) return
+      // 用一次性的 editingStarted 而不是瞬时的 justChanged —— 见上面第 1 条。
+      if (editingStarted || justChanged) return
+      if (exploreNudges >= maxExploreNudges) return
       const counted = countExploration(sessionLog())
+      // 第三道保险，也是**与状态无关**的那一道：催过之后就不再拿「同一个数」催第二次。
+      //
+      // 前两道（editingStarted / exploreNudges）都是状态量，任何一个被别处归零就失效。
+      // 而 `counted.total` 是累计只增的 —— 用它当**单调门坎**，就算将来有人再往
+      // refreshProgress 里加一行 `exploreNudges = 0`，同一批探索也催不出第二句话。
+      // 这条判据的形状值得单独记一笔：让「不可能重复」由数据结构保证，而不是由
+      // 「没有别的地方会重置它」这个约定保证。约定会被后来的改动打破，单调量不会。
+      if (counted.total <= lastNudgedTotal) return
       // 第 1 次在 total >= budget，第 2 次在 total >= budget * 2，依此类推。
       //
       // `total` 是**不同目标数**，不是调用次数 —— 所以「把同一个文件读 4 遍」这种
       // 原地打转不再能把预算烧光，而它恰恰是最该被催的那种。见 explore-budget.js。
       if (counted.total < exploreBudget * (exploreNudges + 1)) return
       exploreNudges += 1
+      lastNudgedTotal = counted.total
       const payload = {
         total: counted.total,
         calls: counted.calls,
