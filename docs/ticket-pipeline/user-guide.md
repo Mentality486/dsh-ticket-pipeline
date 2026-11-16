@@ -176,7 +176,12 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 | 盯什么 | 阈值 | 触发后 |
 | --- | --- | --- |
 | **停太久**（工作区文件指纹 8 分钟没变） | `agentStallWarnMinutes: 8` | 进流程日志 + 催一句，最多 2 次（`agentStallNudges`） |
-| **读太多**（`read`/`grep`/`glob` 合计超预算） | `agentExploreBudget: 12` | 催它「挑最可能的那个文件动手」，最多 2 次（`agentExploreNudges`） |
+| **读太多**（查过多少处**不同的东西**，同文件读第二遍不加数） | `agentExploreBudget: 25` | 催它「挑最可能的那个文件动手」，最多 2 次（`agentExploreNudges`） |
+
+「读太多」数的是**不同目标**而不是调用次数：同一个文件读三遍、同一个关键词搜十几遍
+在旧口径下会把预算瞬间烧光（实测某张票探索 82 次只有 22 个不同目标，73% 是重复），
+而重复本身恰恰是最该被提醒的那件事 —— 所以催办话术会把重复量单独说出来
+（「其中 N 次是在重看同一处」）。预算按项目可覆盖，见下方 FAQ。
 
 两条都**只催不杀**，真正的兜底是 `ticketTimeoutMinutes`（整票硬超时，缺省 40 分钟）。
 催办话术说的都是触发它的那个事实本身 —— 停滞催办说「多久没动」，探索催办说「读了几次」，
@@ -274,7 +279,9 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 
 **Q：改了表里的内容，为什么工单没更新？** 只有「是否处理 = 处理中」的行会被跟踪修订；管理列（处理人 / 处理结果）的变化不触发。
 
-**Q：它老是读一堆文件不动手，能调吗？** 有四个内置常量：`agentExploreBudget`（缺省 12，`read`/`grep`/`glob` 合计超过就催）与 `agentStallWarnMinutes`（缺省 8，工作区文件这么多分钟没变就催），催办次数分别是 `agentExploreNudges` / `agentStallNudges`（缺省都是 2）。**它们目前不出现在设置面板里** —— 要改得改 `src/core/config.js` 的 `BUILTIN_LIMITS`，然后同步安装副本并完全重启宿主。**改小催得更早**，适合模块清晰的项目；改大适合大仓。注意 `agentExploreBudget` 那个数字**同时印在任务书里**（`core/prompt.js` 直接引用它渲染），所以文案与执行永远是同一个值。
+**Q：它老是读一堆文件不动手，能调吗？** 能，但先分清两个旋钮：`agentExploreBudget`（缺省 **25**，数的是查过多少处**不同的东西** —— 同一个文件读第二遍、同一个关键词再搜一遍都不加数）与 `agentStallWarnMinutes`（缺省 8，工作区文件这么多分钟没变就催），催办次数分别是 `agentExploreNudges` / `agentStallNudges`（缺省都是 2）。
+
+**探索预算可以按项目单独配**：项目设置的「基本」组里有一格「探索预算」（在「显示全部字段」下），留空 = 用全局 25；大仓（几十万行 Java、多个模块）填 40–60，小仓填 15。宿主的校验只接受正整数，填错会在那一格上报错。改全局缺省则要动 `src/core/config.js` 的 `BUILTIN_LIMITS`，然后同步安装副本并完全重启宿主。注意 `agentExploreBudget` 那个数字**同时印在任务书里**（`core/prompt.js` 直接引用它渲染），所以文案与执行永远是同一个值 —— 不会再出现「任务书写 12、实际用了 169」那种两边各写一份、谁都没在数的情况。
 
 **Q：为什么它不改我已经配好的验证命令？** 项目配置里的 `verify.build` / `verify.test` 会**原样写进任务书**，标题是「改完怎么验证」。如果两样都没配，任务书会明说「本项目没有配置验证命令，不用为了跑点什么去构建整个工程」—— 这时它不会去猜 `pom.xml` / `package.json`。实测过一次：没注入命令时它自己摸索跑了 12 次 mvn/npm（5.4 分钟），而真正配的验证是个两秒跑完的静态检查。
 
