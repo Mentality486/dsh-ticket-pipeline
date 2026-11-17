@@ -45,7 +45,7 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
-import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, buildSessionTitle, setupAgent } from '../src/adapters/executor-agent/index.js'
+import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, createCombinedNudgeMessage, buildSessionTitle, setupAgent } from '../src/adapters/executor-agent/index.js'
 import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { renderTicketPrompt } from '../src/core/prompt.js'
@@ -2339,6 +2339,79 @@ async function main () {
     // 40 处不同目标 / 预算 12 ⇒ 光按倍数算够催 3 次，但**一旦开始改文件就该彻底停**。
     assert.equal(nudges.length, 1,
       `只该在第 1 轮纯读时催一次；改过代码之后再停下来读也不许念。实际催了 ${nudges.length} 次`)
+  })
+
+  await check('催办：两套监控同时成立时只发一条，不许排队里并排躺着两条长消息', async () => {
+    // 2026-11-17 用户截图：某张票的「2 条排队消息」里并排两条 ——
+    //   ①「你已经查了 61 处不同的东西（read 32 次、grep 31 次、glob 13 次），
+    //      其中 15 次是在重看同一处，任务书给的探索预算是 25 次。」
+    //   ②「已经 8 分钟没有任何文件改动了 —— 你还在读和搜……」
+    //
+    // 一条数动作数、一条数时间，触发条件不同，但**说的是同一件事**：
+    // 「别再读了，动手」。在一次不许闲着的长 turn 里，两套判据经常在同一秒同时成立，
+    // 于是 agent 一口气收到两条长消息，每条都让它重复一遍同样的三步动作。
+    //
+    // 这条用例专门造「两个都成立」的那一秒，断言：只 followup 一次，且发的是合并文案。
+    const nudges = []
+    const agent = {
+      get status () { return 'idle' },
+      get session () { return { seq: 0 } },
+      // 立刻就空闲，让循环转两轮即可（两个判据第 1 轮就都成立）。
+      whenIdle: async () => {},
+      followup: (msg) => { nudges.push(msg) },
+    }
+    const events = []
+    for (let i = 0; i < 40; i += 1) {
+      events.push({ type: 'tool/ptc-dispatch', data: { name: 'read', subCallId: `c:${i}` } })
+    }
+    let clock = 0
+    await waitForAgentIdle(agent, undefined, () => {}, {
+      // 工作区一直没变 ⇒ 停滞判据成立（时间也在往前走）。
+      worktreeSnapshot: async () => ' M unchanged.js\n',
+      stallWarnMs: 60_000,
+      // 两套预算都只给 1 次：这样「整个循环里能发出的消息总数」被钉死在 1 条。
+      // 如果合流坏了，第 1 次唤醒就会各发一条 ⇒ 拿到 2 条、直接红。
+      maxNudges: 1,
+      now: () => { clock += 120_000; return clock },
+      exploreBudget: 12,
+      maxExploreNudges: 1,
+      sessionLog: () => events,
+      onStall: () => {},
+      onExplore: () => {},
+      makeNudgeMessage: (minutes) => ({ kind: 'stall-only', minutes }),
+      makeExploreNudgeMessage: (input) => ({ kind: 'explore-only', input }),
+      makeCombinedNudgeMessage: (input) => ({ kind: 'combined', input }),
+    }).catch(() => { /* 走不到超时，忽略 */ })
+    assert.equal(nudges.length, 1,
+      `两套判据同时成立时只该发一条（合并），实际发了 ${nudges.length} 条`)
+    assert.equal(nudges[0].kind, 'combined',
+      `同时成立时发的必须是合并文案，实际是 ${nudges[0].kind}`)
+    assert.ok(nudges[0].input.minutes > 0, '合并文案要带上「多久没动」')
+    assert.ok(nudges[0].input.explore.total > 0, '合并文案要带上探索了多少处')
+  })
+
+  await check('催办：合并文案把两件事说成一件，动作清单只出现一份', async () => {
+    // 合并的原则不是「把两段拼起来」—— 那样比发两条更糟（更长、更重复）。
+    // 而是认出它们说的是同一件事，**只说一遍**：
+    //   · 开头一个从句把两个观测事实都交代掉（模型需要知道「它被看见了」）；
+    //   · 后面只留一份动作清单。
+    const msg = createCombinedNudgeMessage({
+      minutes: 8,
+      explore: { total: 61, calls: 76, repeated: 15, budget: 25, byTool: { read: 32, grep: 31, glob: 13 } },
+    }, (input) => input)
+    const text = msg.content[0].text
+    assert.match(text, /已经查了 61 处不同的东西/, '要说清探索量')
+    assert.match(text, /read 32 次、grep 31 次、glob 13 次/, '要给出分工具明细')
+    assert.match(text, /其中 15 次是在重看同一处/, '要把「读得多」翻译成「在原地打转」')
+    assert.match(text, /已经 8 分钟没有任何文件改动了/, '同时成立的停滞事实也要交代')
+    assert.match(text, /探索预算是 25 次/, '预算数要跟任务书同源')
+    // 动作清单只能有一份 —— 出现两次就说明它退化成了「两段拼接」。
+    assert.equal((text.match(/edit 它/g) ?? []).length, 1,
+      '动作清单只该出现一份，拼两段会让它变成更长更重复的消息')
+    assert.match(text, /操作流程/, '要给出定位路径')
+    assert.match(text, /截图/, '截图上的字面量是最快的定位线索')
+    assert.match(text, /不要硬猜一个改动交上去/, '不能把「随便改一个」当成出路')
+    assert.doesNotMatch(text, /最有把握的那一处/, '「挑最有把握的那处直接改」是交半成品的许可，不能回来')
   })
 
   await check('saveImage 什么都没返回时跳过空图块，不塞进 content', async () => {

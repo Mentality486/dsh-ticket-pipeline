@@ -1325,6 +1325,7 @@ function quietTicks () {
  *   sessionLog?: () => any[] | undefined,
  *   onExplore?: (input: { total: number, budget: number, byTool: Record<string, number> }) => Promise<void> | void,
  *   makeExploreNudgeMessage?: (input: { total: number, budget: number, byTool: Record<string, number> }) => any,
+ *   makeCombinedNudgeMessage?: (input: { minutes: number, explore: { total: number, budget: number, byTool: Record<string, number> } }) => any,
  *   now?: () => number,
  * }} [options]
  */
@@ -1396,6 +1397,12 @@ async function waitForIdleWithStallCheck (agent, pollMs, signal) {
  *   maxNudges?: number,
  *   onStall?: (input: { minutes: number, nudgeCount: number }) => Promise<void> | void,
  *   makeNudgeMessage?: (minutes: number) => any,
+ *   exploreBudget?: number,
+ *   maxExploreNudges?: number,
+ *   sessionLog?: () => any[] | undefined,
+ *   onExplore?: (input: { total: number, budget: number, byTool: Record<string, number> }) => Promise<void> | void,
+ *   makeExploreNudgeMessage?: (input: { total: number, budget: number, byTool: Record<string, number> }) => any,
+ *   makeCombinedNudgeMessage?: (input: { minutes: number, explore: { total: number, budget: number, byTool: Record<string, number> } }) => any,
  *   now?: () => number,
  * }} [options]
  */
@@ -1490,26 +1497,19 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
      * @returns {Promise<void>}
      */
     const checkStall = async () => {
-      if (!snapshot || stallWarnMs <= 0) return
-      if (now() - lastProgressAt < stallWarnMs) return
+      if (!snapshot || stallWarnMs <= 0) return null
+      if (now() - lastProgressAt < stallWarnMs) return null
       // 冷却期：距上一次催办还没过一个阈值，就先不说话。否则催办会按轮询节奏连发。
-      if (lastNudgeAt > 0 && now() - lastNudgeAt < stallWarnMs) return
-      if (nudges >= maxNudges) return
+      if (lastNudgeAt > 0 && now() - lastNudgeAt < stallWarnMs) return null
+      if (nudges >= maxNudges) return null
       nudges += 1
       lastNudgeAt = now()
       const minutes = Math.max(1, Math.round((now() - lastProgressAt) / 60_000))
       await options.onStall?.({ minutes, nudgeCount: nudges })
-      // 催的话术要具体到「现在该做什么」，泛泛的「加油」只会换来一轮空转。
-      //
-      // 兜底这一支**必须自己造 createUserMessage**，不能去闭包里抓：本函数是模块级
-      // 导出函数（自测要直接调它），而真正的 createUserMessage 是 createAgentExecutor()
-      // 里的局部量。2026-11-11 真机事故就出在这儿 —— 兜底写了 `createUserMessage`，
-      // 而生产路径**没传** makeNudgeMessage，于是催办的一瞬间抛
-      // `createUserMessage is not defined`，把整张票打成失败。
-      const makeNudge = typeof options.makeNudgeMessage === 'function'
-        ? options.makeNudgeMessage
-        : (mins) => createNudgeMessage(mins, resolveCreateUserMessage(undefined))
-      agent.followup(makeNudge(minutes))
+      // **这里不自己 followup**，只把「该催了」这件事交给主循环 ——
+      // 2026-11-17 真机：探索催办与停滞催办在同一次唤醒里各发一条，队列里并排躺着
+      // 两条长消息，说的都是「别再读了、动手吧」。见 deliverNudge。
+      return { minutes, nudgeCount: nudges }
     }
     /**
      * 探索次数超预算了吗。
@@ -1541,11 +1541,11 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
      * @returns {Promise<void>}
      */
     const checkExplore = async (justChanged) => {
-      if (exploreBudget <= 0 || !sessionLog) return
+      if (exploreBudget <= 0 || !sessionLog) return null
       // 已经在改文件了就别再念预算：读几次代码确认上下文是正经事。
       // 用一次性的 editingStarted 而不是瞬时的 justChanged —— 见上面第 1 条。
-      if (editingStarted || justChanged) return
-      if (exploreNudges >= maxExploreNudges) return
+      if (editingStarted || justChanged) return null
+      if (exploreNudges >= maxExploreNudges) return null
       const counted = countExploration(sessionLog())
       // 第三道保险，也是**与状态无关**的那一道：催过之后就不再拿「同一个数」催第二次。
       //
@@ -1554,12 +1554,12 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       // refreshProgress 里加一行 `exploreNudges = 0`，同一批探索也催不出第二句话。
       // 这条判据的形状值得单独记一笔：让「不可能重复」由数据结构保证，而不是由
       // 「没有别的地方会重置它」这个约定保证。约定会被后来的改动打破，单调量不会。
-      if (counted.total <= lastNudgedTotal) return
+      if (counted.total <= lastNudgedTotal) return null
       // 第 1 次在 total >= budget，第 2 次在 total >= budget * 2，依此类推。
       //
       // `total` 是**不同目标数**，不是调用次数 —— 所以「把同一个文件读 4 遍」这种
       // 原地打转不再能把预算烧光，而它恰恰是最该被催的那种。见 explore-budget.js。
-      if (counted.total < exploreBudget * (exploreNudges + 1)) return
+      if (counted.total < exploreBudget * (exploreNudges + 1)) return null
       exploreNudges += 1
       lastNudgedTotal = counted.total
       const payload = {
@@ -1570,10 +1570,56 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
         byTool: counted.byTool,
       }
       await options.onExplore?.(payload)
+      // 同样交给主循环统一投递，见 deliverNudge。
+      return payload
+    }
+    /**
+     * 把「该催了」变成一条真的消息。
+     *
+     * ## 为什么由主循环统一投递，而不是各自 followup
+     *
+     * 2026-11-17 用户截图：某张票的排队消息里**并排躺着两条**——
+     * 「你已经查了 61 处不同的东西……探索预算是 25 次」和
+     * 「已经 8 分钟没有任何文件改动了……」。
+     *
+     * 两条触发条件不同（一个数动作数、一个数时间），但**说的是同一件事**：
+     * 「别再读了，动手」。在一次不许闲着的长 turn 里，两套判据经常在同一秒
+     * 同时成立 —— 于是 agent 一口气收到两条长消息，每条都让它做一遍同样的三步动作。
+     * 这既浪费上下文，也把「催办」变成了噪音：两条都在说的道理只值一条。
+     *
+     * 所以改成：两个 check 只负责判「该不该催」并返回一个结论，投递由这里统一做，
+     * **一次唤醒最多发一条**。两条都成立时合并不丢信息（见合并后的文案）。
+     *
+     * @param {{ minutes: number } | null} stall
+     * @param {{ total: number, calls?: number, repeated?: number, budget: number, byTool?: Record<string, number> } | null} explore
+     * @returns {Promise<void>}
+     */
+    const deliverNudge = async (stall, explore) => {
+      if (!stall && !explore) return
+      // 兜底这两支**必须自己造 createUserMessage**，不能去闭包里抓：本函数是模块级
+      // 导出函数（自测要直接调它），而真正的 createUserMessage 是 createAgentExecutor()
+      // 里的局部量。2026-11-11 真机事故就出在这儿 —— 兜底写了 `createUserMessage`，
+      // 而生产路径**没传** makeNudgeMessage，于是催办的一瞬间抛
+      // `createUserMessage is not defined`，把整张票打成失败。
+      const fallback = () => resolveCreateUserMessage(undefined)
+      if (stall && explore) {
+        const makeCombined = typeof options.makeCombinedNudgeMessage === 'function'
+          ? options.makeCombinedNudgeMessage
+          : (input) => createCombinedNudgeMessage(input, fallback())
+        agent.followup(makeCombined({ minutes: stall.minutes, explore }))
+        return
+      }
+      if (stall) {
+        const makeNudge = typeof options.makeNudgeMessage === 'function'
+          ? options.makeNudgeMessage
+          : (mins) => createNudgeMessage(mins, fallback())
+        agent.followup(makeNudge(stall.minutes))
+        return
+      }
       const makeExploreNudge = typeof options.makeExploreNudgeMessage === 'function'
         ? options.makeExploreNudgeMessage
-        : (input) => createExploreNudgeMessage(input, resolveCreateUserMessage(undefined))
-      agent.followup(makeExploreNudge(payload))
+        : (input) => createExploreNudgeMessage(input, fallback())
+      agent.followup(makeExploreNudge(explore))
     }
     // 醒来的节奏。停滞监控用它去量「多久没动」，探索监控也借它 —— 否则一轮 turn
     // 连跑 40 分钟期间根本醒不过来，等 turn 结束时那 169 次探索早就做完了。
@@ -1598,8 +1644,12 @@ export async function waitForAgentIdle (agent, signal, cancelAgent, options = {}
       // 先刷新「工作区变了没」，再让两套监控去判断。顺序不能反：探索监控要靠
       // 这次刷新知道「它是不是已经开始动手了」，读到旧指纹会把刚改的文件当成没改。
       const justChanged = await refreshProgress()
-      await checkStall()
-      await checkExplore(justChanged)
+      // 两个判据各返回「该催 / 不该催」，**投递统一在这里做**：一次最多发一条。
+      // 两个都成立时合成一条 —— 它们说的是同一件事（别再读了，动手），
+      // 分成两条发只会让 agent 收到两遍同样的三步动作。见 deliverNudge。
+      const stallDue = await checkStall()
+      const exploreDue = await checkExplore(justChanged)
+      await deliverNudge(stallDue, exploreDue)
       const idleSeq = agent.session?.seq
       // 宿主版本的 while 里还等子 agent；插件拿不到 `subagents` 服务，
       // 所以这里判的是「连续几次 whenIdle 之间 seq 都没动」。
@@ -1707,6 +1757,63 @@ function createExploreNudgeMessage (input, createUserMessage) {
 
 /** 导出给自测：探索催话术同样要钉住（尤其「不能提分钟数」这条）。 */
 export { createExploreNudgeMessage }
+
+/**
+ * 两套监控同时成立时，合成一条发。
+ *
+ * 2026-11-17 用户截图：排队消息里并排两条 —— 一条说「你已经查了 61 处不同的
+ * 东西……探索预算是 25 次」，一条说「已经 8 分钟没有任何文件改动了」。
+ * 两条**说的是同一件事**（别再读了，动手），却各写一遍三步动作。
+ *
+ * 合并的原则不是「把两段拼起来」，而是**认出它们说的是同一件事，然后只说一遍**：
+ * - 开头用一个从句把两个观测事实都交代掉（模型需要知道「它被看见了」），
+ *   但**不重复**论证「读下去没用」—— 讲一遍就够。
+ * - 后面只留**一份**动作清单。
+ * - 保留「定位不到就说缺什么」这条出路（它是把「猜一版」堵死的那道门）。
+ *
+ * 注意这里不能提「你花太久了」之类的话：探究型催办的触发条件可能是「读得飞快」，
+ * 说时间会变成假话，模型会先去纠正事实、白烧一轮。
+ *
+ * @param {{ minutes: number, explore: { total: number, calls?: number, repeated?: number, budget: number, byTool?: Record<string, number> } }} input
+ * @param {(input: { content: unknown, source?: { kind: string } }) => unknown} createUserMessage
+ * @returns {any}
+ */
+function createCombinedNudgeMessage (input, createUserMessage) {
+  const explore = input?.explore ?? {}
+  const read = Number(explore.byTool?.read ?? 0)
+  const grep = Number(explore.byTool?.grep ?? 0)
+  const glob = Number(explore.byTool?.glob ?? 0)
+  const parts = []
+  if (read > 0) parts.push(`read ${read} 次`)
+  if (grep > 0) parts.push(`grep ${grep} 次`)
+  if (glob > 0) parts.push(`glob ${glob} 次`)
+  const breakdown = parts.length > 0 ? `（${parts.join('、')}）` : ''
+  const total = Number(explore.total ?? 0)
+  const budget = Number(explore.budget ?? 0)
+  const repeated = Number(explore.repeated ?? 0)
+  const minutes = Number(input?.minutes ?? 0)
+  const repeatNote = repeated > 0 ? `，其中 ${repeated} 次是在重看同一处` : ''
+  const stallNote = minutes > 0 ? `，且已经 ${minutes} 分钟没有任何文件改动了` : ''
+  const text = [
+    `你已经查了 ${total} 处不同的东西${breakdown}${repeatNote}${stallNote}，任务书给的探索预算是 ${budget} 次。`,
+    '这两件事指向同一个结论：**继续读下去不会让答案更清楚，该动手了。**',
+    '',
+    '1. 回到工单的 **「操作流程」那一列**，框出出问题的那个页面；工单带截图的话，',
+    '   **把截图上的标题、按钮文字、表头、字段名、报错文案拿去 grep** —— 那些都是源码里的字面量。',
+    '2. 选出**最可能是问题所在的那一个文件**（不是「相关文件」，是你要动手改的那个），',
+    '   说清它哪一行/哪个分支不对，然后 **edit 它**。',
+    '3. 改完跑验证命令，再根据报错补细节 —— 报错比继续读代码更省时间。',
+    '',
+    '如果你读到现在仍然不知道该改哪个文件，说明缺的不是代码细节，是**需求侧的信息**',
+    '（页面上到底该显示什么、操作流程走的是哪条路径、截图对应哪个页面）。',
+    '**这种情况不要硬猜一个改动交上去。** 在最终说明里写清卡在哪、缺哪条信息，',
+    '这会被当成「需要人补信息」，比交一版不确定能修好的改动好。',
+  ].join('\n')
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+/** 导出给自测：两套监控合流之后的那条文案同样要钉住。 */
+export { createCombinedNudgeMessage }
 
 /**
  * 在宿主 publish 之前把子 agent 装配起来。这是 setup 的全部职责。
