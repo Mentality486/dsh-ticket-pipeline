@@ -16,6 +16,7 @@ import { PHASE_LABEL, TERMINAL, TIMELINE_NODES, phaseLabel, priorityWeight } fro
 import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { describeConfig } from '../core/config.js'
 import { describeCommit, renderCommitSummary } from '../core/commit-summary.js'
+import { renderErrorAdvice, explainError } from '../core/error-advice.js'
 import { foundAtSortKey, summarize, ticketKey } from '../core/store.js'
 // 「能不能重跑」的口径只在 pipeline-reset.js 里定（RESETTABLE_PHASES）。
 // 运行页签（#16）要按它决定给不给按钮，所以这里把它转成一个布尔随票下发 ——
@@ -403,7 +404,9 @@ function compactTicketLine (row, now) {
   if (!isTerminal) {
     const flow = describeFlow(row, now)
     if (flow.station) {
-      station = `｜站${flow.station.no}`
+      // 写「站名」而不是「站⑤」：总览里一行本来就不长，序号要多一次翻图例。
+      const short = shortNameOf(flow.station.node, TIMELINE_NODES[flow.station.node])
+      station = `｜${short}中`
       // 长站点要带「这一站已经跑了多久」，否则「最近动静」只有几十秒（有心跳）
       // 会让人以为刚卡住 —— 这正是明细里踩过的坑，总览里同样要避开。
       if (typeof flow.stationElapsedMs === 'number') {
@@ -430,6 +433,43 @@ function compactTicketLine (row, now) {
 const MAIN_STATIONS = Object.freeze(['discover', 'locate', 'workspace', 'session', 'editing', 'testing', 'mr-opening', 'writeback', 'notify'])
 
 /**
+ * 终态节点对应的「它其实是哪一站没做成」。
+ *
+ * 2026-11-17 真机事故：`sh-row-93` 在 ⑦ 提交时失败，但站带上显示的是
+ * **`⑦✓`**，票面却写着失败。原因不是标错了符号，而是打点顺序 ——
+ * 执行器先 `onPhase('mr-opening')`（这一站本身确实「进到了」，记 `ok: true`），
+ * 之后调度器收尾才补一条独立的 `failed` 节点。而带子只看每个主站**自己**那条
+ * 记录的 `ok`，看不到后面那条 `failed` ⇒ ⑦ 永远是 ✓。
+ *
+ * 修法不是去改那条 ⑦ 的 ok（它没说谎：确实进到了 ⑦），而是把「票失败了」
+ * 这个事实**回填到它真正倒下的那一站**：最后一条到达的主站如果后面跟着一条
+ * `failed`，那一站的 `state` 一律按 `failed` 算。
+ *
+ * 只认 `failed`：`done`/`skipped` 是成功收尾，不该把最后一站涂成红的。
+ */
+const FAILED_TERMINAL = 'failed'
+
+/**
+ * 流程带上的短名（两三个字的人话）。
+ *
+ * 与 `TIMELINE_NODES[node].short` 同源，但这里**带兜底**：老票的 timeline 里
+ * 存的是当时的 `label`，没有 `short`；而 `pipeline-status.js` 在契约层之外
+ * 也可能拿到不认识的 node。取不到就退回 label，再退回 node 本身 —— 宁可长一点，
+ * 也不能让带子上出现空洞。
+ *
+ * @param {string} node
+ * @param {any} meta
+ * @returns {string}
+ */
+function shortNameOf (node, meta) {
+  const short = typeof meta?.short === 'string' ? meta.short.trim() : ''
+  if (short.length > 0) return short
+  const label = typeof meta?.label === 'string' ? meta.label.trim() : ''
+  if (label.length > 0) return label
+  return typeof node === 'string' ? node : '?'
+}
+
+/**
  * 流程带上的状态符号。
  *
  * `now`（▶）必须与 `ok`（✓）分开：一张票正停在⑥跑验证时，⑥标 ✓ 会让人
@@ -440,10 +480,14 @@ const STATION_MARK = Object.freeze({ ok: '✓', failed: '✗', now: '▶', unrea
 /**
  * 总览里「流程带」的一次性图例。只打一次，不逐票重复 ——
  * 九次解释会把总览撑成第二个明细视图。
+ *
+ * 2026-11-17 起带子上写的是中文短名而不是 ①–⑨：用户原话「插件中只标了序号
+ * 用户看不懂啊」。所以图例不再逐个解释九个数字，改说清「顺序」与「符号」两件事
+ * —— 顺序给人看流程走向，符号给人看每站做没做成。
  */
-const FLOW_LEGEND = '（①–⑨ 是 9 个主站：①获取工单 ②查找项目 ③检查工作区 ④创建会话 ⑤处理问题 '
-  + '⑥跑验证 ⑦提交 ⑧回填表格 ⑨发送消息；✓ 做成 / ✗ 没做成 / ▶ 正停在这一站 / – 没走过或没有记录；'
-  + '只有超过 1 分钟的站才标耗时）'
+const FLOW_LEGEND = '（流程带的九站按顺序是：获取工单 → 查找项目 → 检查工作区 → 创建会话 → '
+  + '处理问题 → 跑验证 → 提交 → 回填表格 → 发送消息；✓ 做成 / ✗ 没做成 / ▶ 正停在这一站 / '
+  + '– 没走过或没有记录；只有超过 1 分钟的站才标耗时）'
 
 /**
  * 只给 1 分钟以上的站标耗时。
@@ -483,6 +527,7 @@ function describeStations (row, now) {
         no: TIMELINE_NODES[node].no,
         node,
         label: TIMELINE_NODES[node].label,
+        short: shortNameOf(node, TIMELINE_NODES[node]),
         state: 'unreached',
         at: null,
         elapsedMs: null,
@@ -522,6 +567,18 @@ function describeStations (row, now) {
   // 迟早出现「带子上说停在⑥、结论说停在第⑤站」。
   const flow = describeFlow(row, now)
   const currentNo = !terminal && flow.station ? flow.station.no : undefined
+  // 「它到底倒在哪一站」：最后一条到达过的主站。只有票确实以 failed 收尾时才用
+  // （见 FAILED_TERMINAL 的注释）—— ⑦ 提交失败时那条 ⑦ 打点自己是 ok 的，
+  // 只看它会把「失败」画成「成功」。
+  const lastMainNode = (() => {
+    for (let i = timeline.length - 1; i >= 0; i -= 1) {
+      const node = timeline[i].node
+      if (timeline[i].heartbeat === true) continue
+      if (MAIN_STATIONS.includes(node)) return node
+    }
+    return undefined
+  })()
+  const blamedNode = row.phase === FAILED_TERMINAL ? lastMainNode : undefined
   const stations = []
   let reachedCount = 0
   let failedStation
@@ -533,6 +590,9 @@ function describeStations (row, now) {
     let state
     if (!hit) state = 'unreached'
     else if (hit.entry.ok === false) state = 'failed'
+    // 票以失败收尾时，最后到达的那一站就是倒下的地方 —— 哪怕它自己那条打点是 ok
+    // （执行器先记「进到⑦了」，失败原因由调度器收尾时另记一条 failed）。
+    else if (node === blamedNode) state = 'failed'
     else if (meta.no === currentNo) state = 'now'
     else state = 'ok'
     if (state !== 'unreached') reachedCount += 1
@@ -543,6 +603,7 @@ function describeStations (row, now) {
       no: meta.no,
       node,
       label: hit?.entry.label ?? meta.label,
+      short: shortNameOf(node, meta),
       state,
       at: hit && typeof hit.entry.at === 'number' ? hit.entry.at : null,
       elapsedMs: hit && typeof hit.elapsedMs === 'number' ? hit.elapsedMs : null,
@@ -569,7 +630,13 @@ function describeStations (row, now) {
 }
 
 /**
- * 总览里跟着每张票的第二行：流程带 + 全程耗时。
+ * 总览里跟着每张票的第二行：流程带 + 全程耗时 +（失败了）倒在哪一站。
+ *
+ * 为什么要写中文短名而不是只画符号（2026-11-17 用户原话：「只标了序号 用户看不懂」）：
+ * `①✓ ②✓ ③✗` 对写代码的人是记号，对看工单的人是密码 —— 得回头翻图例，
+ * 翻完还得把九个符号与九个名字对上号。带上短名之后这条带子自己就成句：
+ * `取单✓ 定位✓ 工作区✗`。
+ *
  * @param {any} row
  * @param {number} now
  */
@@ -578,10 +645,22 @@ function renderFlowLine (row, now) {
   if (flow.noRecord) return '        （没有流程记录 —— 这张票的处理早于流程日志功能，或刚入队还没开始打点）'
   const parts = flow.stations.map((station) => {
     const duration = formatShortDuration(station.elapsedMs)
-    return `${station.no}${STATION_MARK[station.state]}${duration ? `（${duration}）` : ''}`
+    return `${station.short}${STATION_MARK[station.state]}${duration ? `（${duration}）` : ''}`
   })
   const total = typeof flow.totalMs === 'number' ? `｜全程 ${formatDuration(flow.totalMs)}` : ''
-  return `        ${parts.join(' ')}${total}`
+  // 失败了就把「倒在哪一站」直接写在同行末尾。
+  //
+  // 不加这一句的话，人要自己在九个符号里找那个 ✗ —— 而「哪个是 ✗」正是
+  // 2026-11-17 那次「⑦✓ 却整票失败」暴露的问题：符号看对不看对，取决于
+  // 人有没有耐心数格子。用一句中文点名，比任何符号都省事。
+  const blamed = flow.failedStation === null
+    ? ''
+    : (() => {
+        const hit = flow.stations.find((s) => s.no === flow.failedStation)
+        const name = hit ? `${hit.short}（${hit.label}）` : ''
+        return `｜✗ 倒在第 ${flow.failedStation} 站${name ? `「${name}」` : ''}`
+      })()
+  return `        ${parts.join(' ')}${total}${blamed}`
 }
 
 function pad2 (n) {
@@ -1206,7 +1285,13 @@ export async function collectStatus (options, args) {
       if (cancelledByUser) {
         // 原文是 'cancelled by user' —— 内部标识符，读的人不需要看见它。
         lines.push('  最近错误：（无。这张票是你取消的，不是报错）')
-      } else if (row.lastError) lines.push(`  最近错误：${row.lastError}`)
+      } else if (row.lastError) {
+        // 2026-11-17 用户原话：「没有明确的失败原因 哪里出的问题怎么修改 都不明确」。
+        // 原来这里直接把 `row.lastError` 原样打出来 —— 那是一整条 shell 命令 + git 的
+        // 英文 stderr，2000 多字，真正有用的只有一句。现在先给人话（为什么 + 怎么办），
+        // 原文缩进挂在最后：解释可以少，原文不能丢。
+        lines.push(...renderErrorAdvice(row.lastError, { indent: '  ' }))
+      }
       if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
       // 待补做的事后动作：票已经是终态，但回填/通知还没做成（进程在中间退出了）。
       // 不写出来，「表里那行还停在处理中」就永远没人知道该去看一眼。
@@ -1316,6 +1401,19 @@ export async function collectStatus (options, args) {
           ? { writeBack: Boolean(row.pendingEffects.writeBack), notify: Boolean(row.pendingEffects.notify) }
           : undefined,
         lastError: row.lastError,
+        // 人话版：为什么 + 怎么办。面板直接渲染这一段，不再自己猜措辞 ——
+        // 同一份解释两处各写一遍迟早分家（工具说「引号拆命令」、面板说「未知错误」）。
+        lastErrorAdvice: row.lastError ? (() => {
+          const advice = explainError(row.lastError)
+          return {
+            known: advice.known,
+            title: advice.title,
+            why: advice.why ?? null,
+            fix: advice.fix ?? null,
+            raw: advice.raw,
+            truncated: advice.truncated,
+          }
+        })() : null,
         testDetail: row.testDetail,
         revisionCount: row.revisionCount,
         attempt: row.attempt,

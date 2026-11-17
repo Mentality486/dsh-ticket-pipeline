@@ -219,6 +219,38 @@ export function normalizeCellText (value) {
 }
 
 /**
+ * 「序号」这一列的归一。比 `normalizeCellText` 多一道判断：**公式原文要丢掉**。
+ *
+ * 2026-11-17 事故：pms 表的序号列写的是 `=IF(COUNTA($B93:$L93)=0,"",ROW()-1)`。
+ * 读值接口缺省按 `ToString` 返回，拿到的是**公式原文**而不是算出来的 `79`。
+ * 于是一张票的 `seq` 变成 40 多个字符的公式，后果有三层：
+ *
+ * 1. 拼进提交说明（`[pms] #IF(COUNTA(...)=0,"",ROW()-1) …`），里面的双引号
+ *    在 Windows PowerShell 5.1 下把整条 `git commit` 命令拆成 5 段 pathspec
+ *    ⇒ 提交失败 ⇒ 票判 failed，而代码其实改完了、验证也过了；
+ * 2. 它还是会话标题 / MR 标题的一部分，人看到一串乱码认不出是哪张票；
+ * 3. `seq` 还会进指纹，公式一变（行号挪动）整张票就成「新内容」。
+ *
+ * 正规修法在 `readSheetValues` 里显式要 `UnformattedValue`（拿计算后的值）。
+ * 这里是**第二道**：万一以后又走了别的读值路径（比如多维表格的公式字段），
+ * 也不能把公式原文当成序号。丢掉之后 `seq` 为空，票的身份退回按行号
+ * （`buildRowIdentity` 的 `fallback-row`），比拿一串公式当身份强。
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function normalizeSeqCell (value) {
+  const text = normalizeCellText(value)
+  if (text.length === 0) return ''
+  const looksLikeFormula = text.length > 16 ||
+    text.startsWith('=') ||
+    text.includes('(') ||
+    text.includes(')') ||
+    /^(?:IF|COUNTA|ROW|SUM|CONCAT|TEXT)\b/i.test(text)
+  return looksLikeFormula ? '' : text
+}
+
+/**
  * 单元格是日期时通常返回毫秒时间戳；统一成 `YYYY-MM-DD` 便于人读。
  * @param {unknown} value
  * @returns {string}
@@ -1424,7 +1456,7 @@ export function createFeishuSource (options = {}) {
       priority: priority === 'high' || priority === 'medium' || priority === 'low' ? priority : undefined,
       department: normalizeCellText(fields[cols.department]),
       foundAt: normalizeDateCell(fields[cols.foundAt]),
-      seq: normalizeCellText(fields[cols.seq]),
+      seq: normalizeSeqCell(fields[cols.seq]),
       status: normalizeCellText(fields[cols.status]),
       screenshots: extractScreenshots(fields[cols.screenshot]),
       raw: { recordId, mtime: pickMtime(item) },
@@ -1681,7 +1713,20 @@ export function createFeishuSource (options = {}) {
     const valuesPath = `${encodeURIComponent(table.sheetId)}!${buildValueRange({ range, endColumn: 25 })}`
     const payload = await apiCall(
       `/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(table.spreadsheetToken)}/values/${valuesPath}`,
-      { method: 'GET', signal },
+      // `valueRenderOption` 必须**显式**要 `UnformattedValue`（2026-11-17 事故）。
+      //
+      // 不传时飞书按 `ToString` 返回：**公式单元格给的是公式原文**。pms 表的
+      // 「序号」列写的是 `=IF(COUNTA($B93:$L93)=0,"",ROW()-1)`，于是插件把
+      // `IF(COUNTA($B93:$L93)=0,"",ROW()-1)` 当成了序号 ——
+      //
+      // ① 它被拼进提交说明：`[pms] #IF(COUNTA(...)=0,"",ROW()-1) 集成minio…`，
+      //    里面的双引号在 PowerShell 5.1 下把那行命令拆散，`git commit` 直接失败；
+      // ② 它还是这张票的 `seq`，人看到的一串乱码就是这里来的。
+      //
+      // `UnformattedValue` 返回**计算后的值**：序号是 `79`、日期是序列号。
+      // 换它不会让别的列变差 —— 实测日期在两种选项下都是序列号（本来就按序列号处理），
+      // 而截图列反而更完整（带 `fileToken`，`ToString` 下只有 `id`/`type`）。
+      { method: 'GET', query: { valueRenderOption: 'UnformattedValue' }, signal },
     )
 
     const values = Array.isArray(payload?.data?.valueRange?.values) ? payload.data.valueRange.values : []
@@ -1823,7 +1868,7 @@ export function createFeishuSource (options = {}) {
         priority: sheetPriorityOf(cells.priority),
         department: normalizeCellText(cells.department),
         foundAt: normalizeSheetDate(cells.foundAt),
-        seq: normalizeCellText(cells.seq),
+        seq: normalizeSeqCell(cells.seq),
         status,
         screenshots: row.screenshots,
         // mtime 恒 0：电子表格没有行级最后修改时间。写 0 而不是 now()，

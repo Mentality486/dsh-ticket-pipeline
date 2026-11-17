@@ -74,6 +74,26 @@ function backoffDelayMs (attempt, retryAfterMs, random) {
 }
 
 /**
+ * 一张票「最后一次有动静」的时刻，用来给「同项目最近的票」排序。
+ *
+ * 为什么不复用 `pipeline_status.js` 里的 `lastActivityAt()`：那个函数是**渲染层**的
+ * 口径（还查 `timelineOf`、按展示需要取最大者），而这里是内核排序，两边分叉了
+ * 也不会有人报错，只会「同一张票在两个地方显示成不同的新旧」。所以这里只认
+ * 票据行自己的三个时间戳，取最大 —— 够回答「刚才」，也不依赖时间线结构。
+ *
+ * @param {any} row
+ * @returns {number} 没有可用时间戳时是 0（排到最后）
+ */
+function rowActivityAt (row) {
+  const candidates = [row?.finishedAt, row?.startedAt, row?.enqueuedAt]
+  let best = 0
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > best) best = value
+  }
+  return best
+}
+
+/**
  * 票据上存的工作区坐标还作数吗？
  *
  * 两个独立的失效来源，任一成立就不能复用：
@@ -186,6 +206,16 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
 
   /** 单飞：防同进程内定时器重入。跨进程靠存储租约。 */
   let running = false
+
+  /**
+   * 本轮里因为「检出被别的进程占着」而让出的票 key。
+   *
+   * `runOne` 记、`tick` 读：下一轮 `pickNext` 要把它们排除掉，否则
+   * `pickNext` 会一遍遍挑回同一张，一轮就把预算耗在一张跑不了的票上。
+   * 每轮 `tick` 开头清空 —— 这是「这一轮」的范围，不是长期状态。
+   * @type {Set<string>}
+   */
+  const skippedByRepoLease = new Set()
 
   /**
    * 扫表本身的成败快照（见 ScanState）。全程只有一个消费者：`collectStatus`
@@ -350,6 +380,70 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
   }
 
   /**
+   * 同一项目里「别的票」—— 给任务书用的「先看这一眼，别把别人刚改的当原始代码」。
+   *
+   * ## 取哪些
+   *
+   * 1. **还没跑完的**（中间态 + 排队中）：它们的意图可读（工单描述），而且
+   *    大概率会改到同一带 —— 但 `changedFiles` 还没有，只能给「它要做什么」。
+   * 2. **最近跑完的 N 张**（done/skipped/failed）：有 `changedFiles` / `commit.files`，
+   *    是「刚才这个目录里发生了什么」的唯一证据。
+   *
+   * ## 为什么按 `lastActivityAt` 排序
+   *
+   * 票据表没有专门的「完成时间」字段，`lastActivityAt` 是唯一稳定的活跃时刻；
+   * `finishedAt` 只在部分路径写。用活跃时刻排出来的「最近」足够用 —— 这一节
+   * 要回答的是「刚才」而不是「精确的第几张」。
+   *
+   * ## 上限
+   *
+   * 最多 6 条、每条最多 8 个文件。任务书不是 git log：列三十张票会让真正相关的
+   * 那一条被淹没，而这里的信息本来就是**线索**、不是清单。
+   *
+   * @param {TicketStore} store
+   * @param {string} projectId
+   * @param {string} currentRecordId 当前跑的那张，必须排除（否则自己跟自己撞车）
+   * @returns {Array<{ recordId: string, phase: string, label: string, files: string[], committed: boolean }>}
+   */
+  function recentProjectTickets (store, projectId, currentRecordId) {
+    /** @type {Array<{ recordId: string, phase: string, label: string, files: string[], committed: boolean }>} */
+    const out = []
+    let rows = []
+    try {
+      rows = store.listTickets()
+    } catch (error) {
+      // 读票据表失败不该影响跑票：这一节是「额外的线索」，没有它票照样能跑完。
+      logInfo('读同项目其它票失败（任务书里那一节就少一段，不影响跑票）', {
+        projectId,
+        reason: toPipelineError(error).message,
+      })
+      return out
+    }
+    const sameProject = rows.filter((row) => {
+      if (!row) return false
+      if ((row.projectId ?? '') !== projectId) return false
+      if ((row.recordId ?? '') === currentRecordId) return false
+      return true
+    })
+    sameProject.sort((a, b) => rowActivityAt(b) - rowActivityAt(a))
+
+    for (const row of sameProject) {
+      if (out.length >= 6) break
+      const files = Array.isArray(row.changedFiles)
+        ? row.changedFiles.filter((file) => typeof file === 'string' && file.length > 0)
+        : (Array.isArray(row.commit?.files) ? row.commit.files : [])
+      out.push({
+        recordId: String(row.recordId ?? ''),
+        phase: String(row.phase ?? ''),
+        label: phaseLabel({ phase: row.phase, testOutcome: row.testOutcome }),
+        files: files.slice(0, 8),
+        committed: typeof row.commit?.sha === 'string' && row.commit.sha.length > 0,
+      })
+    }
+    return out
+  }
+
+  /**
    * 扫一轮，把变化落进存储。
    *
    * 扫失败**不吞**：返回 `scan-failed`，让 `pipeline_scan` 的调用方看见 ——
@@ -485,11 +579,19 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     const exploreBudget = Number(projectEntry?.exploreBudget) > 0
       ? Number(projectEntry.exploreBudget)
       : BUILTIN_LIMITS.agentExploreBudget
-    /** 任务书渲染选项：验证命令 + 探索预算 + 跨票记忆，三处都与执行侧同源。 */
+    // 同一项目里别的票（排在前面的、排后面的、已经跑完的）—— 任务书里要让模型看见。
+    //
+    // 为什么从票据表推、不新开一张表：这件事的真相就在票据表里（`changedFiles` /
+    // `commit.files` / `phase`），再存一份就是第二真相，迟早分叉。
+    // 租约只保证「不同时」，保证不了「先后」；而「刚才那张票改了哪几个文件」
+    // 恰恰是这一张最容易踩到的信息 —— 人写代码会看 git log，模型不会主动查。
+    const inFlight = recentProjectTickets(store, projectId, ticket.recordId)
+    /** 任务书渲染选项：验证命令 + 探索预算 + 跨票记忆 + 同项目在跑的票，四处都与执行侧同源。 */
     const promptOptions = {
       verify: projectEntry?.verify,
       exploreBudget,
       memories: recalled,
+      inFlight,
     }
 
     const handle = linkSignal(undefined)
@@ -526,6 +628,20 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     /** @type {Promise<unknown> | null} */
     let heartbeatPending = null
 
+    /**
+     * 本票占着的**仓库级**租约（检出路径）。空串 = 没占到。
+     *
+     * 为什么要在票级租约之外再加一把：票级只防「同一张票跑两遍」。就地模式
+     * （`isolateWorktree` 缺省 false）下，同一个检出上两张**不同**的票共用一个
+     * 工作目录 —— 两个宿主进程各跑一张，就会互相覆盖对方改到一半的文件，
+     * 而票级租约对此一无所知。仓库级租约把粒度提到检出上，保证任何时刻
+     * 只有一个 agent 在动那个目录。
+     *
+     * 它**只保证不并发**，不解决逻辑冲突（两张票改同一段业务逻辑仍然可能
+     * 互相抵消）—— 那件事由任务书里的「同仓库还有谁在改什么」提示模型避让。
+     */
+    let repoLeasePath = ''
+
     const heartbeatId = setInterval(() => {
       if (heartbeatStopped || leaseLost) return
       heartbeatPending = (async () => {
@@ -535,6 +651,21 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
             leaseLost = true
             handle.abort(new Error('lease-lost'))
             logInfo('续租失败：租约已被别人抢走，让出这张票', { projectId, recordId })
+            return
+          }
+          // 仓库租约同样要续：它的 TTL 跟票级一样，不续就会在长票（跑验证十几分钟）
+          // 中途过期，于是别的进程以为检出自由了、直接进来改。
+          if (repoLeasePath.length > 0) {
+            const repoRenewed = await store.renewRepoLease(repoLeasePath, leaseTtlMs)
+            if (!repoRenewed) {
+              leaseLost = true
+              handle.abort(new Error('lease-lost'))
+              logInfo('仓库租约续租失败：别的进程接手了这个检出，让出这张票', {
+                projectId,
+                recordId,
+                repoPath: repoLeasePath,
+              })
+            }
           }
         } catch (error) {
           leaseLost = true
@@ -715,6 +846,41 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           : missingWorkspaceId
             ? '票据上有工作区路径但没有工作区 id（上次登记降级了），这次补登记'
             : '票据上的工作区坐标仍然有效，直接复用'
+
+      // ── 仓库级租约（检出互斥）────────────────────────────────────────────
+      //
+      // 票级租约已经拿到了（tick 里抢的），但它只防「同一张票跑两遍」。
+      // 就地模式（`isolateWorktree` 缺省 false）下，同一个检出上两张**不同**的票
+      // 共用一个工作目录：两个宿主进程各跑一张，就会互相覆盖对方改到一半的文件，
+      // 而票级租约对此一无所知。仓库级租约把粒度提到检出上。
+      //
+      // **必须在 prepareWorkspace 之前抢**：那里可能真去建 worktree / 登记工作区，
+      // 先建完再发现检出不归我们，白做一遍还要清理。检出路径以 `locate` 的结果为准
+      // （票据上记的老路径可能已失效）。
+      const leaseRepoPath = currentRepoPath.length > 0 ? currentRepoPath : (ws.repoPath ?? '')
+      if (leaseRepoPath.length > 0) {
+        const gotRepo = await store.acquireRepoLease(leaseRepoPath, leaseTtlMs)
+        if (!gotRepo) {
+          logInfo('检出正被别的进程占着，本轮先跑别的票', { projectId, recordId, repoPath: leaseRepoPath })
+          // 记进「本轮让出过的票」，让 tick 换下一张（`pickNext` 的 `excludeKeys`）
+          // —— 不排除的话 pickNext 会立刻挑回同一张，一轮预算全耗在这。
+          skippedByRepoLease.add(key)
+          // 票回到队列等下一轮。这条不是失败：没人做错事，只是别人正在同一个目录里干活。
+          await store.setPhase(key, 'pending', {
+            lastError: '检出正被别的进程占着（防止两个 agent 同时改同一个目录），已放回队列',
+          })
+          await markNode(
+            key,
+            'workspace',
+            `检出 ${leaseRepoPath} 正被另一个进程改着，这张票先让它 —— 本轮去跑别的票，下轮再来`,
+            false,
+          )
+          return true
+        }
+        repoLeasePath = leaseRepoPath
+        logInfo('已占住检出', { projectId, recordId, repoPath: repoLeasePath })
+      }
+
       if ((!row.worktreePath || !ws.workspacePath || missingWorkspaceId || staleCoords) && typeof prepareWorkspace === 'function') {
         const prepared = await prepareWorkspace({
           ticket,
@@ -1147,6 +1313,22 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           await heartbeatPending
         } catch {
           // 心跳自己的错误已经在回调里处理过了，这里不重复上报。
+        }
+      }
+      // 仓库租约先放、票租约后放：顺序反过来会有个窗口 —— 票已自由、检出还锁着，
+      // 另一个进程抢到票却卡在检出上，白白让出一轮。
+      if (repoLeasePath.length > 0) {
+        try {
+          await store.releaseRepoLease(repoLeasePath)
+        } catch (error) {
+          // 放不掉不是致命问题（TTL 到了自己会失效），但要让日志里有线索：
+          // 残留的租约会让那个检出在 TTL 内谁也进不来。
+          logInfo('释放仓库租约失败（TTL 到期后会自动失效）', {
+            projectId,
+            recordId,
+            repoPath: repoLeasePath,
+            reason: toPipelineError(error).message,
+          })
         }
       }
       await store.releaseLease(key)
@@ -1619,6 +1801,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
     }
 
     running = true
+    // 「本轮因为检出被占而让出的票」是每一轮的范围，不是长期状态：
+    // 不清空的话，一张票上一轮被占过，这一轮就再也挑不出来了。
+    skippedByRepoLease.clear()
     /** @type {TickResult} */
     const result = { status: 'ok', scan: emptyScan(), ran: null, ranAll: [], cleaned: false }
 
@@ -1688,9 +1873,14 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           if (aborted || handle.signal.aborted) break
           // 关掉的项目即使还有排着队的票也不再挑（工单 #39）：
           // 关一个项目的意思是「它的事先别动」，包括已经进了队列的那些。
+          //
+          // `excludeKeys` 装的是本轮已经因为「检出被占」让出过的票：
+          // 它们的 phase 又被放回 pending 了，不排除的话 pickNext 会立刻挑回
+          // 同一张，一轮预算全耗在一张跑不了的票上。
           const next = store.pickNext({
             ...(onlyProjectId === null ? {} : { projectId: onlyProjectId }),
             excludeProjects: Array.from(paused),
+            ...(skippedByRepoLease.size === 0 ? {} : { excludeKeys: Array.from(skippedByRepoLease) }),
           })
           if (!next) break
           const leased = await store.acquireLease(next.key, leaseTtlMs)

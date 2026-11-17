@@ -90,7 +90,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 - **五个页签**（运行 / 项目 / 参数 / 凭据 / 体检），**缺省停在「运行」**。一次只画一页（不是藏起来）。
   页签上只在真有未保存 / 待修时才挂数字。
 - **参数页按分组渲染 27 个字段 / 4 个分组**；`enabled` 被提成页面级**主开关**置顶（不在任何分组里）。
-- **项目页 `projects[]` 可编辑**：`listProjectDescriptorPaths()` 共 **34 个深层路径**（面板画 **30 个控件**，
+- **项目页 `projects[]` 可编辑**：`listProjectDescriptorPaths()` 共 **36 个深层路径**（面板画 **32 个控件**，
   `match.appToken` / `match.tableId` / `match.spreadsheetToken` / `match.sheetId` 四个没有输入框
   —— 定位工单表统一走卡片头上的「工单表链接」，贴整条地址，插件自己认多维表格 / 电子表格 / wiki 表）。
   缺省只显示常改字段，其余收在「显示全部字段」；
@@ -178,7 +178,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 node scripts/dev-run.mjs
 ```
 
-**584 项断言，全绿 exit 0**，共 **35 个小节**（编号到 20，另有 `2b` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
+**605 项断言，全绿 exit 0**，共 **37 个小节**（编号到 22，另有 `2b` / `2c` / `2d` / `11.5` / `11.6` / `12b`–`12e` / `16a`–`16d` 这类补丁小节）。
 它只用假 ctx 驱动 `src/index.js`（真 `apply()` 装配，宿主服务全部打桩），其余测的是
 `core/` + `contracts/` + mock 适配器的纯逻辑链路，并转调五个适配器 checks：
 
@@ -186,7 +186,7 @@ node scripts/dev-run.mjs
 |---|---|---|
 | 内核与契约 | — | 调度、租约心跳、退避重试、状态机、store 持久化、`pipeline_*` **六工具**（含 `pipeline_forget`）、组合根接线；`pipeline_status` 两种视图（缺省 `view: 'overview'` 按项目聚合，`view: 'tickets'` 明细）；总览每票第二行是 9 主站流程带（`describeStations` / `renderFlowLine`，符号 `✓/✗/▶/–`、只标 ≥1 分钟的站、终态末站不标耗时、老票说「没有流程记录」）与返回体 `tickets[].flow`；`canReset` / `canForget` 两个布尔与各自的名单；时间线 17 节点表 / 9 主站 / 80 条封顶 |
 | `feishu-checks` | **99** | 假飞书服务端：认证与 token 缓存、401 清缓存重取、single-flight、分页、只收「处理中」、指纹判变更、退役/拨回、截图三形态、SSRF 白名单、错误码分类、扫描全程无写；回填 `PUT …/records/:id` 只写三列、字段缺失返 `{written:false,note}` 不抛、91403 分类；`parseBitableUrl` 链接解析；**电子表格 19 条**（表型分派、裸 token 双试、读值定位、`sheetHeaderRow=2`、列名别名、空序号兜底、序号重复报错、水位三态）；**工作表名对不上 2 条**（填的是文档标题且有唯一可见表时降级并说明、多张可见表时不许瞎猜）、**电子表格回填 8 条**（写对三格、插行后重定位、行被删、缺列、只有读权限、失败票只写一格、回填后不重复收票、token 与工作表 id）；**取票修复 3 条**（`spreadsheetToken` 填整条 wiki 链接要抠出 token 再请求、认不出的链接要报 `invalid-input` 而不是静默拼 404、裸 token 探多维表格报 `1254003 WrongBaseToken` 时要降级去试电子表格） |
-| `gitlab-checks` | **86** | 假 GitLab 服务端：ensureBranch、Commits API、Draft MR、错误分类、敏感文件过滤；本地提交 `commitLocally`；基线 `createBaseline`；保留会话；敏感名单 8 大类 41 条；`.git` 与 profile 篡改自检；`-z` 解析；会话 cwd 与 `workingDirectory` |
+| `gitlab-checks` | **96** | 假 GitLab 服务端：ensureBranch、Commits API、Draft MR、错误分类、敏感文件过滤；本地提交 `commitLocally`；基线 `createBaseline`；保留会话；敏感名单 8 大类 41 条；`.git` 与 profile 篡改自检；`-z` 解析；会话 cwd 与 `workingDirectory`；**`git add` 与忽略文件 2 条**（白名单只放行钉死的 `add --force --` / `ls-files -z --` 形状；已跟踪但被 `.gitignore` 覆盖的文件必须走 `--force`，否则整条 `add` 被拒）；**基线之后别人提交进来的改动不许算进本票 3 条** |
 | `push-qqmail-checks` | **18** | 假 socket 打桩的 SMTP 全流程：EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA、UTF-8 主题编码、多行应答 |
 | `wps-checks` | **34** | 现场构造最小 xlsx：zip 解析、截图挂行、宽限期、水位兜底；下载通道超时/取消/字节上限/跳转校验；取数通道 signal 透传 |
 | `workspace-checks` | **19** | 项目工作区登记与复用；验证命令 signal / 超时 124 / 缺省 30 分钟；适配器名写错要报错并列出可选值 |
@@ -215,8 +215,8 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 `src/remote/descriptors.js` 忘了改 `lib/client.js` 会**静默无响应**（点了体检没反应、宿主也不报错）。
 它同时校验 `require()` 白名单（只允许 `react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、
 `dsh.client.platform === 'web'`（写错宿主会静默跳过整个 bundle），以及 descriptor 数字：
-叶子 **27 个 / 4 组**、schema 信封 **76 节点 / 27 叶子**、Remote **11 个方法**、`projects` 可写 **35 字段**、
-面板项目字段 **31 项**。`client-smoke` 真跑一遍 bundle，**280 条**断言。`client-check` 还会跑**两道静态守卫**：
+叶子 **27 个 / 4 组**、schema 信封 **77 节点 / 27 叶子**、Remote **11 个方法**、`projects` 可写 **36 字段**、
+面板项目字段 **32 项**。`client-smoke` 真跑一遍 bundle，**282 条**断言。`client-check` 还会跑**两道静态守卫**：
 `checkCallArities` 核对**每一处 Remote 调用点的实参个数**（可选参数在浏览器侧也必须按位置传满，
 少传一个就抛 `client api: … expected N argument(s), got N-1` —— 「重跑」「跑一轮」都栽在这上面）；
 `checkEventArgConfusion` 拦「把声明了形参的本地函数裸传给 DOM 事件属性」（`onReload: loadProjects`），

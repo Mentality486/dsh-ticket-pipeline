@@ -1999,9 +1999,16 @@ export async function runFeishuChecks (check) {
       `读值要打对 spreadsheetToken，实际 ${valuesRequest.url}`,
     )
     // range 在 path 里：`!` 与 `:` 必须原样保留（编码了飞书不认）。
+    // 2026-11-17 起带 `?valueRenderOption=UnformattedValue`（要计算后的值而不是公式原文），
+    // 所以这里只校验 path 部分，别把 query 也算进形状里。
     assert.ok(
-      /\/values\/sh1!A1:[A-Z]+$/.test(valuesRequest.url),
+      /\/values\/sh1!A1:[A-Z]+(\?|$)/.test(valuesRequest.url),
       `range 形状应是 {sheetId}!A1:<列>，实际 ${valuesRequest.url}`,
+    )
+    // 缺省渲染选项会给公式原文（2026-11-17 pms|sh-row-93 事故），必须显式要计算后的值。
+    assert.ok(
+      valuesRequest.url.includes('valueRenderOption=UnformattedValue'),
+      `读值必须显式要 UnformattedValue，实际 ${valuesRequest.url}`,
     )
   })
 

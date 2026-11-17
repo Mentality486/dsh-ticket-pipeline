@@ -541,15 +541,44 @@ export function cellReader (row, columns) {
  * 电子表格里序号常常是数字（`1`）或者被填成 `1.0` / `" 1 "`；
  * 身份要稳定，所以统一按「去掉前后空白」的字符串算。
  *
+ * **公式原文一律当成空**（2026-11-17 事故）。pms 表的序号列写的是
+ * `=IF(COUNTA($B93:$L93)=0,"",ROW()-1)`，而读值接口缺省给的是公式原文；
+ * 若不在这里挡掉，这张票的 recordId 会变成 `sh-seq-IF(COUNTA($B93:$L93)=0,"",ROW()-1)`
+ * —— 一个带双引号、含括号、长度 40+ 的身份串。它比「没有序号」坏得多：
+ * ① 会被拼进提交说明，双引号在 PowerShell 下把 git 命令拆散（提交失败）；
+ * ② 同一行只要公式里的行号变了（插一行），身份就变，票会被当成新票。
+ *
+ * 挡掉之后 identitySource 退回 `fallback-row`，按物理行号认 —— 这正是
+ * 设计里写好的兜底路径，排障时还能从 `identitySource` 看出身份是猜的。
+ *
  * @param {string} text
  * @returns {string}
  */
 export function normalizeSeqIdentity (text) {
   const raw = String(text ?? '').trim()
   if (raw.length === 0) return ''
+  if (isFormulaText(raw)) return ''
   // `1.0` / `1` 指同一行，别因为一个人写了小数就换身份。
   if (/^\d+\.0+$/.test(raw)) return raw.replace(/\.0+$/, '')
   return raw
+}
+
+/**
+ * 这段文本像不像「公式原文」而不是人写的值？
+ *
+ * 判据只看「不可能是人写的序号」的形态，不去猜具体函数名 —— 序号就是一个短数字，
+ * 而公式一定长、一定带括号或 `=` 前缀。长度 16 是宽松上限（人不会把序号写成 17 位）。
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isFormulaText (text) {
+  const raw = String(text ?? '').trim()
+  if (raw.length === 0) return false
+  if (raw.length > 16) return true
+  if (raw.startsWith('=')) return true
+  if (raw.includes('(') || raw.includes(')')) return true
+  return /^(?:IF|COUNTA|ROW|SUM|CONCAT|TEXT)\b/i.test(raw)
 }
 
 /**

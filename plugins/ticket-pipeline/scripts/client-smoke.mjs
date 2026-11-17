@@ -381,15 +381,19 @@ function makeRunSnapshot (withHistory) {
  */
 function makeStations (spec) {
   spec = spec || {}
+  // `short` 与宿主 `TIMELINE_NODES[node].short` 保持一致（2026-11-17 起面板画中文短名，
+  // 不再只画 ①✓ —— 用户原话「只标了序号 用户看不懂」）。
   const nodes = [
-    ['discover', '①'], ['locate', '②'], ['workspace', '③'], ['session', '④'], ['editing', '⑤'],
-    ['testing', '⑥'], ['mr-opening', '⑦'], ['writeback', '⑧'], ['notify', '⑨'],
+    ['discover', '①', '取单'], ['locate', '②', '定位'], ['workspace', '③', '工作区'],
+    ['session', '④', '会话'], ['editing', '⑤', '改代码'], ['testing', '⑥', '验证'],
+    ['mr-opening', '⑦', '提交'], ['writeback', '⑧', '回填'], ['notify', '⑨', '通知'],
   ]
   const active = Object.keys(spec).length > 0
-  const stations = nodes.map(([node, no]) => ({
+  const stations = nodes.map(([node, no, short]) => ({
     no,
     node,
     label: node,
+    short,
     state: !active
       ? 'unreached'
       : (spec.failed === node ? 'failed' : (spec.now === node ? 'now' : 'ok')),
@@ -1156,14 +1160,16 @@ async function main () {
   check('票列表按档位分组（需要你处理 / 正在跑 …）',
     textOf(tree).indexOf('需要你处理 1') >= 0 && textOf(tree).indexOf('正在跑 1') >= 0,
     textOf(tree).slice(0, 600))
-  check('每票第二行是 9 站流程带（①…⑨）',
-    textOf(tree).indexOf('①') >= 0 && textOf(tree).indexOf('⑨') >= 0,
+  // 2026-11-17 起流程带写中文短名而不是只有 ①②…（用户原话「只标了序号 用户看不懂」）。
+  check('每票第二行是 9 站流程带，写的是中文短名（不是只有 ①…⑨）',
+    textOf(tree).indexOf('取单') >= 0 && textOf(tree).indexOf('通知') >= 0 &&
+      textOf(tree).indexOf('①') < 0,
     textOf(tree).slice(0, 600))
-  check('失败票那一站的符号是 ✗（不是和成功一样的 ✓）',
-    textOf(tree).indexOf('⑤✗') >= 0,
+  check('失败票那一站的符号是 ✗（不是和成功一样的 ✓），并点名倒在第几站',
+    textOf(tree).indexOf('改代码✗') >= 0 && textOf(tree).indexOf('倒在第 ⑤ 站') >= 0,
     textOf(tree).slice(0, 600))
   check('正在跑的那张标 ▶（与「已经做成」区分开）',
-    textOf(tree).indexOf('⑤▶') >= 0,
+    textOf(tree).indexOf('改代码▶') >= 0,
     textOf(tree).slice(0, 600))
 
   check('渲染了保存按钮', findButton(tree, '保存', 'tp-primary') !== undefined)

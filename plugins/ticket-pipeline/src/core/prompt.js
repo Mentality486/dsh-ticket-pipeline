@@ -164,12 +164,68 @@ function keyLinesOf (memories) {
 }
 
 /**
+ * 「同一检出里还有谁在动」渲染成任务书的一节。
+ *
+ * ## 为什么需要它
+ *
+ * 仓库级租约（`store.acquireRepoLease`）保证**同一时刻只有一个 agent** 在动这个
+ * 检出 —— 它挡住的是「两个进程同时改」。但它挡不住**先后**：上一张票刚改完
+ * 提交、这一张马上接着改，而这一张的任务书对「刚才发生过什么」一无所知。
+ * 人写代码时会看 `git log`，会注意到同事刚动过附近；模型不会自己去查，
+ * 除非你告诉它。
+ *
+ * 更要紧的是「还在跑的那几张」：并发虽然恒 1，但队列里排着的票的**意图**
+ * 是可读的（它们的工单描述），提前知道「还有一张票要改同一个模块」能让它避免
+ * 把一个「等下会被别人重写」的实现固化下来。
+ *
+ * ## 措辞约束
+ *
+ * 写的是**事实 + 建议避让**，不是禁令：我们并不知道它们真会改哪些文件
+ * （票还没跑，改哪是它自己定位出来的）。所以不能用「不许改 X」，
+ * 只能说「这一带有人正在动/刚动过，动手前先看一眼，真需要改就在提交说明里讲清楚」。
+ *
+ * @param {Array<{ recordId: string, phase?: string, label?: string, files?: string[], committed?: boolean }>} inFlight
+ * @returns {string[]}
+ */
+function renderInFlightSection (inFlight) {
+  if (!Array.isArray(inFlight) || inFlight.length === 0) return []
+  const rows = inFlight.filter((item) => item && typeof item.recordId === 'string' && item.recordId.length > 0)
+  if (rows.length === 0) return []
+  const out = []
+  out.push('')
+  out.push('## 同一个项目里还有这些票在动（按顺序跑，不是同时）')
+  out.push('')
+  out.push('这个项目**同一时刻只跑一张票**，所以你手上不会和别人并行改同一个目录。')
+  out.push('但下面这些票排在前面或后面，**它们要动的地方可能和你重叠**：')
+  out.push('')
+  for (const item of rows) {
+    const phase = typeof item.label === 'string' && item.label.length > 0 ? item.label : (item.phase ?? '在跑')
+    const files = Array.isArray(item.files)
+      ? item.files.filter((file) => typeof file === 'string' && file.length > 0).slice(0, 5)
+      : []
+    const filesText = files.length > 0
+      ? `，它改过：${files.join('、')}${(item.files?.length ?? 0) > files.length ? ` 等 ${item.files.length} 个文件` : ''}`
+      : ''
+    const when = item.committed === true ? '（已提交）' : '（还没跑完/结果未知）'
+    out.push(`- ${item.recordId}｜${phase}${when}${filesText}`)
+  }
+  out.push('')
+  out.push('**怎么用这条信息**：')
+  out.push('- 如果你要改的文件正好在上面某一票的清单里，先看一眼那个文件现在是什么样 ——')
+  out.push('  它可能刚被前一张票改过，你看到的就是最新状态，不要按「原始代码」的印象去改。')
+  out.push('- 如果同一段逻辑前后两张票都要动，**不要把它重写一遍**：在提交说明里写清')
+  out.push('  「这一处 A 票已经改过 / 我这次只补 B 的部分」，让后来 review 的人能对上。')
+  out.push('- 这条信息只是**线索**，不是禁令。真实需求该改哪里，仍按下面「定位」那一节自己判断。')
+  return out
+}
+
+/**
  * @param {Ticket} ticket
  * @param {LocateResult} located
- * @param {{ verify?: VerifyCommands, exploreBudget?: number, memories?: Array<{ files?: string[], recordId?: string }> }} [options]
+ * @param {{ verify?: VerifyCommands, exploreBudget?: number, memories?: Array<{ files?: string[], recordId?: string }>, inFlight?: Array<{ recordId: string, phase?: string, label?: string, files?: string[], committed?: boolean }> }} [options]
  *   `verify` 是项目配置里的验证命令；`exploreBudget` 是探索预算（缺省取 `BUILTIN_LIMITS`）；
- *   `memories` 是同类问题的历史改动文件。三者都由调度器从项目配置/limits/记忆表里取，
- *   **渲染与执行同源**。
+ *   `memories` 是同类问题的历史改动文件；`inFlight` 是同一检出上排在前后、可能撞车的票。
+ *   四者都由调度器从项目配置/limits/记忆表/票据表里取，**渲染与执行同源**。
  * @returns {string}
  */
 export function renderTicketPrompt (ticket, located, options = {}) {
@@ -215,6 +271,10 @@ export function renderTicketPrompt (ticket, located, options = {}) {
   //   「随便改一版」改成「说明还缺哪条线索」。
   // 跨票记忆放在「定位」之前：它是最省时间的一条线索，先看到能省掉下面前两步。
   lines.push(...renderMemorySection(options.memories ?? []))
+
+  // 「同一检出里还有谁在动」紧跟在记忆之后：两者都是「别人已经/正在留下什么」，
+  // 放在一起读最省事；再往下就是「你自己该怎么定位」了。
+  lines.push(...renderInFlightSection(options.inFlight ?? []))
 
   lines.push('')
   lines.push('## 定位到具体页面：按「操作流程」走，别在全仓里漫游')

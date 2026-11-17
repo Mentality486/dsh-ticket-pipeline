@@ -879,6 +879,10 @@ export function createAgentExecutor (options = {}) {
         } else {
           ctx.log?.(`executor-agent：没有基线（工作区干净或拍基线失败），本次提交 ${committable.length} 个改动文件`)
         }
+        if (Number(collected.droppedOthers ?? 0) > 0) {
+          // 说清「为什么提交里少了这几个文件」：少的那几个不是我漏了，是别人提交进来的。
+          ctx.log?.(`executor-agent：${collected.droppedOthers} 个改动是基线之后别人提交进来的，不算这张票的产物`)
+        }
         if (blocked.length > 0) {
           // 不抛错：业务代码可能已经改对了，抛了人只看到「失败」，看不到「哪几个文件被拦」。
           // 但不能只写日志 —— 插件日志人平时不看，最后只会在 MR 里发现「少改了一个文件」。
@@ -2109,7 +2113,7 @@ function resolveCreateUserMessage (injected) {
  *   signal: AbortSignal,
  *   baseline?: { sha?: string, head?: string, untracked?: Map<string, string> },
  * }} input
- * @returns {Promise<{ files: string[], changes: Array<{ status: string, path: string, from?: string }> }>}
+ * @returns {Promise<{ files: string[], changes: Array<{ status: string, path: string, from?: string }>, droppedOthers: number }>}
  */
 export async function collectChanges (options, input) {
   const git = options.git
@@ -2120,6 +2124,7 @@ export async function collectChanges (options, input) {
 
   const baseCommit = typeof input.baseCommit === 'string' ? input.baseCommit.trim() : ''
   const baselineSha = typeof input.baseline?.sha === 'string' ? input.baseline.sha.trim() : ''
+  const baselineHead = typeof input.baseline?.head === 'string' ? input.baseline.head.trim() : ''
   const untrackedBaseline = input.baseline?.untracked instanceof Map ? input.baseline.untracked : new Map()
   // 有基线就用基线，否则退回检出点。两者都是「一个能 `git diff` 的 commit-ish」。
   const against = baselineSha.length > 0 ? baselineSha : baseCommit
@@ -2178,7 +2183,49 @@ export async function collectChanges (options, input) {
     changes = filtered
   }
 
-  return { files: changes.map((change) => change.path), changes }
+  // 再排掉「基线之后别人提交进来的改动」。
+  //
+  // 为什么要这一步：`git diff <baseline.sha>` 比的是「基线树 → 当前工作区」。
+  // 如果这中间**另一个进程或人**把改动提交进了这个检出（HEAD 前进了），那些改动
+  // 也在工作区里，于是会出现在这份 diff 里，被当成这张票的产物一起提交 —— 而这个
+  // 检出是允许多个宿主进程共用的（仓库级租约只保证不同时，保证不了「别人刚提交完
+  // 我就开始跑」）。这时提交会替别人签字，`changedFiles` 也会多出一堆不是它改的。
+  //
+  // 判据：`baselineHead..HEAD` 里出现的路径，如果**工作区该路径的内容与 HEAD 一致**
+  // （`git diff HEAD -- <path>` 为空），说明这个路径上的全部变化都来自别人的提交，
+  // 本票一个字没动它 —— 直接排掉。工作区与 HEAD 不一致时保留：那说明 agent 在别人
+  // 的提交之上又改了一笔，这一笔确实是它的。
+  let droppedOthers = 0
+  if (baselineHead.length > 0 && changes.length > 0) {
+    const headResult = await runGit(['rev-parse', 'HEAD'])
+    const currentHead = Number(headResult?.code ?? 1) === 0 ? String(headResult?.stdout ?? '').trim() : ''
+    if (currentHead.length > 0 && currentHead !== baselineHead) {
+      const theirs = await runGit(['diff', '--name-status', '-z', baselineHead, currentHead, '--', '.', ...PLUGIN_WORKTREE_PATHSPEC_EXCLUDES])
+      if (Number(theirs?.code ?? 1) === 0) {
+        const theirsPaths = new Set(parseNameStatusZ(String(theirs.stdout ?? '')).map((change) => change.path))
+        if (theirsPaths.size > 0) {
+          const filtered = []
+          for (const change of changes) {
+            if (!theirsPaths.has(change.path)) {
+              filtered.push(change)
+              continue
+            }
+            // 工作区与 HEAD 一致 ⇒ 这个路径上没有任何「本票新增」的内容。
+            const stillMine = await runGit(['diff', 'HEAD', '--', change.path])
+            const dirtyHere = Number(stillMine?.code ?? 1) === 0 && String(stillMine.stdout ?? '').trim().length > 0
+            if (dirtyHere) {
+              filtered.push(change)
+            } else {
+              droppedOthers += 1
+            }
+          }
+          changes = filtered
+        }
+      }
+    }
+  }
+
+  return { files: changes.map((change) => change.path), changes, droppedOthers }
 }
 
 /**
@@ -2611,6 +2658,12 @@ async function addPathsForCommit (runGit, paths) {
  * 里唯一能看到的上下文，把「测试跑没跑通」「哪些文件被刻意漏掉」写进去，
  * 才能不看插件也能判断这次提交能不能用。
  *
+ * **这里必须清洗双引号**（`sanitizeCommitText`）：本地提交是唯一会把这段文本
+ * 交给 shell 的路径 —— `commitLocally` 用 `git commit -m <这段>`，而
+ * `makeGitRunner` 会把 argv 拼成一条命令串。2026-11-17 `pms|sh-row-93`
+ * 就是因为序号里带着公式的双引号，在 PowerShell 5.1 下被拆成 5 段 pathspec，
+ * 提交失败。（远端 MR 那条走 GitLab JSON API，不过 shell，所以不清洗。）
+ *
  * @param {any} ticket
  * @param {{ blocked?: string[], verification?: { outcome: string, detail: string } }} [extra]
  * @returns {string}
@@ -2627,7 +2680,7 @@ export function buildLocalCommitMessage (ticket, extra = {}) {
   if (blocked.length > 0) {
     lines.push(`未提交（疑似含真实凭据，按约定留在工作区）：${blocked.join('、')}`)
   }
-  return lines.join('\n')
+  return sanitizeCommitText(lines.join('\n'))
 }
 
 /**
@@ -2888,6 +2941,65 @@ function stripGitSuffix (value) {
 }
 
 /**
+ * 提交说明里的「安全字符」清洗。
+ *
+ * 真实事故（pms|sh-row-93，2026-11-17）：提交说明被拼成**一条 shell 命令**
+ * （`makeGitRunner` 把 argv 逐段转义后 join 成一个字符串交给宿主 shell），
+ * 而说明里带了双引号 —— 来源是电子表格「序号」列被读成了公式原文
+ * `IF(COUNTA($B93:$L93)=0,"",ROW()-1)`。在 Windows PowerShell 5.1 下，
+ * **带双引号的参数传给原生 exe 会被重新拆开**，于是 git 收到的是：
+ *
+ * ```
+ * error: pathspec '集成minio组件存放附件图片' did not match any file(s) known to git
+ * error: pathspec 'sh-row-93' did not match any file(s) known to git
+ * ```
+ *
+ * 提交直接失败，票判 failed —— 而代码其实改完了、验证也过了。
+ *
+ * 修法分两层（都要有）：
+ * 1. **根上别再产生双引号**：序号那类外来文本先过一道 `looksLikeFormula` 判断
+ *    （见 `buildMrTitle`），别把公式原文写进标题；
+ * 2. **这里兜底**：提交说明是我们自己的文本，把双引号换成单引号 —— 语义不变
+ *    （都是一句引用/占位），但跨 shell 安全。换行、中文、`$`、反引号都安全：
+ *    它们落在单引号里就是字面量（这也是转义策略选单引号的原因）。
+ *
+ * 为什么不在 `makeGitRunner` 里做：那里会顺带把**文件路径**里的双引号也改掉，
+ * 而改路径 = 提交错文件。文本与路径必须分开处理。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function sanitizeCommitText (text) {
+  return String(text ?? '').replace(/"/g, "'")
+}
+
+/**
+ * 这段文本像不像一个「公式原文」而不是人写的值？
+ *
+ * 2026-11-17 事故：电子表格的「序号」列写的是
+ * `=IF(COUNTA($B93:$L93)=0,"",ROW()-1)`，而读值接口缺省按 `ToString`
+ * 返回**公式原文**，于是这张票的 seq 就是那串 40 多个字符的公式。
+ * 它的后果不止是难看：
+ * - 被拼进提交说明 ⇒ 里面的双引号把 PowerShell 命令拆散，提交失败；
+ * - 被拼进会话标题 / MR 标题 ⇒ 人看到一串乱码，认不出这是哪个序号。
+ *
+ * 判据只看「不可能是人写的序号」的形态，不去猜具体函数名：
+ * 以 `=` 开头、含 `(`、含 `COUNTA`/`IF(` 之类、或长度超过 16 —— 序号就是个短数字。
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function looksLikeFormula (value) {
+  if (typeof value !== 'string') return false
+  const text = value.trim()
+  if (text.length === 0) return false
+  if (text.length > 16) return true
+  if (text.startsWith('=')) return true
+  if (text.includes('(') || text.includes(')')) return true
+  return /^(?:IF|COUNTA|ROW|SUM|CONCAT|TEXT)\b/i.test(text)
+}
+
+/**
  * MR 标题。带 `[<项目>] <recordId>` 前缀是为了在 GitLab 的 MR 列表里一眼看出是哪张票 ——
  * 那个列表里所有标题长得都差不多。
  *
@@ -2895,7 +3007,11 @@ function stripGitSuffix (value) {
  * @returns {string}
  */
 export function buildMrTitle (ticket) {
-  const seq = typeof ticket?.seq === 'string' && ticket.seq.length > 0 ? `#${ticket.seq} ` : ''
+  // 序号是**外来文本**（表格里人写的、或公式算的），进标题前必须挡一道：
+  // 公式原文既看不懂、又会把下游的 shell 命令拆坏（2026-11-17 事故）。
+  // 挡住就退回不带序号的形态 —— 标题里少一个 `#79` 完全不影响可用性。
+  const rawSeq = typeof ticket?.seq === 'string' ? ticket.seq.trim() : ''
+  const seq = rawSeq.length > 0 && !looksLikeFormula(rawSeq) ? `#${rawSeq} ` : ''
   const description = String(ticket?.description ?? '').trim().replace(/\s+/g, ' ')
   const short = description.length > 60 ? `${description.slice(0, 60)}…` : description
   return `[${ticket?.projectId ?? '未知项目'}] ${seq}${short || ticket?.recordId || '修复工单'}`
@@ -2927,7 +3043,10 @@ export function buildMrTitle (ticket) {
  */
 export function buildSessionTitle (ticket, maxBytes = SESSION_TITLE_MAX_BYTES) {
   const projectId = String(ticket?.projectId ?? '').trim() || '未知项目'
-  const seq = typeof ticket?.seq === 'string' && ticket.seq.trim().length > 0 ? ticket.seq.trim() : ''
+  // 序号也可能是公式原文（2026-11-17 事故），标题里同样挡掉 —— 否则 80 字节
+  // 预算会被 `IF(COUNTA($B93:$L93)=0,"",ROW()-1)` 这种串吃光，描述反而被截没。
+  const rawSeq = typeof ticket?.seq === 'string' ? ticket.seq.trim() : ''
+  const seq = rawSeq.length > 0 && !looksLikeFormula(rawSeq) ? rawSeq : ''
   const description = String(ticket?.description ?? '').trim().replace(/\s+/g, ' ')
   const recordId = String(ticket?.recordId ?? '').trim()
   // 描述为空时退到 recordId：至少让这一行能被人对上号。
@@ -2954,6 +3073,10 @@ export function buildSessionTitle (ticket, maxBytes = SESSION_TITLE_MAX_BYTES) {
 
 /**
  * 提交信息。第一行是标题（GitLab 用它做 commit 列表展示），后面是溯源信息。
+ *
+ * 这里**不清洗**：本条走的是 GitLab 的 JSON API（`client.commitFiles({ message })`），
+ * 双引号在 JSON 里是普通字符，没有任何转义风险。只有会把这段文本拼成 shell 命令的
+ * 那条路径才需要清洗 —— 见 `buildLocalCommitMessage`。
  *
  * @param {import('../../contracts/types.js').Ticket} ticket
  * @returns {string}

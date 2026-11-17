@@ -92,26 +92,36 @@ export function phaseLabel (row) {
  *
  * `no` 只用于展示（①…⑨ 是主链路，`·` 是补充站点），不参与任何判定；
  * `label` 写进记录里是**自包含**的 —— 渲染时不查这张表也看得懂。
+ *
+ * `short` 是给流程带用的**两三个字的人话**（2026-11-17 加）。
+ *
+ * 为什么要有它：原先流程带只画 `①✓ ②✓ ③✗ …`，而 ①–⑨ 各是什么全靠一行图例
+ * 去解释 —— 人看到「⑦✓」得回头翻图例才知道那是「提交」，翻完还得记住。
+ * 一张票一段符号再加翻图例，等于把「一眼看懂」变成了一道翻译题。
+ * `short` 让带子自己就能读：`取单✓ 定位✓ 工作区✓ … 提交✗`。
+ *
+ * 长度约束：2–4 个汉字。九站连着写要在**一行**里放下（终端与面板都是单行），
+ * 超过 4 个字九个站就换行，反而看不出「一路顺下来」的形状。
  */
 export const TIMELINE_NODES = Object.freeze({
-  'discover': { no: '①', label: '获取工单' },
-  'locate': { no: '②', label: '查找对应工单的项目' },
-  'workspace': { no: '③', label: '检查工作区' },
-  'session': { no: '④', label: '创建会话（分支+模型）' },
-  'editing': { no: '⑤', label: '处理工单问题' },
-  'testing': { no: '⑥', label: '跑验证' },
-  'mr-opening': { no: '⑦', label: '提交（本地提交 / PR）' },
-  'writeback': { no: '⑧', label: '回填工单表' },
-  'notify': { no: '⑨', label: '发送消息' },
+  'discover': { no: '①', label: '获取工单', short: '取单' },
+  'locate': { no: '②', label: '查找对应工单的项目', short: '定位' },
+  'workspace': { no: '③', label: '检查工作区', short: '工作区' },
+  'session': { no: '④', label: '创建会话（分支+模型）', short: '会话' },
+  'editing': { no: '⑤', label: '处理工单问题', short: '改代码' },
+  'testing': { no: '⑥', label: '跑验证', short: '验证' },
+  'mr-opening': { no: '⑦', label: '提交（本地提交 / PR）', short: '提交' },
+  'writeback': { no: '⑧', label: '回填工单表', short: '回填' },
+  'notify': { no: '⑨', label: '发送消息', short: '通知' },
   // 补充站点：不是用户点名的主链路，但卡在这些地方同样要看得见
-  'worktree-ready': { no: '·', label: '工作区就绪' },
-  'planning': { no: '·', label: '规划改动' },
-  'pending': { no: '·', label: '排队中' },
-  'needs-info': { no: '·', label: '等你补充信息' },
-  'done': { no: '·', label: '已完成' },
-  'skipped': { no: '·', label: '待人工验证' },
-  'failed': { no: '·', label: '失败' },
-  'gone': { no: '·', label: '表格里已删除' },
+  'worktree-ready': { no: '·', label: '工作区就绪', short: '工作区就绪' },
+  'planning': { no: '·', label: '规划改动', short: '规划' },
+  'pending': { no: '·', label: '排队中', short: '排队' },
+  'needs-info': { no: '·', label: '等你补充信息', short: '等你补' },
+  'done': { no: '·', label: '已完成', short: '完成' },
+  'skipped': { no: '·', label: '待人工验证', short: '待验证' },
+  'failed': { no: '·', label: '失败', short: '失败' },
+  'gone': { no: '·', label: '表格里已删除', short: '已删除' },
 })
 
 /**

@@ -1357,6 +1357,80 @@ export async function runGitlabChecks (check) {
     assert.deepEqual(result.changes, [{ path: 'user-edit.txt', status: 'update' }])
   })
 
+  await check('执行器：基线之后别人提交进来的改动不算这张票的产物', async () => {
+    // 现场：同一个检出允许多个宿主进程共用（仓库级租约只保证「不同时」，保证不了
+    // 「别人刚提交完我就开始跑」）。`git diff <baseline.sha>` 比的是「基线树 → 当前
+    // 工作区」，别人中途提交进来的文件也在工作区里，于是会混进这份 diff，被当成
+    // 这张票的产物一起提交 —— 等于替别人签字，`changedFiles` 也会多出不属于它的路径。
+    const calls = []
+    const result = await collectChanges({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'diff' && argv.includes('--name-status') && argv[3] === 'stashsha1') {
+          // 基线 → 工作区：既有别人提交的那个文件，也有本票真改的文件。
+          return { code: 0, stdout: 'M\0others/file.js\0M\0mine.js\0', stderr: '' }
+        }
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'head2\n', stderr: '' }
+        if (argv[0] === 'diff' && argv.includes('--name-status') && argv[3] === 'head1') {
+          // 基线 HEAD → 现在 HEAD：别人提交了 others/file.js
+          return { code: 0, stdout: 'M\0others/file.js\0', stderr: '' }
+        }
+        if (argv[0] === 'diff' && argv[3] === 'HEAD') {
+          // 逐路径问「工作区这一格和 HEAD 一样吗」：别人那个文件一样，本票那个不一样
+          return { code: 0, stdout: argv[4] === 'mine.js' ? 'M mine\n' : '', stderr: '' }
+        }
+        if (argv[0] === 'status') return { code: 0, stdout: '', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: 'base123',
+      baseline: { sha: 'stashsha1', head: 'head1', untracked: new Map() },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result.files, ['mine.js'], '别人提交的那个文件必须被排掉')
+    assert.equal(result.droppedOthers, 1, '排掉了几个要能说出来，日志里要交代')
+  })
+
+  await check('执行器：HEAD 没动过时不做额外 git 调用（不为一无所获的事跑命令）', async () => {
+    const calls = []
+    await collectChanges({
+      git: async (argv) => {
+        calls.push(argv)
+        if (argv[0] === 'diff') return { code: 0, stdout: 'M\0a.js\0', stderr: '' }
+        if (argv[0] === 'rev-parse') return { code: 0, stdout: 'head1\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: 'base123',
+      baseline: { sha: 'stashsha1', head: 'head1', untracked: new Map() },
+      signal: new AbortController().signal,
+    })
+    // HEAD 与基线一致 ⇒ 没有「别人提交」这回事，不该再发那条 diff。
+    assert.equal(calls.filter((argv) => argv[0] === 'diff' && argv.includes('--name-status')).length, 1,
+      'HEAD 没变就只该有一回 name-status diff')
+  })
+
+  await check('执行器：没有 baseline.head 的旧基线也不会误排改动（向后兼容）', async () => {
+    // 老票据上存的 baseline 只有 sha，没有 head。这时不能因为「判断不了」就把改动
+    // 全排掉 —— 宁可多收，不可少收：少收会让票白跑（改动没进提交）。
+    const result = await collectChanges({
+      git: async (argv) => {
+        if (argv[0] === 'diff') return { code: 0, stdout: 'M\0a.js\0', stderr: '' }
+        if (argv[0] === 'rev-parse') throw new Error('不该问 HEAD：没有 baseline.head 就没有可比的两个点')
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }, {
+      cwd: '/repo',
+      baseCommit: 'base123',
+      baseline: { sha: 'stashsha1', untracked: new Map() },
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result.files, ['a.js'])
+    assert.equal(result.droppedOthers, 0)
+  })
+
   await check('执行器：createBaseline 无 git 运行器返回 undefined，stash create 回空串时 sha 记 undefined', async () => {
     assert.equal(await createBaseline({}, '/repo', new AbortController().signal), undefined, '没有 git 就没有可拍的基线')
     const clean = await createBaseline({

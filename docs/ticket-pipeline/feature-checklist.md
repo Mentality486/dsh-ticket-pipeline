@@ -32,6 +32,11 @@
 >
 > 同日再晚（11-17）：一张票跑出两条同名会话 —— 会话 id 原先只在收尾时写盘，
 > 插件一重载就丢，下一轮只能新建。改成「拿到就落库」，见 §1.53。
+> 同日第三轮（11-17）：「①✓②✓…」人看不懂、全打勾却标失败、失败原因是 3098 字原文。
+> 站带改成中文短名（取单 / 定位 / 改代码 / 提交…）、失败回填到真正倒下的那一站、
+> 错误给「为什么 + 怎么办」。顺带查清那条失败的真因是两件事：提交说明里的双引号被
+> PowerShell 重新拆开、电子表格的「序号」列是公式被当成序号读了。见 §1.54。
+> `dev-run` **596/596**、`client-smoke` **282** 条。
 > 同日更早：**新增项目时两格「列名覆盖」被写成 `"[object Object]"`，整笔保存被拒** ——
 > `buildProjectValue()` 的通用分支是 `String(normalized)`，而 `projectRawValue()` 对 `kind === 'columns'`
 > 已经解析成对象了。只有「新增项目」这条整对象通道会踩（已有项目走单字段通道），所以两格空着也报。
@@ -3517,26 +3522,193 @@ lastError: `${was}，启动恢复后重新排队（工作区沿用，不会重�
   把 `recover.js` 的 `sessionHint` 去掉、同时 `sessionId: undefined` → **恰好 1 条红**。
   两次都只红对应用例，恢复后全绿。
 
+### 1.54 「①✓」对看工单的人是密码：站带要写人话，失败要落在倒下的那一站（2026-11-17 第三轮）
+
+用户原话（m13787）：「插件中只标了序号 用户看不懂啊 而且不知道那一步错了 还不好看 优化」；
+随后（m13909）把面板上 `sh-row-93` 的整段输出贴回来，末尾一句：
+「没有明确的失败原因 哪里出的问题怎么修改 都不明确」。
+
+#### 现场
+
+一句话里叠了三个毛病，而且互相掩护 —— 谁先修都看不出效果：
+
+| 现象 | 真因 |
+|---|---|
+| 站带是 `①✓②✓③✓④✓⑤✓（12 分 25 秒）⑥✓⑦✓⑧✓⑨✓` | 九站只有符号，人要回头翻图例才知道 ⑦ 是「提交」 |
+| 全 ✓ 却标着「失败」 | 执行器先 `onPhase('mr-opening')` 记一条 `ok:true`，真正的失败由调度器收尾另记一条 `failed`；站带只看每站自身 `ok`，看不到后面那条 |
+| 「最近错误」是 3098 字的原文 | 里面塞着整条 `git commit -m ...` 命令、几十个文件路径、以及同一段 stderr 重复两次 |
+
+第 2 条是这次最值钱的发现：**「全打勾但结果是失败」比直接报错更让人困惑** ——
+人会以为自己看漏了某一站，于是把九站重新数一遍，数完还是全 ✓。
+
+#### 改法
+
+**一、站名写人话。** `TIMELINE_NODES` 每个节点加一个 2–4 字的 `short`（`取单` / `定位` /
+`工作区` / `会话` / `改代码` / `验证` / `提交` / `回填` / `通知`），站带走 `short` 不走 `no`：
+
+```
+取单✓ 定位✓ 工作区✓ 会话✓ 改代码✓（12 分 25 秒） 验证✓ 提交✓ 回填✓ 通知✓｜全程 45 分 34 秒
+```
+
+长度约束写进注释：2–4 字，九站要在一行里放得下；`①✓` 那种记号留给工具输出（要紧凑），
+面板给人看。
+
+**二、失败回填到它倒下的那一站。** `describeStations` 倒序扫最后一条主站，
+`row.phase === 'failed'` 时把那一站的状态强制成 `failed`：
+
+```js
+const blamedNode = row.phase === FAILED_TERMINAL ? lastMainNode : undefined
+// ...
+else if (node === blamedNode) state = 'failed'
+```
+
+只认 `failed` —— `done` / `skipped` 不许涂红（它们最后一站自己那条也是 `ok`，
+照搬同一套逻辑会把成功的票误标成失败）。站带上再补一句「｜✗ 倒在第 ⑦ 站「提交（提交）』」，
+省掉人自己去找那个 ✗。
+
+**三、错误要给「为什么 + 怎么办」。** 新增 `src/core/error-advice.js`，12 条规则，
+判据是**特征串**不是 `kind`（`internal` 一个值盖住几十种情况，按 kind 分等于没分）：
+
+```
+最近错误：提交失败：git 把提交说明里的引号当成了文件名
+  为什么：提交说明里带了双引号。插件把这条命令交给 Windows PowerShell 执行时，
+          PowerShell 会重新拆一次带双引号的参数，于是说明被切成好几段，
+          git 把后半段当成了「要提交哪些文件」的路径。代码其实已经改完了、验证也过了。
+  怎么办：已修复（2026-11-17）：提交说明会把双引号换成单引号，序号里的公式也不再进标题。
+          这张票直接「重跑」即可 —— 工作区里的改动还在，重跑会重新提交。
+  原文：本地提交失败（git commit -m fix(pms): [pms] #IF(COUNTA(…）…（原文共 3098 字，已截断）
+```
+
+三条硬约束写进文件头：**只解释不吞原文**（排障的人可能要原样去搜）、**认不出就老实说认不出**
+（硬套模板比不解释更坏）、**判据用特征串不用 kind**。
+
+#### 判据
+
+1. **符号是给人看的还是给机器看的，决定它该不该出现在界面上。** `①✓` 在工具输出里省地方，
+   在面板上就是密码本。两处不是同一份文案，但必须是同一个数据源（`short` 从 `TIMELINE_NODES` 取）。
+2. **状态要按「结果」算，不能按「每一步自己说 ok」算。** 每站自己 `ok:true` 而整票 `failed`
+   是常态（失败发生在站的收尾里），站带必须补一层「按最终结果回填」。
+3. **错误的「原文」和「解释」要分开给。** 人先看解释决定怎么办，需要深挖时才看原文 ——
+   把两者混在一行里，等于让人先读完 3098 字才知道结论。
+4. **同一份解释不许两处各写一遍。** 工具输出与面板都用宿主下发的 `lastErrorAdvice`，
+   面板不再自己拼措辞（否则工具说「引号拆命令」、面板说「未知错误」，人不知道该信哪个）。
+5. **挡一次不够，要挡在「最靠近源头」的那一层。** 双引号既在 `sanitizeCommitText`（出口）挡，
+   也在序号解析（入口）挡 —— 公式与双引号各有两条进入路径，只挡一条会漏。
+
+#### 自测
+
+- `dev-run` 584 → **596**，新增 12 条（第 21 节 5 条 + 第 22 节 6 条 + 会话标题 1 条）：
+  - 第 21 节（顺序号公式 / 提交说明双引号）：`looksLikeFormula` 正反例、`sanitizeCommitText`
+    正反例（`$HOME`、反引号、`-- `、换行、`%` 必须原样保留）、本地提交说明不含双引号、
+    `buildMrTitle` 挡公式、电子表格序号是公式时退回 `sh-row-93` 且 `identitySource === 'fallback-row'`。
+  - 第 22 节（错误要能看懂）：认得出的错误三样齐全 / 认不出的老实说认不出 / 原文不被吞
+    （含超长截断且**明说**截断）/ 渲染行形状且长原文渲染后要短得多 /
+    `pipeline_status` 明细给人话且「最近错误」只出现一次 / **⑦ 自己 ok、票却失败时 ✗ 落在⑦身上**
+    （含 `done` 票不许涂红）。
+- 既有 3 条站带断言改成中文短名（`取单✓ 定位✓ 工作区✓ …`）；图例断言改成
+  `/流程带的九站按顺序是：获取工单 → 查找项目/` —— **文案变了断言就该跟着变，不是把断言放宽**。
+- 回归验证（`.scratch/_regress-562.cjs`，参数 `none|nosanitize|noformula|noseqguard`）：
+  `nosanitize` → 红「提交说明里还有双引号」；`noformula` → 红「标题里不该出现公式」；
+  `noseqguard` → 红「公式要当成空序号」。三次都只红对应用例。
+- **第一版测试是假绿的**：用公式当序号时 `buildMrTitle` 已经把公式挡掉，双引号根本没进文本，
+  于是「拆掉清洗」和「拆掉公式判断」两种改法都 589/590 全绿。改成「描述本身带双引号」+
+  单测 `buildMrTitle` 之后才抓住。**一条永远绿的回归用例比没有更坏** —— 它会让人以为这条路有人守。
+
+### 1.55 同一个检出上「先后两张票」：租约只管得到票，管不到目录（2026-11-17）
+
+#### 现场
+
+用户问的是 super-agent 那类形态：「多个会话在一个工作区修改，可能改同一个文件，插件能让他们
+互相有感知么」。实际观察：GUI 里那些会话是**先后**的，不是同时的 —— `scheduler.js` 一直是
+`let running = false`，重入直接回 `already-running`。所以「并发」不是当时的问题。
+
+但这不等于没问题。三个真实缺口：
+
+1. **租约的粒度是「票」，不是「检出」**。`store.acquireLease(ticketKey(projectId, recordId), ttl)`
+   —— 防的是「同一张票被跑两遍」。就地模式（`isolateWorktree` 缺省 false）下，同一个仓库上的
+   两张**不同**票共用一个工作目录，两个宿主进程可以同时改它。票级锁对此一言不发。
+2. **后一张票看不到前一张改了什么**。人写代码会顺手看一眼 `git log` 或者同事刚动过哪儿，
+   模型不会主动去查。前一张票刚改了 `pms-server/.../TicketController.java`，后一张票按
+   「原始代码」的印象去改，就会把前一票的修复覆盖掉。
+3. **`changedFiles` 会把别人的提交算进来**。`collectChanges` 用
+   `git diff <baseline.sha>`（基线 = agent 动手前拍的 `git stash create`）。如果这中间
+   另一个进程把改动**提交**进了这个检出，那些文件也在工作区里，于是出现在同一份 diff 里，
+   被当成这张票的产物一起提交 —— 替别人签字，复盘时也数不清到底谁改了什么。
+
+#### 做了什么（四层，对应工单里「第 2 档」）
+
+**A. 仓库级互斥（`store.js` + `scheduler.js`）**
+
+- `repoLeaseKey(repoPath)`：复用同一张 `leases` 表，key 用 `repo\u0000<归一化路径>`。
+  归一化是 `\` → `/`、折连续斜杠、去尾斜杠、Windows 下折大小写 —— **`D:\WorkSpace\repo`、
+  `D:/WorkSpace/repo/`、`D:\\WorkSpace\\repo` 必须是同一把锁**，否则换个写法就能绕开互斥。
+- `acquireRepoLease` / `renewRepoLease` / `releaseRepoLease` / `isRepoLeasedByOther`，
+  形状与票级完全一致（含回读校验，因为 read→put 之间没有互斥）。
+- `runOne` **在 `prepareWorkspace` 之前**抢检出（那里可能真去建 worktree / 登记工作区，
+  先建完才发现检出不归我们就是白做）；抢不到就把这张票放回 `pending`、写一句人话
+  `lastError`、记一条时间线，然后 `return true` 让出这一轮。
+- 租约心跳（`heartbeatId`）里**同时续两把锁**：票租约续成功后马上续仓库租约，
+  续不上就 `leaseLost = true` + `handle.abort()` 让出。
+- `finally` 里**先放仓库租约、再放票租约** —— 顺序反过来会有一个「票已自由、检出还锁着」的窗口。
+- `tick` 的消费循环把让出的票 key 收进 `skippedByRepoLease`，下一圈 `pickNext({ excludeKeys })`
+  跳过它 —— 否则一轮会在同一张票上原地打转。**关键语义：抢不到检出不是「这一轮停了」，
+  而是「这张票先让它，去跑队列里别的票」。**
+
+**B. 票史推导（`recentProjectTickets`，不新开表）**
+
+从 `store.listTickets()` 推同项目、非本票、按 `rowActivityAt` 降序取前 6 条，
+每条带 `recordId / phase / label / files（前 8 个）/ committed`。**不新开表**：真相就在
+票据表里，再存一份就是第二真相，迟早分叉。
+
+**C. 任务书告知（`prompt.js` 的 `renderInFlightSection`）**
+
+插在「代码定位」相关章节之后、「定位到具体页面」之前（两者都是「别人已经/正在留下什么」，
+放一起读最省事）。正文先破误解「同一时刻只跑一张票，所以你手上不会和别人并行改同一个目录」，
+再给清单，再给三条用法：改到同一文件先看它现在什么样、同一段逻辑别重写、
+**「这条信息只是线索，不是禁令」**——票还没跑，改哪是它自己定位出来的，我们并不知道。
+
+**D. `changedFiles` 归属修正（`collectChanges`）**
+
+`baseline` 现在除了 `sha` 还带 `head`。收完改动后：若 `baseline.head !== 当前 HEAD`，
+就 `git diff --name-status <head> <HEAD>` 查出「这中间别人提交了哪些路径」；对这些路径
+再逐条问 `git diff HEAD -- <path>` —— **工作区与 HEAD 一致**说明该路径上的全部变化都来自
+别人的提交（排掉，计入 `droppedOthers`）；**不一致**说明 agent 在别人的提交之上又改了一笔
+（保留）。没有 `baseline.head` 的老基线一律不排（判断不了就多收，少收会让票白跑）。
+
+#### 判据
+
+- **换个写法也抢不到同一把锁**：路径归一化之后必须是同一个 key。
+- **一个项目被占不能拖垮整轮**：让出这张，接着跑下一张。
+- **静默必须能被下一次尝试纠正**：抢不到只是这一轮让出，不是把票判失败。
+- **「不是它改的」不该进它的提交**：多收会替别人签字，少收会让票白跑 —— 两者都要有断言。
+
+#### 自测
+
+`dev-run` 596 → **602**（仓库租约 3 条：key 归一化 / 让出但接着跑 / 跑完释放；
+任务书 3 条：出现位置与措辞 / 没有就不出现 / 从票据表推出且排除自己），
+`gitlab-checks` 86 → **96**（`git add` 与忽略文件 2 条 + 基线之后别人提交 3 条 +
+白名单形状等既有项合并计数）。
+
 ## 2. 代码清单
 
-`src/` 共 **50 个 .js / 24 732 行**；`scripts/` 共 10 个 .mjs / **17 923 行**（`dev-run.mjs` **7 660 行**）；`lib/client.js` **5 356 行**（浏览器端设置面板）。
+`src/` 共 **51 个 .js / 25 461 行**；`scripts/` 共 10 个 .mjs / **18 335 行**（`dev-run.mjs` **8 059 行**）；`lib/client.js` **5 385 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
-| `src/contracts/` | 1 655（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 6 709（14 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 11 119（17 个 .js） | 见下表 |
-| `src/tools/` | 2 921（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
+| `src/contracts/` | 1 669（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
+| `src/core/` | 7 023（15 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`error-advice.js`（把 `lastError` 翻成「为什么 + 怎么办」，12 条规则按特征串匹配，认不出就老实说认不出）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 11 426（17 个 .js） | 见下表 |
+| `src/tools/` | 3 019（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
 | `src/remote/` | 965（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
-| 根 | 1 359（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
+| 根 | 1 360（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
 | 适配器 | 行数 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `source-feishu/` | 3 759（`index.js` 2 231 + `sheets.js` 724 + `probe.js` 804） | **真实可用（含电子表格）** | 飞书多维表格 API + **电子表格 API**；`resolveTable` 是表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`），`get_node` 不再硬写 `obj_type`；`scan` 拆 `scanBitable`（翻页 + 早停）/ `scanSheet`（读全表 + 逐行指纹、mtime 恒 0、不早停）；水位、状态值可配、recordIds 收窄、截图三形态（电子表格只支持 path/url，内嵌图当没有）、`allowedImageHosts` 白名单；**`appToken` 可写整条表格 URL**（`parseBitableUrl` 啃 `?table=` / `?view=`）；**`extractSheetToken` 四种写法都认**（`/sheets/<token>`、`/wiki/<token>`、裸 token；带协议头却认不出就抛 `invalid-input`，不再原样拼进接口）；**`writeResult` 回填三列**（多维表格按 `record_id` PUT；**电子表格按序号列重新定位行 + `values_batch_update` 写三格，工单 #22**） |
+| `source-feishu/` | 3 833（`index.js` 2 277 + `sheets.js` 754 + `probe.js` 804） | **真实可用（含电子表格）** | 飞书多维表格 API + **电子表格 API**；`resolveTable` 是表型分派总闸（显式 `tableKind` → `spreadsheetToken` → `appToken` 双试 → `docNamePattern`），`get_node` 不再硬写 `obj_type`；`scan` 拆 `scanBitable`（翻页 + 早停）/ `scanSheet`（读全表 + 逐行指纹、mtime 恒 0、不早停）；水位、状态值可配、recordIds 收窄、截图三形态（电子表格只支持 path/url，内嵌图当没有）、`allowedImageHosts` 白名单；**`appToken` 可写整条表格 URL**（`parseBitableUrl` 啃 `?table=` / `?view=`）；**`extractSheetToken` 四种写法都认**（`/sheets/<token>`、`/wiki/<token>`、裸 token；带协议头却认不出就抛 `invalid-input`，不再原样拼进接口）；**`writeResult` 回填三列**（多维表格按 `record_id` PUT；**电子表格按序号列重新定位行 + `values_batch_update` 写三格，工单 #22**） |
 | `source-wps/` | 1 675 | **experimental（解析可用；配了「表格链接」就有内置取数通道）** | `index.js` + `xlsx.js` + `zip.js`；自解 xlsx/OOXML、截图按锚点解包；「待修改项目」列进 `targetProject`；recordIds 收窄；取数通道有两个：`match.sheetUrl` 非空时 `wpsOptionsFromMatch()` 会装内置下载器（**不需要注入**），或宿主注入 `fetchSheet`；两者都没有才抛 `MISSING_FETCH_SHEET`（**2026-11-16 纠正**：此前写成「主装配不注入 ⇒ 一张票都拿不到」是错的，`pipeline_doctor` 也据此从「一律阻断」改成分档）；`recordId` 用行号 ⇒ 插行会让票换身份（已知限制）；**`downloadSheetLimited` 下载通道有超时 / 取消 / 字节上限 / 逐跳重定向校验** |
 | ~~`source-webform/`~~ | ~~106~~ | **已移除（工单 #18）** | 演示用内存表单源，水位只在内存里 `memoryWatermark = new Map()`，重启就把同一批工单重收一遍。实现已移到 `plugins/ticket-pipeline/scripts/fixtures/source-webform/index.js` 留档（`scripts/` 不进安装包），`PLATFORMS` 只剩 `feishu / wps / mock`，老配置会拿到「改用 mock 或 feishu」的迁移提示 |
 | `source-mock/` | 337 | 测试 | 离线源；也接 recordIds；实现 `writeResult` 供自测断言 |
-| `executor-agent/` | 3 315（`index.js` 2 880 + `agent-failure.js` 252 + **`explore-budget.js` 183**） | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试）；**两套看门狗共用一次 `git status` 指纹** —— 停滞（8 分钟没改文件）+ **探索超预算（`read`/`grep`/`glob` 数到 `agentExploreBudget` 就催，`explore-budget.js` 只认 `tool/ptc-dispatch` 的 `data.name`，不认恒为 `run_code` 的 `tool/call`）** |
+| `executor-agent/` | 3 548（`index.js` 3 113 + `agent-failure.js` 252 + **`explore-budget.js` 183**） | **真实实现** | 真 agent 改码、**先拍基线**（`createBaseline`：`git stash create` + 未跟踪文件内容哈希）再 `-z` 口径收集改动、跑验证、在工作区检出里做本地提交（`commitLocally`，点名暂存 `git add -- <文件>`）；`unstageSensitiveFiles` 把 agent 自己暂存进去的敏感文件退回去；**敏感名单 8 大类 41 条正则**、**`.git`/profile 篡改自检**（28 个 hook 名 + 10 个 git 元数据文件 + 4 个 `cordis.*`）；**`reportFlow` 通过 `ctx.onFlow` 上报 ④ 创建会话（分支+模型，含会话 id / provider+model / 工作目录）**；三个出口都带 `sessionId`，`keepSession` 控制会话回收；`repo.gitlab.enabled: true` 时才额外开 draft MR；含 `agent-failure.js` 失败原因识别（限流转可重试）；**两套看门狗共用一次 `git status` 指纹** —— 停滞（8 分钟没改文件）+ **探索超预算（`read`/`grep`/`glob` 数到 `agentExploreBudget` 就催，`explore-budget.js` 只认 `tool/ptc-dispatch` 的 `data.name`，不认恒为 `run_code` 的 `tool/call`）** |
 | `executor-mock/` | 144 | 测试 | 只演不动真格；返回假的 `commit = { sha: 'mock…', branch, files }` |
 | `gitlab-client/` | 495 | **真实可用** | Commits API + MR API；源分支已有开放 MR 时复用而不撞 409 |
 | `push-qqmail/` | 581 | **真实可用** | 零依赖手写 SMTP（`node:net` / `node:tls` / `node:crypto`），已实发成功 |
@@ -3793,7 +3965,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 
 | 命令 | 断言数 | 结果 |
 | --- | --- | --- |
-| `node scripts/dev-run.mjs` | **584** | 通过 584，失败 0（2026-11-13 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36），**514**（停滞看门狗的 2 条，见 §1.37），**517**（运行页签三件事：删除记录 / 重跑实参 / canReset+canForget 3 条，见 §1.38），**521**（探索预算强制执行 4 条，见 §1.39），**530**（跨票记忆 9 条，见 §1.39），**544**（项目级开关 4 条 + 补做挂进 tick 3 条），**548**（「测这张表」4 条），**551**（体检把「表里没有待办」误报成配置错 3 条，见 §1.41），**557**（工作表名对不上：适配器降级 2 条 + 体检 2 条 + 探针 2 条 + `testProject` 1 条，见 §1.42），**562**（会话标题 5 条，见 §1.44）、**569**（会话标题改成「修复…」开头 + 缺 workspaceId 的票补登记 + `git add` 撞上已跟踪的被忽略文件 7 条，见 §1.45）、**575**（同一张票重跑接着上一轮的会话继续 6 条，见 §1.46；跨票记忆抽词口径订正，见 §1.47）、**576**（回填单元格只留「人下一步要用的」1 条，见 §1.48）、**577**（2026-11-16 纠正金山源「取数通道未接」这个错误说法：体检改成按「有没有配表格链接」分档，1 条；同日补 `checkEventArgConfusion` 静态守卫与 2 个调用点包一层，不新增 `dev-run` 断言，只加 `client-check` / `client-smoke`，见 §1.49）、**580**（探索预算口径改成「不同目标数」+ 阈值 12→25 + 项目级覆盖 3 条，见 §1.50）、**581**（不许反复催：可重置计数器挡不住重复，1 条，见 §1.51）、**583**（两套看门狗合流成一条消息 2 条，见 §1.52）—— 见 §1.40。这 583 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 99 条（见 §1.26 与 §1.23 注） |
+| `node scripts/dev-run.mjs` | **596** | 通过 596，失败 0（2026-11-17 实跑；262 → 274 → 285 → 288 → 293 → 294 → 319 → 325 → 363 → 376 → 378 → 382 → 383 → 384 → **451**（2026-11-09→ **482**（2026-11-10）。451 之前那批：319 是「回填工单表 / 保留会话 / 基线收集 / 配置面板」四项改造，再往后 6 条是「选择分支」，再往后 38 条是「上线加固」的 5 条阻断项 + 4 条重要项（见 §1.14），再往后 13 条是「关键节点流程日志（时间线）」（见 §1.16），再往后 2 条是「appToken 贴整条链接」的配置校验，再往后 4 条是「从 0 到 1」审计（见 §1.19），再往后 1 条是「工作区就绪 / 检查工作区两站不许说同一句话」，再往后 1 条是「票据行里的数字键脏字段会被剔掉」（见 §1.20），再往后 20 条是「飞书电子表格支持」（见 §1.21）。**2026-11-10 = 22 张产品工单的落地批次**：451 之后依次涨到 462（doctor 三档 + GitLab/WPS 降级）、463、469（多维表格列名别名）、475（运行页签）、482（电子表格回填）、483（探针归一 spreadsheetToken），**486**（总览流程带 3 条，见 §1.25），**491**（定位工单表只留一个入口 + 电子表格取票修复 5 条，见 §1.26），**492**（运行页签「显示历史」1 条，见 §1.27），**495**（体检补状态值口径 2 条 + 探针表型探测，见 §1.28），**498**（定位捷径不能跳过表型判定 1 条 + `tableId`/`sheetId` 并存警告 1 条，见 §1.30），**508**（探索预算 1 条 + 停滞看门狗 4 条 + 飞书推送适配器 5 条，见 §1.32 与 §1.33），**509**（预算不能交半成品 1 条，见 §1.34），**511**（体检白名单跟上 feishu 2 条，见 §1.35），**512**（「交付未完成」不都是已完成的 1 条，见 §1.36），**514**（停滞看门狗的 2 条，见 §1.37），**517**（运行页签三件事：删除记录 / 重跑实参 / canReset+canForget 3 条，见 §1.38），**521**（探索预算强制执行 4 条，见 §1.39），**530**（跨票记忆 9 条，见 §1.39），**544**（项目级开关 4 条 + 补做挂进 tick 3 条），**548**（「测这张表」4 条），**551**（体检把「表里没有待办」误报成配置错 3 条，见 §1.41），**557**（工作表名对不上：适配器降级 2 条 + 体检 2 条 + 探针 2 条 + `testProject` 1 条，见 §1.42），**562**（会话标题 5 条，见 §1.44）、**569**（会话标题改成「修复…」开头 + 缺 workspaceId 的票补登记 + `git add` 撞上已跟踪的被忽略文件 7 条，见 §1.45）、**575**（同一张票重跑接着上一轮的会话继续 6 条，见 §1.46；跨票记忆抽词口径订正，见 §1.47）、**576**（回填单元格只留「人下一步要用的」1 条，见 §1.48）、**577**（2026-11-16 纠正金山源「取数通道未接」这个错误说法：体检改成按「有没有配表格链接」分档，1 条；同日补 `checkEventArgConfusion` 静态守卫与 2 个调用点包一层，不新增 `dev-run` 断言，只加 `client-check` / `client-smoke`，见 §1.49）、**580**（探索预算口径改成「不同目标数」+ 阈值 12→25 + 项目级覆盖 3 条，见 §1.50）、**581**（不许反复催：可重置计数器挡不住重复，1 条，见 §1.51）、**583**（两套看门狗合流成一条消息 2 条，见 §1.52）、**584**（会话 id 拿到就落库 1 条，见 §1.53）、**596**（站带改中文短名 + 失败落到倒下的站 + 错误人话化 12 条，见 §1.54）—— 见 §1.40。这 596 条**也包括** `runFeishuChecks` 从 `dev-run` 里驱动的那 99 条（见 §1.26 与 §1.23 注） |
 | `node scripts/chain-smoke.mjs` | **11** | 通过 11，失败 0 |
 | `node scripts/client-smoke.mjs` | **280** | 通过 280（215 → 219：§1.29；→ 240 左右：运行页签筛选/搜索与后果提示；→ 260：飞书通知分支 6 条 + 「测这张表」4 条 + 描述符 11 个；→ 276：面板四处保存/实参 bug 的回归，见 §1.41 之后那四个 commit；→ 280：「重新读取」带事件对象不报错的运行时断言 4 条，见 §1.49） |
 
@@ -3935,7 +4107,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | --- | --- |
 | 内核零平台知识 | `core/` 与 `contracts/` 里 grep 不到任何飞书 / 金山专有字段；平台差异全在 `SOURCES` 表与适配器目录里 |
 | 契约自洽 | 8 个契约文件、11 个 phase、7 类错误都有单测覆盖（`dev-run.mjs` 第 1 节） |
-| 回归网够密 | **584** 项离线断言 + **282** 条面板断言 + **99** 条飞书断言全绿，改一处坏一处会立刻被看见 |
+| 回归网够密 | **596** 项离线断言 + **282** 条面板断言 + **99** 条飞书断言全绿，改一处坏一处会立刻被看见 |
 | 装配层已是表驱动 | 加平台 = 加目录 + `SOURCES` 一行（ADR-0001） |
 | 坏隔离已做 | 一个项目配错不拖垮其它项目；能力名拼错只记日志 |
 

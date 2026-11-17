@@ -132,6 +132,37 @@ export function ticketKey (projectId, recordId) {
 }
 
 /**
+ * 仓库级租约的 key。
+ *
+ * 票级租约（`ticketKey`）只保证「同一张票不会被两个进程同时跑」。但同一个检出上
+ * 的两张**不同**票一样会互相踩：就地模式（`isolateWorktree` 缺省 false）下它们
+ * 共用一个工作目录，一个在 `git checkout` 切分支、另一个正在上面改文件。
+ * 所以再加一把「同一个仓库同时只能有一张票在跑」的锁。
+ *
+ * 用同一个 `leases` 表、不同的 key 形状（`repo\u0000<路径>`）：与票级 key 的
+ * `projectId\u0000recordId` 形状相同但前缀不可能是项目名（项目名里有 `\u0000`
+ * 才会撞，而 `validateProject` 要求非空字符串且平台标识不含它），两者不会互相覆盖。
+ *
+ * 归一化：分隔符统一成 `/`、去掉末尾斜杠；Windows 上再折成小写。
+ * 不折大小写的话 `D:\WorkSpace\mgiot-pms` 与 `d:/workspace/mgiot-pms` 会拿到
+ * **两把不同的锁** —— 等于没锁。这是同一个目录，必须是同一把。
+ *
+ * @param {string} repoPath 检出根目录（可以是相对/绝对，只要同一目录写法一致）
+ * @returns {string} 空串表示路径不可用（调用方据此跳过抢锁）
+ */
+export function repoLeaseKey (repoPath) {
+  const raw = typeof repoPath === 'string' ? repoPath.trim() : ''
+  if (raw.length === 0) return ''
+  // 反斜杠统一成正斜杠，再把连续斜杠折成一个、去掉末尾斜杠：
+  // `D:\WorkSpace\mgiot-pms`、`D:/WorkSpace/mgiot-pms/`、`D:\\WorkSpace\\mgiot-pms`
+  // 必须是同一把锁 —— 否则「同一个目录换种写法」就能绕过互斥。
+  const slashed = raw.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  if (slashed.length === 0) return ''
+  const folded = process.platform === 'win32' ? slashed.toLowerCase() : slashed
+  return `repo\u0000${folded}`
+}
+
+/**
  * 判断一个字段名是不是「字符串被 `Object.entries` 展开」留下的数字键。
  *
  * 票据行里没有任何字段是以数字命名的，所以 `"0".."17"` 这种键只可能是脏数据。
@@ -766,6 +797,67 @@ export class TicketStore {
     return Boolean(current && current.ownerToken !== this.ownerToken && current.leaseExpiresAt > this.now())
   }
 
+  // ── 仓库级租约 ──────────────────────────────────────────
+  //
+  // 和票级租约走同一张表、同一套 read→判断→put→回读，语义只有一个区别：
+  // 它锁的是「一个检出」（`repoLeaseKey`），不是「一张票」。
+  //
+  // 为什么需要它：票级租约只防「同一张票被跑两遍」。就地模式下同一个检出上的
+  // 两张票共用一个工作目录，A 在改文件、B 在 `git checkout` 切分支，两边都
+  // 「合法」。仓库级锁把这类冲突变成「排队」—— 这是本轮唯一的并发控制手段。
+  //
+  // 注意它**不解决**「一票改文件、另一票改同一个文件」这种逻辑冲突：
+  // 那把锁只保证任何时刻只有一个 agent 在动那个检出。真正的文件级互斥
+  // （第 1 档）没做，所以任务书里还会把「同仓库还有谁在改什么」告诉模型（见
+  // `core/prompt.js` 的 `renderInFlightSection`），让它自己避让。
+
+  /**
+   * 抢仓库租约。语义同 `acquireLease`，只是 key 换成 `repoLeaseKey(repoPath)`。
+   *
+   * @param {string} repoPath 检出根目录
+   * @param {number} ttlMs
+   * @returns {Promise<boolean>} 路径为空时返回 false（调用方该当作「抢不到」）
+   */
+  async acquireRepoLease (repoPath, ttlMs) {
+    const key = repoLeaseKey(repoPath)
+    if (key.length === 0) return false
+    return this.acquireLease(key, ttlMs)
+  }
+
+  /**
+   * @param {string} repoPath
+   * @param {number} ttlMs
+   * @returns {Promise<boolean>}
+   */
+  async renewRepoLease (repoPath, ttlMs) {
+    const key = repoLeaseKey(repoPath)
+    if (key.length === 0) return false
+    return this.renewLease(key, ttlMs)
+  }
+
+  /**
+   * @param {string} repoPath
+   * @returns {Promise<void>}
+   */
+  async releaseRepoLease (repoPath) {
+    const key = repoLeaseKey(repoPath)
+    if (key.length === 0) return
+    await this.releaseLease(key)
+  }
+
+  /**
+   * 这个检出现在是不是被别的进程占着。
+   *
+   * @param {string} repoPath
+   * @returns {boolean} 路径不可用时返回 false（「没被占」—— 没有可用路径的票
+   *   本来也抢不到锁，由 `acquireRepoLease` 的 false 拦下，不该在这里再挡一次）
+   */
+  isRepoLeasedByOther (repoPath) {
+    const key = repoLeaseKey(repoPath)
+    if (key.length === 0) return false
+    return this.isLeasedByOther(key)
+  }
+
   // ── 队列 ────────────────────────────────────────────────
 
   /**
@@ -788,6 +880,8 @@ export class TicketStore {
    * @param {string} [options.projectId] 只在这一个项目里挑（面板「只跑这个项目」用）。
    * @param {string[]} [options.excludeProjects] 这些项目的票不挑（项目级暂停用：
    *   调度器每轮按活配置算出「现在哪些项目被关着」传进来）。
+   * @param {string[]} [options.excludeKeys] 这些主键的票不挑（本轮已试过、因检出
+   *   被别人占着而没跑成的票 —— 不排除的话一轮会原地打转）。
    *   不传 = 全部项目一起排队，与以前完全一样。
    * @returns {TicketRecordRow | undefined}
    */
@@ -798,9 +892,15 @@ export class TicketStore {
     // 用「排除谁」而不是「只允许谁」：配置里删掉的项目留下的历史票不该因为
     // 不在白名单里就永远挑不出来（那会变成一张卡在队列里、谁也跑不了的死票）。
     const excluded = Array.isArray(options?.excludeProjects) ? new Set(options.excludeProjects) : null
+    // 本轮已经试过、但因为「仓库正被别的票占着」没跑成的票：不要再挑回来，
+    // 否则 `pickNext` 每次都返回同一张，一轮里其余票永远轮不到。
+    // 按 key 排而不是按项目排：同一个项目里的两张票用的是同一个检出，
+    // 排掉一张就够了，但这个参数本身不预设任何粒度，由调用方决定。
+    const skipKeys = Array.isArray(options?.excludeKeys) ? new Set(options.excludeKeys) : null
     const candidates = this.listTickets().filter((row) => {
       if (only !== null && row.projectId !== only) return false
       if (excluded !== null && excluded.has(row.projectId ?? '')) return false
+      if (skipKeys !== null && skipKeys.has(row.key)) return false
       if (TERMINAL.includes(row.phase)) return false
       if (row.phase === 'needs-info') return false
       // 只跑排队中的票；中间态留给启动恢复。

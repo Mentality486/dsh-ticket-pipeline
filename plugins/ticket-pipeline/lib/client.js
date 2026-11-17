@@ -2442,11 +2442,16 @@ window.__ModuleLoader__.load({
     var STATION_SYMBOL = { ok: '✓', failed: '✗', now: '▶', unreached: '–' }
 
     /**
-     * 一张票的流程带（面板版）：`①– ②✓ ③✓ ④✓ ⑤✓（4 分 32 秒） ⑥✓ …`。
+     * 一张票的流程带（面板版）：`取单✓ 定位✓ 改代码✓（4 分 32 秒） 提交✗ …`。
      *
      * 用宿主下发的 `flow.stations` 渲染，不自己再读 timeline ——「第几站」「这一站
      * 花了多久」的判定口径只在 `describeStations()` 一处，面板重算一遍迟早分家
      * （工具说停在第⑤站、面板说停在⑥）。
+     *
+     * 站点文字取 `s.short`（宿主从 `TIMELINE_NODES[node].short` 给），**不再只画 ①✓**：
+     * 2026-11-17 用户原话「插件中只标了序号 用户看不懂啊」—— 九个数字要人去翻图例，
+     * 翻完还得数到第几个。带中文短名的带子自己就是一句话。
+     * `s.no` 仍留在 `title` 里，鼠标悬停能看到「第⑤站」这种坐标。
      */
     function renderFlowStrip (flow) {
       if (!flow) return null
@@ -2459,17 +2464,30 @@ window.__ModuleLoader__.load({
       for (var i = 0; i < stations.length; i += 1) {
         var s = stations[i]
         var duration = stationDuration(s.elapsedMs)
+        var name = s.short || s.label || s.no
         parts.push(h('span', {
           key: s.no,
           className: 'tp-st tp-st-' + s.state,
-          title: (s.label || '') + (duration ? '（这一站花了 ' + duration + '）' : ''),
-        }, s.no + (STATION_SYMBOL[s.state] || '?') + (duration ? '（' + duration + '）' : '')))
+          title: '第 ' + s.no + ' 站：' + (s.label || '') + (duration ? '（这一站花了 ' + duration + '）' : ''),
+        }, name + (STATION_SYMBOL[s.state] || '?') + (duration ? '（' + duration + '）' : '')))
+      }
+      // 失败了就在末尾点名倒在哪一站 —— 九个符号里找那个 ✗ 太费眼。
+      var blamed = null
+      if (flow.failedStation) {
+        var hit = null
+        for (var j = 0; j < stations.length; j += 1) {
+          if (stations[j].no === flow.failedStation) { hit = stations[j]; break }
+        }
+        var hitName = hit ? (hit.short || hit.label || '' ) + '（' + (hit.label || '') + '）' : ''
+        blamed = h('span', { className: 'tp-flow-failed' },
+          '｜✗ 倒在第 ' + flow.failedStation + ' 站' + (hitName ? '「' + hitName + '」' : ''))
       }
       return h('span', { className: 'tp-flow' },
         parts,
         typeof flow.totalMs === 'number' && fullDuration(flow.totalMs).length > 0
           ? h('span', { className: 'tp-flow-total' }, '全程 ' + fullDuration(flow.totalMs))
-          : null)
+          : null,
+        blamed)
     }
 
     /**
@@ -2544,7 +2562,18 @@ window.__ModuleLoader__.load({
         var rerunBusy = props.busy && props.action === t.recordId
         var forgetBusy = props.busy && props.action === ('forget:' + t.recordId)
         var detail = []
-        if (t.lastError) detail.push('最近错误：' + t.lastError)
+        // 2026-11-17 用户原话：「没有明确的失败原因 哪里出的问题怎么修改 都不明确」。
+        // 宿主下发的 `lastErrorAdvice` 是人话版（为什么 + 怎么办）；`lastError` 是原文，
+        // 长在几百上千字、还夹着整条 shell 命令 —— 只把它折叠在最后一行里。
+        // 认不出来时宿主给的是「这条错误插件还认不出来」+ 原文，比闷着强。
+        if (t.lastErrorAdvice) {
+          var advice = t.lastErrorAdvice
+          detail.push('最近错误：' + (advice.title || '原因未记录'))
+          if (advice.why) detail.push('为什么：' + advice.why)
+          if (advice.fix) detail.push('怎么办：' + advice.fix)
+        } else if (t.lastError) {
+          detail.push('最近错误：' + t.lastError)
+        }
         if (t.testDetail) detail.push('验证：' + t.testDetail)
         if (t.commitSha) detail.push('提交：' + String(t.commitSha).slice(0, 8))
         if (t.commitSummary) detail.push('改动：' + t.commitSummary)

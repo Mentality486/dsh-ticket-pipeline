@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 
-import { TicketStore, TABLES, makeDomainRepo, makeMemoryRepo, ticketKey } from '../src/core/store.js'
+import { TicketStore, TABLES, makeDomainRepo, makeMemoryRepo, repoLeaseKey, ticketKey } from '../src/core/store.js'
 import { createScheduler } from '../src/core/scheduler.js'
 import { recoverPending } from '../src/core/recover.js'
 import { createMockSource, DEFAULT_SEEDS } from '../src/adapters/source-mock/index.js'
@@ -45,10 +45,12 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
-import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, createCombinedNudgeMessage, buildSessionTitle, setupAgent } from '../src/adapters/executor-agent/index.js'
+import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, createCombinedNudgeMessage, buildSessionTitle, setupAgent, buildLocalCommitMessage, buildMrTitle, looksLikeFormula, sanitizeCommitText } from '../src/adapters/executor-agent/index.js'
 import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { renderTicketPrompt } from '../src/core/prompt.js'
+import { buildRowIdentity, isFormulaText, normalizeSeqIdentity } from '../src/adapters/source-feishu/sheets.js'
+import { explainError, renderErrorAdvice } from '../src/core/error-advice.js'
 import { describeMemory, extractKeywords, MEMORY_KEYWORD_VERSION, MEMORY_TABLE, recallMemories, TicketMemory } from '../src/core/ticket-memory.js'
 import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
@@ -300,6 +302,62 @@ async function main () {
     const result = await store.setPhase(k('rec-mock-001'), 'pending')
     assert.equal(result, undefined, '终态不可退回')
     assert.equal(store.getTicket(k('rec-mock-001')).phase, 'done')
+  })
+
+  await check('仓库租约：同一个检出换个写法也只认一把锁', async () => {
+    // 就地模式下两张**不同**的票可能跑在同一个检出上，票级租约对此一无所知。
+    // 仓库级租约的 key 必须把路径归一 —— 否则 `D:\WorkSpace\repo`、
+    // `D:/WorkSpace/repo/`、`D://WorkSpace//repo` 各拿一把锁，等于没锁。
+    const repo = makeMemoryRepo()
+    const a = new TicketStore({ repo, log: silent })
+    const b = new TicketStore({ repo, log: silent })
+    assert.equal(repoLeaseKey('D:\\WorkSpace\\repo'), repoLeaseKey('D:/WorkSpace/repo/'), '反斜杠与尾斜杠要归一')
+    assert.equal(repoLeaseKey('D:/WorkSpace/repo'), repoLeaseKey('D://WorkSpace//repo'), '连续斜杠要折成一个')
+    assert.equal(repoLeaseKey('   '), '', '空路径没有锁')
+    assert.equal(repoLeaseKey(undefined), '', 'undefined 不该抛')
+
+    assert.equal(await a.acquireRepoLease('D:/WorkSpace/repo', 60_000), true, '第一个 owner 拿到')
+    assert.equal(await b.acquireRepoLease('D:\\WorkSpace\\repo\\', 60_000), false, '换种写法不能绕过')
+    assert.equal(b.isRepoLeasedByOther('D:/WorkSpace/repo'), true)
+    assert.equal(await b.renewRepoLease('D:/WorkSpace/repo', 60_000), false, '不是自己的不许续')
+    assert.equal(await a.renewRepoLease('D:/WorkSpace/repo', 60_000), true, '自己的照常续')
+    await a.releaseRepoLease('D:/WorkSpace/repo')
+    assert.equal(await b.acquireRepoLease('D:/WorkSpace/repo', 60_000), true, '释放后别人才能拿')
+  })
+
+  await check('仓库租约：别的 owner 占着时这张票让出，但一轮接着跑别的票', async () => {
+    // 这是 A 层（仓库级互斥）真正要保证的语义：抢不到检出不是「这一轮停了」，
+    // 而是「这张票先让它，去跑队列里别的票」—— 否则一个项目被占就整轮空转。
+    const { store, scheduler } = harness({ maxTicketsPerTick: 3 })
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    for (const ticket of scan.created) await store.enqueue(ticket, { phase: 'pending' })
+    // 假装另一个宿主进程正占着这个检出。
+    const other = new TicketStore({ repo: store.repo, log: silent })
+    assert.equal(await other.acquireRepoLease('D:/WorkSpace/demo-repo', 60_000), true)
+
+    const result = await scheduler.tick({ skipScan: true, maxTicketsPerTick: 3 })
+    assert.equal(result.status, 'ok')
+    // 三张票全在同一个检出上 ⇒ 谁都跑不成。
+    // 注意判据是**票面状态**而不是 `ranAll.length`：`ranAll` 记的是「本轮碰过哪几张」，
+    // 让出的票也会进这个数组（它确实被挑出来处理过了），拿它判「跑成没跑成」是错的。
+    const rows = store.listTickets()
+    assert.equal(rows.filter((row) => row.phase === 'pending').length, 3, '全都留在队列里等下一轮')
+    assert.ok(rows.every((row) => /检出正被别的进程占着/.test(row.lastError ?? '')), '要让日志/票面上说清为什么让出')
+    assert.equal(rows.every((row) => row.phase !== 'done'), true, '一张都不该真跑完')
+    assert.deepEqual(result.ranAll.map((item) => item.ok), [false, false, false], '让出的票不该被记成「跑成了」')
+  })
+
+  await check('仓库租约：跑完就释放，下一轮同一个检出能重新抢到', async () => {
+    const { store, scheduler } = harness()
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    await store.enqueue(scan.created[0], { phase: 'pending' })
+    const first = await scheduler.tick({ skipScan: true })
+    assert.equal(first.ranAll.length, 1, '先跑成一张')
+    // 跑完必须放锁：不放的话这个检出在 TTL 内谁也进不来（10 分钟干等）。
+    assert.equal(store.isRepoLeasedByOther('D:/WorkSpace/demo-repo'), false, '跑完要把检出锁放掉')
+    assert.equal(await store.acquireRepoLease('D:/WorkSpace/demo-repo', 60_000), true, '下一轮还能重新抢')
   })
 
   section('2b. 多项目主键隔离')
@@ -908,17 +966,19 @@ async function main () {
       store: { listTickets: () => [doneRow] }, getConfig: () => validateConfig({}).value, now: () => base + 400_000,
     }).execute({}, {})
     // 图例只打一次，且把符号含义说清（不然 ✓/✗/▶ 要人去猜）。
-    assert.match(out.text, /①–⑨ 是 9 个主站/, `要有流程带图例：${out.text}`)
+    // 2026-11-17 起带子写中文短名，图例改说「顺序」而不是逐个解释 ①–⑨。
+    assert.match(out.text, /流程带的九站按顺序是：获取工单 → 查找项目/, `要有流程带图例：${out.text}`)
     assert.match(out.text, /✓ 做成 \/ ✗ 没做成 \/ ▶ 正停在这一站/, `图例要解释符号：${out.text}`)
     // 走完的票：九站全 ✓，只有 ⑤ 标了耗时。
+    // 2026-11-17 起带子上写中文短名而不是只有 ①–⑨：用户原话「只标了序号 用户看不懂」。
     assert.ok(
-      out.text.includes('①✓ ②✓ ③✓ ④✓ ⑤✓（5 分 0 秒） ⑥✓ ⑦✓ ⑧✓ ⑨✓'),
+      out.text.includes('取单✓ 定位✓ 工作区✓ 会话✓ 改代码✓（5 分 0 秒） 验证✓ 提交✓ 回填✓ 通知✓'),
       `走完的票九站全 ✓、只标超过 1 分钟的站：${out.text}`,
     )
     assert.match(out.text, /｜全程 5 分 8 秒/, `要报全程耗时：${out.text}`)
     // 终态票的最后一站不该标耗时：跑完 28 小时的票若用「现在」算，
     // ⑨ 会显示成 28 小时，看着像卡在发消息上。
-    assert.ok(!/⑨✓（/.test(out.text), `终态票的最后一站不标耗时：${out.text}`)
+    assert.ok(!/通知✓（/.test(out.text), `终态票的最后一站不标耗时：${out.text}`)
 
     // 机器可读：面板画进度条直接用这一份，不各自再压一遍。
     const flow = out.tickets[0].flow
@@ -949,7 +1009,7 @@ async function main () {
     const out = await createPipelineStatusTool({
       store: { listTickets: () => [running] }, getConfig: () => validateConfig({}).value, now: () => base + 90_000,
     }).execute({}, {})
-    assert.ok(out.text.includes('①✓ ②✓ ③– ④– ⑤▶'), `停在 ⑤ 要标 ▶、没走到的标 –：${out.text}`)
+    assert.ok(out.text.includes('取单✓ 定位✓ 工作区– 会话– 改代码▶'), `停在 ⑤ 要标 ▶、没走到的标 –：${out.text}`)
     const flow = out.tickets[0].flow
     assert.equal(flow.currentStation, '⑤')
     assert.equal(flow.failedStation, null)
@@ -957,7 +1017,7 @@ async function main () {
     // 跑着的票：最后一站用「现在」算。这里 ⑤ 才跑了 30 秒 —— 不到 1 分钟的门槛，
     // 所以带上不标耗时（秒级噪音），但机器可读的 elapsedMs 仍是真实值。
     assert.equal(flow.stations[4].elapsedMs, 30_000)
-    assert.ok(!out.text.includes('⑤▶（'), `不到 1 分钟的站不标耗时：${out.text}`)
+    assert.ok(!out.text.includes('改代码▶（'), `不到 1 分钟的站不标耗时：${out.text}`)
 
     // 挂了的：② 这条打点 ok=false，要标 ✗，而且机器可读要能指出是第几站。
     const broken = {
@@ -976,9 +1036,11 @@ async function main () {
     const brokenOut = await createPipelineStatusTool({
       store: { listTickets: () => [broken] }, getConfig: () => validateConfig({}).value, now: () => base + 10_000,
     }).execute({}, {})
-    assert.ok(brokenOut.text.includes('①✓ ②✗ ③– ④–'), `挂掉的站要标 ✗：${brokenOut.text}`)
+    assert.ok(brokenOut.text.includes('取单✓ 定位✗ 工作区– 会话–'), `挂掉的站要标 ✗：${brokenOut.text}`)
     assert.equal(brokenOut.tickets[0].flow.failedStation, '②')
     assert.equal(brokenOut.tickets[0].flow.currentStation, null, '终态票没有「正停在」这一站')
+    // 「倒在哪一站」要有一句中文点名 —— 用户原话：「不知道那一步错了」。
+    assert.match(brokenOut.text, /｜✗ 倒在第 ② 站「定位（查找对应工单的项目）」/, `要点名倒在哪站：${brokenOut.text}`)
   })
 
   await check('pipeline_status：老票没有时间线时说「没有流程记录」，不画一条全 – 的带', async () => {
@@ -2101,6 +2163,65 @@ async function main () {
     assert.match(withBudget, /探索预算 7 次/, '任务书里的数字要跟着配置走，不能写死 12')
     const defaulted = renderTicketPrompt(ticket, {}, {})
     assert.match(defaulted, new RegExp(`探索预算 ${BUILTIN_LIMITS.agentExploreBudget} 次`), '不传就用 BUILTIN_LIMITS')
+  })
+
+  await check('任务书：同一项目里别的票要写在「定位」之前，且不许说成禁令', async () => {
+    // 仓库级租约只保证「不同时」，保证不了「先后」。这一节要补的是后者：
+    // 人写代码会看 git log 注意到同事刚动过附近，模型不会主动查 —— 除非告诉它。
+    const ticket = { projectId: 'pms', recordId: 'rec-self', description: '列表翻页丢数据' }
+    const inFlight = [
+      { recordId: 'sh-row-81', phase: 'done', label: '已完成（已验证）', files: ['a/b.js', 'a/c.js'], committed: true },
+      { recordId: 'sh-row-82', phase: 'editing', label: '改代码', files: [], committed: false },
+    ]
+    const text = renderTicketPrompt(ticket, {}, { inFlight })
+    const memoryAt = text.indexOf('## 同一个项目里还有这些票在动')
+    const locateAt = text.indexOf('## 定位到具体页面')
+    assert.ok(memoryAt >= 0, '这一节必须出现')
+    assert.ok(locateAt > memoryAt, '要排在「定位」之前 —— 那条线索比定位步骤更省时间')
+    assert.match(text, /同一时刻只跑一张票/, '要先说清不是并发，否则人会以为有两个 agent 在抢同一个目录')
+    assert.match(text, /sh-row-81｜已完成（已验证）（已提交），它改过：a\/b\.js、a\/c\.js/)
+    assert.match(text, /sh-row-82｜改代码（还没跑完\/结果未知）/)
+    // 措辞：这是线索不是禁令 —— 票还没跑，改哪是它自己定位出来的，我们并不知道。
+    assert.match(text, /只是\*\*线索\*\*，不是禁令/)
+    assert.equal(/不许改|禁止修改/.test(text), false, '没跑完的票不许写成「禁止改这些文件」')
+  })
+
+  await check('任务书：没有同项目的其它票时，这一节完全不出现（不制造噪音）', async () => {
+    const ticket = { projectId: 'pms', recordId: 'rec-self', description: 'x'.repeat(30) }
+    for (const inFlight of [undefined, [], [{ recordId: '' }]]) {
+      const text = renderTicketPrompt(ticket, {}, { inFlight })
+      assert.equal(text.includes('同一个项目里还有这些票在动'), false,
+        `inFlight=${JSON.stringify(inFlight)} 时不该出现这一节`)
+    }
+  })
+
+  await check('任务书：同项目别的票是从票据表推出来的，且排除自己', async () => {
+    const { store, scheduler } = harness()
+    const source = createMockSource()
+    const scan = await source.scan(new AbortController().signal)
+    for (const item of scan.created) await store.enqueue(item, { phase: 'pending' })
+    // 先跑成一张（拿到 changedFiles / commit），再让第二张进 planning —— 那时任务书里
+    // 应该看得见第一张改过哪些文件。
+    const first = await scheduler.tick({ skipScan: true })
+    assert.equal(first.ranAll.length, 1, '先跑成一张')
+    const seen = []
+    const spy = {
+      async run (ticket, located, ctx) {
+        seen.push(ctx.prompt ?? '')
+        return createMockExecutor().run(ticket, located, ctx)
+      },
+    }
+    const h2 = harness({ executor: spy })
+    const scan2 = await h2.source.scan(new AbortController().signal)
+    for (const item of scan2.created) await h2.store.enqueue(item, { phase: 'pending' })
+    await h2.scheduler.tick({ skipScan: true })
+    assert.equal(seen.length, 1)
+    const prompt = seen[0]
+    assert.match(prompt, /## 同一个项目里还有这些票在动/, '同项目还有别的票时要出现这一节')
+    const selfId = scan2.created[0].recordId
+    const listed = prompt.slice(prompt.indexOf('## 同一个项目里还有这些票在动'), prompt.indexOf('## 定位到具体页面'))
+    assert.equal(listed.includes(`${selfId}｜`), false, '不能把自己列进去（自己跟自己撞车）')
+    assert.match(listed, /rec-mock-002/, '要列出同项目里排后面的票')
   })
 
   await check('探索计数：只数 read/grep/glob 这类「只取信息」的调用，不数 edit/write/pwsh', async () => {
@@ -7816,6 +7937,224 @@ function makeFakeCtx ({ domain, registered }) {
     })
     assert.ok(logs.some((line) => line.includes('写会话标题失败')), '要把失败记进日志，否则「为什么没名字」查不到')
     assert.ok(appended.some((i) => i.type === 'sandbox/mode'), '标题失败不能让沙箱模式也丢掉')
+  })
+
+  section('21. 序号是公式、提交说明带双引号：两条都要挡住（2026-11-17 sh-row-93）')
+
+  await check('looksLikeFormula：公式原文认得出，人写的序号认不出', async () => {
+    // 事故现场的真值：pms 表「序号」列写的是这串。
+    const formula = 'IF(COUNTA($B93:$L93)=0,"",ROW()-1)'
+    assert.equal(looksLikeFormula(formula), true, '这串就是事故里被当成序号的东西')
+    assert.equal(looksLikeFormula('=IF(COUNTA($B93:$L93)=0,"",ROW()-1)'), true, '带 = 前缀也要认出来')
+    assert.equal(looksLikeFormula('COUNTA(A:A)'), true, '函数名开头的短串也要挡')
+    assert.equal(looksLikeFormula('这是一个特别特别特别长的单元格内容啊'), true, '长度本身就是判据（序号不会 18 个字）')
+    // 反例：真正的人写序号不能被挡 —— 挡错了票就认不出自己是谁。
+    assert.equal(looksLikeFormula('79'), false)
+    assert.equal(looksLikeFormula('A-12'), false)
+    assert.equal(looksLikeFormula('sh-row-93'), false)
+    assert.equal(looksLikeFormula(''), false)
+    assert.equal(looksLikeFormula(null), false)
+  })
+
+  await check('提交说明里的双引号要换掉（PowerShell 会把它拆成多条 pathspec）', async () => {
+    // 2026-11-17 实测：Windows PowerShell 5.1 下 `git commit -m 'a ""b"" c'`
+    // 会被拆成 5 段，git 报 `error: pathspec 'c' did not match any file(s)`，
+    // 提交失败 ⇒ 票判 failed，而代码其实改完了、验证也过了。
+    // 换单引号语义不变（都是一句引用/占位），但跨 shell 安全。
+    assert.equal(sanitizeCommitText('a "b" c'), "a 'b' c")
+    assert.equal(sanitizeCommitText('没有引号'), '没有引号', '没引号时不许改动任何字符')
+    // 其它危险字符必须**原样保留**：它们在单引号里是字面量，改了就篡改了提交说明。
+    for (const keep of ['$HOME', '`ls`', 'a -- b', '中文\n换行', '100%']) {
+      assert.equal(sanitizeCommitText(keep), keep, `不该动 ${keep}`)
+    }
+  })
+
+  await check('本地提交说明带上双引号也不会让它带着引号出去', async () => {
+    // 端到端：喂给 shell 的那一份，一个双引号都不许剩。
+    //
+    // 注意**双引号的来源不止序号**：工单的问题描述是人写的，人会在里面写
+    // 引号（「点『确定』后没反应」、英文 `"Cancel"` 按钮…）。所以序号那道
+    // `looksLikeFormula` 挡不住这一类 —— 必须靠 `sanitizeCommitText` 兜底。
+    // 这条用例故意让**描述**带双引号，专门锁第二层。
+    const text = buildLocalCommitMessage(
+      { projectId: 'pms', recordId: 'sh-row-93', seq: '79', description: '点 "确定" 后没反应', revisionCount: 1 },
+      { verification: { outcome: 'passed', detail: 'test 全部退出码 0' } },
+    )
+    assert.equal(text.includes('"'), false, `提交说明里还有双引号，PowerShell 会把命令拆散：${text}`)
+    assert.ok(text.includes("点 '确定' 后没反应"), `描述还得在，引号换成单引号即可：${text}`)
+    assert.ok(text.includes('工单标识: sh-row-93'), '溯源信息还得在')
+    assert.ok(text.includes('验证：通过'), '验证结论还得在')
+  })
+
+  await check('MR 标题也不许出现公式原文', async () => {
+    // 标题里出现 `#IF(COUNTA($B93:$L93)=0,"",ROW()-1)` 的后果：
+    // ① 人看不懂这是哪张票；② 它会被拼进提交说明的第一行，双引号再往下去拆命令。
+    // 这条单独锁 `buildMrTitle`（会话标题那一条锁的是另一个函数）。
+    const title = buildMrTitle({
+      projectId: 'pms', recordId: 'sh-row-93', seq: 'IF(COUNTA($B93:$L93)=0,"",ROW()-1)', description: '集成minio组件存放附件图片',
+    })
+    assert.equal(title.includes('COUNTA'), false, `标题里不该出现公式：${title}`)
+    assert.equal(title.includes('"'), false, `标题里不该出现公式带的双引号：${title}`)
+    assert.equal(title, '[pms] 集成minio组件存放附件图片', `序号挡掉后只剩项目与描述：${title}`)
+    // 反例：正常序号必须照旧进标题 —— 它是人翻表对号用的。
+    assert.equal(
+      buildMrTitle({ projectId: 'pms', recordId: 'sh-row-93', seq: '79', description: '集成minio组件存放附件图片' }),
+      '[pms] #79 集成minio组件存放附件图片',
+    )
+  })
+
+  await check('会话标题也不许出现公式原文（80 字节预算会被它吃光）', async () => {
+    const formulaTicket = {
+      projectId: 'pms',
+      recordId: 'sh-row-93',
+      seq: 'IF(COUNTA($B93:$L93)=0,"",ROW()-1)',
+      description: '集成minio组件存放附件图片',
+    }
+    const title = buildSessionTitle(formulaTicket)
+    assert.equal(title.includes('COUNTA'), false, `标题里不该出现公式：${title}`)
+    assert.equal(title.includes('"'), false, `标题里不该出现公式带的双引号：${title}`)
+    assert.ok(title.includes('集成minio'), `描述要完整出现：${title}`)
+    assert.equal(title, '修复集成minio组件存放附件图片（pms）', `序号挡掉后括号里只剩项目：${title}`)
+  })
+
+  await check('电子表格序号列：公式原文当成没有序号，不当身份串', async () => {
+    // 身份层（sheets.js）是第二道：即使读值路径又把公式拿回来了，
+    // recordId 也不能变成 `sh-seq-IF(COUNTA(...)...)` —— 那串含双引号、
+    // 会跟着提交失败，而且公式里行号一变（插一行）身份就变、票被当成新票。
+    const formula = 'IF(COUNTA($B93:$L93)=0,"",ROW()-1)'
+    assert.equal(normalizeSeqIdentity(formula), '', '公式要当成空序号')
+    assert.equal(isFormulaText(formula), true)
+    // 兜底走行号，identitySource 要能看出身份是猜的。
+    const identity = buildRowIdentity({ mode: 'seq', seqValue: formula, rowNumber: 93 })
+    assert.equal(identity.recordId, 'sh-row-93', `公式要被挡掉、退回行号：${identity.recordId}`)
+    assert.equal(identity.identitySource, 'fallback-row', '要标明身份是兜底猜的，排障时看得见')
+    // 反例：正常序号必须照旧。
+    assert.equal(normalizeSeqIdentity('1.0'), '1', '1.0 与 1 是同一行，别因为写了小数就换身份')
+    assert.equal(normalizeSeqIdentity(' A-12 '), 'A-12')
+    assert.deepEqual(buildRowIdentity({ mode: 'seq', seqValue: '79', rowNumber: 93 }), {
+      recordId: 'sh-seq-79', identitySource: 'seq',
+    })
+  })
+
+  section('22. 错误要能看懂：给一句人话 + 为什么 + 怎么办（2026-11-17 sh-row-93）')
+
+  // 真机上那条 lastError 的开头（3098 字，这里只留特征部分）。
+  const REAL_QUOTE_ERROR = '本地提交失败（git commit -m fix(pms): [pms] #IF(COUNTA($B93:$L93)=0,"",ROW()-1) '
+    + '集成minio组件存放附件图片\n\n工单标识: sh-row-93\n\n）：error: pathspec \'集成minio组件存放附件图片\n\n'
+    + '工单标识:\' did not match any file(s) known to git\nerror: pathspec \'sh-row-93\' did not match any file(s) known to git'
+
+  await check('认得出的错误：一句人话 + 为什么 + 怎么办，三样都要有', async () => {
+    const advice = explainError(REAL_QUOTE_ERROR)
+    assert.equal(advice.known, true, '这条错误必须认得出 —— 它是我们自己的 bug，认不出等于没修')
+    assert.equal(advice.rule, 'git-pathspec-quote')
+    // 标题要短、要带病因，不能是「本地提交失败（git commit -m …）」那种原文复读。
+    assert.ok(advice.title.length < 60, `标题要能一眼看完：${advice.title}`)
+    assert.ok(!advice.title.includes('git commit -m'), `标题里不许出现整条命令：${advice.title}`)
+    assert.ok(advice.title.includes('引号'), `标题要点出病因：${advice.title}`)
+    assert.ok(typeof advice.why === 'string' && advice.why.length > 20, '要解释机制，不是只重复结论')
+    assert.ok(typeof advice.fix === 'string' && advice.fix.includes('重跑'), '要给出可执行动作')
+  })
+
+  await check('认不出的错误：老实说认不出，不许硬套模板', async () => {
+    // 硬套模板比不解释更坏 —— 会把人引到错的方向去查。
+    const advice = explainError('SomeBrandNewFailure: quantum flux inverted at sector 7')
+    assert.equal(advice.known, false, '这条不该被硬认成某种已知错误')
+    assert.equal(advice.rule, undefined)
+    assert.ok(advice.title.includes('quantum') || advice.title.includes('SomeBrandNew'), `原文要留着当标题：${advice.title}`)
+    assert.ok(advice.fix.includes('认不出来'), `要明说认不出来：${advice.fix}`)
+  })
+
+  await check('原文不许被吞：认不出、认得，两种情况都留原文', async () => {
+    // 「悄悄改写错误信息」比不解释更坏 —— 排障的人会以为那就是全部。
+    for (const input of [REAL_QUOTE_ERROR, 'SomeBrandNewFailure: quantum flux']) {
+      const advice = explainError(input)
+      assert.ok(advice.raw.length > 0, '原文必须保留')
+      assert.ok(input.startsWith(advice.raw.slice(0, 20)), '开头要与原文字面一致，不许被改写')
+    }
+    // 超长要截断并**说明截断了**（不能看起来像完整原文）。
+    const huge = `${REAL_QUOTE_ERROR}${'填充'.repeat(2000)}`
+    const advice = explainError(huge)
+    assert.equal(advice.truncated, true, '超长要标 truncated')
+    assert.ok(advice.raw.length < huge.length, '超长要真的截断')
+    assert.ok(advice.raw.includes('已截断'), `要明说截断了：${advice.raw.slice(-40)}`)
+  })
+
+  await check('渲染成几行：最近错误 / 为什么 / 怎么办 / 原文', async () => {
+    const lines = renderErrorAdvice(REAL_QUOTE_ERROR)
+    assert.equal(lines[0].startsWith('  最近错误：'), true, `第一行要是「最近错误」：${lines[0]}`)
+    assert.ok(lines.some((l) => l.includes('为什么：')), '要有「为什么」')
+    assert.ok(lines.some((l) => l.includes('怎么办：')), '要有「怎么办」')
+    assert.ok(lines.some((l) => l.includes('原文：')), '要有原文（别人可能要原样去搜）')
+    // 渲染结果必须比原文短得多 —— 原样打出来是我们这次要修的那个问题。
+    // 注意：短错误（几十字）上加解释天然会变长，那是对的；要比的是真机那种长原文。
+    const longError = `${REAL_QUOTE_ERROR}\n未提交（疑似含真实凭据，按约定留在工作区）：${
+      Array.from({ length: 40 }, (_, i) => `pms-server/src/main/java/com/company/pms/service/impl/SomeServiceImpl${i}.java`).join(' ')
+    }`
+    const longRendered = renderErrorAdvice(longError).join('\n')
+    assert.ok(
+      longRendered.length < longError.length * 0.6,
+      `长原文的渲染结果要短得多：${longRendered.length} vs ${longError.length}`,
+    )
+  })
+
+  await check('pipeline_status 明细里给的是人话，不是那条 3000 字的命令', async () => {
+    const broken = {
+      key: k('advice-failed'),
+      projectId: DEMO,
+      recordId: 'advice-failed',
+      phase: 'failed',
+      attempt: 0,
+      lastError: REAL_QUOTE_ERROR,
+      timeline: [
+        { node: 'discover', label: '获取工单', at: 1_000, ok: true },
+        { node: 'mr-opening', label: '提交（本地提交 / PR）', at: 2_000, ok: true },
+        { node: 'failed', label: '失败', at: 3_000, ok: false },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [broken] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ recordId: 'advice-failed' }, {})
+    assert.match(out.text, /最近错误：提交失败：git 把提交说明里的引号当成了文件名/, `要给人话标题：${out.text}`)
+    assert.match(out.text, /为什么：/, '要有机制解释')
+    assert.match(out.text, /怎么办：/, '要有可执行动作')
+    // 面板直接渲染这一段，所以机器可读那一份也得有。
+    assert.equal(out.tickets[0].lastErrorAdvice.known, true)
+    assert.ok(out.tickets[0].lastErrorAdvice.fix.includes('重跑'))
+    // 只有一行「最近错误：」标题 —— 不许因为原文太长而重复出现多次。
+    assert.equal((out.text.match(/最近错误：/g) || []).length, 1, '「最近错误」只该出现一次')
+  })
+
+  await check('⑦ 提交站自己 ok、票却失败时，站带要把 ✗ 落在它身上', async () => {
+    // 2026-11-17 真机：执行器先 onPhase('mr-opening') 记 ok:true，失败由调度器
+    // 收尾另记一条 failed ⇒ 站带上 ⑦ 是 ✓，人看不出倒在哪。这正是「不知道哪一步错了」。
+    const row = {
+      key: k('blame'),
+      projectId: DEMO,
+      recordId: 'blame',
+      phase: 'failed',
+      attempt: 0,
+      lastError: '本地提交失败',
+      timeline: [
+        { node: 'discover', label: '获取工单', at: 1_000, ok: true },
+        { node: 'testing', label: '跑验证', at: 2_000, ok: true },
+        { node: 'mr-opening', label: '提交（本地提交 / PR）', at: 3_000, ok: true },
+        { node: 'failed', label: '失败', at: 3_100, ok: false },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [row] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({}, {})
+    const flow = out.tickets[0].flow
+    assert.equal(flow.failedStation, '⑦', `失败要归到⑦那一站，实际 ${flow.failedStation}`)
+    assert.equal(flow.stations[6].state, 'failed', '⑦ 要标 ✗ 而不是 ✓ —— 它自己那条打点是 ok，但票是失败的')
+    assert.equal(flow.stations[5].state, 'ok', '没倒下的站不许被涂红')
+    // 已完成/待验证的票不许被涂红（只认 failed）。
+    const doneRow = { ...row, phase: 'done', lastError: undefined }
+    const doneOut = await createPipelineStatusTool({
+      store: { listTickets: () => [doneRow] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({}, {})
+    assert.equal(doneOut.tickets[0].flow.failedStation, null, 'done 的票没有「倒在哪一站」')
+    assert.equal(doneOut.tickets[0].flow.stations[6].state, 'ok', 'done 的票⑦还是 ✓')
   })
 
   // ── 收尾 ────────────────────────────────────────────────
