@@ -68,7 +68,7 @@ export function createPipelineResetTool (options) {
       from: {
         type: 'string',
         description: '从哪一站开始。缺省（推荐）是「从失败的那一站接着跑」，只重做没做成的那一步；'
-          + '填 begin 才是整票从头跑一遍。',
+          + '填 begin 才是整票从头跑一遍；也可以点名一个主站（editing / testing / mr-opening）覆盖默认值。',
       },
     },
     // 机器可读字段放在返回值里，给人看的文本在 `text` 字段。
@@ -176,14 +176,24 @@ export async function collectReset (options, args) {
         + '一般不填就好：缺省就是从失败的那一站接着跑。',
     }
   }
+  // 显式指定的站优先于票上记的失败站：人可以说「我知道它死在第 7 站，但我要从第 5 站重做」。
+  // 之前这一行只看 `row.failedStation`，`from: 'editing'` 虽然通过了校验却被静默忽略 ——
+  // 校验说「认得出」，行为却当没传，比直接报错更难发现。
   const resumeTarget = restartFromBegin
     ? null
-    : (row.failedStation ?? undefined)
+    : (isMainStation(fromRaw) ? fromRaw : (row.failedStation ?? undefined))
   // 上一轮卡在哪一类事上（改代码 / 跑验证 / 提交 …）。只用于文案，
   // 但它是用户那句「是工单处理问题失败了 还是测试失败了」的直接回答。
   // 只认真正的主站：`failedStation` 可能是老数据里留下的怪值，那时宁可不提这一句。
   const failCategory = isMainStation(resumeTarget) ? failureCategoryOf(resumeTarget) : ''
-  const ok = await options.store.resetByHuman(row.key, restartFromBegin ? { resumeFrom: null } : {})
+  // 传给 store 的选项必须是**我们已经算出来的那个决定**，不能靠「不传 = 按失败站走」：
+  // 人点名 `from: editing` 时票上记的还是 `mr-opening`，不传就等于把人的话咽了
+  // （`resetByHuman` 缺省读 `failedStation`）。只有「既没点名、也没记失败站」才传 `{}`，
+  // 让 store 自己走它那条缺省路径。
+  const resetOptions = restartFromBegin
+    ? { resumeFrom: null }
+    : (isMainStation(fromRaw) ? { resumeFrom: fromRaw } : {})
+  const ok = await options.store.resetByHuman(row.key, resetOptions)
   if (!ok) {
     // resetByHuman 只有「记录不见了」或「状态在读到与写入之间变了」才会返回 false。
     return {

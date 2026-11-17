@@ -8289,6 +8289,29 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(out.text, /从头/, `文案要说清是从头，实际：${out.text}`)
   })
 
+  await check('pipeline_reset 的 from 认得出就真按它跑（点名一站要覆盖票上的失败站）', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-e'), projectId: DEMO, recordId: 'rec-e', phase: 'failed', attempt: 1, failedStation: 'mr-opening', lastError: 'x' },
+    ]
+    let seenOptions
+    const tool = createPipelineResetTool({
+      store: {
+        ...store,
+        listTickets: () => rows,
+        resetByHuman: async (_key, options) => { seenOptions = options; return true },
+      },
+    })
+    // 人可能觉得「上一轮提交前的那些改动不可信，从改代码重来」——
+    // 校验认得出这个站，行为就必须真按它跑。之前走的是 `{ resumeFrom: undefined }`，
+    // store 会退回去用 failedStation，于是 `from: editing` 被静默忽略。
+    const out = await tool.execute({ recordId: 'rec-e', from: 'editing' }, {})
+    assert.equal(out.reset, true)
+    assert.equal(out.resumeFrom, 'editing', `点名了 editing 就该从 editing 续，实际：${out.resumeFrom}`)
+    assert.deepEqual(seenOptions, { resumeFrom: 'editing' }, '要显式把点名的站交给 store，别让它退回失败站')
+    assert.match(out.text, /接着跑/)
+  })
+
   await check('pipeline_reset 的 from 认不出就明说，不猜（猜错方向比慢更糟）', async () => {
     const { store } = harness({})
     const rows = [
