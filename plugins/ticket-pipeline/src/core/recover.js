@@ -129,9 +129,19 @@ export async function recoverPending ({ store, worktreeExists, log, now }) {
 
       // 工作区还在：坐标留着，让 `runOne` 直接复用（`isStaleWorkspaceCoords` 会再确认一遍）。
       // 恢复完 phase 是 pending，所以「上次停在哪」只能写进 lastError 让人看见。
+      //
+      // 会话 id **故意不动**：下一轮 `runOne` 会把它交给执行器，执行器先 `agents.resume`
+      // 续接同一个会话（续不上才新建）。这正是它该有的行为 —— 一张票从「跑到一半被打断」
+      // 变成「从头再开一个会话」在 GUI 里是两条同名会话，人分不清哪条是真的。
+      // 真机撞过（2026-11-17，`pms|sh-row-93`），修法在调度器那一侧：
+      // `onSessionId` 拿到 id 就立刻落库，不再只留在内存里等收尾。
+      //
+      // 文案里带上「会续接」，是因为人看到「重新排队」容易以为是从零跑一遍，
+      // 于是去 GUI 里找两条会话、拿第一条当废记录 —— 实际上它会被接着用。
       const was = RESUME_LABEL[row.phase] ?? `上次停在「${row.phase}」`
+      const sessionHint = row.sessionId ? '；这一轮会接着用上一轮的会话' : ''
       await store.setPhase(row.key, 'pending', {
-        lastError: `${was}，启动恢复后重新排队（工作区沿用，不会重新 clone）`,
+        lastError: `${was}，启动恢复后重新排队（工作区沿用，不会重新 clone${sessionHint}）`,
         enqueuedAt: nowFn(),
       })
       resumed += 1
@@ -140,6 +150,7 @@ export async function recoverPending ({ store, worktreeExists, log, now }) {
         recordId: row.recordId,
         was: row.phase,
         to: 'pending',
+        resumeSessionId: row.sessionId,
       })
     } catch (error) {
       logInfo('启动恢复：这一条处理失败，跳过', {

@@ -388,6 +388,37 @@ export class TicketStore {
   }
 
   /**
+   * 立刻把「这一轮用的哪个会话」落库。
+   *
+   * 为什么不能等收尾时再一起写：`sessionId` 原先只在**异常收尾**那几条路径上写盘
+   * （超时/失败/取消），正常跑到一半时它只活在 `scheduler.js` 的局部变量
+   * `runSessionId` 里。真机撞过（2026-11-17，`pms|sh-row-93`）：跑到第 13 分钟时
+   * 人去改了一下插件配置，宿主重载插件 → `recoverPending()` 把还在 `editing` 的票
+   * 放回队列 → 旧实例连同 `runSessionId` 一起消失，票上 `sessionId` 是空的 →
+   * 下一轮 `executor.run` 拿到 `undefined`，**新建了第二个会话**，同一个工作区里
+   * 就有两条同名会话（一条还没落盘就夭折了，一条重跑）。
+   *
+   * 代价与收益：每票多一次 put（一次执行只发生一次，因为执行器只建一次会话），
+   * 换来的是「任何时候断开，下一轮都能认出上一轮的会话」。
+   *
+   * 故意不做成 `setPhase` 的一个补丁：`setPhase` 会顺带重写 `finishedAt`/`startedAt`
+   * 这些时间戳，而这里只想动一个字段；且调用点在执行器运行**期间**，那时 phase
+   * 是 `editing` 之类的中间态，用 `setPhase` 需要再传一遍目标 phase，容易写错。
+   *
+   * @param {string} key 票据复合主键
+   * @param {string} sessionId 执行器刚建/刚续上的会话 id
+   * @returns {Promise<boolean>} 写进去了没有（票不存在、id 为空时 false）
+   */
+  async setSessionId (key, sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return false
+    const row = this.getTicket(key)
+    if (!row) return false
+    if (row.sessionId === sessionId) return true
+    await this.repo.put(TABLES.tickets, key, { ...row, sessionId })
+    return true
+  }
+
+  /**
    * 记一项「交付」的结果（改动有没有落盘 / 表格有没有写回 / 人有没有收到通知）。
    *
    * 为什么要和 `phase` 分开：`phase` 答的是「走到哪一站了」，一票到了 `done` 之后

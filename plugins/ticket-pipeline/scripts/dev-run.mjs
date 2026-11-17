@@ -1273,6 +1273,22 @@ async function main () {
     const kept = store2.getTicket(k('rec-mock-001'))
     assert.equal(kept.worktreePath, 'D:/wt/keep', '工作区有效时绝不能把坐标清掉')
     assert.equal(kept.phase, 'pending')
+
+    // 会话 id 也要活着过去：下一轮靠它 `agents.resume` 续接。
+    // 2026-11-17 真机事故里，恢复把票放回队列后票上没有 sessionId，于是第二轮
+    // 新建了第二个会话（同一工作区两条同名会话）。清掉它 = 每重载一次就多一条。
+    await store2.setSessionId(k('rec-mock-001'), 'kept-session')
+    // `pending → editing` 不是合法边（见 PHASE_TRANSITIONS），得顺着走：
+    // setPhase 遇到非法转移是「记日志 + 返回 undefined」而不是抛，写错了这里会
+    // 静默留在 pending，恢复逻辑压根不会碰它 —— 断言就会因为「文案没变」而红。
+    await store2.setPhase(k('rec-mock-001'), 'worktree-ready', {})
+    await store2.setPhase(k('rec-mock-001'), 'planning', {})
+    await store2.setPhase(k('rec-mock-001'), 'editing', {})
+    assert.equal(store2.getTicket(k('rec-mock-001')).phase, 'editing', '前置：得真的停在中间态，否则恢复不会处理它')
+    await recoverPending({ store: store2, worktreeExists: async () => true, log: silent })
+    const kept2 = store2.getTicket(k('rec-mock-001'))
+    assert.equal(kept2.sessionId, 'kept-session', '恢复不能把上一轮的会话 id 抹掉，否则下一轮只能新建')
+    assert.match(kept2.lastError, /接着用上一轮的会话/, `文案要让人知道不是从零跑：${kept2.lastError}`)
   })
 
   await check('needs-info 恢复时不动它', async () => {
@@ -5653,6 +5669,35 @@ function makeFakeCtx ({ domain, registered }) {
     seen.length = 0
     await scheduler.tick()
     assert.deepEqual(seen, ['fresh-session'], `重跑时执行器必须拿到上一轮的会话 id，实际拿到：${JSON.stringify(seen)}`)
+  })
+
+  await check('会话 id 拿到就落库：这一轮就算半路被打断，下一轮也认得出它', async () => {
+    // 2026-11-17 真机事故（`pms|sh-row-93`）：票跑到第 13 分钟，人去改了插件配置，
+    // 宿主重载插件 → `recoverPending()` 把还在 editing 的票放回队列。旧实例连同
+    // 局部变量 `runSessionId` 一起没了，票上 `sessionId` 是空的 → 下一轮拿到
+    // `undefined` → `agents.create` 新建了**第二个会话**，同一个工作区里两条同名会话。
+    //
+    // 所以判据是：执行器一报上会话 id，它就必须已经在库里 —— 而不是等收尾。
+    // 这里刻意让执行器报完 id 之后就抛错（模拟「半路被打断、result 根本不存在」），
+    // 如果 sessionId 只在收尾路径上写盘，这个断言必然失败。
+    const probe = {
+      id: 'session-persist-immediately',
+      async run (ticket, target, ctx) {
+        await ctx.onPhase('editing')
+        await ctx.onSessionId('mid-run-session')
+        // 报完 id 立刻「被打断」：执行器返回不了结果。
+        throw new Error('模拟插件被卸载 / 进程被打断')
+      },
+    }
+    const { scheduler, store } = harness({ executor: probe })
+    await scheduler.tick()
+    const key = k('rec-mock-001')
+    const row = store.getTicket(key)
+    assert.equal(
+      row.sessionId,
+      'mid-run-session',
+      `执行器报上会话 id 的那一刻就该落库，否则重载/重启之后续接不上（实际：${JSON.stringify(row.sessionId)}）`,
+    )
   })
 
   await check('pipeline_status：回填结果成功/失败都要能一眼看到', async () => {

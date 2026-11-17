@@ -792,10 +792,31 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 执行器内部才知道的那几站（主要是 ④ 创建会话：分支 + 模型）由它自己
         // 调 onFlow 报上来；这里只负责把它落到票据的时间线上，不让日志写失败炸整票。
         onFlow: (node, label, detail, ok) => markNode(key, node, detail, ok, label),
-        // 会话 id 先存着：执行器后面抛异常/超时/被取消时，返回值根本不存在，
-        // 只有这里能拿到「哪一次会话没干成活」。见上面的 runSessionId。
-        onSessionId: (sessionId) => {
-          if (typeof sessionId === 'string' && sessionId.length > 0) runSessionId = sessionId
+        // 会话 id 拿到就**立刻落库**，不能只记在局部变量里等收尾。
+        // 真机事故（2026-11-17，`pms|sh-row-93`）：跑到第 13 分钟时人改了插件配置，
+        // 宿主重载插件 → `recoverPending()` 把还在 editing 的票放回队列 → 旧实例
+        // 连同 `runSessionId` 一起消失，票上没有 sessionId → 下一轮新建了第二个会话。
+        // 落库之后，同样的重载会让下一轮 `agents.resume` 续接上，而不是另起一个。
+        //
+        // 用 async 而不是「记下来、fire-and-forget 去写」：执行器本来就在 `await`
+        // 这个回调（见 `executor-agent/index.js` 的 `await ctx.onSessionId(...)`），
+        // 我们正是要「它返回时写入已经落盘」这个保证 —— 不 await 的话，
+        // 插件恰好在写盘途中被卸载，恰好又回到这次事故的形态。
+        async onSessionId (sessionId) {
+          if (typeof sessionId !== 'string' || sessionId.length === 0) return
+          runSessionId = sessionId
+          try {
+            await store.setSessionId(key, sessionId)
+          } catch (error) {
+            // 落库失败不能影响跑票：会话续接是优化，票能不能跑完是主线。
+            // 但也不能静默 —— 下次再发生就又会多一个会话，日志里得留下线索。
+            logInfo('会话 id 落库失败（不影响这一轮执行，但重启后可能续接不上）', {
+              projectId,
+              recordId,
+              sessionId,
+              reason: toPipelineError(error).message,
+            })
+          }
         },
       })
 
