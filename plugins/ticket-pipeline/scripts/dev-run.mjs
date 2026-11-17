@@ -57,6 +57,7 @@ import {
   failureCategoryOf,
   isMainStation,
   lastMainStationOf,
+  MAIN_STATIONS,
   resumePlanOf,
   stationRankOf,
 } from '../src/core/station.js'
@@ -8206,6 +8207,21 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(canResumeFrom('writeback'), false)
     assert.equal(canResumeFrom('editing'), true)
     assert.equal(canResumeFrom('mr-opening'), true)
+    // ①–④ 也没有可续的进度（读表格、定位仓库、建工作区、建会话都是秒级准备动作），
+    // 而且那两个判据必须一致 —— 各写一份时会出现「面板说会从 ④ 接着跑、
+    // 执行器其实从头开始」，两边都不算错但都在骗人。
+    for (const prepStation of ['discover', 'locate', 'workspace', 'session']) {
+      assert.equal(resumePlanOf(prepStation), null, `${prepStation} 没有可续的进度`)
+      assert.equal(canResumeFrom(prepStation), false, `${prepStation} 不该被说成「能接着跑」`)
+    }
+    // 全站一致性：能续 ⇔ 有续跑计划。
+    for (const node of MAIN_STATIONS) {
+      assert.equal(
+        canResumeFrom(node),
+        resumePlanOf(node) !== null,
+        `${node}：canResumeFrom 与 resumePlanOf 必须同一套判据`,
+      )
+    }
   })
 
   await check('station：失败类别按「人要做的事」命名，不用 phase 名', () => {
@@ -8310,6 +8326,23 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(out.resumeFrom, 'editing', `点名了 editing 就该从 editing 续，实际：${out.resumeFrom}`)
     assert.deepEqual(seenOptions, { resumeFrom: 'editing' }, '要显式把点名的站交给 store，别让它退回失败站')
     assert.match(out.text, /接着跑/)
+  })
+
+  await check('pipeline_reset from 点名准备阶段的站要说「用 begin」，不能假装能续（假话比拒绝更坏）', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-f'), projectId: DEMO, recordId: 'rec-f', phase: 'failed', attempt: 1, failedStation: 'mr-opening' },
+    ]
+    const tool = createPipelineResetTool({ store: { ...store, listTickets: () => rows, resetByHuman: async () => true } })
+    // ①–④ 是主站，但没有「进度」可续（读表格 / 定位仓库 / 建工作区 / 建会话都是秒级动作）。
+    // 接受它们却按「从头跑」执行，文案就会写成「会从「④ 创建会话」接着跑」—— 那是假话。
+    for (const prepStation of ['discover', 'session']) {
+      const out = await tool.execute({ recordId: 'rec-f', from: prepStation }, {})
+      assert.equal(out.reset, false, `${prepStation} 不该被接受为续跑起点`)
+      assert.equal(out.reason, 'bad-from')
+      assert.match(out.text, /begin/, '要告诉人「要从那里重来就用 begin」')
+      assert.doesNotMatch(out.text, /接着跑（/, '别把准备站说成续跑起点')
+    }
   })
 
   await check('pipeline_reset 的 from 认不出就明说，不猜（猜错方向比慢更糟）', async () => {

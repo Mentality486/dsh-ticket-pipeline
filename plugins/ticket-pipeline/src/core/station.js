@@ -118,10 +118,14 @@ export function lastMainStationOf (timeline) {
  *
  * @param {string | undefined} station 主站 node id
  * @returns {{ station: string, rank: number, agent: boolean, verify: boolean, collect: boolean } | null}
- */
-export function resumePlanOf (station) {
+ */export function resumePlanOf (station) {
   const rank = stationRankOf(station)
   if (rank === 0) return null
+  // ①–④ 没有「进度」可续：读表格、定位仓库、建工作区、建会话都是秒级的准备动作，
+  // 重做一遍比「续」还便宜，而且那些站倒下时工作区/会话根本没建起来。
+  // 和 `canResumeFrom` 用同一条下界 —— 两处判据不一致时，
+  // 会出现「面板说会从 ④ 接着跑、执行器其实从头开始」这种都说不上错但都在骗人的状态。
+  if (rank < STATION_RANK.editing) return null
   const RANK_OF_TESTING = STATION_RANK.testing
   const RANK_OF_WRITEBACK = STATION_RANK.writeback
   // ⑧⑨ 不归执行器管：那两站倒下时票已经交付了，补做走调度器的 `pendingEffects`。
@@ -158,8 +162,10 @@ export function resumePlanOf (station) {
  * @returns {boolean}
  */
 export function canResumeFrom (station) {
-  const rank = stationRankOf(station)
-  return rank >= STATION_RANK.editing && rank <= STATION_RANK['mr-opening']
+  // 直接复用 resumePlanOf 的判据，不另写一遍比较式：
+  // 两处各写一份时，「能不能续」与「续起来做什么」会各自漂移，
+  // 面板说「会从 ④ 接着跑」而执行器其实从头开始 —— 两边都不算错，但都在骗人。
+  return resumePlanOf(station) !== null
 }
 
 /**

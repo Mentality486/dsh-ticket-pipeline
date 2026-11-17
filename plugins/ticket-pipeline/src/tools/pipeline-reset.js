@@ -28,7 +28,7 @@
 
 import { defineTool, textBlocks } from './define.js'
 import { PHASE_LABEL } from '../contracts/types.js'
-import { describeResumeFrom, failureCategoryOf, isMainStation } from '../core/station.js'
+import { canResumeFrom, describeResumeFrom, failureCategoryOf, isMainStation } from '../core/station.js'
 
 /** 可以被人工重开的阶段。与 `store.resetByHuman` 的判定必须保持一致。 */
 export const RESETTABLE_PHASES = ['failed', 'needs-info', 'gone']
@@ -68,7 +68,8 @@ export function createPipelineResetTool (options) {
       from: {
         type: 'string',
         description: '从哪一站开始。缺省（推荐）是「从失败的那一站接着跑」，只重做没做成的那一步；'
-          + '填 begin 才是整票从头跑一遍；也可以点名一个主站（editing / testing / mr-opening）覆盖默认值。',
+          + '也可以点名一个可续的站（editing / testing / mr-opening）覆盖默认值；'
+          + '填 begin 才是整票从头跑一遍。①–④ 是准备阶段的站，没有可续的进度，要重来请用 begin。',
       },
     },
     // 机器可读字段放在返回值里，给人看的文本在 `text` 字段。
@@ -166,14 +167,20 @@ export async function collectReset (options, args) {
   // 猜错方向（从中间续）比慢更糟，它会把上一轮的半成品当成已完成。
   const fromRaw = typeof safeArgs.from === 'string' ? safeArgs.from.trim().toLowerCase() : ''
   const restartFromBegin = fromRaw === 'begin' || fromRaw === 'start' || fromRaw === 'scratch'
-  if (fromRaw.length > 0 && !restartFromBegin && !isMainStation(fromRaw)) {
+  if (fromRaw.length > 0 && !restartFromBegin && !canResumeFrom(fromRaw)) {
+    // ①–④ 是主站、但**没有可续的进度**：读表格、定位仓库、建工作区、建会话都是秒级的
+    // 准备动作，重做一遍比「续」还便宜。接受它们却按「从头跑」执行，文案就会写成
+    // 「会从「④ 创建会话」接着跑」—— 那是假话。所以这里按「认不出」处理，
+    // 并直接告诉人「这种站请用 begin」。
+    const hint = isMainStation(fromRaw)
+      ? `「${fromRaw}」是准备阶段的站（读表格 / 定位仓库 / 建工作区 / 建会话），没有可续的进度，`
+        + '要从那里重来请用 begin。\n'
+      : `from 只认能续跑的主站（editing / testing / mr-opening），或者 begin（整票重来），不认「${fromRaw}」。\n`
     return {
       reset: false,
       reason: 'bad-from',
       recordId,
-      text: `from 只认主站的 node id（discover / locate / workspace / session / editing / testing / mr-opening），`
-        + `或者 begin（整票重来），不认「${fromRaw}」。\n`
-        + '一般不填就好：缺省就是从失败的那一站接着跑。',
+      text: hint + '一般不填就好：缺省就是从失败的那一站接着跑。',
     }
   }
   // 显式指定的站优先于票上记的失败站：人可以说「我知道它死在第 7 站，但我要从第 5 站重做」。
@@ -181,7 +188,7 @@ export async function collectReset (options, args) {
   // 校验说「认得出」，行为却当没传，比直接报错更难发现。
   const resumeTarget = restartFromBegin
     ? null
-    : (isMainStation(fromRaw) ? fromRaw : (row.failedStation ?? undefined))
+    : (canResumeFrom(fromRaw) ? fromRaw : (row.failedStation ?? undefined))
   // 上一轮卡在哪一类事上（改代码 / 跑验证 / 提交 …）。只用于文案，
   // 但它是用户那句「是工单处理问题失败了 还是测试失败了」的直接回答。
   // 只认真正的主站：`failedStation` 可能是老数据里留下的怪值，那时宁可不提这一句。
@@ -192,7 +199,7 @@ export async function collectReset (options, args) {
   // 让 store 自己走它那条缺省路径。
   const resetOptions = restartFromBegin
     ? { resumeFrom: null }
-    : (isMainStation(fromRaw) ? { resumeFrom: fromRaw } : {})
+    : (canResumeFrom(fromRaw) ? { resumeFrom: fromRaw } : {})
   const ok = await options.store.resetByHuman(row.key, resetOptions)
   if (!ok) {
     // resetByHuman 只有「记录不见了」或「状态在读到与写入之间变了」才会返回 false。
