@@ -8369,6 +8369,43 @@ function makeFakeCtx ({ domain, registered }) {
     assert.match(out.text, /从头开始/)
   })
 
+  await check('pipeline_status：失败之后回填/通知照跑，倒推「死在哪」不能在事后动作上取最后一条', async () => {
+    // 真机 `sh-row-82`：17:03:38 记了一条 `· ✗ 失败 —— 执行器收尾：本地提交失败（…）`，
+    // 之后 ⑧ 回填、⑨ 通知**照样往下走**（失败也要通知人）。
+    // 直接取「最后一条主站」于是拿到 ⑨，面板印成「卡在哪一步：**发通知**」——
+    // 而它明明死在 ⑦ 提交。失败之后发生的事不能反过来当成死因。
+    const row = {
+      key: ticketKey(DEMO, 'after-fail'),
+      projectId: DEMO,
+      recordId: 'after-fail',
+      phase: 'failed',
+      attempt: 1,
+      lastError: '本地提交失败（git add -- .idea/jarRepositories.xml）：The following paths are ignored',
+      // 老数据没有 failedStation —— 走的正是「倒推」那条路。
+      timeline: [
+        { node: 'discover', label: '获取工单', at: 1_000, ok: true },
+        { node: 'workspace', label: '检查工作区', at: 2_000, ok: true },
+        { node: 'session', label: '创建会话（分支+模型）', at: 3_000, ok: true },
+        { node: 'editing', label: '处理工单问题', at: 4_000, ok: true },
+        { node: 'testing', label: '跑验证', at: 5_000, ok: true },
+        { node: 'mr-opening', label: '提交（本地提交 / PR）', at: 6_000, ok: true },
+        { node: 'failed', label: '失败', at: 7_000, ok: false, detail: '执行器收尾：本地提交失败（git add -- …）' },
+        { node: 'writeback', label: '回填工单表', at: 8_000, ok: true },
+        { node: 'notify', label: '发送消息', at: 9_000, ok: true },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [row] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ recordId: 'after-fail' }, {})
+    const payload = out.tickets[0]
+    assert.equal(payload.failedStation, 'mr-opening', `倒推必须截断在失败那一条之前，实际：${payload.failedStation}`)
+    assert.equal(payload.failureCategory, '提交')
+    assert.match(out.text, /卡在哪一步：\*\*提交\*\*/)
+    assert.doesNotMatch(out.text, /卡在哪一步：\*\*发通知\*\*/, '别把失败之后才发生的通知当成死因')
+    // 流程带上 ✗ 也得落在 ⑦，不能落在 ⑨。
+    assert.equal(payload.flow.failedStation, '⑦')
+  })
+
   await check('pipeline_status 明细要直说「卡在哪一步」和「怎么接着跑」，并给机器可读字段', async () => {
     const row = {
       key: ticketKey(DEMO, 'stuck'),

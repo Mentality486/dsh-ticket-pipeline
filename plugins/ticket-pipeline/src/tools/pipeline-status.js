@@ -471,6 +471,46 @@ function shortNameOf (node, meta) {
 }
 
 /**
+ * 「这张票倒在哪一站」—— 唯一的判定入口，明细与流程带共用。
+ *
+ * 两处各写一遍的代价是真机出过的：流程带用「落库的 failedStation，没有就倒推」
+ * 判对了（`⑦`），明细却只读落库那份，于是同一张票在同一个输出里既有
+ * `提交✗` 又有 `卡在哪一步：**未知**（第 0 站「」）`。
+ *
+ * 优先落库：那是失败当时的判断，人重开之后依然说得清「上回死在哪」；
+ * 倒推那份兼容 2026-11-17 之前的老票 —— 那时还没有 `failedStation`。
+ * 落库优先还解决一个真问题：时间线会被人工重置接着往下写，
+ * 重开一次之后再倒推，最后一条主站已经变成重开后的站了。
+ *
+ * @param {any} row
+ * @returns {string | undefined}
+ */
+function blamedStationOf (row) {
+  if (!row || row.phase !== FAILED_TERMINAL) return undefined
+  const recorded = typeof row.failedStation === 'string' && MAIN_STATIONS.includes(row.failedStation)
+    ? row.failedStation
+    : undefined
+  if (recorded) return recorded
+  const timeline = Array.isArray(row.timeline) ? row.timeline : []
+  // 倒推必须在**失败那一条打点**之前截断。
+  //
+  // 真机踩过：`sh-row-82` 17:03:38 记了一条 `· ✗ 失败 —— 执行器收尾：本地提交失败（git add …）`，
+  // 之后 ⑧ 回填、⑨ 通知照样往下走（它们是「事后动作」，失败也要通知人）。
+  // 直接取「最后一条主站」于是拿到 ⑨，印成「卡在哪一步：**发通知**」——
+  // 而它明明死在 ⑦ 提交。失败之后发生的事不能反过来当成死因。
+  let cut = timeline.length
+  for (let i = timeline.length - 1; i >= 0; i -= 1) {
+    if (timeline[i]?.heartbeat === true) continue
+    if (timeline[i]?.ok === false) { cut = i; break }
+  }
+  for (let i = cut - 1; i >= 0; i -= 1) {
+    if (timeline[i]?.heartbeat === true) continue
+    if (MAIN_STATIONS.includes(timeline[i]?.node)) return timeline[i].node
+  }
+  return undefined
+}
+
+/**
  * 流程带上的状态符号。
  *
  * `now`（▶）必须与 `ok`（✓）分开：一张票正停在⑥跑验证时，⑥标 ✓ 会让人
@@ -568,25 +608,12 @@ function describeStations (row, now) {
   // 迟早出现「带子上说停在⑥、结论说停在第⑤站」。
   const flow = describeFlow(row, now)
   const currentNo = !terminal && flow.station ? flow.station.no : undefined
-  // 「它到底倒在哪一站」：优先用**落库的那一份**（`row.failedStation`）。
-  //
+  // 「它到底倒在哪一站」：唯一的判定入口 `blamedStationOf`（明细与流程带共用）。
   // 两条路都要留：落库那份是失败当时的判断，人重开之后依然说得清「上回死在哪」；
   // 倒推那份用来兼容 2026-11-17 之前的老票 —— 那时还没有这个字段。
   // 落库优先还解决一个真问题：时间线会被人工重置接着往下写，
   // 重开一次之后再倒推，最后一条主站已经变成重开后的站了。
-  const lastMainNode = (() => {
-    for (let i = timeline.length - 1; i >= 0; i -= 1) {
-      const node = timeline[i].node
-      if (timeline[i].heartbeat === true) continue
-      if (MAIN_STATIONS.includes(node)) return node
-    }
-    return undefined
-  })()
-  const recordedStation = typeof row.failedStation === 'string' && MAIN_STATIONS.includes(row.failedStation)
-    ? row.failedStation
-    : undefined
-  // 票现在**不在**失败态、但记着上回倒在哪：那是历史，不该把带子上的站点涂红。
-  const blamedNode = row.phase === FAILED_TERMINAL ? (recordedStation ?? lastMainNode) : undefined
+  const blamedNode = blamedStationOf(row)
   const stations = []
   let reachedCount = 0
   let failedStation
@@ -1306,7 +1333,11 @@ export async function collectStatus (options, args) {
         // 「是工单处理问题失败了，还是测试失败了」—— 用户原话。
         // 这句话必须单独成行、并且用**人要做的动作**命名（改代码 / 跑验证 / 提交），
         // 不要拿 phase 名（editing / mr-opening）敷衍，那不是给人看的词。
-        const failedStation = typeof row.failedStation === 'string' ? row.failedStation : undefined
+        //
+        // 站从哪来：优先落库的 `row.failedStation`；老数据（2026-11-17 之前失败的票）
+        // 没这个字段，就用时间线倒推 —— 真机 `sh-row-82` 一开始就印出
+        // 「卡在哪一步：**未知**（第 0 站「」）」，比不写还糟。
+        const failedStation = blamedStationOf(row)
         const category = failureCategoryOf(failedStation)
         if (category.length > 0) {
           lines.push(`  卡在哪一步：**${category}**（第 ${stationRankOf(failedStation)} 站「${describeResumeFrom(failedStation)}」）`)
@@ -1382,6 +1413,8 @@ export async function collectStatus (options, args) {
       // 交付没做成的项（#08）：渲染循环里也算一次，这里重新算而不是捕获 ——
       // 两个循环的 row 不是同一个作用域，捕获会拿到最后一张票的。
       const ticketsIssues = deliveryIssues(row)
+      // 「倒在哪一站」也在这里重算一次，理由同上（同一条链路只有一个判定入口）。
+      const blamedStation = blamedStationOf(row)
       return {
         projectId: row.projectId,
         recordId: row.recordId,
@@ -1439,12 +1472,14 @@ export async function collectStatus (options, args) {
         })() : null,
         // 「倒在哪一站」的机器可读版（2026-11-17 用户原话：「这失败了也没告诉用户
         // 哪一步失败了 是工单处理问题失败了 还是测试失败了」）。
-        // `failedStation` 是落库的那一份（老数据可能没有，才是 null）；
+        // 三个字段必须由**同一个** `blamedStationOf` 推出：真机出过同一份输出里
+        // 既有 `提交✗` 又有 `卡在哪一步：未知（第 0 站「」）`，
+        // 就是因为带子走了「落库+倒推」、这几个字段只读了落库那份。
         // `failureCategory` 已经是人话（改代码 / 跑验证 / 提交…），面板直接印；
         // `canResume` 决定「重跑」按钮的措辞是「从提交那一步接着跑」还是「从头再跑」。
-        failedStation: typeof row.failedStation === 'string' ? row.failedStation : null,
-        failureCategory: row.phase === 'failed' ? failureCategoryOf(row.failedStation) : null,
-        canResume: row.phase === 'failed' && canResumeFrom(row.failedStation),
+        failedStation: blamedStation ?? null,
+        failureCategory: row.phase === 'failed' ? failureCategoryOf(blamedStation) : null,
+        canResume: canResumeFrom(blamedStation),
         testDetail: row.testDetail,
         revisionCount: row.revisionCount,
         attempt: row.attempt,
@@ -1459,7 +1494,12 @@ export async function collectStatus (options, args) {
         station: flow.station,
         // 这一站已经跑了多久 + 经验区间（分钟，只有长站点有）。
         // 与 stalledForMs 是两个数：有站点心跳之后，后者永远只有几十秒。
-        stationElapsedMs: flow.stationElapsedMs,
+        //
+        // 收尾之后不再下发：2026-11-17 真机面板上出现过「这一站已经待了 5751 分钟」，
+        // 而那张票四天前就失败了 —— 终态的票这个数字只会越来越大，没有信息量，
+        // 读起来还像「它还卡在那儿」。判据放在这里（有 flow.terminal），
+        // 面板不必自己再判一次终态。
+        stationElapsedMs: flow.terminal ? null : flow.stationElapsedMs,
         stationRange: flow.stationRange,
         heartbeatCount: flow.heartbeatCount,
         lastNodeOk: flow.lastNodeOk,

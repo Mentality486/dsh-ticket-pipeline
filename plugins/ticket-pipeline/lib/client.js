@@ -2595,8 +2595,11 @@ window.__ModuleLoader__.load({
             detail.push('交付·' + issue.label + '：没做成 —— ' + (issue.error || '原因未记录'))
           }
         }
+        // 「这一站已经待了 5751 分钟」——2026-11-17 真机出现过这句，读起来像「它还卡在那儿」，
+        // 而那张票四天前就已经失败了。宿主编译详情时对**已收尾**的票把 `stationElapsedMs`
+        // 置成 null（判据在那边，面板不重复判一次终态），这里只要它还在就印。
         if (t.stationElapsedMs && t.station) {
-          detail.push('这一站已经待了 ' + Math.round(t.stationElapsedMs / 60000) + ' 分钟')
+          detail.push('这一站已经跑了 ' + Math.round(t.stationElapsedMs / 60000) + ' 分钟')
         }
         if (t.worktreePath) detail.push('改代码目录：' + t.worktreePath)
         if (t.sessionId) detail.push('处理会话：' + t.sessionId)
