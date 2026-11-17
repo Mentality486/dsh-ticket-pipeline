@@ -17,6 +17,7 @@ import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { describeConfig } from '../core/config.js'
 import { describeCommit, renderCommitSummary } from '../core/commit-summary.js'
 import { renderErrorAdvice, explainError } from '../core/error-advice.js'
+import { canResumeFrom, describeResumeFrom, failureCategoryOf, stationRankOf } from '../core/station.js'
 import { foundAtSortKey, summarize, ticketKey } from '../core/store.js'
 // 「能不能重跑」的口径只在 pipeline-reset.js 里定（RESETTABLE_PHASES）。
 // 运行页签（#16）要按它决定给不给按钮，所以这里把它转成一个布尔随票下发 ——
@@ -567,9 +568,12 @@ function describeStations (row, now) {
   // 迟早出现「带子上说停在⑥、结论说停在第⑤站」。
   const flow = describeFlow(row, now)
   const currentNo = !terminal && flow.station ? flow.station.no : undefined
-  // 「它到底倒在哪一站」：最后一条到达过的主站。只有票确实以 failed 收尾时才用
-  // （见 FAILED_TERMINAL 的注释）—— ⑦ 提交失败时那条 ⑦ 打点自己是 ok 的，
-  // 只看它会把「失败」画成「成功」。
+  // 「它到底倒在哪一站」：优先用**落库的那一份**（`row.failedStation`）。
+  //
+  // 两条路都要留：落库那份是失败当时的判断，人重开之后依然说得清「上回死在哪」；
+  // 倒推那份用来兼容 2026-11-17 之前的老票 —— 那时还没有这个字段。
+  // 落库优先还解决一个真问题：时间线会被人工重置接着往下写，
+  // 重开一次之后再倒推，最后一条主站已经变成重开后的站了。
   const lastMainNode = (() => {
     for (let i = timeline.length - 1; i >= 0; i -= 1) {
       const node = timeline[i].node
@@ -578,7 +582,11 @@ function describeStations (row, now) {
     }
     return undefined
   })()
-  const blamedNode = row.phase === FAILED_TERMINAL ? lastMainNode : undefined
+  const recordedStation = typeof row.failedStation === 'string' && MAIN_STATIONS.includes(row.failedStation)
+    ? row.failedStation
+    : undefined
+  // 票现在**不在**失败态、但记着上回倒在哪：那是历史，不该把带子上的站点涂红。
+  const blamedNode = row.phase === FAILED_TERMINAL ? (recordedStation ?? lastMainNode) : undefined
   const stations = []
   let reachedCount = 0
   let failedStation
@@ -658,7 +666,11 @@ function renderFlowLine (row, now) {
     : (() => {
         const hit = flow.stations.find((s) => s.no === flow.failedStation)
         const name = hit ? `${hit.short}（${hit.label}）` : ''
-        return `｜✗ 倒在第 ${flow.failedStation} 站${name ? `「${name}」` : ''}`
+        // 站名后面再补一个「哪一类失败」：站名回答「在哪」，这一类回答「是什么性质」。
+        // 两者对应人下一步要做的动作不同 —— 改代码要去看 diff，跑验证要去看测试输出。
+        const category = hit ? failureCategoryOf(hit.node) : ''
+        const tail = category.length > 0 ? `（${category}）` : ''
+        return `｜✗ 倒在第 ${flow.failedStation} 站${name ? `「${name}」` : ''}${tail}`
       })()
   return `        ${parts.join(' ')}${total}${blamed}`
 }
@@ -1291,6 +1303,17 @@ export async function collectStatus (options, args) {
         // 英文 stderr，2000 多字，真正有用的只有一句。现在先给人话（为什么 + 怎么办），
         // 原文缩进挂在最后：解释可以少，原文不能丢。
         lines.push(...renderErrorAdvice(row.lastError, { indent: '  ' }))
+        // 「是工单处理问题失败了，还是测试失败了」—— 用户原话。
+        // 这句话必须单独成行、并且用**人要做的动作**命名（改代码 / 跑验证 / 提交），
+        // 不要拿 phase 名（editing / mr-opening）敷衍，那不是给人看的词。
+        const failedStation = typeof row.failedStation === 'string' ? row.failedStation : undefined
+        const category = failureCategoryOf(failedStation)
+        if (category.length > 0) {
+          lines.push(`  卡在哪一步：**${category}**（第 ${stationRankOf(failedStation)} 站「${describeResumeFrom(failedStation)}」）`)
+          if (canResumeFrom(failedStation)) {
+            lines.push('  怎么接着跑：pipeline_reset 会从这一步继续，不用从头再来（同一个会话接着用）')
+          }
+        }
       }
       if (row.testDetail) lines.push(`  测试说明：${row.testDetail}`)
       // 待补做的事后动作：票已经是终态，但回填/通知还没做成（进程在中间退出了）。
@@ -1414,6 +1437,14 @@ export async function collectStatus (options, args) {
             truncated: advice.truncated,
           }
         })() : null,
+        // 「倒在哪一站」的机器可读版（2026-11-17 用户原话：「这失败了也没告诉用户
+        // 哪一步失败了 是工单处理问题失败了 还是测试失败了」）。
+        // `failedStation` 是落库的那一份（老数据可能没有，才是 null）；
+        // `failureCategory` 已经是人话（改代码 / 跑验证 / 提交…），面板直接印；
+        // `canResume` 决定「重跑」按钮的措辞是「从提交那一步接着跑」还是「从头再跑」。
+        failedStation: typeof row.failedStation === 'string' ? row.failedStation : null,
+        failureCategory: row.phase === 'failed' ? failureCategoryOf(row.failedStation) : null,
+        canResume: row.phase === 'failed' && canResumeFrom(row.failedStation),
         testDetail: row.testDetail,
         revisionCount: row.revisionCount,
         attempt: row.attempt,

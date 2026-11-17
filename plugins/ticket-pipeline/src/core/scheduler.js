@@ -14,6 +14,7 @@ import { TERMINAL, canTransition, TIMELINE_NODES, phaseLabel } from '../contract
 import { fingerprintChanged, summarize, ticketKey } from './store.js'
 import { BUILTIN_LIMITS } from './config.js'
 import { extractKeywords, recallMemories } from './ticket-memory.js'
+import { lastMainStationOf, describeResumeFrom, stationRankOf } from './station.js'
 import { normalizeTestOutcome } from '../contracts/work-executor.js'
 import { renderTicketContent, renderTicketPrompt } from './prompt.js'
 
@@ -952,6 +953,19 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         // 任务书里那句「探索预算 N 次」用的就是这个数；执行器的计数器也用它。
         // 从同一个变量下发，项目级覆盖才不会只在一边生效。
         exploreBudget,
+        // ── 续跑：只重做失败的那一步 ────────────────────────
+        //
+        // 人点「重跑」时不该整票从头来。2026-11-17 用户原话：
+        // 「不要重新跑 应该是修复只针对失败的那一步进行修复然后接着跑后续的
+        //   还在那个失败的会话中继续」。判据集中在 core/station.js，
+        // 这里只把三个事实交给执行器：从哪站续、上回为什么死、上回的基线长什么样。
+        resumeFrom: typeof row.resumeFrom === 'string' && row.resumeFrom.length > 0 ? row.resumeFrom : undefined,
+        resumeReason: typeof row.lastError === 'string' ? row.lastError : undefined,
+        // 上一轮拍下的基线：续跑必须复用它，重新拍会把 agent 已改好的内容
+        // 当成「人来之前就有的」全部过滤掉（见 core/station.js 与 store.setBaseline）。
+        baseline: row.baseline && typeof row.baseline === 'object' ? row.baseline : undefined,
+        // 上一轮的验证结论：从 ⑦ 提交续跑时不重跑验证，靠这一份让结论仍然诚实。
+        verification: row.verification && typeof row.verification === 'object' ? row.verification : undefined,
         config,
         log: (msg, detail) => logInfo(msg, detail),
         onPhase,
@@ -980,6 +994,31 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
               projectId,
               recordId,
               sessionId,
+              reason: toPipelineError(error).message,
+            })
+          }
+        },
+        // 基线拍到就落库：只在内存里的话，超时/重载/中断之后就拿不到了，
+        // 而那时工作区已经被 agent 改过，重新拍基线等于把它的成果当人的改动过滤掉。
+        async onBaseline (baseline) {
+          try {
+            await store.setBaseline(key, baseline)
+          } catch (error) {
+            logInfo('基线落库失败（不影响这一轮，但这一轮失败后就没法从中间续跑）', {
+              projectId,
+              recordId,
+              reason: toPipelineError(error).message,
+            })
+          }
+        },
+        // 验证结论落库：⑦ 提交失败之后续跑要靠它「不重跑验证、也不撒谎」。
+        async onVerification (verification) {
+          try {
+            await store.setVerification(key, verification)
+          } catch (error) {
+            logInfo('验证结论落库失败（不影响这一轮）', {
+              projectId,
+              recordId,
               reason: toPipelineError(error).message,
             })
           }
@@ -1023,6 +1062,13 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
       }
       if (willNotify(finalPhase)) pendingEffects.notify = true
 
+      // 倒在哪一站：只在失败时记，而且**必须在写 `failed` 那条时间线之前**算。
+      // 算晚了，倒序扫到的第一条主站就是刚写进去的失败节点本身，永远得到 `undefined`。
+      // 判据见 `core/station.js`：最后一个做成了的主站就是它当时正在干的活。
+      const failedStation = finalPhase === 'failed'
+        ? lastMainStationOf(store.getTicket(key)?.timeline)
+        : undefined
+
       await store.setPhase(key, finalPhase, {
         changedFiles: result.changedFiles ?? row.changedFiles,
         testOutcome: result.testOutcome,
@@ -1034,6 +1080,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         lastError: finalLastError,
         lastErrorKind: finalLastErrorKind,
         pendingEffects: Object.keys(pendingEffects).length > 0 ? pendingEffects : undefined,
+        // 跑成了就把「上一轮倒在哪」「这次从哪续跑」一起清掉：
+        // 不清的话，一张已经 done 的票再被人工重开，会莫名其妙只跑后半段。
+        failedStation,
+        resumeFrom: undefined,
       })
       await markExtra(key, finalPhase, finalLastError ? `执行器收尾：${finalLastError}` : (result.commit?.sha ? `本地提交 ${String(result.commit.sha).slice(0, 12)}` : '执行器收尾，无本地提交'), finalPhase !== 'failed')
 
@@ -1197,6 +1247,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           sessionId: runSessionId.length > 0 ? runSessionId : undefined,
           lastError: timedOut ? `超时 ${timeoutMinutes} 分钟` : 'cancelled by user',
           pendingEffects: Object.keys(timeoutEffects).length > 0 ? timeoutEffects : undefined,
+          // 超时/取消也记「倒在哪一站」：超时最常见的形态就是「⑤ 改代码卡了 40 分钟」，
+          // 不记的话人在面板上看到一个全绿的带子 + 一句「超时」。
+          failedStation: lastMainStationOf(store.getTicket(key)?.timeline),
+          resumeFrom: undefined,
         })
         await markExtra(key, 'failed', timedOut ? `整票超时 ${timeoutMinutes} 分钟，已标 failed` : '被人工取消，已标 failed', false)
         if (writeBackTimeout) {
@@ -1251,6 +1305,9 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: normalized.message,
           lastErrorKind: normalized.kind,
           enqueuedAt: dueAt,
+          // 退避重试也记下倒在哪：自动重试是「整轮再来」（网络抖一下不该只重跑后半段），
+          // 但人得看得见它反复死在同一站 —— 那说明不是抖动，是那一步真有毛病。
+          failedStation: lastMainStationOf(store.getTicket(key)?.timeline),
         })
         await markExtra(key, 'failed', `第 ${attempt} 次没跑成（${normalized.message}），可重试，${Math.round(waitMs / 1000)} 秒后再来`, false)
         logInfo('可重试错误，退避后再来', { projectId, recordId, attempt, kind: normalized.kind, retryInMs: waitMs })
@@ -1264,6 +1321,10 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
         const failedEffects = {}
         if (writeBackFailure) failedEffects.writeBack = { phase: 'failed', lastError: normalized.message, worktreePath: ws.worktreePath, sessionId: runSessionId, attempt }
         if (willNotify('failed')) failedEffects.notify = true
+        // 抛异常这条路也要记「倒在哪一站」：真机 `sh-row-82` 就是从执行器里**抛**出来的
+        // （`commitLocally` 失败后 throw），走的是这个 catch 而不是正常收尾那条。
+        // 只在成功收尾里记，等于最常见的失败形态反而没有这个字段。
+        const thrownStation = lastMainStationOf(store.getTicket(key)?.timeline)
         await store.setPhase(key, 'failed', {
           attempt,
           // 同上：失败终态也要留住会话 id，否则通知与状态里都没有可追问的入口。
@@ -1271,6 +1332,8 @@ export function createScheduler ({ store, sources, locator, executor, push, conf
           lastError: normalized.message,
           lastErrorKind: normalized.kind,
           pendingEffects: Object.keys(failedEffects).length > 0 ? failedEffects : undefined,
+          failedStation: thrownStation,
+          resumeFrom: undefined,
         })
         await markExtra(key, 'failed', `第 ${attempt} 次没跑成，已用尽重试：${normalized.message}`, false)
         if (writeBackFailure) {

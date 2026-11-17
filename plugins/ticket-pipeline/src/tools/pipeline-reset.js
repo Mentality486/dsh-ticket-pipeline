@@ -28,6 +28,7 @@
 
 import { defineTool, textBlocks } from './define.js'
 import { PHASE_LABEL } from '../contracts/types.js'
+import { describeResumeFrom, failureCategoryOf, isMainStation } from '../core/station.js'
 
 /** 可以被人工重开的阶段。与 `store.resetByHuman` 的判定必须保持一致。 */
 export const RESETTABLE_PHASES = ['failed', 'needs-info', 'gone']
@@ -63,6 +64,11 @@ export function createPipelineResetTool (options) {
       projectId: {
         type: 'string',
         description: '工单所属项目名（projects[].name）。只有同名 recordId 会冲突时才需要传。',
+      },
+      from: {
+        type: 'string',
+        description: '从哪一站开始。缺省（推荐）是「从失败的那一站接着跑」，只重做没做成的那一步；'
+          + '填 begin 才是整票从头跑一遍。',
       },
     },
     // 机器可读字段放在返回值里，给人看的文本在 `text` 字段。
@@ -150,7 +156,34 @@ export async function collectReset (options, args) {
     }
   }
 
-  const ok = await options.store.resetByHuman(row.key)
+  // 从哪一站接着跑。默认「从失败那一站续」，`from: 'begin'` 才整票重来。
+  //
+  // 为什么默认改成续跑（2026-11-17 用户要求）：「不要重新跑 应该是修复只针对失败的
+  // 那一步进行修复然后接着跑后续的 还在那个失败的会话中继续」。整票从头跑一次要几十分钟
+  // （⑤ 让 agent 把几十个文件重新读一遍），而失败在 ⑦ 提交时那些活早就干完了。
+  //
+  // 判据只看「认不认得上一轮倒在哪」，不看用户的措辞：认不出（老数据）就老实从头跑 ——
+  // 猜错方向（从中间续）比慢更糟，它会把上一轮的半成品当成已完成。
+  const fromRaw = typeof safeArgs.from === 'string' ? safeArgs.from.trim().toLowerCase() : ''
+  const restartFromBegin = fromRaw === 'begin' || fromRaw === 'start' || fromRaw === 'scratch'
+  if (fromRaw.length > 0 && !restartFromBegin && !isMainStation(fromRaw)) {
+    return {
+      reset: false,
+      reason: 'bad-from',
+      recordId,
+      text: `from 只认主站的 node id（discover / locate / workspace / session / editing / testing / mr-opening），`
+        + `或者 begin（整票重来），不认「${fromRaw}」。\n`
+        + '一般不填就好：缺省就是从失败的那一站接着跑。',
+    }
+  }
+  const resumeTarget = restartFromBegin
+    ? null
+    : (row.failedStation ?? undefined)
+  // 上一轮卡在哪一类事上（改代码 / 跑验证 / 提交 …）。只用于文案，
+  // 但它是用户那句「是工单处理问题失败了 还是测试失败了」的直接回答。
+  // 只认真正的主站：`failedStation` 可能是老数据里留下的怪值，那时宁可不提这一句。
+  const failCategory = isMainStation(resumeTarget) ? failureCategoryOf(resumeTarget) : ''
+  const ok = await options.store.resetByHuman(row.key, restartFromBegin ? { resumeFrom: null } : {})
   if (!ok) {
     // resetByHuman 只有「记录不见了」或「状态在读到与写入之间变了」才会返回 false。
     return {
@@ -164,14 +197,26 @@ export async function collectReset (options, args) {
     }
   }
 
+  // `resumeTarget` 是「这次真正会从哪跑」：`resetByHuman` 内部对「不传 resumeFrom」
+  // 的处理是「按票上记的失败站走」，所以这里的值要和它算的一致，文案才不会骗人。
+  const willResume = !restartFromBegin && typeof resumeTarget === 'string' && resumeTarget.length > 0
+  const resumeNote = willResume
+    ? `下一轮轮询会从「${describeResumeFrom(resumeTarget)}」接着跑，不重做前面已经做完的步骤`
+      + (failCategory.length > 0 ? `（上一轮卡在「${failCategory}」）。\n` : '。\n')
+      + '它用的还是上一轮那个会话，前面读过的代码、改好的文件都还在。\n'
+    : '下一轮轮询会把它当成一张新票重新跑（从头开始）。\n'
+
   return {
     reset: true,
     reason: 'ok',
     recordId,
     projectId: row.projectId,
     phase: 'pending',
+    // 机器可读：面板与 Remote 的调用方靠这两个字段决定要不要提示「这是续跑」
+    resumeFrom: willResume ? resumeTarget : null,
+    failedStation: typeof row.failedStation === 'string' ? row.failedStation : null,
     text: `已重开：${row.projectId ? `[${row.projectId}] ` : ''}${recordId} 回到队列（阶段改回排队中，重试次数与最近错误已清空）。\n`
-      + '下一轮轮询会把它当成一张新票重新跑。\n'
+      + resumeNote
       + '想立刻推进一轮，用 pipeline_scan。',
   }
 }

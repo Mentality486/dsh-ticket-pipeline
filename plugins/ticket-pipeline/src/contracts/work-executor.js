@@ -33,6 +33,24 @@
  *   从零开始意味着把同一段探索再走一遍（2026-11-13 实测：`sh-row-82` 第二轮仍探了 57 次，
  *   其中 5 个文件第一轮刚读过，而第二轮总共才读 11 个）。
  *   可选 —— 新票没有上一轮，老调用方不传就是「每次都新建」的老行为。
+ * @property {string} [resumeFrom] 从哪一站接着跑（主站 node id，见 `core/station.js`）。
+ *   人工重开一张失败的票时，调度器不再「整票从头跑」：失败在 ⑦ 提交的票，代码早就改好了，
+ *   再让 agent 从零探索一遍既慢又可能改成另一个样子（2026-11-17 用户要求：
+ *   「不要重新跑 应该是修复只针对失败的那一步进行修复然后接着跑后续的 还在那个失败的会话中继续」）。
+ *   值 >= `testing` 时执行器**跳过 agent 那一整段**，直接收集改动 → 验证 → 提交；
+ *   更早的站（如 `editing`）仍要 agent 动手，但任务书里会写清「上一轮停在哪、别重新探索」。
+ *   可选 —— 不传就是「从头跑一遍」的老行为。
+ * @property {string} [resumeReason] 上一轮死在这一站的原因（一句人话），拼进重推给 agent 的那段说明。
+ * @property {{ sha: string, head: string, untracked: Array<[string, string]> }} [baseline] 上一轮拍下的基线。
+ *   续跑时**必须**用它，不能重新拍：agent 已经把文件改了，此刻拍基线等于把它的改动当成
+ *   「人来之前就有的」全过滤掉，最后一张票跑完却是「没有可提交的改动」。
+ * @property {(baseline: { sha: string, head: string, untracked: Map<string, string> }) => void | Promise<void>} [onBaseline]
+ *   基线拍好就交给调度器存下来 —— 只活在内存里的话，中途崩掉/超时之后就再也拿不到了。
+ * @property {{ outcome: string, detail: string }} [verification] 上一轮的验证结论。
+ *   只在「从 ⑦ 提交续跑」时用：那时代码一个字节没变，重跑验证只是再等几分钟，
+ *   结论不会有第二种可能。拿不到就老实重跑 —— 不能拿「上次应该没问题」当这次的结果。
+ * @property {(verification: { outcome: string, detail: string }) => void | Promise<void>} [onVerification]
+ *   验证跑完就把结论交给调度器存下来，⑦ 提交失败后才能既不重跑、又不撒谎。
  * @property {number} [exploreBudget] 这一票的探索预算（按「不同目标」计，不是按调用次数）。
  *   调度器算好传进来：项目级 `exploreBudget` 优先，缺省是全局 `agentExploreBudget`。
  *   执行器拿它做催办计数，任务书里那句「探索预算 N 次」也由调度器用同一个值渲染 ——

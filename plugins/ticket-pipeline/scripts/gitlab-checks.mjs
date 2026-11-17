@@ -374,6 +374,10 @@ function makeRunEnv (options = {}) {
   const resumed = []
   /** @type {string[]} */
   const reportedSessionIds = []
+  // 续跑用到的两条通道：基线（拍完就落库）与验证结论（跑完就落库）。
+  // 分开记而不是塞进 logs：断言要拿到结构化对象本身，而不是一句中文。
+  const reportedBaselines = []
+  const reportedVerifications = []
   /** @type {string[]} */
   const phases = []
   /** @type {Array<{ message: string, paths: string[] }>} */
@@ -568,9 +572,25 @@ function makeRunEnv (options = {}) {
     ...(options.trackSessionId === true
       ? { onSessionId: (id) => { reportedSessionIds.push(id) } }
       : {}),
+    // 续跑：从哪一站接着跑（`core/station.js` 的主站 node id）+ 上一轮死在那里的原因。
+    // 只有用例显式给了才传 —— 不传就是「整票从头跑」的老行为。
+    ...(options.resumeFrom === undefined ? {} : { resumeFrom: options.resumeFrom }),
+    ...(options.resumeReason === undefined ? {} : { resumeReason: options.resumeReason }),
+    // 上一轮拍下的基线 / 验证结论：续跑要靠它们，否则会重新拍基线（把 agent 的改动
+    // 当成人的）或重跑一遍验证（代码一个字节没变，纯浪费）。
+    ...(options.baseline === undefined ? {} : { baseline: options.baseline }),
+    ...(options.verification === undefined ? {} : { verification: options.verification }),
+    // 执行器把基线/验证结论交回来的通道。调度器靠它们落库，
+    // 不接的话「⑦ 提交失败后再续跑不重跑验证」就永远拿不到结论。
+    ...(options.trackBaseline === true
+      ? { onBaseline: (baseline) => { reportedBaselines.push(baseline) } }
+      : {}),
+    ...(options.trackVerification === true
+      ? { onVerification: (verification) => { reportedVerifications.push(verification) } }
+      : {}),
   }
 
-  return { executor, ctx, controller, state, agent, created, resumed, phases, commits, gitCalls, gitServer, setupState, changes, logs, executorLogs, reportedSessionIds, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
+  return { executor, ctx, controller, state, agent, created, resumed, phases, commits, gitCalls, gitServer, setupState, changes, logs, executorLogs, reportedSessionIds, reportedBaselines, reportedVerifications, ticket: TICKET, target: { repoPath: '/repo', remote: 'git@gitlab.example.com:group/sub/repo.git', baseBranch: 'main' } }
 }
 
 /**
@@ -855,6 +875,116 @@ export async function runGitlabChecks (check) {
     await env.executor.run(env.ticket, env.target, env.ctx)
     assert.equal(env.resumed.length, 0, '没有上一轮就不该去 resume（拿空 id 续接会直接抛）')
     assert.equal(env.created.length, 1)
+  })
+
+  // ── 续跑：只修失败那一步 ────────────────────────────────
+  //
+  // 这组用例守的是 2026-11-17 用户那句：「不要重新跑 应该是修复只针对失败的那一步
+  // 进行修复然后接着跑后续的 还在那个失败的会话中继续」。
+  //
+  // 为什么不能整票重跑：`pms|sh-row-82` 失败在 ⑦ 提交，代码早就改完、验证也过了
+  // （真机 50 分 46 秒里 ⑤ 占了 40 分钟）。重跑一遍 = 让 agent 把几十个文件重新读一遍，
+  // 还可能改成另一个样子。
+  await check('续跑：从 ⑦ 提交接着跑时不起 agent（代码早就改完了，再让 agent 动手是浪费也是风险）', async () => {
+    const env = makeRunEnv({
+      resumeFrom: 'mr-opening',
+      resumeReason: '本地提交失败（git add）：被 .gitignore 挡住了',
+      previousSessionId: 'ticket-demo-rec-9-1794559498030',
+      verification: { outcome: 'passed', detail: 'check-consistency 退出码 0' },
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.created.length, 0, '从⑦续跑不该新建会话')
+    assert.equal(env.resumed.length, 0, '也不该去 resume —— 这一轮根本不需要 agent')
+    assert.equal(env.state.followups.length, 0, '不该再往任何会话里推任务书')
+    // 提交照做：这一轮的全部工作就是把上次没提交成的改动提交掉。
+    assert.equal(env.commits.length, 1, '续跑的目标就是把它提交掉')
+  })
+
+  await check('续跑：从 ⑦ 接着跑时沿用上一轮的验证结论，不重跑验证（代码一个字节没变）', async () => {
+    // 真机 pms 的验证命令要跑 5 分钟，而它检查的东西这一刻根本没变。
+    let ranVerify = 0
+    const env = makeRunEnv({
+      resumeFrom: 'mr-opening',
+      verification: { outcome: 'passed', detail: 'check-consistency 退出码 0' },
+      runCommand: async () => { ranVerify += 1; return { code: 0, stdout: 'ok', stderr: '' } },
+      verify: { test: 'node scripts/check-consistency.mjs' },
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(ranVerify, 0, '不能重跑验证')
+    assert.ok(
+      env.phases.includes('testing'),
+      '不重跑不等于跳过这一站 —— 时间线上还得有 ⑥，否则人以为验证没做过',
+    )
+  })
+
+  await check('续跑：没有上一轮的验证结论就老实重跑（拿不到不能猜「应该没问题」）', async () => {
+    let ranVerify = 0
+    const env = makeRunEnv({
+      resumeFrom: 'mr-opening',
+      runCommand: async () => { ranVerify += 1; return { code: 0, stdout: 'ok', stderr: '' } },
+      verify: { test: 'node scripts/check-consistency.mjs' },
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(ranVerify, 1, '拿不到上一轮的结论就必须真跑一遍')
+  })
+
+  await check('续跑：从 ⑤ 改代码接着跑时仍要 agent，但推的是「接着做」而不是整份任务书', async () => {
+    const env = makeRunEnv({
+      resumeFrom: 'editing',
+      resumeReason: 'agent 改了半小时没动到地方',
+      previousSessionId: 'ticket-demo-rec-9-1794559498030',
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.resumed.length, 1, '有上一轮会话就续接它（「还在那个失败的会话中继续」）')
+    assert.equal(env.state.followups.length, 1)
+    const text = env.state.followups[0].content.map((block) => block.text ?? '').join('\n')
+    assert.match(text, /接着/, `续跑要说明是接着干，实际：${text.slice(0, 200)}`)
+    assert.ok(
+      !text.includes('任务书正文'),
+      '续跑不该把整份任务书再推一遍 —— 那等于让它从头再来',
+    )
+    assert.match(text, /上一轮/, '要说清上一轮停在哪、为什么停')
+  })
+
+  await check('续跑：复用上一轮拍的基线，绝不重新拍（重新拍会把 agent 改好的当成人的改动全过滤掉）', async () => {
+    const env = makeRunEnv({
+      resumeFrom: 'mr-opening',
+      // `head` 要和当前 HEAD 一致：`collectChanges` 会排掉「基线之后别人提交进来的改动」，
+      // 两边 HEAD 不同时它要靠 `git diff HEAD -- <path>` 确认，而假 git 让它回空 ⇒ 全丢。
+      baseline: { sha: 'stash-base-1', head: 'head-1', untracked: [['notes.md', 'h1']] },
+      headSha: 'head-1',
+      verification: { outcome: 'passed', detail: 'ok' },
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    // 数一下 `git stash create` 被调了几次：续跑时必须是 0。
+    const stashCalls = env.gitCalls.filter((argv) => argv[0] === 'stash' && argv[1] === 'create').length
+    assert.equal(stashCalls, 0, '续跑必须复用存下来的基线，不能重新拍')
+    // 提交时用的 paths 仍然是「agent 改的那些」——说明基线真的在起作用。
+    assert.equal(env.commits.length, 1, '复用基线之后仍然收得到改动')
+  })
+
+  await check('续跑：第一轮拍下的基线会交给调度器存下来（只活在内存里，中断后就拿不到了）', async () => {
+    const env = makeRunEnv({ trackBaseline: true })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.reportedBaselines.length, 1, '拍完基线就要交出去')
+    const reported = env.reportedBaselines[0]
+    assert.equal(typeof reported.sha, 'string')
+    assert.equal(typeof reported.head, 'string')
+    assert.ok(
+      reported.untracked instanceof Map || Array.isArray(reported.untracked),
+      '未跟踪文件哈希要能序列化（Map 会在 JSON 里变成空对象，落库时转数组）',
+    )
+  })
+
+  await check('续跑：验证结论跑完就交回调度器（⑦ 提交失败后才能既不重跑、又不撒谎）', async () => {
+    const env = makeRunEnv({
+      trackVerification: true,
+      runCommand: async () => ({ code: 0, stdout: 'ok', stderr: '' }),
+      verify: { test: 'node scripts/check-consistency.mjs' },
+    })
+    await env.executor.run(env.ticket, env.target, env.ctx)
+    assert.equal(env.reportedVerifications.length, 1, '验证跑完就要把结论交出去')
+    assert.equal(env.reportedVerifications[0].outcome, 'passed')
   })
 
   await check('执行器：会话 cwd 用项目工作区根，改代码目录靠 workingDirectory 钉到 worktree', async () => {

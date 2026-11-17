@@ -51,6 +51,15 @@ import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '
 import { renderTicketPrompt } from '../src/core/prompt.js'
 import { buildRowIdentity, isFormulaText, normalizeSeqIdentity } from '../src/adapters/source-feishu/sheets.js'
 import { explainError, renderErrorAdvice } from '../src/core/error-advice.js'
+import {
+  canResumeFrom,
+  describeStation,
+  failureCategoryOf,
+  isMainStation,
+  lastMainStationOf,
+  resumePlanOf,
+  stationRankOf,
+} from '../src/core/station.js'
 import { describeMemory, extractKeywords, MEMORY_KEYWORD_VERSION, MEMORY_TABLE, recallMemories, TicketMemory } from '../src/core/ticket-memory.js'
 import { SHOW_SUMMARY_ARGS, parseShowSummaryZ } from '../src/contracts/git-status.js'
 import {
@@ -8155,6 +8164,183 @@ function makeFakeCtx ({ domain, registered }) {
     }).execute({}, {})
     assert.equal(doneOut.tickets[0].flow.failedStation, null, 'done 的票没有「倒在哪一站」')
     assert.equal(doneOut.tickets[0].flow.stations[6].state, 'ok', 'done 的票⑦还是 ✓')
+  })
+
+  section('23. 失败要落到倒下的那一站，重开只修那一步并接着原会话跑（2026-11-17 sh-row-82）')
+  await check('station：主站按①②③…排序，补充站不算主站', () => {
+    assert.equal(isMainStation('editing'), true)
+    assert.equal(isMainStation('planning'), false, '补充站不是「哪一步失败」的答案')
+    assert.equal(stationRankOf('discover'), 1)
+    assert.equal(stationRankOf('mr-opening'), 7)
+    assert.equal(stationRankOf('writeback'), 8)
+    assert.equal(stationRankOf('notify'), 9)
+    assert.equal(stationRankOf('nope'), 0)
+  })
+
+  await check('station：lastMainStationOf 倒着找最后做过的站，跳过心跳', () => {
+    const timeline = [
+      { node: 'discover', at: 100, ok: true },
+      { node: 'editing', at: 200, ok: true },
+      { node: 'editing', at: 300, ok: true, heartbeat: true },
+      { node: 'testing', at: 400, ok: true },
+    ]
+    assert.equal(lastMainStationOf(timeline), 'testing')
+    // 只有补充站时不能被当成「失败在某一步」——那是准备阶段。
+    assert.equal(lastMainStationOf([{ node: 'worktree-ready', at: 1, ok: true }]), undefined)
+    assert.equal(lastMainStationOf([]), undefined)
+    assert.equal(lastMainStationOf(undefined), undefined)
+  })
+
+  await check('station：⑦ 提交倒下时续跑不重跑验证；⑤ 改代码倒下时仍要 agent', () => {
+    const submit = resumePlanOf('mr-opening')
+    assert.equal(submit.agent, false, '⑦ 只是提交没做成，代码早就改完了')
+    assert.equal(submit.verify, false, '代码一个字节没变，重跑验证纯浪费')
+    assert.equal(submit.collect, true, '仍要收集改动 —— 那是这次要提交的东西')
+    const edit = resumePlanOf('editing')
+    assert.equal(edit.agent, true, '⑤ 倒下说明活没干完，必须让 agent 动手')
+    assert.equal(edit.verify, true, '它改了代码，验证当然要重跑')
+    // ⑧⑨ 不在这条路上（回填/通知走 pendingEffects），别给出误导性的计划 ——
+    // 给一个「agent/verify/collect 全 false」的计划会让执行器空跑一轮再返回无提交的结果。
+    assert.equal(resumePlanOf('writeback'), null)
+    assert.equal(resumePlanOf('notify'), null)
+    assert.equal(canResumeFrom('writeback'), false)
+    assert.equal(canResumeFrom('editing'), true)
+    assert.equal(canResumeFrom('mr-opening'), true)
+  })
+
+  await check('station：失败类别按「人要做的事」命名，不用 phase 名', () => {
+    // 用户原话：「是工单处理问题失败了 还是测试失败了」—— 他要的是这个区分。
+    assert.equal(failureCategoryOf('editing'), '改代码')
+    assert.equal(failureCategoryOf('testing'), '跑验证')
+    assert.equal(failureCategoryOf('mr-opening'), '提交')
+    assert.equal(failureCategoryOf('writeback'), '回填表格')
+    // 判不出站（老数据 / 还没进任何主站）不能说成「准备阶段」也不能留空 ——
+    // 留空会让面板渲染成「卡在哪一步：****」。
+    assert.equal(failureCategoryOf(undefined), '未知')
+    assert.equal(describeStation('mr-opening').no, '⑦')
+    assert.equal(describeStation('mr-opening').short, '提交')
+  })
+
+  await check('失败收尾会把「倒在哪一站」落库（不然面板只能靠猜）', async () => {
+    // 真机 `sh-row-82` 是执行器里**抛**出来的（`commitLocally` 失败后 throw），
+    // 走的是 catch 那条路 —— 只测正常收尾会漏掉最常见的形态。
+    const { store, scheduler } = harness({
+      executor: {
+        ...createMockExecutor(),
+        async run (ticket, target, ctx) {
+          void ticket; void target
+          await ctx.onPhase('editing', '开始改代码')
+          await ctx.onPhase('testing', '跑验证')
+          await ctx.onPhase('mr-opening', '做本地提交')
+          throw new PipelineError('internal', '本地提交失败：.idea 被 .gitignore 挡住')
+        },
+      },
+      config: { maxAttempts: 1 },
+    })
+    await scheduler.tick({})
+    const row = store.listTickets()[0]
+    assert.equal(row.phase, 'failed')
+    assert.equal(
+      row.failedStation,
+      'mr-opening',
+      `失败站要落库（真机 sh-row-82 就死在 ⑦ 提交），实际 ${row.failedStation}`,
+    )
+  })
+
+  await check('成功收尾会把「倒在哪一站」清掉（否则 done 的票一重开会莫名只跑后半段）', async () => {
+    const { store, scheduler } = harness({})
+    await scheduler.tick({})
+    const row = store.listTickets().find((item) => item.phase === 'done')
+    assert.ok(row, '这一轮应该有一张跑成了')
+    assert.equal(row.failedStation, undefined, 'done 的票不带「倒在哪一站」')
+    assert.equal(row.resumeFrom, undefined, 'done 的票也不带「这次从哪续跑」')
+  })
+
+  await check('pipeline_reset 缺省从失败那一站续跑，不再整票从头跑', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-a'), projectId: DEMO, recordId: 'rec-a', phase: 'failed', attempt: 2, failedStation: 'mr-opening', lastError: '本地提交失败' },
+    ]
+    const tool = createPipelineResetTool({ store: { ...store, listTickets: () => rows, resetByHuman: async () => true } })
+    const out = await tool.execute({ recordId: 'rec-a' }, {})
+    assert.equal(out.reset, true)
+    assert.equal(out.resumeFrom, 'mr-opening', '缺省就续跑，不再从头')
+    assert.match(out.text, /接着跑/, `文案要说清是续跑，实际：${out.text}`)
+    assert.match(out.text, /提交/, '要点名上一轮卡在「提交」这一类事上')
+  })
+
+  await check('pipeline_reset from:begin 才是整票重跑（保留一条「实在要从头来」的路）', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-b'), projectId: DEMO, recordId: 'rec-b', phase: 'failed', attempt: 1, failedStation: 'editing', lastError: 'x' },
+    ]
+    let seenOptions
+    const tool = createPipelineResetTool({
+      store: {
+        ...store,
+        listTickets: () => rows,
+        resetByHuman: async (_key, options) => { seenOptions = options; return true },
+      },
+    })
+    const out = await tool.execute({ recordId: 'rec-b', from: 'begin' }, {})
+    assert.equal(out.reset, true)
+    assert.equal(out.resumeFrom, null, 'begin 就是「不续跑」')
+    assert.deepEqual(seenOptions, { resumeFrom: null }, '要显式告诉 store「这次别按失败站续」')
+    assert.match(out.text, /从头/, `文案要说清是从头，实际：${out.text}`)
+  })
+
+  await check('pipeline_reset 的 from 认不出就明说，不猜（猜错方向比慢更糟）', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-c'), projectId: DEMO, recordId: 'rec-c', phase: 'failed', attempt: 1, failedStation: 'testing' },
+    ]
+    const tool = createPipelineResetTool({ store: { ...store, listTickets: () => rows, resetByHuman: async () => true } })
+    const out = await tool.execute({ recordId: 'rec-c', from: '哪里错了' }, {})
+    assert.equal(out.reset, false)
+    assert.equal(out.reason, 'bad-from')
+    assert.match(out.text, /begin/)
+  })
+
+  await check('没有失败站的票（老数据）重开仍然从头跑，不硬猜一个站', async () => {
+    const { store } = harness({})
+    const rows = [
+      { key: ticketKey(DEMO, 'rec-d'), projectId: DEMO, recordId: 'rec-d', phase: 'failed', attempt: 1 },
+    ]
+    const tool = createPipelineResetTool({ store: { ...store, listTickets: () => rows, resetByHuman: async () => true } })
+    const out = await tool.execute({ recordId: 'rec-d' }, {})
+    assert.equal(out.reset, true)
+    assert.equal(out.resumeFrom, null)
+    assert.match(out.text, /从头开始/)
+  })
+
+  await check('pipeline_status 明细要直说「卡在哪一步」和「怎么接着跑」，并给机器可读字段', async () => {
+    const row = {
+      key: ticketKey(DEMO, 'stuck'),
+      projectId: DEMO,
+      recordId: 'stuck',
+      phase: 'failed',
+      attempt: 1,
+      lastError: '本地提交失败（git add ...）：The following paths are ignored by one of your .gitignore files',
+      failedStation: 'mr-opening',
+      timeline: [
+        { node: 'discover', label: '获取工单', at: 1_000, ok: true },
+        { node: 'editing', label: '处理工单问题', at: 2_000, ok: true },
+        { node: 'testing', label: '跑验证', at: 3_000, ok: true },
+        { node: 'mr-opening', label: '提交（本地提交 / PR）', at: 4_000, ok: true },
+        { node: 'failed', label: '失败', at: 4_100, ok: false },
+      ],
+    }
+    const out = await createPipelineStatusTool({
+      store: { listTickets: () => [row] }, getConfig: () => validateConfig({}).value, now: () => 10_000,
+    }).execute({ recordId: 'stuck' }, {})
+    // 人话：哪一步、属于哪类事。
+    assert.match(out.text, /卡在哪一步/, `明细要直说卡在哪，实际：${out.text}`)
+    assert.match(out.text, /提交/, '要点名「提交」这一站')
+    assert.match(out.text, /怎么接着跑/, '要告诉人下一步怎么做，而不是让人自己去猜')
+    assert.match(out.text, /pipeline_reset/, '给出具体入口')
+    // 机器可读：面板/调用方靠它决定要不要显示「接着跑」。
+    assert.equal(out.tickets[0].flow.failedStation, '⑦')
+    void out
   })
 
   // ── 收尾 ────────────────────────────────────────────────

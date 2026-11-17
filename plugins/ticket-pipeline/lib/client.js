@@ -2574,6 +2574,14 @@ window.__ModuleLoader__.load({
         } else if (t.lastError) {
           detail.push('最近错误：' + t.lastError)
         }
+        // 2026-11-17 用户原话：「这失败了也没告诉用户哪一步失败了 是工单处理问题失败了
+        // 还是测试失败了」。宿主已经把它归成**人要做的动作**（改代码 / 跑验证 / 提交…），
+        // 面板只负责印出来 —— 不在这里再推一遍站点，两处各推一次迟早会分家。
+        if (t.failureCategory) {
+          detail.push(t.canResume
+            ? '卡在哪一步：' + t.failureCategory + '（重跑会从这一步接着跑，前面的不重做）'
+            : '卡在哪一步：' + t.failureCategory)
+        }
         if (t.testDetail) detail.push('验证：' + t.testDetail)
         if (t.commitSha) detail.push('提交：' + String(t.commitSha).slice(0, 8))
         if (t.commitSummary) detail.push('改动：' + t.commitSummary)
@@ -2608,14 +2616,20 @@ window.__ModuleLoader__.load({
             // 「重跑」是本页签最大的价值：失败票以前只能回对话里敲 pipeline_reset，
             // 或者去表格里把「是否处理」拨走再拨回来（那样会连内容重做）。
             // canReset 由宿主按 RESETTABLE_PHASES 算好，面板不自己判断。
+            // 措辞跟着 `canResume` 走（2026-11-17）：能从失败那一站接着跑时就说清楚，
+            // 否则人以为「重跑」还是从头来一遍，宁可不敢点。
             t.canReset
               ? h('button', {
                 type: 'button',
                 className: 'tp-btn tp-sm',
                 disabled: props.busy,
-                title: t.cancelledByUser ? '这是你手动取消的，重跑会重新排进队列' : '把这张票放回队列，下一轮重新跑',
+                title: t.cancelledByUser
+                  ? '这是你手动取消的，重跑会重新排进队列'
+                  : (t.canResume
+                      ? '从「' + t.failureCategory + '」那一步接着跑，前面做完的不重做，会话也还是原来那个'
+                      : '把这张票放回队列，下一轮重新跑'),
                 onClick: function () { props.onRerun(t.recordId) },
-              }, rerunBusy ? '重开中…' : '重跑')
+              }, rerunBusy ? '重开中…' : (t.canResume ? '接着跑' : '重跑'))
               : null,
             // 「删除」删的只是**本地记录**：工单表那一行还在、代码不回滚、工作区不删。
             // 所以按钮叫「删除记录」不叫「删除」，点下去还要再确认一次 ——

@@ -14,6 +14,7 @@
 import { canTransition, priorityWeight, TERMINAL, TIMELINE_NODES } from '../contracts/types.js'
 import { PipelineError } from '../contracts/errors.js'
 import { isIsolatedWorktreePath } from './worktree-path.js'
+import { describeResumeFrom } from './station.js'
 
 /**
  * 一张票的时间线最多留多少条记录。
@@ -79,6 +80,19 @@ export const TABLES = Object.freeze({
  * @property {{ sha: string, branch: string, files: string[] }} [commit] 工作区检出里的本地提交（本阶段的交付形态）
  * @property {{ iid: number, url: string, draft: boolean }} [mr] 远程 GitLab 开出来的 draft MR（可选出口）
  * @property {string} [sessionId] 这次执行用的会话 id（会话默认保留在项目工作区名下，可在 GUI 里点回去继续问）
+ * @property {string} [failedStation] 上一轮**倒在哪一站**（主站 node id，见 core/station.js）。
+ *   失败收尾时从时间线倒推落库 —— 不落库的话，「哪一步失败了」只能靠渲染期再推一遍，
+ *   而人工重开、启动恢复这些**不经过调度器渲染**的路径就一个字都拿不到。
+ * @property {string} [resumeFrom] 下一次开跑从哪一站接着跑（由 `resetByHuman` 写入）。
+ *   和 `failedStation` 分开两个字段：前者是「上一次死在哪」的事实，后者是「这一次从哪跑」的决定 ——
+ *   人可以决定从 `begin` 重来，那时 `resumeFrom` 空而 `failedStation` 仍在，面板照样说得清历史。
+ * @property {{ sha: string, head: string, untracked: Array<[string, string]> }} [baseline] 这一轮的起始基线
+ *   （`git stash create` 的结果 + 当时的 HEAD + 未跟踪文件哈希）。续跑时要用它来分辨
+ *   「哪些改动是 agent 干的」——重新拍基线会把 agent 已经改好的内容当成人的东西全部过滤掉。
+ * @property {{ outcome: string, detail: string }} [verification] 这一轮的验证结论。
+ *   单独落库是为了「从 ⑦ 提交续跑」时不必重跑验证：那一刻代码一个字节都没变，
+ *   重跑只是再花几分钟（真机 pms 的验证命令要跑 5 分钟），而结论不会有第二种可能。
+ *   落库的是**当轮真实跑出来的**，不是猜的 —— 拿不到就老实重跑，绝不拿「应该没问题」当结论。
  * @property {{ written: boolean, fields?: string[], at?: number, note?: string }} [writeBack] 回填工单表的结果。**只看这一项判断不了「交付没交付」**——它是某一次尝试的回执；整体交付状态看 `delivery`。
  * @property {{ commit?: DeliveryState, writeBack?: DeliveryState, notify?: DeliveryState }} [delivery] 交付维度：与 `phase` 正交。phase 答「走到哪一站」，delivery 答「该交出去的东西交齐了没有」（#08）。三项各自独立成败，`attempts` 记试了几次。
  * @property {import('../contracts/types.js').TimelineEntry[]} [timeline] 关键节点流程日志：每个节点一条，带完成时刻与成败。**不是**工单原文里那个「流程」列（那是 `flow`，字符串），别搞混。由 `appendTimeline` 追加，只有人工重置才会清空。
@@ -450,6 +464,87 @@ export class TicketStore {
   }
 
   /**
+   * 记下「上一轮倒在哪一站」。
+   *
+   * 为什么必须落库而不能只在渲染时倒推（见 `core/station.js`）：倒推要用到时间线，
+   * 而人工重开（`resetByHuman`）会把时间线接着往下写、启动恢复又可能截断，
+   * 更要紧的是**重开这个动作本身**需要一个不依赖任何渲染的判据 ——
+   * 「从第 7 站接着跑」这个决定必须在票上看得见，否则下一轮只能从头开始。
+   *
+   * @param {string} key 票据复合主键
+   * @param {string | undefined} station 主站 node id；`undefined` = 清掉（跑成了的时候）
+   * @returns {Promise<boolean>}
+   */
+  async setFailedStation (key, station) {
+    const row = this.getTicket(key)
+    if (!row) return false
+    const next = { ...row }
+    if (typeof station === 'string' && station.length > 0) next.failedStation = station
+    else delete next.failedStation
+    await this.repo.put(TABLES.tickets, key, next)
+    return true
+  }
+
+  /**
+   * 把这一轮的起始基线落库，供**续跑**时复用。
+   *
+   * 为什么基线要存：`collectChanges` 靠「基线 → 当前工作区」的 diff 分辨哪些改动是
+   * agent 干的。基线只活在执行器的内存里时，一旦这一轮被中断（超时/重载/取消），
+   * 下一轮只能重新拍一次 —— 而那时 agent 的改动**已经躺在工作区里**，
+   * 重新拍等于把它们全当成「人来之前就有的」，于是最后一张票跑完却是
+   * 「没有可提交的改动」。这是续跑功能的必要条件，不是优化项。
+   *
+   * 只留需要的三样：`stash create` 的 sha、当时的 HEAD、未跟踪文件的哈希表。
+   * 存成数组而不是 Map：存储走 JSON，Map 会被序列化成 `{}`。
+   *
+   * @param {string} key 票据复合主键
+   * @param {{ sha?: string, head?: string, untracked?: Map<string, string> | Array<[string, string]> } | undefined} baseline
+   * @returns {Promise<boolean>}
+   */
+  async setBaseline (key, baseline) {
+    const row = this.getTicket(key)
+    if (!row) return false
+    const next = { ...row }
+    const sha = typeof baseline?.sha === 'string' ? baseline.sha.trim() : ''
+    const head = typeof baseline?.head === 'string' ? baseline.head.trim() : ''
+    const raw = baseline?.untracked
+    const untracked = raw instanceof Map ? [...raw.entries()] : (Array.isArray(raw) ? raw : [])
+    if (sha.length === 0 && head.length === 0 && untracked.length === 0) {
+      delete next.baseline
+    } else {
+      next.baseline = { sha, head, untracked: untracked.filter((pair) => Array.isArray(pair) && typeof pair[0] === 'string') }
+    }
+    await this.repo.put(TABLES.tickets, key, next)
+    return true
+  }
+
+  /**
+   * 把这一轮的验证结论落库，供**从 ⑦ 提交续跑**时复用。
+   *
+   * 为什么要存：⑦ 提交倒下时代码早就改完、验证也跑过了，重新跑一遍验证
+   * 只是再等几分钟（真机 pms 的命令要 5 分钟），而它检查的东西一个字节都没变。
+   * 但「不重跑」不能变成「闭嘴不说」—— 结论必须能原样说出来，所以它得在票上。
+   *
+   * 存的是**当轮真实跑出来的**结论，不是推断。拿不到就老实重跑：
+   * 宁可多花几分钟，也不能拿「上次应该没问题」当这次的结果。
+   *
+   * @param {string} key 票据复合主键
+   * @param {{ outcome?: string, detail?: string } | undefined} verification
+   * @returns {Promise<boolean>}
+   */
+  async setVerification (key, verification) {
+    const row = this.getTicket(key)
+    if (!row) return false
+    const next = { ...row }
+    const outcome = typeof verification?.outcome === 'string' ? verification.outcome.trim() : ''
+    const detail = typeof verification?.detail === 'string' ? verification.detail : ''
+    if (outcome.length === 0) delete next.verification
+    else next.verification = { outcome, detail }
+    await this.repo.put(TABLES.tickets, key, next)
+    return true
+  }
+
+  /**
    * 记一项「交付」的结果（改动有没有落盘 / 表格有没有写回 / 人有没有收到通知）。
    *
    * 为什么要和 `phase` 分开：`phase` 答的是「走到哪一站了」，一票到了 `done` 之后
@@ -609,13 +704,31 @@ export class TicketStore {
    * `pendingEffects`；旧的那份如果留着，启动补偿会在新结果上再补发一次旧通知，
    * 说出跟当前状态对不上的话。
    *
+   * ## 从哪一站接着跑（2026-11-17）
+   *
+   * 重开不再一律「整票从头跑一遍」。失败在 ⑦「提交」的票，代码早就改好并验证过了，
+   * 再从 ⑤ 让 agent 重新探索一遍既慢又可能改成另一个样子 —— 用户的原话是
+   * 「不要重新跑 应该是修复只针对失败的那一步进行修复然后接着跑后续的 还在那个失败的会话中继续」。
+   *
+   * 所以重置时把「上一轮倒在哪一站」写进 `resumeFrom`，调度器读它交给执行器：
+   * 后段站（`testing` 及之后）连 agent 都不起，直接收集改动 → 验证 → 提交；
+   * 前段站仍然要 agent 动手，但会**续接原来那个会话**并告诉它上一轮死在哪。
+   *
+   * 认不出倒在哪一站（老数据、时间线被截断、人工指定 `from: 'begin'`）时
+   * 不写 `resumeFrom`，退回「从头跑」—— 猜错方向比慢更糟。
+   *
    * @param {string} key 票据复合主键
+   * @param {{ resumeFrom?: string | null }} [options] `resumeFrom` 省略 = 用票上记的失败站；
+   *   显式传 `null` = 强制从头跑（人知道自己在干什么时用）。
    * @returns {Promise<boolean>}
    */
-  async resetByHuman (key) {
+  async resetByHuman (key, options = {}) {
     const row = this.getTicket(key)
     if (!row) return false
     if (row.phase !== 'failed' && row.phase !== 'needs-info' && row.phase !== 'gone') return false
+    // `undefined` = 调用方没表态，按票上记的失败站走；`null` = 明确要求从头跑。
+    const requested = options.resumeFrom === undefined ? row.failedStation : options.resumeFrom
+    const resumeFrom = typeof requested === 'string' && requested.length > 0 ? requested : undefined
     const next = {
       ...row,
       phase: 'pending',
@@ -623,7 +736,10 @@ export class TicketStore {
       lastError: undefined,
       finishedAt: undefined,
       enqueuedAt: this.now(),
+      // 显式写 undefined 会删字段（见 setPhase 的说明），正好用来表达「这次从头跑」。
+      resumeFrom,
     }
+    if (resumeFrom === undefined) delete next.resumeFrom
     // undefined 会被 repo 原样写进去，这里显式删字段（和 setPhase 的 undefined=删 语义一致）。
     delete next.pendingEffects
     // 时间线**不清空**：上一轮走到哪儿、卡在哪儿，正是重开之后最想对照着看的东西。
@@ -635,7 +751,9 @@ export class TicketStore {
       label: '排队中',
       at: next.enqueuedAt,
       ok: true,
-      detail: `人工重置，重新入队（第 ${(row.attempt ?? 0) + 1} 次尝试作废，从头再跑一遍）`,
+      detail: resumeFrom === undefined
+        ? `人工重置，重新入队（第 ${(row.attempt ?? 0) + 1} 次尝试作废，从头再跑一遍）`
+        : `人工重置，重新入队（第 ${(row.attempt ?? 0) + 1} 次尝试作废），${describeResumeFrom(resumeFrom)}`,
     })
     next.timeline = timeline.length > TIMELINE_LIMIT ? timeline.slice(timeline.length - TIMELINE_LIMIT) : timeline
     await this.repo.put(TABLES.tickets, key, next)

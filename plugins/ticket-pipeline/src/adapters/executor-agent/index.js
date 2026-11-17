@@ -70,6 +70,7 @@ import {
 } from '../../contracts/git-status.js'
 import { agentFailureToPipelineError, watchAgentFailures } from './agent-failure.js'
 import { countExploration, describeExploration, EXPLORE_BUDGET } from './explore-budget.js'
+import { describeResumeFrom, resumePlanOf } from '../../core/station.js'
 
 /** 给 `agents.create` 的 sessionId 前缀。sessionId 里不能出现 `/`，所以下面全部替换掉。 */
 const SESSION_PREFIX = 'ticket'
@@ -636,6 +637,20 @@ export function createAgentExecutor (options = {}) {
       // —— 实测 `sh-row-82` 第二次重跑仍探了 57 次索，其中 5 个文件第一轮刚读过，
       // 而它这一轮总共才读 11 个。
       const previousSessionId = typeof ctx?.sessionId === 'string' ? ctx.sessionId.trim() : ''
+      // 从哪一站接着跑（见 core/station.js）。空 = 从头跑一遍，老行为。
+      //
+      // 三种值对应三种跑法，差别很大，所以判据只能有一个来源：
+      // - ⑤ editing / ⑥ testing：还是要 agent 动手（验证失败通常是测试报错，得改代码），
+      //   但**续接原来那个会话**，任务书里明说「上一轮停在哪、别重新探索」；
+      // - ⑦ mr-opening：代码改完、验证也过了，倒的是打包这一步 —— **不起 agent**，
+      //   直接收集改动 → 提交。重跑验证纯属浪费（真机 pms 的验证命令要跑几分钟，
+      //   而它检查的东西这一刻根本没变）；
+      // - ⑧⑨ 走不到这里（见 canResumeFrom）。
+      const resumeFrom = typeof ctx?.resumeFrom === 'string' && ctx.resumeFrom.length > 0
+        ? ctx.resumeFrom
+        : ''
+      const resumePlan = resumePlanOf(resumeFrom)
+      const resumeReason = typeof ctx?.resumeReason === 'string' ? ctx.resumeReason.trim() : ''
       const messages = buildMessages(ticket, ctx, options.prompts?.untrustedNotice)
 
       /** setup 回调里拿到的 agentCtx（收会话要用它的 `sessions` 服务）。 */
@@ -676,11 +691,24 @@ export function createAgentExecutor (options = {}) {
       // 分两步而不是「有旧 id 就只走 resume」：resume 是**外部状态**在说话
       // （持久化后端可能没挂、会话可能被人删了、header 可能坏掉），失败原因
       // 一律不该让这张票跑不了。续接失败就当成「没有上一轮」，照常新建。
+      //
+      // 续跑且从 ⑦ 提交接着跑时**根本不起 agent**：代码改完、验证也过了，
+      // 倒的只是打包这一步。起一个 agent 再让它「什么都别做」既浪费
+      // 又可能让它顺手改点别的（那才是真正的风险）。
+      const needsAgent = resumePlan ? resumePlan.agent : true
       let created
       /** 这一轮实际用的会话 id 与它的来源。 */
-      let sessionId = ''
+      let sessionId = typeof ctx?.sessionId === 'string' ? ctx.sessionId.trim() : ''
       let resumed = false
-      if (previousSessionId.length > 0 && typeof agents.resume === 'function') {
+      if (!needsAgent) {
+        // 会话 id 沿用票上那个：结果里要带回去（通知与面板都靠它指出「哪一轮」），
+        // 而且下一轮万一又要 agent，还得接着用同一个。
+        ctx.log?.('executor-agent：这一轮从 ⑦ 提交接着跑，不起 agent（代码与验证上一轮都做完了）')
+        await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+          `从「${describeResumeFrom(resumeFrom)}」接着跑，这一轮不新建会话`,
+          sessionId.length > 0 ? `沿用会话 ${sessionId}` : '上一轮没有留下会话 id',
+        ].filter(Boolean).join('，'))
+      } else if (previousSessionId.length > 0 && typeof agents.resume === 'function') {
         try {
           created = await agents.resume({
             resumeSessionId: previousSessionId,
@@ -700,7 +728,7 @@ export function createAgentExecutor (options = {}) {
           created = undefined
         }
       }
-      if (!created) {
+      if (!created && needsAgent) {
         // 新建才需要算 id 与 cwd：续接的 cwd 来自持久化会话的 header，不由这里定。
         sessionId = buildSessionId(ticket, ctx)
         try {
@@ -733,7 +761,7 @@ export function createAgentExecutor (options = {}) {
         }
       }
       const agent = created?.agent
-      if (!agent || typeof agent.followup !== 'function') {
+      if (needsAgent && (!agent || typeof agent.followup !== 'function')) {
         await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
           `会话没起来：${resumed ? 'agents.resume' : 'agents.create'} 没有返回可用的 agent（缺 followup）`,
           `会话 ${sessionId}`,
@@ -749,20 +777,22 @@ export function createAgentExecutor (options = {}) {
       // 外面（调度器）看不见这些，只有这里知道 —— 所以「创建会话（分支+模型）」
       // 这一站由执行器自己记。续接与新建要分开说：时间线上写「续接」人就知道
       // 这一轮是接着上一轮的记忆跑的，不会纳闷「为什么它一上来就直奔某个文件」。
-      await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
-        `会话 ${sessionId}${resumed ? '（续接上一轮）' : ''}`,
-        `模型 ${describeModel(agentOptions)}`,
-        `分支 ${flowBranch(ctx)}`,
-        `工作目录 ${sessionCwd}`,
-        flowWorkspaceLabel(ctx),
-      ].filter(Boolean).join('，'))
+      if (needsAgent) {
+        await reportFlow(ctx, log, 'session', FLOW_LABEL.session, [
+          `会话 ${sessionId}${resumed ? '（续接上一轮）' : ''}`,
+          `模型 ${describeModel(agentOptions)}`,
+          `分支 ${flowBranch(ctx)}`,
+          `工作目录 ${sessionCwd}`,
+          flowWorkspaceLabel(ctx),
+        ].filter(Boolean).join('，'))
+      }
 
       // 会话 id 在 `agents.create` 之前就算出来了，但只有「真的建成了」才值得交出去。
       // 交给调度器的理由：票后来抛异常 / 超时 / 被取消时，**执行器返回不了结果**，
       // 调度器手上就只剩一条没有 sessionId 的 failed 票 —— 人看着「失败了」却找不到
       // 那一轮会话，没法点进去看它到底怎么想的（评审里 failed 票「不可行动」的主因）。
       // 这个回调是可选的，写失败不影响跑票。
-      if (typeof ctx.onSessionId === 'function') {
+      if (needsAgent && typeof ctx.onSessionId === 'function') {
         try {
           await ctx.onSessionId(sessionId)
         } catch (error) {
@@ -782,7 +812,8 @@ export function createAgentExecutor (options = {}) {
       // 盯着 agent 到底为什么失败。模型调用失败（限流、配额用尽、上游 5xx）
       // 和「agent 真干了但觉得不用改」从外面看一模一样：都是闲下来了、一个字没改。
       // 只有把失败原因挖出来，才能把前者判成可重试、后者判成真结论。
-      const failureWatcher = watchAgentFailures(agent)
+      // 不起 agent 的续跑（⑦ 提交）没有可盯的东西，用一个恒空的替身。
+      const failureWatcher = needsAgent ? watchAgentFailures(agent) : { detect: () => null }
 
       try {
         // ── 2. 拍基线：只提交 agent 改过的，不动人自己没收起来的改动 ──
@@ -794,10 +825,37 @@ export function createAgentExecutor (options = {}) {
         //
         // 基线拍不到不影响跑票 —— 退化成老行为（按 baseCommit 收集全部改动），
         // 最多是把人原有的改动一起提交，那也比整票失败强。
-        const baseline = await createBaseline(options, worktreePath, signal).catch((error) => {
+        //
+        // 续跑时**复用上一轮存下来的基线**，绝不重新拍（见下面 `reusedBaseline`）：
+        // 上一轮 agent 的改动这时已经躺在工作区里，此刻拍基线等于把它们
+        // 当成「人来之前就有的」全部过滤掉，最后一轮跑完却是「没有可提交的改动」。
+        const reusedBaseline = resumePlan && ctx?.baseline
+          ? {
+              sha: typeof ctx.baseline.sha === 'string' ? ctx.baseline.sha : undefined,
+              head: typeof ctx.baseline.head === 'string' ? ctx.baseline.head : undefined,
+              untracked: new Map(Array.isArray(ctx.baseline.untracked) ? ctx.baseline.untracked : []),
+            }
+          : undefined
+        const baseline = reusedBaseline ?? await createBaseline(options, worktreePath, signal).catch((error) => {
           ctx.log?.(`executor-agent：拍基线失败，退化为按检出点收集改动（人原本未提交的改动可能被一起提交）：${error?.message ?? String(error)}`)
           return undefined
         })
+        if (reusedBaseline) {
+          ctx.log?.('executor-agent：续跑，复用上一轮拍下的基线（不重新拍，否则 agent 已经改好的内容会被当成人的改动过滤掉）')
+        } else if (baseline && typeof ctx.onBaseline === 'function') {
+          // 基线拍好就交给调度器存下来：只活在内存里的话，中途崩掉/超时/重载之后
+          // 就再也拿不到，续跑就只能重新拍 —— 而那时工作区已经被改过了。
+          // 写失败不影响这一轮跑票（最多少一次可续跑的机会），所以只记日志。
+          try {
+            await ctx.onBaseline({
+              sha: baseline.sha,
+              head: baseline.head,
+              untracked: baseline.untracked,
+            })
+          } catch (error) {
+            ctx.log?.(`executor-agent：把基线交给调度器失败（不影响本轮，但这一轮就没法续跑）：${error?.message ?? String(error)}`)
+          }
+        }
 
         // ── 2b. 拍「碰不得的元数据」快照 ──────────────────────
         //
@@ -817,16 +875,30 @@ export function createAgentExecutor (options = {}) {
         }
 
         // ── 3. 推任务：必须 followup（inject 不唤醒 agent）──
-        agent.followup(createUserMessage({ content: messages, source: { kind: 'user' } }))
-        await ctx.onPhase('editing', 'agent 已接到任务书，开始改代码')
-
-        // ── 4. 等 agent 干完 ───────────────────────────────
         //
-        // 这里除了「等结束」还要盯一件事：它到底有没有动手。
-        // 2026-11-11 的事故是 39 分钟读了 23 个文件、写了 0 个文件 —— 按
-        // `session.seq` 看一直在推进，按文件看一步没走。所以进步信号只能是
-        // 工作区的真实状态，不能用 seq。
-        await waitForAgentIdle(agent, signal, cancelAgent, {
+        // 续跑时不重复推整份任务书：agent 的任务在上一轮的会话里已经交代过了。
+        // 重推一份「从头做这张票」的说明书，等于让它把已经做完的事再做一遍
+        // —— 而人想要的恰恰相反（用户原话：「还在那个失败的会话中继续」）。
+        // 这里只补一句「上一轮停在哪、接着往下做」，而且只在需要 agent 时发
+        // （⑦ 提交那条路根本不起 agent）。
+        if (needsAgent) {
+          agent.followup(createUserMessage({
+            content: resumePlan
+              ? [{ type: 'text', text: createResumeMessage(resumeFrom, resumeReason) }]
+              : messages,
+            source: { kind: 'user' },
+          }))
+          await ctx.onPhase('editing', resumePlan
+            ? `续跑：从「${describeResumeFrom(resumeFrom)}」接着做${resumeReason.length > 0 ? `（上一轮：${resumeReason}）` : ''}`
+            : 'agent 已接到任务书，开始改代码')
+
+          // ── 4. 等 agent 干完 ───────────────────────────────
+          //
+          // 这里除了「等结束」还要盯一件事：它到底有没有动手。
+          // 2026-11-11 的事故是 39 分钟读了 23 个文件、写了 0 个文件 —— 按
+          // `session.seq` 看一直在推进，按文件看一步没走。所以进步信号只能是
+          // 工作区的真实状态，不能用 seq。
+          await waitForAgentIdle(agent, signal, cancelAgent, {
           // 用 porcelain 状态当「有没有东西变了」的指纹：
           // 它同时覆盖「改了已有文件」「新增了文件」「删了文件」三种，
           // 而且不碰索引、不产生任何副作用。
@@ -861,7 +933,8 @@ export function createAgentExecutor (options = {}) {
             log(`executor-agent：${detail}，超过探索预算 ${budget} 次，催它开始动手`)
             await ctx.onPhase('editing', `${detail}，已超过探索预算 ${budget} 次，催它先动手`)
           },
-        })
+          })
+        }
 
         // ── 5. 收集改动 ────────────────────────────────────
         // 不只是「改了哪些文件」，还要知道每个文件是新增 / 修改 / 删除：
@@ -976,8 +1049,32 @@ export function createAgentExecutor (options = {}) {
         }
 
         // ── 6. 验证 ────────────────────────────────────────
-        await ctx.onPhase('testing', '跑项目配置里的验证命令')
-        const verification = await runVerification(options, verify, worktreePath, signal)
+        //
+        // 续跑到 ⑦ 提交时**不重跑验证**：上一轮已经跑过并通过（否则走不到 ⑦），
+        // 而这一刻代码一个字节都没变，重跑只是再花几分钟（真机 pms 的验证命令
+        // 要跑 5 分钟，而它检查的东西根本没变）。上一轮的结论由调度器存下来传回来
+        // （`ctx.verification`）—— 拿不到就老实重跑，不拿「应该没问题」当结论。
+        let verification
+        if (resumePlan && !resumePlan.verify && ctx?.verification) {
+          verification = {
+            outcome: String(ctx.verification.outcome ?? 'not-run'),
+            detail: `沿用上一轮的验证结论（${String(ctx.verification.detail ?? '未记录')}）；这一轮没有再跑一遍`,
+          }
+          ctx.log?.('executor-agent：续跑，沿用上一轮的验证结论（代码没变，不重跑验证）')
+          await ctx.onPhase('testing', `沿用上一轮的验证结论：${verification.detail}`)
+        } else {
+          await ctx.onPhase('testing', '跑项目配置里的验证命令')
+          verification = await runVerification(options, verify, worktreePath, signal)
+          // 验证结论要落库：⑦ 提交失败之后续跑，就靠这一份「上一轮验证过了」
+          // 才能既不重跑、又不撒谎。写失败不影响这一轮（最多少一次可复用）。
+          if (typeof ctx.onVerification === 'function') {
+            try {
+              await ctx.onVerification({ outcome: verification.outcome, detail: verification.detail })
+            } catch (error) {
+              ctx.log?.(`executor-agent：把验证结论交给调度器失败（不影响本轮）：${error?.message ?? String(error)}`)
+            }
+          }
+        }
 
         // ── 7. 本地提交（+ 可选开 draft MR）───────────────
         // 需求：处理完「向本地仓库（非远程）提交 PR」。本机 git push 物理上不可能
@@ -1184,6 +1281,35 @@ export function buildMessages (ticket, ctx, untrustedNotice) {
     : [...source]
 
   return messages
+}
+
+/**
+ * 续跑时推给 agent 的那一句话。
+ *
+ * 为什么不是「重新推一遍任务书」：`followup` 是追加到**同一个会话**里的，
+ * 模型看得到上一轮它自己做过什么。此时再给它一份「从头做这张票」的说明书，
+ * 它多半会重新读一遍代码 —— 而用户要的恰恰是「别重复，接着往下做」。
+ *
+ * 所以这段只讲三件事：上一轮死在哪、为什么死、这一轮该干什么。
+ * 最后一句「不要从零重新探索」是刻意的：模型对「重新开始」有很强的先验，
+ * 不说这一句它就会把已经摸清的东西再摸一遍（2026-11-13 实测第二轮仍探了 57 次）。
+ *
+ * @param {string} resumeFrom 主站 node id
+ * @param {string} [reason] 上一轮的失败原因（一句人话）
+ * @returns {string}
+ */
+export function createResumeMessage (resumeFrom, reason) {
+  const station = describeResumeFrom(resumeFrom)
+  const why = typeof reason === 'string' && reason.trim().length > 0 ? reason.trim() : ''
+  const lines = [
+    `上一轮这张票停在「${station}」这一步，没有跑完${why.length > 0 ? `，原因是：${why}` : ''}。`,
+    '',
+    '这一轮**接着往下做**，不要从头再来：',
+    '- 你上一轮读过的代码、已经改好的文件都还在，先看工作区的现状（`git diff`）确认进度，别重新探索一遍；',
+    '- 有需要就继续改，改完这一步就够，后面几步流水线会自己接着走；',
+    '- 如果你判断上一轮的改动其实已经做完，直接说明「这一步不需要再改」也可以。',
+  ]
+  return lines.join('\n')
 }
 
 /**
