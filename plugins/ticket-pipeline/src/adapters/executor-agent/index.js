@@ -57,6 +57,8 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
+import { unlink, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 
 import { PipelineError, toPipelineError } from '../../contracts/errors.js'
@@ -2722,7 +2724,11 @@ export async function commitLocally (options, input) {
   }))]
 
   if (addTargets.length > 0) await addPathsForCommit(runGit, addTargets)
-  await runGit(['commit', '-m', buildLocalCommitMessage(ticket, { blocked, verification }), '--', ...commitSpecs])
+  // 提交说明走临时文件，**不进命令行**（2026-11-18 修复，见 withCommitMessageFile 的注释）。
+  await withCommitMessageFile(
+    buildLocalCommitMessage(ticket, { blocked, verification }),
+    (messagePath) => runGit(['commit', '-F', messagePath, '--', ...commitSpecs])
+  )
   const head = await runGit(['rev-parse', 'HEAD'])
   const sha = String(head?.stdout ?? '').trim()
   if (sha.length === 0) {
@@ -2778,17 +2784,58 @@ async function addPathsForCommit (runGit, paths) {
 }
 
 /**
+ * 把一段文本临时落到磁盘上，交给 `fn(路径)` 用完就删。
+ *
+ * 为什么需要它（2026-11-18，四张票全倒在 ⑦ 提交站之后的复盘）：
+ *
+ * `makeGitRunner` 会把 argv 拼成**一条命令串**交给宿主 shell，也就是文本必须
+ * 活着穿过 shell 的词法分析。而 Windows PowerShell 5.1 与 bash 对引号的规则
+ * **无法同时满足**（`.scratch/_probe-quote-dual2.mjs` 三种转义法各跑一遍）：
+ *
+ * | 转义法 | PowerShell 5.1 | bash |
+ * | --- | --- | --- |
+ * | `'` → `'\''`（bash 经典，当时实现） | 3/3 破 | 全过 |
+ * | `'` → `''`（PowerShell 双单引号） | 全过 | 3/3 破（`it's` 变成 `its`） |
+ * | `'"'"'`（双壳通用） | 3/3 破 | 全过 |
+ *
+ * 于是「清洗双引号」只是把一种坏法换成另一种：`sanitizeCommitText` 把 `"` 换成
+ * `'` 之后，只要工单描述里本来有撇号（`don't`），PowerShell 就报
+ * `The string is missing the terminator`。治本的办法是**不让文本进命令行**：
+ * 写进临时文件，`git commit -F <文件>` 只让 shell 看见一个普通路径。
+ *
+ * 落 `os.tmpdir()` 而不是工作区：工作区里的新文件会被 `collectChanges` 当成
+ * agent 的改动，凭空多出一个待提交文件。
+ *
+ * @template T
+ * @param {string} text
+ * @param {(path: string) => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withCommitMessageFile (text, fn) {
+  const dir = tmpdir()
+  const name = `dsh-ticket-commit-${randomUUID()}.txt`
+  const path = join(dir, name)
+  try {
+    await writeFile(path, text, 'utf8')
+    return await fn(path)
+  } finally {
+    await unlink(path).catch(() => {})
+  }
+}
+
+/**
  * 本地提交的提交说明。
  *
  * 比 `buildCommitMessage` 多带验证结论与未提交文件：提交说明是人在 `git log`
  * 里唯一能看到的上下文，把「测试跑没跑通」「哪些文件被刻意漏掉」写进去，
  * 才能不看插件也能判断这次提交能不能用。
  *
- * **这里必须清洗双引号**（`sanitizeCommitText`）：本地提交是唯一会把这段文本
- * 交给 shell 的路径 —— `commitLocally` 用 `git commit -m <这段>`，而
- * `makeGitRunner` 会把 argv 拼成一条命令串。2026-11-17 `pms|sh-row-93`
- * 就是因为序号里带着公式的双引号，在 PowerShell 5.1 下被拆成 5 段 pathspec，
- * 提交失败。（远端 MR 那条走 GitLab JSON API，不过 shell，所以不清洗。）
+ * **这里不再清洗引号**：以前用 `git commit -m <这段>`，文本要穿过 shell，
+ * 双引号在 PowerShell 5.1 下会把命令拆成 5 段 pathspec（2026-11-17
+ * `pms|sh-row-93`）。当时用 `sanitizeCommitText` 把 `"` 换成 `'` 绕过，结果
+ * 描述里本来有撇号时又崩（`The string is missing the terminator`）。
+ * 现在改走 `withCommitMessageFile` + `git commit -F <文件>`，文本不过 shell，
+ * 引号原样保留才对。（远端 MR 那条走 GitLab JSON API，本来就不清洗。）
  *
  * @param {any} ticket
  * @param {{ blocked?: string[], verification?: { outcome: string, detail: string } }} [extra]
@@ -2806,7 +2853,7 @@ export function buildLocalCommitMessage (ticket, extra = {}) {
   if (blocked.length > 0) {
     lines.push(`未提交（疑似含真实凭据，按约定留在工作区）：${blocked.join('、')}`)
   }
-  return sanitizeCommitText(lines.join('\n'))
+  return lines.join('\n')
 }
 
 /**
@@ -3064,39 +3111,6 @@ export function parseGitRemote (remote) {
 /** @param {string} value */
 function stripGitSuffix (value) {
   return String(value ?? '').replace(/\.git$/, '').replace(/^\/+/, '').replace(/\/+$/, '')
-}
-
-/**
- * 提交说明里的「安全字符」清洗。
- *
- * 真实事故（pms|sh-row-93，2026-11-17）：提交说明被拼成**一条 shell 命令**
- * （`makeGitRunner` 把 argv 逐段转义后 join 成一个字符串交给宿主 shell），
- * 而说明里带了双引号 —— 来源是电子表格「序号」列被读成了公式原文
- * `IF(COUNTA($B93:$L93)=0,"",ROW()-1)`。在 Windows PowerShell 5.1 下，
- * **带双引号的参数传给原生 exe 会被重新拆开**，于是 git 收到的是：
- *
- * ```
- * error: pathspec '集成minio组件存放附件图片' did not match any file(s) known to git
- * error: pathspec 'sh-row-93' did not match any file(s) known to git
- * ```
- *
- * 提交直接失败，票判 failed —— 而代码其实改完了、验证也过了。
- *
- * 修法分两层（都要有）：
- * 1. **根上别再产生双引号**：序号那类外来文本先过一道 `looksLikeFormula` 判断
- *    （见 `buildMrTitle`），别把公式原文写进标题；
- * 2. **这里兜底**：提交说明是我们自己的文本，把双引号换成单引号 —— 语义不变
- *    （都是一句引用/占位），但跨 shell 安全。换行、中文、`$`、反引号都安全：
- *    它们落在单引号里就是字面量（这也是转义策略选单引号的原因）。
- *
- * 为什么不在 `makeGitRunner` 里做：那里会顺带把**文件路径**里的双引号也改掉，
- * 而改路径 = 提交错文件。文本与路径必须分开处理。
- *
- * @param {string} text
- * @returns {string}
- */
-export function sanitizeCommitText (text) {
-  return String(text ?? '').replace(/"/g, "'")
 }
 
 /**

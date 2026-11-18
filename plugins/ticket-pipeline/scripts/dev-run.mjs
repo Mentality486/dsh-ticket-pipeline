@@ -45,7 +45,7 @@ import { runWpsChecks } from './wps-checks.mjs'
 import { runWorkspaceChecks } from './workspace-checks.mjs'
 import { apply, detectBaseBranch, makeCommandRunner, makeGitRunner, fullAccessSandboxPolicy, inspectCheckout, describeDirtyCheckout, makeCredentialsDescriber } from '../src/index.js'
 import { isIsolatedWorktreePath } from '../src/core/worktree-path.js'
-import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, createCombinedNudgeMessage, buildSessionTitle, setupAgent, buildLocalCommitMessage, buildMrTitle, looksLikeFormula, sanitizeCommitText } from '../src/adapters/executor-agent/index.js'
+import { waitForAgentIdle, createNudgeMessage, createExploreNudgeMessage, createCombinedNudgeMessage, buildSessionTitle, setupAgent, buildLocalCommitMessage, buildMrTitle, looksLikeFormula } from '../src/adapters/executor-agent/index.js'
 import { countExploration, describeExploration, EXPLORATION_TOOLS, EXPLORE_BUDGET } from '../src/adapters/executor-agent/explore-budget.js'
 import { COMMIT_SUMMARY_FILE_LIMIT, describeCommit, renderCommitSummary } from '../src/core/commit-summary.js'
 import { renderTicketPrompt } from '../src/core/prompt.js'
@@ -7966,34 +7966,27 @@ function makeFakeCtx ({ domain, registered }) {
     assert.equal(looksLikeFormula(null), false)
   })
 
-  await check('提交说明里的双引号要换掉（PowerShell 会把它拆成多条 pathspec）', async () => {
-    // 2026-11-17 实测：Windows PowerShell 5.1 下 `git commit -m 'a ""b"" c'`
-    // 会被拆成 5 段，git 报 `error: pathspec 'c' did not match any file(s)`，
-    // 提交失败 ⇒ 票判 failed，而代码其实改完了、验证也过了。
-    // 换单引号语义不变（都是一句引用/占位），但跨 shell 安全。
-    assert.equal(sanitizeCommitText('a "b" c'), "a 'b' c")
-    assert.equal(sanitizeCommitText('没有引号'), '没有引号', '没引号时不许改动任何字符')
-    // 其它危险字符必须**原样保留**：它们在单引号里是字面量，改了就篡改了提交说明。
-    for (const keep of ['$HOME', '`ls`', 'a -- b', '中文\n换行', '100%']) {
-      assert.equal(sanitizeCommitText(keep), keep, `不该动 ${keep}`)
-    }
-  })
-
-  await check('本地提交说明带上双引号也不会让它带着引号出去', async () => {
-    // 端到端：喂给 shell 的那一份，一个双引号都不许剩。
+  await check('提交说明走临时文件，不走命令行（-m 会被 PowerShell 拆成多条 pathspec）', async () => {
+    // 2026-11-18 复盘：以前用 `git commit -m <说明>`，说明必须活着穿过 shell 的
+    // 词法分析。而 PowerShell 5.1 与 bash 的引号规则**无法同时满足**：
+    // 三种转义法各跑一遍，总有一个 shell 全破（见 withCommitMessageFile 的注释）。
+    // 只要工单描述里有双引号或撇号，提交就失败 —— 四张票全倒在 ⑦ 站。
     //
-    // 注意**双引号的来源不止序号**：工单的问题描述是人写的，人会在里面写
-    // 引号（「点『确定』后没反应」、英文 `"Cancel"` 按钮…）。所以序号那道
-    // `looksLikeFormula` 挡不住这一类 —— 必须靠 `sanitizeCommitText` 兜底。
-    // 这条用例故意让**描述**带双引号，专门锁第二层。
+    // 现在的做法：说明写进 `os.tmpdir()` 的临时文件，`git commit -F <文件>`。
+    // shell 只看得见一个普通路径，引号一个字节都不经过它。所以**不清洗引号**才对。
     const text = buildLocalCommitMessage(
       { projectId: 'pms', recordId: 'sh-row-93', seq: '79', description: '点 "确定" 后没反应', revisionCount: 1 },
       { verification: { outcome: 'passed', detail: 'test 全部退出码 0' } },
     )
-    assert.equal(text.includes('"'), false, `提交说明里还有双引号，PowerShell 会把命令拆散：${text}`)
-    assert.ok(text.includes("点 '确定' 后没反应"), `描述还得在，引号换成单引号即可：${text}`)
+    assert.ok(text.includes('点 "确定" 后没反应'), `引号要原样保留（说明不过 shell，没有理由清洗）：${text}`)
     assert.ok(text.includes('工单标识: sh-row-93'), '溯源信息还得在')
     assert.ok(text.includes('验证：通过'), '验证结论还得在')
+    // 撇号同理：以前把 " 换成 ' 之后，描述里本来有撇号反而会崩
+    // （`The string is missing the terminator`）。
+    const withApostrophe = buildLocalCommitMessage(
+      { projectId: 'pms', recordId: 'sh-row-90', seq: '90', description: "点不动 don't panic", revisionCount: 1 },
+    )
+    assert.ok(withApostrophe.includes("don't panic"), `撇号也要原样保留：${withApostrophe}`)
   })
 
   await check('MR 标题也不许出现公式原文', async () => {

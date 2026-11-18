@@ -15,6 +15,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync, existsSync } from 'node:fs'
 
 import { createGitlabClient, ensureDraftTitle } from '../src/adapters/gitlab-client/index.js'
 import {
@@ -449,8 +450,23 @@ function makeRunEnv (options = {}) {
     if (argv[0] === 'add') return { code: 0, stdout: '', stderr: '' }
     // 本地提交：记下 commit 的 argv（paths 在 `--` 之后），供断言核对「只提交非敏感文件」。
     if (argv[0] === 'commit') {
+      // 本地提交改成 `commit -F <临时文件> -- <paths>`（2026-11-18）：提交说明
+      // 不再进命令行，所以这里要**真去读那个文件**才能拿到说明。读不到就记成
+      // 空串，让「说明必须有内容」的断言自己红出来，别静默吞掉。
       const sep = argv.indexOf('--')
-      commits.push({ message: argv[argv.indexOf('-m') + 1], paths: sep >= 0 ? argv.slice(sep + 1) : [] })
+      const msgIndex = argv.indexOf('-F')
+      let message = ''
+      if (msgIndex >= 0) {
+        try {
+          message = readFileSync(String(argv[msgIndex + 1]), 'utf8')
+        } catch {
+          message = ''
+        }
+      }
+      // 不在假 git 里断言「不许出现 -m」：那会让**每一条**走到提交的用例都红，
+      // 分不清是「这条路坏了」还是「用例本身写错了」。这里只如实记录，断言交给
+      // 专门的那条用例（`提交说明走 -F 临时文件`）。
+      commits.push({ message, messagePath: msgIndex >= 0 ? String(argv[msgIndex + 1]) : '', paths: sep >= 0 ? argv.slice(sep + 1) : [] })
       return { code: options.commitFails ? 1 : 0, stdout: '', stderr: options.commitFails ? 'nothing to commit' : '' }
     }
     if (argv[0] === 'rev-parse' && argv[1] === 'HEAD') {
@@ -1200,6 +1216,32 @@ export async function runGitlabChecks (check) {
     assert.deepEqual(addCall, ['add', '--', 'src/login.js'], '暂存也不能碰到敏感文件')
     assert.ok(/application\.yml/.test(env.commits[0].message), '提交说明要写清哪些文件被刻意留下')
     assert.ok(/未提交/.test(env.commits[0].message))
+  })
+
+  await check('执行器：提交说明走 -F 临时文件，双引号原样落进 git（四张票全倒在 ⑦ 站的根因）', async () => {
+    // 2026-11-18 真机：四张票全倒在 ⑦ 提交站，错误是
+    // `error: pathspec '集成minio…' did not match any file(s)` —— 提交说明里的
+    // 双引号（来自公式序号或人写的描述）在 PowerShell 5.1 下把命令拆成了多段。
+    //
+    // 当时的「修复」是 `sanitizeCommitText` 把 `"` 换成 `'`，结果只把故障从
+    // 「双引号」换成「撇号」（`The string is missing the terminator`）。
+    // 真正的原因是**文本不该进命令行**：两种 shell 的引号规则无法同时满足。
+    //
+    // 现在说明写进临时文件、`git commit -F <文件>`。这条用例锁三件事：
+    // ① argv 里没有 `-m`（说了不再走命令行就别留后门）；② `-F` 指向的文件里
+    // 就是我们想提交的那段文本，一个字节都不差；③ 收尾后临时文件已被删掉。
+    const env = makeRunEnv()
+    // `TICKET` 是 Object.freeze 的（防止用例互相污染），所以这里派生一份带引号的。
+    const ticket = { ...TICKET, description: '点 "确定" 后没反应，don\'t panic' }
+    const result = await env.executor.run(ticket, env.target, env.ctx)
+    assert.equal(result.phase, 'done')
+    assert.equal(env.commits.length, 1)
+    const [commit] = env.commits
+    assert.ok(commit.messagePath.length > 0, '必须用 -F <临时文件> 交说明')
+    assert.ok(commit.message.includes('点 "确定" 后没反应'), `双引号要原样保留：${commit.message}`)
+    assert.ok(commit.message.includes("don't panic"), `撇号也要原样保留：${commit.message}`)
+    assert.ok(commit.message.includes('工单标识:'), '溯源信息还得在')
+    assert.equal(existsSync(commit.messagePath), false, '临时文件用完必须删掉，别在 tmpdir 里堆垃圾')
   })
 
   await check('执行器：没打开 repo.gitlab.enabled 时只做本地提交，不碰 GITLAB_TOKEN', async () => {
