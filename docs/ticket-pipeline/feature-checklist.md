@@ -38,6 +38,13 @@
 > PowerShell 重新拆开、电子表格的「序号」列是公式被当成序号读了。见 §1.54。
 > `dev-run` **626/626**、`client-smoke` **282** 条（其中 9 条来自同一工作区的另一路改动 ——
 > 检出级互斥 / 同项目票史 / 归属修正，见 §1.55）。
+> 次日（11-18）：用户贴回四张失败票的面板截图，问「为什么在提交时容易错」——
+> 四张**全部倒在 ⑦ 提交站**，而它们改代码、跑验证都是 ✓。查出来是两类，第二类是真 bug：
+> 提交说明经 `git commit -m <说明>` 进命令行，说明里的双引号（公式序号、或人写的描述）
+> 在 PowerShell 5.1 下把命令拆成了多段 pathspec。上一轮用「把 `"` 换成 `'`」绕过，
+> 只是把双引号故障换成了撇号故障 —— 两种 shell 的引号规则**无法同时满足**（三种转义法实测矩阵）。
+> 治本是让文本不过 shell：写进 `os.tmpdir()` 临时文件，`git commit -F <文件>`。见 §1.57。
+> `dev-run` **626/626**、`gitlab-checks` **104** 条。
 > 同日更早：**新增项目时两格「列名覆盖」被写成 `"[object Object]"`，整笔保存被拒** ——
 > `buildProjectValue()` 的通用分支是 `String(normalized)`，而 `projectRawValue()` 对 `kind === 'columns'`
 > 已经解析成对象了。只有「新增项目」这条整对象通道会踩（已有项目走单字段通道），所以两格空着也报。
@@ -3765,19 +3772,108 @@ else if (node === blamedNode) state = 'failed'
 `pipeline_reset` 六条分支 + `pipeline_status` 明细），
 `gitlab-checks` 96 → **103**（续跑 7 条）。
 
+`gitlab-checks` 103 → **104**（§1.57 的端到端提交：`-F` 临时文件 + 双引号/撇号原样）。
+
 两条回归验证都只红对应用例：把 `failedStation` 那两行去掉 → 红「失败站要落库」；
 把 `pipeline_reset` 的缺省值改回 `null` → 红「缺省从失败那一站续跑」。
 
+### 1.57 提交说明不能走命令行：两种 shell 的引号规则无法同时满足（2026-11-18）
+
+#### 现场
+
+用户发来面板截图：四张票 `sh-row-82` / `sh-row-86` / `sh-row-93` / `sh-row-94`
+**全部倒在 ⑦ 提交站**，四张的「改代码」「验证」都是 ✓。用户问：
+
+> 检查一下为什么在提交时 容易错吴
+
+读存储里四条 `lastError`，分成两类：
+
+| 票 | 错误形态 | 根因 |
+| --- | --- | --- |
+| `sh-row-82` | `git add -- .idea/jarRepositories.xml` → `The following paths are ignored by one of your .gitignore files: .idea` | 已在 2026-11-13 的 `addPathsForCommit` 修掉（先 `ls-files` 问在不在库、在库的走 `add --force`） |
+| `sh-row-86/93/94` | `git commit -m <说明>` → `error: pathspec '集成minio组件存放附件图片' did not match any file(s)` | **提交说明被按空格拆成了多段 pathspec** |
+
+第二类的共同点：说明里有**双引号**。来源是电子表格「序号」列被读成了公式原文
+`IF(COUNTA($B93:$L93)=0,"",ROW()-1)`（已在 2026-11-17 用 `UnformattedValue` + `looksLikeFormula` 修掉），
+但描述本身也是人写的，随时可能带引号（「点『确定』后没反应」、英文 `"Cancel"` 按钮）。
+
+#### 根因
+
+`src/index.js:434-493` 的 `makeGitRunner` 把 argv 拼成**一条命令串**交给宿主 shell：
+
+```js
+const quoted = ['git', ...cwdArgs, '-c', 'core.hooksPath=/dev/null', ...argv]
+  .map(a => /^[A-Za-z0-9@%+=:,./_-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\''`)}'`)
+  .join(' ')
+```
+
+用的是 **bash 经典单引号转义**。问题是这个插件的宿主 shell 可能是 Windows PowerShell 5.1，
+而**两种 shell 的引号规则无法同时满足** ——`.scratch/_probe-quote-dual2.mjs` 三种转义法各跑一遍：
+
+| 转义法 | PowerShell 5.1 | bash |
+| --- | --- | --- |
+| `'` → `'\''`（bash 经典，当时实现） | 3/3 破（`The string is missing the terminator: '.`） | 全过 |
+| `'` → `''`（PowerShell 双单引号） | 全过 | 3/3 破（`it's` 变成 `its`） |
+| `'"'"'`（双壳通用） | 3/3 破 | 全过 |
+
+**上一轮的修复没治本**：`sanitizeCommitText` 把 `"` 换成 `'`，只是把「双引号故障」
+换成了「撇号故障」——`.scratch/_probe-quote7.mjs` 实测「描述带双引号 → 清洗成单引号」
+报 `fatal: Invalid path '/上传'`，「描述本身带撇号」报 `The string is missing the terminator`。
+
+#### 改法
+
+**文本不该进命令行**。提交说明写进 `os.tmpdir()` 的临时文件，`git commit -F <文件>`，
+shell 只看得见一个普通路径（`src/adapters/executor-agent/index.js` 的 `withCommitMessageFile`）：
+
+```js
+await withCommitMessageFile(
+  buildLocalCommitMessage(ticket, { blocked, verification }),
+  (messagePath) => runGit(['commit', '-F', messagePath, '--', ...commitSpecs])
+)
+```
+
+三件配套：
+
+1. `buildLocalCommitMessage` **不再清洗引号**（`sanitizeCommitText` 删除）—— 文本不过 shell，就该原样保留；
+2. 临时文件落 `os.tmpdir()` 而不是工作区：工作区里的新文件会被 `collectChanges` 当成 agent 的改动；
+3. `finally` 里 `unlink`，别在 tmpdir 里堆垃圾（自测专门锁这一条）。
+
+**为什么不用 stdin（`-F -`）**：`-F -` 与 `--pathspec-from-file=-` 抢同一个 stdin
+（`.scratch/_probe-pathspec.mjs` → `fatal: empty string is not a valid pathspec`）。
+说明走临时文件、路径继续命令行传参，两件事互不干扰。
+
+#### 判据
+
+- **让 shell 只看命令，不看文本**：任何「用户内容」都不该活着穿过 shell 的词法分析。
+- **修掉一种坏法不等于修好**：把 `"` 换成 `'` 只是换了故障形态，要问「这个文本为什么必须过 shell」。
+- **「两种实现都支持」必须先各跑一遍**：没有实测矩阵，跨 shell 的转义就是猜。
+- **端到端要真的起 shell**：假 git 只能证明 argv 形状，证明不了真 shell 会不会拆；
+  `.scratch/_e2e-commit.mjs` 用真 git 仓库 + 真 `powershell.exe` / `git.exe` bash 各跑三类文本，
+  3/3 全过；对照组旧写法 `-m` 在 PowerShell 上 `exit=1`。
+
+#### 自测
+
+`dev-run` 626 项不变、`gitlab-checks` 103 → **104**（新增一条端到端：跑真执行器走完整条
+`commitLocally`，断言 ① argv 里没有 `-m`；② `-F` 指向的文件内容与说明逐字相同（双引号、撇号都原样在）；
+③ 收尾后临时文件已删）。
+
+原来的两条 `sanitizeCommitText` 用例改成「引号要原样保留」（双引号 + 撇号各一条反例），
+因为清洗本身已经退役 —— 留着旧断言就是在锁一个错的实现。
+
+回归验证：把 `-F` 改回 `-m` → 恰好 2 条红（「必须用 -F <临时文件> 交说明」与
+「提交说明要写清哪些文件被刻意留下」），恢复后 626/626。
+
+
 ## 2. 代码清单
 
-`src/` 共 **52 个 .js / 26 531 行**；`scripts/` 共 10 个 .mjs / **18 933 行**（`dev-run.mjs` **8 453 行**）；`lib/client.js` **5 402 行**（浏览器端设置面板）。
+`src/` 共 **52 个 .js / 26 545 行**；`scripts/` 共 10 个 .mjs / **18 968 行**（`dev-run.mjs` **8 446 行**）；`lib/client.js` **5 402 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 687（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 7 763（16 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`error-advice.js`（把 `lastError` 翻成「为什么 + 怎么办」，12 条规则按特征串匹配，认不出就老实说认不出）**、**`station.js`（九站顺序 / `lastMainStationOf` 倒推失败站 / `resumePlanOf` 把「倒在哪站」翻译成「这一轮做什么」/ `failureCategoryOf` 用人要做的动作命名）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
-| `src/adapters/` | 11 599（17 个 .js） | 见下表 |
-| `src/tools/` | 3 105（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
+| `src/core/` | 7 769（16 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`error-advice.js`（把 `lastError` 翻成「为什么 + 怎么办」，12 条规则按特征串匹配，认不出就老实说认不出）**、**`station.js`（九站顺序 / `lastMainStationOf` 倒推失败站 / `resumePlanOf` 把「倒在哪站」翻译成「这一轮做什么」/ `failureCategoryOf` 用人要做的动作命名）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/adapters/` | 11 613（17 个 .js） | 见下表 |
+| `src/tools/` | 3 152（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
 | `src/remote/` | 965（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |
 | 根 | 1 360（1 个 .js） | `src/index.js` —— 组合根（装配全部适配器、注册**五个**工具、起轮询；`inspectCheckout` / `describeDirtyCheckout` / `pickAdapterFactory` / `VERIFY_TIMEOUT_MS` 也在这里） |
 
@@ -4071,7 +4167,7 @@ export const PUSHES = { mock, pushplus, qqmail }            // 全局单实例
 | 12c | 走宿主 shell 必须显式带 sandboxPolicy | 写授权 |
 | 12d | 工具输出必须是 lossless JSON | `undefined` 会让宿主判整次调用失败 |
 | 12e | 平台可插拔 | 状态值可配 + 金山文档接进组合根；`PLATFORMS` 只剩 `feishu/wps/mock`，`webform` 拿到迁移提示（见 #18） |
-| 13 | 新适配器 | gitlab 客户端 **86 项**（新增 7 条本地提交断言 + 10 条 `-z` 收集/暂存断言 + 10 条基线/keepSession 断言 + **8 条敏感名单与篡改自检断言**，原 51）/ qqmail 推送 18 项 / wps 工单源 **34 项** |
+| 13 | 新适配器 | gitlab 客户端 **104 项**（新增 7 条本地提交断言 + 10 条 `-z` 收集/暂存断言 + 10 条基线/keepSession 断言 + **8 条敏感名单与篡改自检断言**，原 51）/ qqmail 推送 18 项 / wps 工单源 **34 项** |
 | 14 | 项目工作区 | **19 项**：目录不存在给可照做的报错、无 `repo.path`、未登记则登记、已登记则复用、create 幂等、无 registry 降级、create 抛错降级、无 fs 服务、fs 说是文件、同项目多票复用、attachSession 归属；**验证命令的 signal 语义与超时 124**、**适配器名写错要抛并列出可选值** |
 | 15 | 改代码落点 | `inspectCheckout` 干净/脏/拿不到状态三种情况（`-z -uall` + 排除插件自有目录）；`describeDirtyCheckout` 脏工作区只提醒不拒跑、文案能照着理解；`isIsolatedWorktreePath` 只认 `.agents/worktrees/<name>`；真实 `apply()` 缺省不建隔离 worktree、票据落在工作区根上（`branch` = 检出当前分支、`baseCommit` = 检出 HEAD） |
 | 16 | 处理完回填工单表 + 保留工作区会话 | done → 三列都写；`writeBackStatus` 可配、空白回落「是」；`writeBack=false` 完全不写（退化成只读）；failed 不回填；回填失败只记票据、票态不回退、不影响通知；老适配器没有 `writeResult` 时静默跳过；执行器返回 `sessionId` 落到票据、状态里能看到去哪找会话；`pipeline_status` 成功/失败都能一眼看到；skipped 的回填首句要说「待人工验证」 |

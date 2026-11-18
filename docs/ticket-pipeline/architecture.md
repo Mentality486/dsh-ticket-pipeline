@@ -98,6 +98,7 @@
 - [12.26 界面上给人看的符号要写人话；失败要落到它倒下的那一站](#1226-界面上给人看的符号要写人话失败要落到它倒下的那一站错误要给为什么--怎么办2026-11-17-第三轮)
 - [12.27 串行是「同一时刻一张」，不是「互不相干」：租约粒度要落到检出上](#1227-串行是同一时刻一张不是互不相干租约粒度要落到检出上2026-11-17)
 - [12.28 「从失败那一步接着跑」：续跑是状态机问题，不是重试问题](#1228-从失败那一步接着跑续跑是状态机问题不是重试问题2026-11-17)
+- [12.29 提交说明不能走命令行：两种 shell 的引号规则无法同时满足](#1229-提交说明不能走命令行两种-shell-的引号规则无法同时满足2026-11-18)
 12A. [安全与权限边界](#12a-安全与权限边界)
 13. [事实来源](#13-事实来源)
 
@@ -3454,6 +3455,83 @@ else if (node === blamedNode) state = 'failed'
 `pipeline_reset` 四条分支 + `pipeline_status` 明细），`gitlab-checks` 96 → **103**
 （续跑 7 条：不起 agent / 沿用验证 / 没有结论就重跑 / 仍要 agent 但只推「接着做」/
 复用基线不重拍 / 基线交回调度器 / 验证结论交回调度器）。
+
+### 12.29 提交说明不能走命令行：两种 shell 的引号规则无法同时满足（2026-11-18）
+
+四张失败票（`sh-row-82` / `sh-row-86` / `sh-row-93` / `sh-row-94`）**全部倒在 ⑦ 提交站**，
+而它们的 ⑤ 改代码、⑥ 跑验证都是 ✓。真机 `lastError` 分两类：
+
+| 错误形态 | 张数 | 真因 |
+| --- | --- | --- |
+| `The following paths are ignored by one of your .gitignore files: .idea` | 1 | 暂存了被忽略的已跟踪文件（2026-11-13 已由 `addPathsForCommit` 的 `ls-files` 探测修掉） |
+| `error: pathspec '…' did not match any file(s) known to git` × N 段 | 3 | **提交说明被按空格拆成了多段 pathspec** |
+
+#### 一、说明为什么会被拆开
+
+`src/index.js` 的 `makeGitRunner` 把 argv 拼成**一条命令串**交给宿主 shell，
+转义用的是 bash 经典写法：
+
+```js
+.map(a => /^[A-Za-z0-9@%+=:,./_-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\''`)}'`)
+```
+
+这套在 bash 下是正确的，在 Windows PowerShell 5.1 下不成立 —— `'` 是普通字符、
+`'\''` 会被解析成一串散开的字面量与空格，于是 git 收到的是
+`-m '重构项目阶段流程，…' 'sh-row-86 修订次数:' '1 验证：通过…'`。
+
+**三种转义法实测矩阵**（真实 git 仓库 + 真 shell）：
+
+| 转义法 | PowerShell 5.1 | bash |
+| --- | --- | --- |
+| `'` → `'\''`（当前实现） | 3/3 破（`The string is missing the terminator: '.`） | 全过 |
+| `'` → `''`（PowerShell 双单引号） | 全过 | 3/3 破（撇号被吞：`it's` → `its`） |
+| `'"'"'`（双壳通用写法） | 3/3 破（只拿到 `it`） | 全过 |
+
+⇒ **没有任何一种转义法能同时满足两个 shell。** 上一轮把 `"` 换成 `'`（`sanitizeCommitText`）
+只是把「双引号故障」换成了「撇号故障」，方向上就错了。
+
+#### 二、治本：让文本不过 shell
+
+`git commit -F <文件>` 把说明从命令行挪到文件，shell 只看命令本身。
+临时文件落在 `os.tmpdir()`，**不能落进工作区** —— 工作区多出的新文件会被 `collectChanges`
+当成 agent 的改动收进提交。用完 `unlink`：
+
+```js
+async function withCommitMessageFile (text, fn) {
+  const path = join(tmpdir(), `dsh-ticket-commit-${randomUUID()}.txt`)
+  try {
+    await writeFile(path, text, 'utf8')
+    return await fn(path)
+  } finally {
+    await unlink(path).catch(() => {})
+  }
+}
+```
+
+`commitLocally` 里改成 `runGit(['commit', '-F', messagePath, '--', ...commitSpecs])`。
+**路径仍走命令行**：`git add` 的 `--pathspec-from-file` 与 `-F -` 抢同一个 stdin，
+不能同时用；真机 `mgiot-pms` 的 958 个跟踪文件里含引号/撇号的是 0 个，风险可接受。
+
+#### 覆盖了两类内容
+
+| 内容 | `-F` 覆盖路径 | 结论 |
+| --- | --- | --- |
+| 说明含英文双引号（工单序号是 `IF(COUNTA(...),"",ROW()-1)` 这类公式时） | `git commit -F <文件>` | ✅ 逐字还原 |
+| 说明含英文撇号（`don't`、`it's`） | 同上 | ✅ 逐字还原 |
+| 说明含反引号 / `$` / 多行 / 全角括号 | 同上 | ✅ 逐字还原 |
+| 文件名含空格 | 命令行单引号转义 | ✅ 两壳都过 |
+| 文件名含撇号 | 命令行单引号转义 | ❌ PowerShell 破（真机不存在这类文件名） |
+
+#### 判据
+
+- **文本内容不该进命令行**：有自由文本（说明、提示、正文）就走文件或 stdin，命令行只放控制参数。
+- **不要用「换一种字符」绕开转义问题**：那只是把故障形态换掉，下一种字符还会撞同一堵墙。
+- **要按「真 shell」验证，不按「我这台能跑」验证**：`execFileSync` 直调 git 永远绿，必须经由宿主 shell。
+- **临时文件要落在体检/收集看不见的地方**：`os.tmpdir()` 而不是工作区，否则会被当成 agent 的改动。
+
+**自测**：`dev-run` 626 项不变（原来的两条 `sanitizeCommitText` 用例合并成「说明原样保留双引号与撇号」）；
+`gitlab-checks` 96 → **104**（新增一条端到端：跑真执行器走完整条 `commitLocally`，
+断言 `-F` 指向的文件里有双引号、有撇号、有 `工单标识:`，且临时文件用完被删掉）。
 
 ## 13. 事实来源
 
