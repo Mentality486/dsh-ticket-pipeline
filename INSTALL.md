@@ -12,12 +12,13 @@
 
 ## 一、你拿到的是什么
 
-有两种形态，装法只差一个参数，本文两条都写。
+有三种形态，装法各差一点点，本文三条都写。
 
 | 形态 | 长相 | 适合 |
 |---|---|---|
-| **tgz 包**（推荐） | 一个 `local-ticket-pipeline-0.1.0-test.1.tgz`，约 536 KB（文件名里的版本号以你手上那个为准） | 微信/飞书直接发文件 |
-| **整个仓库** | 一个目录，里面有 `plugins/ticket-pipeline/` | 你要跟着作者更新，或者想读源码 |
+| **tgz 包**（推荐给不走 GitHub 的人） | 一个 `local-ticket-pipeline-0.1.0-test.1.tgz`，约 536 KB（文件名里的版本号以你手上那个为准） | 微信/飞书直接发文件 |
+| **GitHub 直装**（推荐给能上 GitHub 的人） | 仓库地址 + 一个分支名 | 不想 clone、想一直跟着作者更新 |
+| **整个仓库** | 一个目录，里面有 `plugins/ticket-pipeline/` | 你要读源码、要改插件本身 |
 
 tgz 里是**插件本体 59 个文件**。整仓形态下你要指向的 `plugins/ticket-pipeline/` 除了那 59 个，还多一个 `scripts/`（作者的自测脚本），装的时候不参与。
 
@@ -31,7 +32,7 @@ tgz 里**不含**任何配置或凭据。
 
 ---
 
-## 二、装（二选一）
+## 二、装（三选一）
 
 ### A. 拿到 tgz
 
@@ -61,6 +62,33 @@ dsh.cmd plugin --profile desktop add "file:D:\dsh-ticket-pipeline\plugins\ticket
 
 > **注意 `file:` 后面是绝对路径**，`~`、相对路径、引号里带 `%` 都会让 pnpm 解析错。
 > 路径里有空格时必须用双引号包住整段（中文路径也能装，作者实测过）。
+
+### C. 直接从 GitHub 装（不 clone，一条命令）
+
+仓库是公开的，不用 GitHub 账号，也不用配 ssh key。装这一条：
+
+```powershell
+dsh.cmd --% plugin --profile desktop add "github:Mentality486/dsh-ticket-pipeline#v0.0.1&path:/plugins/ticket-pipeline"
+```
+
+看到下面这样就算成了（约 1～2 分钟，pnpm 要下 4 MB 左右的 tarball）：
+
+```
++ @local/ticket-pipeline 0.1.0-test.1
+Done in 1m 33.5s using pnpm v11.28.5
+```
+
+这条命令有两个**不能省**的地方，省了必然报 `ERR_PNPM_INVALID_DEPENDENCY_NAME ... invalid alias "dsh-ticket-pipeline#v0.0.1"`：
+
+| 不能省 | 为什么 |
+|---|---|
+| **`--%`** | 它是 PowerShell 的「后面别解析」开关。没有它，`&` 会被当成命令分隔符，spec 在传给 pnpm 之前就被截断了。用变量包、用反引号转义、在 cmd 里用 `^&` 都不稳，`--%` 是唯一可靠的写法。 |
+| **`&path:/plugins/ticket-pipeline`** | 仓库根目录没有 `package.json`，pnpm 默认只认仓库根，于是把 `#v0.0.1` 当成包名的一部分。带 `path:` 它才会进子目录找包。 |
+
+更新：作者推了新提交之后，**把同一条命令再跑一次就行** —— 实测过，同样 spec 再 `add` 会装到新内容（这点和 tgz 不同，tgz 同版本号重装不生效）。
+
+> 想装别的分支或 tag，把 `#v0.0.1` 换掉即可，例如 `#main`、`#v0.0.2`。
+> 这条命令在你的终端里跑，走的是 https（`codeload.github.com`），不需要 ssh 权限。
 
 ### 命令里那个 `dsh.cmd` 在哪
 

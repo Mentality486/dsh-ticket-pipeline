@@ -1,5 +1,6 @@
 # DSH 会话临时产物与本地缓存
 .scratch/
+.dsh-home/
 *.log
 node_modules/
 dist/

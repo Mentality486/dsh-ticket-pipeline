@@ -2,6 +2,7 @@
   "name": "@local/ticket-pipeline",
   "version": "0.1.0-test.1",
   "private": true,
+  "license": "MIT",
   "description": "工单流水线：从工单表检测变化，定位代码、改动验证、在检出里做本地提交、回填表格并推送通知。",
   "type": "module",
   "exports": {

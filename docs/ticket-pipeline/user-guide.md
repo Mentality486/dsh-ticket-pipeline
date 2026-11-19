@@ -17,11 +17,15 @@
 
 ### 1. 装插件
 
+最省事的是从 GitHub 直装（不用 clone，不用 GitHub 账号）：
+
 ```bash
-dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
+dsh.cmd --% plugin --profile desktop add "github:Mentality486/dsh-ticket-pipeline#v0.0.1&path:/plugins/ticket-pipeline"
 ```
 
-**拿到的不是仓库、而是一个 `.tgz`？** 把 `file:` 后面换成那个文件的绝对路径，其余一样。两种形态的完整装法（含更新、卸载）见 [安装说明](../../INSTALL.md)。
+`--%` 和 `&path:` 都不能省 —— 前者让 PowerShell 别把 `&` 当命令分隔符，后者告诉 pnpm 去子目录找包（仓库根没有 `package.json`）。
+
+也可以从本地装：`dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"`。**拿到的不是仓库、而是一个 `.tgz`？** 把 `file:` 后面换成那个文件的绝对路径，其余一样。三种形态的完整装法（含更新、卸载、同版本号覆盖的坑）见 [安装说明](../../INSTALL.md)。
 
 装完**完全重启 DSH 宿主**（桌面包由 Electron 独占管理，刷新页面不算）。**过了没有**：对话里说 `pipeline_status`，工具有响应。
 
