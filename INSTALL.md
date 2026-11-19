@@ -20,7 +20,7 @@
 | **GitHub 直装**（推荐给能上 GitHub 的人） | 仓库地址 + 一个分支名 | 不想 clone、想一直跟着作者更新 |
 | **整个仓库** | 一个目录，里面有 `plugins/ticket-pipeline/` | 你要读源码、要改插件本身 |
 
-tgz 里是**插件本体 59 个文件**。整仓形态下你要指向的 `plugins/ticket-pipeline/` 除了那 59 个，还多一个 `scripts/`（作者的自测脚本），装的时候不参与。
+tgz 里是**插件本体 60 个文件**。整仓形态下你要指向的 `plugins/ticket-pipeline/` 除了那 60 个，还多一个 `scripts/`（作者的自测脚本），装的时候不参与。
 
 tgz 里**不含**任何配置或凭据。
 
