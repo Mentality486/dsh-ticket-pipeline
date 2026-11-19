@@ -54,9 +54,9 @@ git clone https://github.com/Mentality486/dsh-ticket-pipeline.git D:\dsh-ticket-
 dsh.cmd plugin --profile desktop add "file:D:\dsh-ticket-pipeline\plugins\ticket-pipeline"
 ```
 
-> ⚠️ **clone 完先看一眼有没有 `plugins\ticket-pipeline` 这个目录。** 仓库的默认分支如果没有内容，
-> 你会得到一个只有 README 的空壳，上面那条 `add` 会报路径不存在。这种情况要么让作者把默认分支指到可用的那支，
-> 要么干脆用 tgz（路 A）。想指定分支：`git clone -b <分支名> <地址> D:\dsh-ticket-pipeline`。
+> **clone 完确认一下有没有 `plugins\ticket-pipeline` 这个目录。** 默认分支 `main` 现在是有内容的（`main` 与
+> `v0.0.1` 指向同一个提交），正常 clone 下来就有。如果没有，说明默认分支被改到了别的分支上 ——
+> 那就显式指定：`git clone -b v0.0.1 <地址> D:\dsh-ticket-pipeline`，或者干脆用 tgz（路 A）。
 
 仓库里除了插件本体（`plugins/ticket-pipeline/`），还有作者的设计文档（`docs/`）和自测脚本。装插件只用前面那个目录。
 
