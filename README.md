@@ -12,6 +12,8 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 装完**完全重启 DSH 宿主**（桌面包由 Electron 独占管理，刷新页面不算）。
 总开关 `enabled` 缺省是 `false` —— 装完不会自己开始跑，这是故意的。
 
+**拿到的不是仓库、而是一个 `.tgz` 文件？** 装法只差一个参数，见 [安装说明](INSTALL.md)（含更新、卸载、同版本号覆盖的坑）。
+
 ## 三个门槛（缺一样都跑不出第一张工单）
 
 1. **飞书应用**：开放平台建企业自建应用，拿 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 填进设置页「凭据」。
@@ -29,6 +31,7 @@ dsh.cmd plugin --profile desktop add "file:<本仓库>/plugins/ticket-pipeline"
 
 | 想干什么 | 去哪 |
 |---|---|
+| **装插件（拿 tgz / 拿仓库 / 更新 / 卸载）** | [安装说明](INSTALL.md) |
 | 从零跑通第一张工单 | [使用手册 · 快速开始](docs/ticket-pipeline/user-guide.md#快速开始) |
 | 每天怎么用、通知怎么读、出问题怎么办 | [使用手册 · 日常循环](docs/ticket-pipeline/user-guide.md#日常循环) · [排障](docs/ticket-pipeline/user-guide.md#排障) |
 | 某个配置键叫什么、缺省多少 | [配置项参考](docs/ticket-pipeline/reference/config.md) |
