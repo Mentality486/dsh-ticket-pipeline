@@ -219,7 +219,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 它同时校验 `require()` 白名单（只允许 `react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、
 `dsh.client.platform === 'web'`（写错宿主会静默跳过整个 bundle），以及 descriptor 数字：
 叶子 **27 个 / 4 组**、schema 信封 **77 节点 / 27 叶子**、Remote **13 个方法**、`projects` 可写 **36 字段**、
-面板项目字段 **32 项**。`client-smoke` 真跑一遍 bundle，**282 条**断言。`client-check` 还会跑**两道静态守卫**：
+面板项目字段 **32 项**。`client-smoke` 真跑一遍 bundle，**306 条**断言。`client-check` 还会跑**两道静态守卫**：
 `checkCallArities` 核对**每一处 Remote 调用点的实参个数**（可选参数在浏览器侧也必须按位置传满，
 少传一个就抛 `client api: … expected N argument(s), got N-1` —— 「重跑」「跑一轮」都栽在这上面）；
 `checkEventArgConfusion` 拦「把声明了形参的本地函数裸传给 DOM 事件属性」（`onReload: loadProjects`），

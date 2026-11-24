@@ -2189,21 +2189,63 @@ window.__ModuleLoader__.load({
       '.tp-pick-btn{flex:0 0 auto;white-space:nowrap}',
       // 「选择 WSL 目录」展开后的浏览框：与卡片同宽、缩进一级，左边一条竖线
       // 表示「这东西属于上面那个字段」，不是另起一个区块。
-      '.tp-wsl{margin:6px 0 0;padding:8px 10px;border-left:3px solid #6366f1;',
-      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);border-radius:0 6px 6px 0}',
-      '.tp-wsl-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px}',
-      '.tp-wsl-crumb{font-size:12px;font-family:var(--dsw-font-family,ui-monospace,monospace);',
-      '  color:var(--dsw-alias-label-secondary,#61666b);word-break:break-all;flex:1 1 auto;min-width:0}',
-      '.tp-wsl-list{max-height:220px;overflow:auto;margin:0;padding:0;list-style:none;',
-      '  border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.08));border-radius:6px;',
-      '  background:var(--dsw-alias-bg-layer-1,#fff)}',
-      '.tp-wsl-item{display:flex;align-items:center;gap:6px;padding:3px 8px;cursor:pointer;',
-      '  font-size:12px;font-family:var(--dsw-font-family,ui-monospace,monospace)}',
+      //
+      // 2026-11-24 第二轮重做视觉：原来是一排同权重的按钮 + 一行长路径 + 一个
+      // 平铺列表，字号全一样，看不出「哪一层、能不能点」。现在分四段：
+      //   ① 工具条（选发行版 / 回家 / 就选这个 / 收起）
+      //   ② 面包屑（每一段都能点着往上跳，当前段加粗不点）
+      //   ③ 列表（文件夹图标 + 文件名省略号截断 + hover 才出现的 ›）
+      //   ④ 页脚（要填进仓库路径的那串，以及它是「盘符」还是「共享」）
+      '.tp-wsl{margin:6px 0 0;overflow:hidden;border-radius:0 8px 8px 0;',
+      '  border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.08));border-left:3px solid #6366f1;',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb)}',
+      '.tp-wsl-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 10px;',
+      '  border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06))}',
+      '.tp-wsl-bar .tp-select{flex:0 0 auto;max-width:190px}',
+      '.tp-wsl-path{display:flex;align-items:center;gap:1px;flex-wrap:wrap;padding:5px 8px;',
+      '  font-size:12px;font-family:var(--dsw-font-family,ui-monospace,monospace);',
+      '  color:var(--dsw-alias-label-secondary,#61666b);',
+      '  border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06))}',
+      '.tp-wsl-seg{border:0;background:none;font:inherit;color:inherit;padding:1px 3px;',
+      '  border-radius:4px;cursor:pointer}',
+      '.tp-wsl-seg:hover{background:var(--dsw-alias-bg-layer-3,#eef0f3);',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-wsl-seg.tp-wsl-here{font-weight:600;cursor:default;',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-wsl-seg.tp-wsl-here:hover{background:none}',
+      '.tp-wsl-count{margin-left:auto;white-space:nowrap;font-size:11px;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-wsl-list{max-height:240px;overflow:auto;margin:0;padding:4px;list-style:none}',
+      '.tp-wsl-item{display:flex;align-items:center;gap:8px;width:100%;padding:4px 6px;',
+      '  border:0;border-radius:5px;background:none;cursor:pointer;text-align:left;',
+      '  font:inherit;font-size:13px;color:var(--dsw-alias-label-primary,#0f1115)}',
       '.tp-wsl-item:hover{background:var(--dsw-alias-bg-layer-3,#eef0f3)}',
+      '.tp-wsl-item:disabled{opacity:.5;cursor:default}',
       '.tp-wsl-item.tp-wsl-hidden{color:var(--dsw-alias-label-tertiary,#81858c)}',
-      '.tp-wsl-item .tp-wsl-name{flex:1 1 auto;min-width:0;word-break:break-all}',
-      '.tp-wsl-empty{padding:10px 8px;font-size:12px;',
-      '  color:var(--dsw-alias-label-tertiary,#81858c);text-align:center}',
+      // 文件夹图标用两个方块拼（CSS 画的，不引 SVG/emoji）：主体 + 左上角那个小舌片。
+      '.tp-wsl-ico{position:relative;flex:0 0 auto;width:12px;height:9px;border-radius:1px;',
+      '  background:currentColor;opacity:.25}',
+      '.tp-wsl-ico:before{content:"";position:absolute;top:-3px;left:0;width:6px;height:3px;',
+      '  border-radius:1px 1px 0 0;background:currentColor}',
+      '.tp-wsl-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;',
+      '  white-space:nowrap}',
+      '.tp-wsl-chev{flex:0 0 auto;font-size:12px;opacity:0;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-wsl-item:hover .tp-wsl-chev{opacity:1}',
+      '.tp-wsl-empty{padding:16px 8px;font-size:12px;text-align:center;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-wsl-foot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 10px;',
+      '  border-top:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06));font-size:12px}',
+      '.tp-wsl-target{flex:1 1 auto;min-width:0;word-break:break-all;',
+      '  font-family:var(--dsw-font-family,ui-monospace,monospace);',
+      '  color:var(--dsw-alias-label-primary,#0f1115)}',
+      '.tp-wsl-kind{flex:0 0 auto;font-size:11px;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c)}',
+      // 等宿主回话时的骨架条：比「读取中…」四个字更能说明「正在列目录」。
+      '.tp-wsl-skel{height:12px;margin:7px 8px;border-radius:3px;',
+      '  background:linear-gradient(90deg,rgba(0,0,0,.05),rgba(0,0,0,.12),rgba(0,0,0,.05));',
+      '  background-size:200% 100%;animation:tp-wsl-pulse 1.1s ease-in-out infinite}',
+      '@keyframes tp-wsl-pulse{0%{background-position:200% 0}100%{background-position:-200% 0}}',
       // 「粘贴工单表链接」：输入框 + 按钮横排，与「选择目录」同一套手感。
       '.tp-link-row{grid-column:1/-1}',
       '.tp-link-input{display:flex;gap:6px;align-items:center}',
@@ -3241,6 +3283,8 @@ window.__ModuleLoader__.load({
       var entries = listing && Array.isArray(listing.entries) ? listing.entries : []
       var note = listing && typeof listing.note === 'string' ? listing.note : ''
       var truncated = listing && listing.truncated === true
+      // 面板层的失败（拿不到清单 / 请求本身抛了）优先于宿主回的 note。
+      var failure = typeof props.error === 'string' && props.error.length > 0 ? props.error : ''
 
       var distroOptions = distros.map(function (item) {
         var label = item.name + (item.default === true ? '（默认）' : '')
@@ -3256,12 +3300,72 @@ window.__ModuleLoader__.load({
             disabled: busy,
             onClick: function () { props.onOpen(entry.path) },
           },
-            h('span', { className: 'tp-wsl-name' }, entry.name + '/'),
-            h('span', null, '›')))
+          h('span', { className: 'tp-wsl-ico' }),
+          h('span', { className: 'tp-wsl-name' }, entry.name + '/'),
+          h('span', { className: 'tp-wsl-chev' }, '›')))
       })
 
+      // 面包屑：路径里每一段都能点着跳回去（根 `/` 单独一格）。
+      // 为什么不用「↑ 上一层」一个按钮：找深了两层之后，人想跳回的不是「上一层」
+      // 而是「上三层那个 projects」—— 一次点到位比连点三次省事，也让人看得见自己在哪。
+      var segments = []
+      if (path !== '' && path !== '/') {
+        var parts = path.split('/').filter(function (part) { return part.length > 0 })
+        var acc = ''
+        for (var s = 0; s < parts.length; s += 1) {
+          acc = acc + '/' + parts[s]
+          segments.push({ name: parts[s], path: acc })
+        }
+      }
+      var crumbNodes = [
+        h('button', {
+          key: 'root',
+          type: 'button',
+          className: 'tp-wsl-seg' + (segments.length === 0 ? ' tp-wsl-here' : ''),
+          disabled: busy || segments.length === 0,
+          title: '这个发行版的根目录',
+          onClick: function () { if (segments.length > 0) props.onOpen('/') },
+        }, '/'),
+      ]
+      for (var c = 0; c < segments.length; c += 1) {
+        // 分隔符只在非第一段前画：根那格本身就是 `/`，再补一个会变成 `//home`。
+        if (c > 0) crumbNodes.push(h('span', { key: 'sep' + c }, '/'))
+        crumbNodes.push(h('button', {
+          key: 'seg' + c,
+          type: 'button',
+          className: 'tp-wsl-seg' + (c === segments.length - 1 ? ' tp-wsl-here' : ''),
+          disabled: busy || c === segments.length - 1,
+          title: segments[c].path,
+          onClick: (function (target) {
+            return function () { if (target !== path) props.onOpen(target) }
+          })(segments[c].path),
+        }, segments[c].name))
+      }
+
+      // 这一格最终要写进 repo.path 的是 `target`。标出它是哪一类，
+      // 因为用户会疑惑「为什么这里显示 D:\ 而不是 /mnt/d」。
+      var kind = ''
+      if (/^\\\\/.test(target)) kind = '共享路径（UNC）'
+      else if (/^[A-Za-z]:/.test(target)) kind = '本地盘符'
+
+      var listArea = busy === true
+        ? h('div', null,
+          h('div', { className: 'tp-wsl-skel', style: { width: '62%' } }),
+          h('div', { className: 'tp-wsl-skel', style: { width: '48%' } }),
+          h('div', { className: 'tp-wsl-skel', style: { width: '71%' } }))
+        : (entries.length === 0
+          ? h('div', { className: 'tp-wsl-empty' },
+            note.length > 0 || failure.length > 0 ? '这一层读不出来（原因见上）。' : '这个目录下面没有子目录。')
+          : h('ul', { className: 'tp-wsl-list' }, items))
+
+      // 两种「读不到」要分开画：`failure` 是面板层的请求失败（清单没拿到 /
+      // wslList 抛了），`note` 是宿主说得清但读不了（不存在 / 没权限）。
+      var problems = []
+      if (failure.length > 0) problems.push(h('p', { key: 'f', className: 'tp-err', style: { margin: '6px 10px' } }, failure))
+      if (note.length > 0) problems.push(h('p', { key: 'n', className: 'tp-err', style: { margin: '6px 10px' } }, note))
+
       return h('div', { className: 'tp-wsl' },
-        h('div', { className: 'tp-wsl-head' },
+        h('div', { className: 'tp-wsl-bar' },
           h('select', {
             className: 'tp-select tp-sm',
             value: distro,
@@ -3291,27 +3395,20 @@ window.__ModuleLoader__.load({
             title: '收起浏览框（已填的路径不动）',
             onClick: function () { props.onClose() },
           }, '收起')),
-        h('div', { className: 'tp-wsl-head' },
-          h('button', {
-            type: 'button',
-            className: 'tp-btn tp-sm',
-            disabled: disabled || path === '' || path === '/',
-            title: '上一层',
-            onClick: function () { props.onUp() },
-          }, '↑ 上一层'),
-          h('span', { className: 'tp-wsl-crumb' }, busy ? '读取中…' : (path === '' ? '(还没读)' : path))),
-        note.length > 0 ? h('p', { className: 'tp-err' }, note) : null,
-        // 一个条目都没有时要说清是「空目录」还是「读不出来」—— 后者上面已经有 note。
-        entries.length === 0 && note.length === 0 && busy !== true
-          ? h('div', { className: 'tp-wsl-empty' }, '这个目录下面没有子目录。')
-          : h('ul', { className: 'tp-wsl-list' }, items),
-        truncated ? h('p', { className: 'tp-help' }, '条目太多，只列了前面一部分；进到具体子目录继续找。') : null,
-        h('p', { className: 'tp-help' },
-          '选中的路径：',
-          h('code', null, target.length === 0 ? '(未选)' : target),
-          '。WSL 里的目录通过 `\\\\wsl.localhost` 共享访问，比原生路径慢一些；'
-          + '改文件用的是 Windows 侧的工具，所以宿主里那份 9P 写入适配（`dsh-wsl-folder` 的 write）不在时，'
-          + 'agent 写文件会报 `ENOTSUP`。'))
+        h('div', { className: 'tp-wsl-path' },
+          crumbNodes,
+          h('span', { className: 'tp-wsl-count' },
+            busy === true ? '读取中…'
+              // 读不到的时候「N 个文件夹」是没有意义的（它不是 0，是「不知道」）——
+              // 写 0 会让人以为这一层真的是空的，接着就去找别的地方。
+              : (failure.length > 0 || note.length > 0) ? ''
+                : (entries.length + ' 个文件夹' + (truncated ? '（只列了一部分）' : '')))),
+        problems,
+        listArea,
+        h('div', { className: 'tp-wsl-foot' },
+          h('span', null, '将填入：'),
+          h('span', { className: 'tp-wsl-target' }, target.length === 0 ? '(未选)' : target),
+          kind.length > 0 ? h('span', { className: 'tp-wsl-kind' }, kind) : null))
     }
 
     /**
@@ -3502,16 +3599,15 @@ window.__ModuleLoader__.load({
                   distro: props.wslWho.distro === undefined ? '' : props.wslWho.distro,
                   listing: props.wslListing,
                   busy: props.wslBusy === true,
+                  // 面板层的失败（拿不到发行版清单 / 列目录请求本身炸了）与
+                  // 宿主回的 `note`（目录存在但读不出来）是两件事，分开传、一起画。
+                  error: props.wslError,
                   disabled: disabled,
                   onDistro: function (name) { props.onWslDistro(key, name) },
                   onHome: function () { props.onWslDistro(key, props.wslWho.distro) },
+                  // 面包屑与列表条目共用这一个：面板那边只认 `(key, distro, path)`，
+                  // 不区分「往上跳」还是「往里进」—— 都是「列这一层」。
                   onOpen: function (path) { props.onWslOpen(key, props.wslWho.distro, path) },
-                  onUp: function () {
-                    var here = props.wslListing && typeof props.wslListing.path === 'string' ? props.wslListing.path : ''
-                    if (here === '' || here === '/') return
-                    var cut = here.lastIndexOf('/')
-                    props.onWslOpen(key, props.wslWho.distro, cut <= 0 ? '/' : here.slice(0, cut))
-                  },
                   onSelect: function () { props.onWslUse(key) },
                   onClose: function () { props.onWslClose() },
                 }))
@@ -3718,6 +3814,9 @@ window.__ModuleLoader__.load({
             wslDistros: props.wslDistros,
             wslListing: props.wslListing,
             wslBusy: props.wslBusy === true,
+            // 面板上那句「拿不到发行版清单 / 列目录失败」也得往下传 —— 它只在
+            // 浏览框里显示，面板层自己没地方画（`setWslError` 只有写、没有读）。
+            wslError: props.wslError,
             onWslDistro: props.onWslDistro,
             onWslOpen: props.onWslOpen,
             onWslUse: props.onWslUse,
@@ -5405,6 +5504,7 @@ window.__ModuleLoader__.load({
             wslDistros: wslDistros,
             wslListing: wslListing,
             wslBusy: wslBusy,
+            wslError: wslError,
             onWslDistro: function (key, distro) { loadWslDirectoryFrom(key, distro, undefined) },
             onWslOpen: function (key, distro, path) { loadWslDirectoryFrom(key, distro, path) },
             onWslUse: onUseWslTarget,

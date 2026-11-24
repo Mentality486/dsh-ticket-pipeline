@@ -650,9 +650,12 @@ function makeHost () {
         },
         wslList: async function (distro, path) {
           calls.wslList.push([distro, path])
+          if (calls.failWslList === true) {
+            return { ok: false, error: { message: '列目录失败了（假宿主故意）' } }
+          }
           // 缺省（path 没传）回 home；传了就回那个目录的一层。
-          // 特意让 `/home/me/projects` 这一层的 `target` 与 `path` 不同 ——
-          // 断言要能抓住「面板回填了 path 而不是 target」这个错。
+          // `target` 一律跟 `path` 不一致 —— UNC 形态换算出来的东西本来就是另一串字符，
+          // 而且断言要能抓住「面板回填了 path 而不是 target」这个错。
           if (path === undefined) {
             return {
               ok: true,
@@ -666,13 +669,27 @@ function makeHost () {
               },
             }
           }
+          if (path === '/home/me/projects') {
+            return {
+              ok: true,
+              value: {
+                distro,
+                path,
+                parent: '/home/me',
+                target: '\\\\wsl.localhost\\' + distro + '\\home\\me\\projects\\mgiot-pms',
+                entries: [],
+                truncated: false,
+              },
+            }
+          }
+          // 其它层（面包屑往回跳时会走到这里）：只回这一层本身，不带子目录。
           return {
             ok: true,
             value: {
               distro,
               path,
-              parent: '/home/me',
-              target: '\\\\wsl.localhost\\' + distro + '\\home\\me\\projects\\mgiot-pms',
+              parent: path === '/' ? null : path.slice(0, path.lastIndexOf('/')) || '/',
+              target: '\\\\wsl.localhost\\' + distro + String(path).replace(/\//g, '\\'),
               entries: [],
               truncated: false,
             },
@@ -2226,6 +2243,41 @@ async function main () {
       check('画出了 home 那一层的目录条目', textOf(tree).indexOf('projects/') >= 0)
       check('面包屑显示的是 Linux 路径', textOf(tree).indexOf('/home/me') >= 0)
 
+      // 第二轮 UI（2026-11-24）：面包屑每一段都能往回跳，取代原来那个「↑ 上一层」。
+      // 钉三件事：①上一层那个按钮没了（两套导航并存会让人不确定该点哪个）
+      // ②中间那一段（home）点得动，且带的是它自己的绝对路径
+      // ③最后一段（当前目录 me）点不动 —— 点了也只是重列同一层。
+      check('没有「↑ 上一层」按钮（面包屑取代它了）', findButton(tree, '上一层') === undefined)
+      const segButton = (label) => findAll(tree, (node) => node.type === 'button' &&
+        String(node.props.className || '').indexOf('tp-wsl-seg') >= 0 &&
+        textOf(node) === label)[0]
+      const crumbHome = segButton('home')
+      check('面包屑中间那一段（home）是个能点的按钮', crumbHome !== undefined)
+      check('面包屑最后一段（当前目录）不可点',
+        findAll(tree, (node) => node.type === 'button' &&
+          String(node.props.className || '').indexOf('tp-wsl-here') >= 0 &&
+          node.props.disabled === true && textOf(node) === 'me').length === 1)
+      check('页脚标出要填进仓库路径的那串是共享路径还是盘符',
+        textOf(tree).indexOf('将填入：') >= 0 && textOf(tree).indexOf('共享路径（UNC）') >= 0,
+        textOf(tree).slice(0, 200))
+      if (crumbHome !== undefined) {
+        const before = ctx.calls.wslList.length
+        crumbHome.props.onClick()
+        tree = await render(WslPanel, { view: 'page' })
+        check('点面包屑往回跳，带的是那一段的绝对路径',
+          ctx.calls.wslList.length === before + 1 &&
+          ctx.calls.wslList[ctx.calls.wslList.length - 1][1] === '/home',
+          JSON.stringify(ctx.calls.wslList))
+        check('跳回去之后面包屑跟着缩短（当前目录只剩 /home）', segButton('me') === undefined)
+        // 后面的下钻/选择断言得在 home 那一层做：重新点一次入口，它会按缓存
+        // 里的发行版清单重新列 home（不再问宿主清单）。
+        const reopen = findButton(tree, '选择 WSL 目录')
+        if (reopen !== undefined) {
+          reopen.props.onClick()
+          tree = await render(WslPanel, { view: 'page' })
+        }
+      }
+
       // 点条目下钻：必须传满 distro + path（浏览器侧位置参数硬校验）。
       const entryButton = findButton(tree, 'projects/')
       check('目录条目可点', entryButton !== undefined)
@@ -2257,6 +2309,23 @@ async function main () {
         check('选完 WSL 目录不写宿主（只改草稿）',
           ctx.calls.mutate.length === mutateBeforeWsl, String(ctx.calls.mutate.length))
         check('选完 WSL 目录后浏览框收起了', findButton(tree, '就选这个目录') === undefined)
+      }
+
+      // 失败提示必须真的画得出来（2026-11-24 第二轮修掉的真 bug）：
+      // `wslError` 原来只有 `setWslError(...)` 七处写入、**没有任何一处读出来渲染**，
+      // 于是「清单拿不到」「列目录失败」用户一条都看不见，屏幕上只剩
+      // 「这个目录下面没有子目录」—— 把「请求炸了」说成「空的」，比不提示更糟。
+      const reopenForError = findButton(tree, '选择 WSL 目录')
+      check('浏览框收起后入口按钮还在（可以再打开）', reopenForError !== undefined)
+      if (reopenForError !== undefined) {
+        ctx.calls.failWslList = true
+        reopenForError.props.onClick()
+        tree = await render(WslPanel, { view: 'page' })
+        check('列目录失败时把原因画出来，而不是假装空目录',
+          textOf(tree).indexOf('列目录失败了（假宿主故意）') >= 0, textOf(tree).slice(0, 240))
+        check('失败时不再显示「这个目录下面没有子目录」',
+          textOf(tree).indexOf('这个目录下面没有子目录') < 0)
+        ctx.calls.failWslList = false
       }
     }
   }
