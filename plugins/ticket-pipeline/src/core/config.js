@@ -656,6 +656,20 @@ function validateProject (raw, index) {
   const repo = p.repo && typeof p.repo === 'object' && !Array.isArray(p.repo) ? p.repo : {}
   const repoPath = typeof repo.path === 'string' ? repo.path.trim() : ''
   if (repoPath.length === 0) fail('repo.path', '必须是非空字符串（本地 git 检出根目录）', '填这个项目对应的仓库在你本机的路径，例如 D:/WorkSpace/pms')
+  // WSL 里的检出（2026-11-24 加）：面板上「选择 WSL 目录」会填成
+  // `\\wsl.localhost\<发行版>\...`，这是合法配置 —— git 全套命令在 UNC 上都能跑
+  // （实测 `rev-parse` / `status -z` / `worktree add` / `stash create` 全通），
+  // 所以**不拦**。但它在 9P 共享上，有三件该提前知道的事，写成提醒而不是让人
+  // 半年后对着 `ENOTSUP` 猜。`/mnt/d/...` 已经由选择器换算成 `D:\...`，
+  // 那条路径在 Windows 盘上，不会走到这里。
+  if (/^\\\\wsl(\$|\.localhost)\\/i.test(repoPath)) {
+    warnings.push(
+      `项目 ${name || `#${index}`} 的仓库在 WSL 里（${repoPath}）—— ` +
+      '能跑，但三点注意：①9P 共享比 Windows 盘慢（`git status` 一次约 1 秒）；' +
+      '②宿主写文件靠 `dsh-wsl-folder` 那份 9P 适配，缺了会在改码阶段报 `ENOTSUP`；' +
+      '③git 会把这条路径规范化成 `//wsl.localhost/...` 返回，所以别拿它和配置里的字面值比相等。'
+    )
+  }
 
   // 项目级开关（`enabled`）：缺省 true。只接受布尔；写成 'false' 这种字符串是
   // 典型的 YAML 手误，静默当成「没关」会让「我以为我关了」变成最难查的那一类

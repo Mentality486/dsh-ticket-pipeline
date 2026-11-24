@@ -47,7 +47,7 @@ src/
     push-qqmail/     QQ 邮箱 SMTP 真实现（零依赖手写协议）
   tools/             pipeline_scan / pipeline_status / pipeline_cancel / pipeline_reset / pipeline_forget / pipeline_doctor
                      （每个都导出一个 collect* 纯「算结果」函数，Remote 那边调同一个）
-  remote/            浏览器端可调的 Remote：11 个 direct 方法（见下）
+  remote/            浏览器端可调的 Remote：13 个 direct 方法（见下）
   index.js           组合根 + 三张注册表（SOURCES / EXECUTORS / PUSHES）
 lib/
   client.js          浏览器端 bundle：插件设置页（五个页签：运行 / 项目 / 参数 / 凭据 / 体检）
@@ -60,7 +60,7 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 
 ## Remote 方法与设置页
 
-`ticketPipeline` 命名空间下 11 个 direct 方法：
+`ticketPipeline` 命名空间下 13 个 direct 方法：
 
 | 方法 | 参数 | 干什么 |
 |---|---|---|
@@ -75,11 +75,13 @@ scripts/             自测（不进安装包）；fixtures/ 放已下线适配�
 | `reset(recordId, projectId?)` | 2 | 复用 `collectReset`；`projectId` 是 `acceptsUndefined` |
 | `forget(recordId, projectId?)` | 2 | 复用 `collectForget`：**只删插件本地的票据行**，不碰工单表 / 不回滚代码 / 不删工作区；只对终态与 `needs-info` 生效 |
 | `testProject(index)` | 1 | 「测这张表」（工单 #43）：只把 `projects[index]` 交给体检那份飞书探针，逐层回 ✅/❌。**为什么是下标不是项目名** —— 项目名允许重复（`config.js` 只警告不拦），而下标与面板那张卡片一一对应 |
+| `wslDistros()` | — | WSL 发行版清单（`src/core/wsl.js` 的 `listWslDistros`）：注册表 `HKCU\...\Lxss` 优先、不起进程，失败才退 `wsl.exe -l -v`；**永不抛错**，拿不到就回 `{available:false, note}` |
+| `wslList(distro, path?)` | 2 | 列 WSL 里一层目录（只列目录）。返回的 `target` 已是「能直接写进 `repo.path` 的形态」：drvfs（`/mnt/d/x`）换算成 `D:\x`，其余是 `\\wsl.localhost\<发行版>\...`。读不到给 `note` 不抛 |
 
 **可选参数也必须传满位置**：浏览器的 `prepareInvocation` 用 `descriptor.parameters.length`
 校验实参个数，`acceptsUndefined` **只在宿主侧**参与判定。调用侧少传一个就抛
 `client api: … expected N argument(s), got N-1`（「点重跑报错」就是这么来的）。
-所以面板里 `ns.reset(recordId, undefined)` / `ns.forget(recordId, projectId)` 都写满位置。
+所以面板里 `ns.reset(recordId, undefined)` / `ns.forget(recordId, projectId)` / `ns.scan(undefined)` 都写满位置。
 
 **工具与面板共用「算结果」那一层**：每个 `tools/pipeline-*.js` 都导出 `collect*`，工具 `execute` 与
 `remote/host.js` 都调它。**不要复制实现，也不要用假 `exec` 复用 `execute`** —— 那是把工具外壳当内部 API，
@@ -216,7 +218,7 @@ node scripts/client-smoke.mjs        # 假 React 真跑一遍 bundle：注册 sl
 `src/remote/descriptors.js` 忘了改 `lib/client.js` 会**静默无响应**（点了体检没反应、宿主也不报错）。
 它同时校验 `require()` 白名单（只允许 `react` / `react/jsx-runtime` / `react-dom` / `react-dom/client`）、
 `dsh.client.platform === 'web'`（写错宿主会静默跳过整个 bundle），以及 descriptor 数字：
-叶子 **27 个 / 4 组**、schema 信封 **77 节点 / 27 叶子**、Remote **11 个方法**、`projects` 可写 **36 字段**、
+叶子 **27 个 / 4 组**、schema 信封 **77 节点 / 27 叶子**、Remote **13 个方法**、`projects` 可写 **36 字段**、
 面板项目字段 **32 项**。`client-smoke` 真跑一遍 bundle，**282 条**断言。`client-check` 还会跑**两道静态守卫**：
 `checkCallArities` 核对**每一处 Remote 调用点的实参个数**（可选参数在浏览器侧也必须按位置传满，
 少传一个就抛 `client api: … expected N argument(s), got N-1` —— 「重跑」「跑一轮」都栽在这上面）；

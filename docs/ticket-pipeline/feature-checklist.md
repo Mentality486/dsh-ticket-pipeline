@@ -2,7 +2,31 @@
 
 > 生成日期：2026-11-05
 > 代码基线：工作区 `D:\WorkSpace\dsh-ticket-pipeline`；本轮「40 分钟改一个小功能 + 通知换掉付费第三方」的代码与本文同一次提交，上一轮已提交代码为 `fdf8895`（图片块字段名改成 `attachment`）；插件目录 `plugins/ticket-pipeline`
-> 最近一次更新：2026-11-16，**「修复说明的不足」** —— 用户原话「修复说明的不足」，指的是前一天
+> 最近一次更新：2026-11-24，**「选择仓库路径」多了「选择 WSL 目录」** —— 用户原话
+> 「插件选择仓库路径 时支持选择windows文件夹和WSL文件夹」。他贴的截图是宿主「添加工作区」对话框，
+> 上面有「Windows 文件夹 / WSL 文件夹」两个入口，而插件这一格只有「选择目录」一个按钮，
+> 走的是 `uiWorkspace.pickDirectory()` —— **系统选择器只看得见盘符**，检出在 WSL 里的人
+> 用它永远找不到自己的仓库。
+>
+> 那套 WSL 对话框不是宿主内置的，是 `dsh-wsl-folder` 插件的（占了 `sidebar.workspaces.directoryFlow`
+> 与 `conversation.hero.workspace.directoryFlow` 两个 slot）。**没有复用它**：那是别人的私有 HTTP 路由
+> （`GET /dsh-wsl-folder/list` 等），只在装了它的机器上存在，跨插件耦合。
+>
+> 新增 `src/core/wsl.js`（502 行，零 npm 依赖，本仓第一处 `node:child_process`）。三条实测结论决定了它长什么样：
+> ①`\\wsl.localhost\` **这个根列不出来**（`readdir` / `stat` 全 `ENOENT`），所以「有哪些发行版」只能问
+> Windows —— 注册表 `HKCU\...\Lxss` 优先（不起进程），失败才 `wsl.exe -l -v`，且它的输出是 **UTF-16LE**；
+> ②`/mnt/d` 这类 drvfs 挂载点在 UNC 上是 **EPERM**，必须换算成 `D:\`（它就在 Windows 盘上，不算 WSL 目录）；
+> ③git 全套命令在 UNC 上都能跑（`rev-parse` / `status --porcelain -z` / `worktree add` / `stash create` 全通），
+> 但 `rev-parse --show-toplevel` 会把路径规范化成 `//wsl.localhost/...` —— 任何「路径相等」比较都得先归一。
+>
+> 面板上「选择目录」旁边多一个「选择 WSL 目录」，展开一个内联浏览框（发行版下拉 + 面包屑 + 目录列表 +
+> 「就选这个目录」）。**回填的是 `target` 不是 `path`**：drvfs 下 `path` 是 `/mnt/d/x`、`target` 是 `D:\x`，
+> 填错 git 就找不到仓库 —— 所以断言里刻意让假宿主把这两个值设成不一样。
+> Remote 多两个方法（`wslDistros()` / `wslList(distro, path?)`）⇒ **13 个**。
+> 配置层不拦 WSL 路径（那是合法配置），只给一条提醒说清三点代价（9P 慢 / 缺 `dsh-wsl-folder` 时
+> 写文件 `ENOTSUP` / git 返回的路径形态与配置字面值不同）。见 §1.58。
+> `dev-run` 577 → **634/634**（新增 7 条，第 24 节）、`client-smoke` 282 → **297** 条。
+> 此前 2026-11-16，**「修复说明的不足」** —— 用户原话「修复说明的不足」，指的是前一天
 > 我向他列的「八条优势 + 五条不足」里站不住的地方。查出两处，一处是**错的**、一处是**缺守卫**：
 > ①`pipeline_doctor` 对任何 `platform: 'wps'` 的项目都报**阻断**，理由写的是「取数通道是注入式的，
 > 主装配没注入」—— 这句是错的，`wpsOptionsFromMatch()` 明明有「配了 `match.sheetUrl` 就装内置下载器」
@@ -3863,15 +3887,132 @@ await withCommitMessageFile(
 回归验证：把 `-F` 改回 `-m` → 恰好 2 条红（「必须用 -F <临时文件> 交说明」与
 「提交说明要写清哪些文件被刻意留下」），恢复后 626/626。
 
+### 1.58 「选择仓库路径」要能进 WSL：两次换算、三种路径形态，和一条不能靠猜的规矩（2026-11-24）
+
+#### 诉求
+
+用户原话「插件选择仓库路径 时支持选择windows文件夹和WSL文件夹」，附带的截图是宿主「添加工作区」
+对话框：上面两个入口「Windows 文件夹 / 使用系统文件夹选择器」和「WSL 文件夹 / 浏览 WSL 发行版中的
+Linux 目录」，下面还列着「最近的 WSL 位置」与三条使用提示。
+
+而插件这一格只有一个「选择目录」按钮，接的是 `uiWorkspace.pickDirectory()` —— **系统原生选择器
+只看得到盘符**。检出在 WSL 里的人（`/home/wangchong/projects/mgiot-pms`）用它永远找不到自己的仓库，
+只能手打 `\\wsl.localhost\Ubuntu-24.04\home\...`，而没人会记得住那种路径。
+
+#### 先查清：那个对话框不是宿主的
+
+asar 里搜「Windows 文件夹」「WSL 文件夹」「要添加的文件夹在哪里」「最近的 WSL 位置」**全部 0 命中**；
+`uiWorkspace` 的十个方法里也**没有任何 WSL 相关方法**。再去看
+`C:\Users\Administrator\.dsh\profiles\desktop\node_modules\dsh-wsl-folder\`（v1.1.1）——
+README 自己写着「本插件以更低的优先级占住这两个插槽，自己的对话框画在 `shell.overlay` 里」。
+
+**所以没有复用它**，理由不是「不想」而是「不该」：它的能力挂在 5 个私有 HTTP 路由上
+（`GET /dsh-wsl-folder/{distros,home,list,warm}`、`POST /dsh-wsl-folder/pick`），
+只在装了它的机器上存在。插件依赖一个可选邻座的私有接口，等于把自己的可用性绑在别人的版本上。
+
+#### 三条实测结论（决定了新模块长什么样）
+
+写 `.scratch/_probe-wsl-{browse,write,git-full,roots,stash,module}.mjs` 一组探针，真机跑出来的：
+
+| 事实 | 后果 |
+| --- | --- |
+| `readdirSync('\\\\wsl.localhost')`、`'\\\\wsl.localhost\\'`、`'\\\\wsl$'`、`'\\\\?\\UNC\\wsl.localhost'` **全部 ENOENT**；只有 `'\\\\wsl.localhost\\Ubuntu-24.04'` 能列（66 条目） | **发行版清单没法从文件系统拿**，只能问 Windows：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`（`reg.exe query /s`，不起 `wsl.exe`），失败才退 `wsl.exe -l -v` |
+| `wsl.exe -l -q` 的输出是 **UTF-16LE**（`55 00 62 00 75 00…`），utf8 解出来满是 `\u0000` | 起进程一律 `encoding: 'buffer'`，自己判编码：**先看 BOM（`FF FE`）、再看有没有 NUL 字节**，两者都中才 `utf16le` |
+| `\\\\wsl.localhost\\Ubuntu-24.04\\mnt\\d` → **EPERM**（9P 不服务 drvfs 挂载点） | `/mnt/<盘符>/...` 必须换算成真实盘符路径（`/mnt/d/x` → `D:\x`）；那条路径**在 Windows 盘上**，不是 WSL 目录 |
+| UNC 上 `git init/add/commit/status --porcelain -z/rev-parse/diff --name-status -z/hash-object/worktree add/worktree remove/stash create` **全通** | 不做「WSL 路径不支持」的拦截 —— 那是假话。`git status` 一次约 1046 ms，属可接受 |
+| `rev-parse --show-toplevel` 返回 **`//wsl.localhost/Ubuntu-24.04/...`**（双斜杠正斜杠） | 任何「路径相等」比较必须先归一化，不能和配置里的 `\\wsl.localhost\...` 字面比 |
+| UNC 上 `linkSync`（硬链接）**FAIL `ENOTSUP`**，普通写 / `flag:'wx'` / `.tmp`+`rename` 都 OK | 宿主写工具在 UNC 上要靠 `dsh-wsl-folder` 的 `write` 补丁（它把那一次硬链接换成排他复制）；缺了它 agent 会在改码阶段挂 |
+
+顺带记两条**踩过的坑**：
+- `UNC_HOSTS.map((h) => h.replace(/\./g, '\\.'))` 只转义了点、没转义 `$` ⇒ `\\wsl$\` 那条老写法永远匹配不上（探针报 `FAIL wsl$ legacy`）。改成 `h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')`。
+- `node -e "fs.readdirSync('\\\\wsl.localhost')"` 里的反斜杠会被 JSON 与 shell 两层吃掉，变成 `D:\wsl.localhost` —— **探针一律写文件再 `node` 跑**。
+
+#### 落点
+
+新增 `plugins/ticket-pipeline/src/core/wsl.js`（**502 行**，零 npm 依赖；本仓第一处
+`node:child_process`，`package.json` 的 dependencies 仍为空）。纯函数与副作用分开：
+
+- 纯函数：`decodeWslOutput` / `parseWslUnc` / `toWslUnc` / `normalizeLinuxPath` /
+  `drvfsWindowsPath` / `parseLxssRegistry` / `parseWslListVerbose` / `wslAutomountRoot` /
+  `passwdHome` / `wslDefaultUser` / `requireDistro` / `wslDirectoryOf` / `describeWslTarget`
+- 副作用（都可注入 `run` 替身）：`listWslDistros` / `resolveWslHome` / `listWslDirectory`
+
+三条设计决定：
+
+1. **`listWslDistros` 永不抛错**。没装 WSL 是常态（大多数人没有），面板只需要知道「这里没有 WSL」，
+   而不是收到一条异常。返回 `{available, distros, note?}`，`note` 给人话。
+2. **失败结果不进缓存**（`DISTRO_TTL_MS = 30_000` 只缓存成功）。装好 WSL 之后不必重启插件就能用。
+3. **`listWslDirectory` 给 `note` 不给异常**。读不到目录（`not-found` / `denied` / `unreadable` 三档）
+   就在浏览框里显示一句人话 —— 抛到顶层只会让整个面板白屏。
+
+三层接线：`src/remote/descriptors.js` 加 `wslDistros()`（无参）与 `wslList(distro, path?)`（⇒ **13 个方法**）、
+`src/remote/host.js` 两个方法动态 `import('../core/wsl.js')` 转调（与 `config()` 同风格）、
+`lib/client.js` 补两侧描述符 + 浏览框 + CSS。
+
+#### 面板
+
+`WslBrowser` 组件（发行版下拉带「（默认）」标注 / 「家目录」/ 「↑ 上一层」/ 面包屑 / 目录列表 /
+「就选这个目录」/ 「收起」），紧跟在「仓库路径」输入框下面展开 —— **不是 modal**：
+面板里本来就没有任何 modal/overlay 基础设施，为一个字段新建一套不划算；而且它是「这一格的选择器」，
+不是独立对话框。
+
+三个取舍值得写下来：
+
+- **回填 `target` 不填 `path`**。drvfs 下 `path` 是 `/mnt/d/x`、`target` 是 `D:\x`。填错 git 就报
+  「not a git repository」，而人看到的是「我明明选对了」。所以 `client-smoke` 里那个假宿主
+  **刻意让 `target ≠ path`**，断言「选中后输入框里是 UNC、不是 `/home/me/projects`」。
+- **`wslWho` 记的是草稿键 `p1.repo.path`，不是卡片下标**。第一版按下标写，`client-smoke`
+  6 条红 —— 因为按钮传下来的 `key` 是 `projectKey(index, field.path)`（字符串），而判定用的是
+  `props.wslWho.index === index`（数字），永不相等。更要紧的是：同一张卡上可能有两格都带目录选择器，
+  比下标会让两个框同时展开、却都显示宿主最后列的那一层。
+- **打开浏览框先问宿主拿发行版清单**，拿到过一次就缓存在面板 state 里（切卡片不用再问一次）。
+
+#### 配置层：不拦，但要说清代价
+
+`src/core/config.js` 的 `validateProject()` 加一条：`repo.path` 命中
+`/^\\\\wsl(\$|\.localhost)\\/i` 时 `warnings.push(...)`，**不 `fail`**。理由：git 全套实测都能跑，
+拦下来等于说假话。提醒里讲三件事：9P 比 Windows 盘慢；缺 `dsh-wsl-folder` 的 write 适配会在改码阶段
+报 `ENOTSUP`；git 返回的路径形态与配置字面值不同，别拿来比相等。
+
+面板侧 `projectIssues()` 同样给一条 `soft`（软提示，不拦保存），措辞对齐。
+
+#### 自测
+
+`dev-run` 577 → **634/634**（第 24 节 7 条新断言）：UTF-16LE 解码（含「纯 ASCII 无 NUL 不许当 UTF-16」）、
+UNC 四种写法 + `..` 不越界、三种路径形态互转（含自定义 automount 前缀）、注册表解析（`DefaultDistribution`
+的 GUID 对应哪个）+ `wsl -l -v` 滤表头、清单拿不到时给人话且**不抛**（三档：抛错 / 空 / 注册表成功就不起进程）、
+列目录的入口校验（`requireDistro` 拦 `../etc`、空串、带空格）、WSL 路径是合法配置只提醒不拦
+（`wsl$` 老写法同认；`D:\...` 与 `\\server\share\...` 都不被误判）。
+
+`client-smoke` 282 → **297**（新增 15 条）：按钮在且可用、点了会问宿主拿清单、浏览框画出来、
+发行版下拉两项、缺省落默认发行版的 home（`path` 传 `undefined`）、home 那一层的条目画出来、
+面包屑是 Linux 路径、条目可点、点条目按 `distro + path` 再列一层、**选中的是 target 不是 path**、
+没把 Linux 路径填进仓库路径、选完不写宿主（只改草稿）、选完浏览框收起。
+
+`client-check`：`Remote 描述符一致（13 个方法）`、`浏览器侧 Remote 调用点 12 处`、
+`DOM 事件属性透传 4 处，其中裸函数名 0 处` —— 新按钮的 `onClick` 写成 `function () { props.onOpenWsl(key) }`，
+正好是 `checkEventArgConfusion` 要求的那种形态。
+
+#### 四条判据
+
+- **「别的插件有」不等于「我该复用」**：先确认那个能力是不是公共契约。宿主 slot/插件私有路由是
+  别人的实现细节，依赖它等于把可用性绑在邻座的版本上。
+- **平台差异要先用探针撞一遍再设计**：`\\wsl.localhost\` 列不出来、`/mnt/d` 是 EPERM、
+  `wsl.exe` 输出是 UTF-16LE —— 这三条任意一条猜错，模块结构都会不一样。
+- **「不支持」和「能跑但有代价」是两回事**：git 在 UNC 上全套都能跑，就该放行 + 提醒，而不是拦截。
+  拦截的真实后果是：用户以为自己配错了，去改一个没坏的东西。
+- **同一个值有两个形态时，把「写哪一个」写进断言**：`path` 与 `target` 就是这么一对，
+  只断言「有东西被填进去了」等于没测。
+
 
 ## 2. 代码清单
 
-`src/` 共 **52 个 .js / 26 545 行**；`scripts/` 共 10 个 .mjs / **18 968 行**（`dev-run.mjs` **8 446 行**）；`lib/client.js` **5 402 行**（浏览器端设置面板）。
+`src/` 共 **53 个 .js / 27 214 行**；`scripts/` 共 10 个 .mjs / **19 322 行**（`dev-run.mjs` **8 659 行**）；`lib/client.js` **5 814 行**（浏览器端设置面板）。
 
 | 目录 | 行数 | 文件 |
 | --- | --- | --- |
 | `src/contracts/` | 1 687（9 个 .js） | `errors.js`（错误模型）、`types.js`（阶段机 + 指纹 + **`TIMELINE_NODES` 17 节点表 / `TimelineEntry` / `parseBitableUrl` / `parseFeishuLink`**）、`feishu-columns.js`（`FEISHU_SEMANTIC_FIELDS` 13 个语义列名）、`ticket-source.js`（`scan` 只读 + `writeResult` 唯一写入口）、`work-executor.js`（`ExecCtx` + **`onFlow` 回调**）、`push-adapter.js`、`repo-locator.js`、`record-filter.js`、`git-status.js`（`-z` 状态/改名解析 + 插件自有目录排除规则） |
-| `src/core/` | 7 769（16 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow`）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`error-advice.js`（把 `lastError` 翻成「为什么 + 怎么办」，12 条规则按特征串匹配，认不出就老实说认不出）**、**`station.js`（九站顺序 / `lastMainStationOf` 倒推失败站 / `resumePlanOf` 把「倒在哪站」翻译成「这一轮做什么」/ `failureCategoryOf` 用人要做的动作命名）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
+| `src/core/` | 8 301（17 个 .js） | `prompt.js`（任务书渲染；`renderTicketContent` 的图片块**字段名是 `attachment`**，照宿主 `ImageBlock` 契约；`## 工作方式` 一节含**探索预算**，`## 改完怎么验证` 由项目 verify 注入，flow < 15 字时改走「截图字面量 ⇒ grep」）、**`ticket-memory.js`（跨票记忆：关键词抽取 / 召回 / 命中计数，key = projectId）**、`scheduler.js`（调度核心 + `writeBackFor` / `renderWriteBackResult` / `pendingEffects` / `replayPendingEffects` + **`markNode` / `markExtra` 全链路打点** + 成功票写记忆）、`store.js`（持久化 + 租约 + **`appendTimeline`** + `sanitizeRow` + **`forgetTicket`**）、`config.js`（配置校验 + 描述符 + `projects` 子树 + **飞书表定位「至少一个依据」校验 / 两套 token 并存的警告** + **WSL 仓库路径只提醒不拦**）、`recover.js`（启动恢复）、`workspace.js`（项目工作区）、`worktree-path.js`（`isIsolatedWorktreePath`，清理安全校验）、**`plugin-version.js`（安装副本 vs 源码的文件级比对）**、**`error-advice.js`（把 `lastError` 翻成「为什么 + 怎么办」，12 条规则按特征串匹配，认不出就老实说认不出）**、**`station.js`（九站顺序 / `lastMainStationOf` 倒推失败站 / `resumePlanOf` 把「倒在哪站」翻译成「这一轮做什么」/ `failureCategoryOf` 用人要做的动作命名）**、**`branches.js`（`parseBranchRefs` / `mergeBranchChoices` / `listBranches`，分支候选）**、**`wsl.js`（UNC ↔ Linux 路径 ↔ 盘符三次换算 / 注册表与 `wsl.exe` 拿发行版清单 / UNC 上列一层目录；`listWslDistros` 与 `listWslDirectory` 都**不抛错**）、`prompt.js` / `prompts.js`（任务书与反注入提示）、`domain.js`、`branch-name.js` |
 | `src/adapters/` | 11 613（17 个 .js） | 见下表 |
 | `src/tools/` | 3 152（7 个 .js） | `define.js`（工具范本）、`pipeline-scan.js`、**`pipeline-status.js`（按项目聚合的总览 + 9 主站流程带 + 关键节点时间线 + 「现在停在第 N 站」+ `canReset`/`canForget` 两个布尔）**、`pipeline-doctor.js`、`pipeline-reset.js`、**`pipeline-forget.js`（删本地票据记录；`FORGETTABLE_PHASES` 与 `canForget` 是「能不能删」的唯一口径）**、`pipeline-cancel.js` |
 | `src/remote/` | 965（2 个 .js） | `descriptors.js`（**11 个 Remote 方法**，含五个带参的 `setProjectTable(index, url)`、`status(includeDone?)`、`scan(projectId?)`、`reset(recordId, projectId?)`、`forget(recordId, projectId?)` 与 `testProject(index)`）、`host.js`（宿主 Remote 通道 + **`describeProject` 摊平电子表格字段** + `setProjectTable` 解析落盘 + **`status`/`scan`/`cancel`/`reset`/`forget` 复用工具的 collect\* 层**；`status(includeDone)` 只认严格 `true`，对应运行页签的「显示历史」） |

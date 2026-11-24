@@ -8429,6 +8429,218 @@ function makeFakeCtx ({ domain, registered }) {
     void out
   })
 
+  // ── 24. WSL 选目录：路径换算必须是纯函数、清单只能问宿主 ─────────────
+  //
+  // 为什么这一节值得写：`\\wsl.localhost\` 这个根**列不出来**（真实探针实测
+  // ENOENT），所以「有哪些发行版」在浏览器里根本无从下手；而 `/mnt/d` 这类
+  // drvfs 挂载点在 UNC 上又是 EPERM —— 也就是说选择器里看到的是 Linux 路径，
+  // 最终要写进 `repo.path` 的却可能是 `D:\`。这两次换算只要错一次，git 就会
+  // 报「not a git repository」，而人看到的是「我明明选对了」。
+  section('24. WSL 选目录：UNC 与 drvfs 的两次换算，以及清单只能问宿主')
+  const wsl = await import('../src/core/wsl.js')
+
+  await check('wsl：wsl.exe 的输出是 UTF-16LE，别按 utf8 解', () => {
+    // 真实字节：`wsl -l -q` 头两个字符 `U\0b\0`。
+    const raw = Buffer.from('Ubuntu-24.04\r\ndocker-desktop\r\n', 'utf16le')
+    assert.equal(wsl.decodeWslOutput(raw), 'Ubuntu-24.04\r\ndocker-desktop\r\n')
+    // 带 BOM 的也认。
+    assert.equal(wsl.decodeWslOutput(Buffer.concat([Buffer.from([0xFF, 0xFE]), raw])), 'Ubuntu-24.04\r\ndocker-desktop\r\n')
+    // 纯 ASCII 且没有 NUL 的（reg.exe 的输出偶尔这样）不能被当 UTF-16 —— 否则每个字符之间会插一个 \u0000。
+    const ascii = Buffer.from('DistributionName    REG_SZ    Ubuntu-24.04', 'utf8')
+    assert.equal(wsl.decodeWslOutput(ascii), 'DistributionName    REG_SZ    Ubuntu-24.04')
+  })
+
+  await check('wsl：UNC 两种写法都认，且 `..` 不能把人带出发行版', () => {
+    assert.deepEqual({ ...wsl.parseWslUnc('\\\\wsl.localhost\\Ubuntu-24.04\\home\\me') },
+      { distro: 'Ubuntu-24.04', path: '/home/me' })
+    // 老式 `wsl$` 宿主名里的 `$` 必须转义，否则正则里它是「行尾」。
+    assert.deepEqual({ ...wsl.parseWslUnc('\\\\wsl$\\Ubuntu-24.04\\home\\me') },
+      { distro: 'Ubuntu-24.04', path: '/home/me' })
+    // 正斜杠与 `\\?\UNC\` 命名空间形式也认（git 自己会把 toplevel 输出成 `//wsl.localhost/...`）。
+    assert.deepEqual({ ...wsl.parseWslUnc('//wsl.localhost/Ubuntu-24.04/home/me') },
+      { distro: 'Ubuntu-24.04', path: '/home/me' })
+    assert.deepEqual({ ...wsl.parseWslUnc('\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\me') },
+      { distro: 'Ubuntu-24.04', path: '/home/me' })
+    // 根目录。
+    assert.deepEqual({ ...wsl.parseWslUnc('\\\\wsl.localhost\\Ubuntu-24.04\\') },
+      { distro: 'Ubuntu-24.04', path: '/' })
+    // 不是 WSL 路径的一律 undefined —— 调用方靠这个判「这个仓在不在 WSL 里」。
+    assert.equal(wsl.parseWslUnc('D:\\repo'), undefined)
+    assert.equal(wsl.parseWslUnc('\\\\server\\share\\x'), undefined)
+    assert.equal(wsl.parseWslUnc(''), undefined)
+    assert.equal(wsl.parseWslUnc(undefined), undefined)
+    // `..` 被吃掉：`...\Ubuntu-24.04\..\..\Windows\System32` 不能解析成一个能读的路径。
+    const escape = wsl.parseWslUnc('\\\\wsl.localhost\\Ubuntu-24.04\\..\\..\\Windows')
+    assert.equal(escape.path.indexOf('..') < 0, true, `不许留 ..：${escape.path}`)
+  })
+
+  await check('wsl：Linux 路径 ↔ UNC ↔ 盘符，三种形态来回换都不丢东西', () => {
+    assert.equal(wsl.toWslUnc('Ubuntu-24.04', '/home/me'), '\\\\wsl.localhost\\Ubuntu-24.04\\home\\me')
+    assert.equal(wsl.toWslUnc('Ubuntu-24.04', '/'), '\\\\wsl.localhost\\Ubuntu-24.04\\')
+    assert.equal(wsl.normalizeLinuxPath('home/me/'), '/home/me')
+    assert.equal(wsl.normalizeLinuxPath('\\home\\me'), '/home/me')
+    assert.equal(wsl.normalizeLinuxPath('/'), '/')
+    // drvfs：`/mnt/d/proj` 在 Windows 上就是 `D:\proj`，它**不在 9P 上**，所以不算 WSL 目录。
+    assert.equal(wsl.drvfsWindowsPath('/mnt/d/proj'), 'D:\\proj')
+    assert.equal(wsl.drvfsWindowsPath('/mnt/d'), 'D:\\')
+    assert.equal(wsl.drvfsWindowsPath('/home/me'), undefined, 'home 在 9P 共享上，不换算')
+    // 自定义 automount 前缀也要认（发行版可以把它改成 /windrv）。
+    assert.equal(wsl.drvfsWindowsPath('/windrv/e/x', '/windrv/'), 'E:\\x')
+  })
+
+  await check('wsl：注册表解析要认出默认发行版，`wsl -l -v` 解析要滤掉表头', () => {
+    const registry = [
+      '\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{61b1d0c7-0000-0000-0000-000000000000}',
+      '    DistributionName    REG_SZ    Ubuntu-24.04',
+      '    Version    REG_DWORD    0x2',
+      '',
+      'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{aaaaaaaa-1111-2222-3333-444444444444}',
+      '    DistributionName    REG_SZ    docker-desktop',
+      '    Version    REG_DWORD    0x2',
+      '',
+      'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
+      '    DefaultDistribution    REG_SZ    {61b1d0c7-0000-0000-0000-000000000000}',
+    ].join('\r\n')
+    const distros = wsl.parseLxssRegistry(registry)
+    assert.equal(distros.length, 2)
+    const ubuntu = distros.find((one) => one.name === 'Ubuntu-24.04')
+    const docker = distros.find((one) => one.name === 'docker-desktop')
+    assert.equal(ubuntu.default, true, 'DefaultDistribution 指的 GUID 就是默认那个')
+    assert.equal(ubuntu.version, 2)
+    assert.equal(docker.default, false)
+
+    const verbose = [
+      '  NAME            STATE           VERSION',
+      '* Ubuntu-24.04    Running         2',
+      '  docker-desktop  Stopped         2',
+    ].join('\n')
+    const parsed = wsl.parseWslListVerbose(verbose)
+    assert.equal(parsed.length, 2, `表头不能被当成发行版：${JSON.stringify(parsed)}`)
+    assert.equal(parsed.find((one) => one.name === 'Ubuntu-24.04').default, true, '`*` 前缀就是默认')
+    assert.equal(parsed.find((one) => one.name === 'docker-desktop').default, false)
+  })
+
+  await check('wsl：发行版清单拿不到时给人话，绝不抛错（没装 WSL 是常态）', async () => {
+    wsl.resetWslDistroCache()
+    const failing = async () => { throw new Error('reg.exe 被策略挡了') }
+    const out = await wsl.listWslDistros({ run: failing })
+    assert.equal(out.available, false)
+    assert.equal(out.distros.length, 0)
+    assert.match(out.note, /没读到 WSL 发行版清单/, out.note)
+
+    // 注册表空、`wsl -l -v` 也空 → 「有 WSL 但没有发行版」，与上面区分开。
+    wsl.resetWslDistroCache()
+    const empty = async () => Buffer.from('', 'utf8')
+    const none = await wsl.listWslDistros({ run: empty })
+    assert.equal(none.available, false)
+    assert.match(none.note, /没有任何发行版/, none.note)
+
+    // 注册表成功就不该再起 `wsl.exe`（热路径一次进程都不起）。
+    wsl.resetWslDistroCache()
+    const calls = []
+    const registryOnly = async (file, args) => {
+      calls.push([file, args[0]])
+      return Buffer.from([
+        'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{x}',
+        '    DistributionName    REG_SZ    Ubuntu-24.04',
+        '    Version    REG_DWORD    0x2',
+      ].join('\r\n'), 'utf8')
+    }
+    const fromRegistry = await wsl.listWslDistros({ run: registryOnly })
+    assert.equal(fromRegistry.available, true)
+    assert.equal(fromRegistry.distros[0].name, 'Ubuntu-24.04')
+    assert.equal(calls.length, 1, `只该问一次注册表，实际：${JSON.stringify(calls)}`)
+    assert.equal(calls[0][1], 'query')
+    wsl.resetWslDistroCache()
+  })
+
+  await check('wsl：列目录的 target 必须能直接写进 repo.path，且发行版名两边都要拦', async () => {
+    // `listWslDirectory` 内部用的是真 `readdir`（这正是它比 `wsl.exe ls` 快的原因：
+    // 一次进程都不起），所以这里不伪造目录内容 —— 那要连 fs 一起替换，测出来的是
+    // 替换件不是产品代码。真正要钉的是**入口校验**与**换算口径**：
+    const source = wsl.listWslDirectory.toString()
+    assert.match(source, /drvfsWindowsPath/, '换算必须走 drvfsWindowsPath，别在列表里另写一份')
+    assert.match(source, /readdir/, '列目录靠 readdir，不是 wsl.exe ls（省一次进程）')
+    assert.match(source, /note:/, '读不到目录时给 note，不能抛到面板上白屏')
+
+    // 发行版名既是 UNC 的一段、也是 `wsl.exe` 的 argv：两边都得拦住。
+    assert.throws(() => wsl.requireDistro('../etc'), /发行版名不合法/)
+    assert.throws(() => wsl.requireDistro(''), /发行版名不合法/)
+    assert.throws(() => wsl.requireDistro('a b'), /发行版名不合法/, '空格会把 argv 拆开')
+    assert.equal(wsl.requireDistro('  Ubuntu-24.04  '), 'Ubuntu-24.04')
+
+    // `wslDirectoryOf` 只认 UNC：`/mnt/d` 换出来的 `D:\` 就在 Windows 盘上，不是 WSL 目录。
+    assert.deepEqual({ ...wsl.wslDirectoryOf('\\\\wsl.localhost\\Ubuntu-24.04\\home\\me') },
+      { distro: 'Ubuntu-24.04', path: '/home/me' })
+    assert.equal(wsl.wslDirectoryOf('D:\\repo'), undefined)
+
+    // 不存在的发行版名要在拼 UNC 之前就被拦住（否则会去问一个不存在的共享）。
+    await assert.rejects(
+      () => wsl.listWslDirectory({ distro: '../etc' }),
+      /发行版名不合法/,
+    )
+  })
+
+  await check('wsl：远程方法只透传，宿主侧不自己实现一套路径换算', async () => {
+    const { TicketPipelineRemote } = await import('../src/remote/host.js')
+    wsl.resetWslDistroCache()
+    /** @type {Array<string>} */
+    const seen = []
+    const remote = new TicketPipelineRemote({
+      getConfig: () => ({ projects: [] }),
+      doctorOptions: {},
+      // `wslDistros` / `wslList` 都是 `await import('../core/wsl.js')` 之后直接转调，
+      // 所以这里只能验证「方法存在、签名是那两个、且不会因为缺 store 而炸」——
+      // 真的一层目录由 wsl.js 自己的断言覆盖。
+    })
+    assert.equal(typeof remote.wslDistros, 'function')
+    assert.equal(typeof remote.wslList, 'function')
+    // 没有 store 也必须能工作：这两个方法不碰票据库（给没开总开关的人用）。
+    const distros = await remote.wslDistros()
+    assert.equal(typeof distros.available, 'boolean')
+    assert.equal(Array.isArray(distros.distros), true)
+    seen.push('distros')
+    // 不存在的发行版名要被 requireDistro 拦住（而不是去拼一条奇怪 UNC）。
+    await assert.rejects(() => remote.wslList('../etc', undefined), /发行版名不合法/)
+    seen.push('reject')
+    assert.deepEqual(seen, ['distros', 'reject'])
+  })
+
+  await check('wsl：仓库在 WSL 里是合法配置（只提醒不拦），/mnt 换算出来的盘符路径不算', () => {
+    // 为什么不拦：git 全套命令在 UNC 上实测都能跑（rev-parse / status -z /
+    // worktree add / stash create）。拦下来等于告诉用户「你这个仓库不能用来跑票」，
+    // 而那是假话；只提醒才是真话 ——「能跑，但有三点代价」。
+    const base = {
+      name: 'wslrepo',
+      match: { platform: 'mock' },
+      repo: { path: '\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\projects\\mgiot-pms' },
+    }
+    // `validateConfig` 成功时回 `{ value, warnings? }`，失败才回 `{ issues, warnings? }`
+    // —— 所以「没拦」的判据是 `issues === undefined`，不是 `issues.length === 0`。
+    const issuesOf = (result) => (Array.isArray(result.issues) ? result.issues : [])
+    const warningsOf = (result) => (Array.isArray(result.warnings) ? result.warnings : [])
+    const wslResult = validateConfig({ projects: [base] })
+    assert.deepEqual(issuesOf(wslResult), [], `不该拦：${JSON.stringify(issuesOf(wslResult))}`)
+    const warning = warningsOf(wslResult).find((one) => /WSL/.test(one))
+    assert.ok(warning !== undefined, `要有提醒，实际：${JSON.stringify(warningsOf(wslResult))}`)
+    assert.match(warning, /ENOTSUP/, '说清最可能撞上的那个错')
+    assert.match(warning, /dsh-wsl-folder/, '说清缺什么会这样')
+
+    // `wsl$` 老写法同样认。
+    const legacy = validateConfig({ projects: [{ ...base, repo: { path: '\\\\wsl$\\Ubuntu-24.04\\home\\me\\p' } }] })
+    assert.deepEqual(issuesOf(legacy), [])
+    assert.ok(warningsOf(legacy).some((one) => /WSL/.test(one)))
+
+    // drvfs 换算出来的真实盘符路径就在 Windows 盘上 —— 不该被当成 WSL 目录吓人。
+    const drive = validateConfig({ projects: [{ ...base, repo: { path: 'D:\\WorkSpace\\mgiot-pms' } }] })
+    assert.deepEqual(issuesOf(drive), [])
+    assert.equal(warningsOf(drive).filter((one) => /WSL/.test(one)).length, 0, '盘符路径不是 WSL 路径')
+
+    // 普通 UNC（网络共享）也不该被认成 WSL。
+    const share = validateConfig({ projects: [{ ...base, repo: { path: '\\\\server\\share\\repo' } }] })
+    assert.equal(warningsOf(share).filter((one) => /WSL/.test(one)).length, 0)
+  })
+
   // ── 收尾 ────────────────────────────────────────────────
   console.log(`\n通过 ${passed} 项，失败 ${failed} 项`)
   if (failed > 0) {

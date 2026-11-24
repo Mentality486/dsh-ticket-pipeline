@@ -476,6 +476,39 @@ export class TicketPipelineRemote {
       text: lines.join('\n'),
     }
   }
+
+  /**
+   * 「选择 WSL 目录」的发行版清单。
+   *
+   * 为什么这个能力必须落在宿主：`\\wsl.localhost\` 根**列不出来**
+   * （9P 不提供「有哪些发行版」这一层，实测 `ENOENT`），唯一来源是
+   * Windows 注册表（`HKCU\...\Lxss`）或 `wsl.exe -l -v` —— 都要跑进程。
+   *
+   * **不抛错**：没装 WSL 是常态，面板只需要知道「这里没有」而不是收到异常。
+   * 面板拿 `available: false` 就把「选择 WSL 目录」按钮变成不可点。
+   */
+  async wslDistros () {
+    const { listWslDistros } = await import('../core/wsl.js')
+    return listWslDistros()
+  }
+
+  /**
+   * 列 WSL 里的目录（只列目录）。
+   *
+   * 返回体的 `target` 是**该写进 `repo.path` 的那个路径**：
+   * drvfs 挂载点（`/mnt/d/...`）换算成真实盘符路径 `D:\...`，
+   * 其余换算成 UNC `\\wsl.localhost\<distro>\...`。
+   *
+   * 这一步换算必须在宿主做：`/mnt/*` 在 UNC 视图里是 `EPERM`（列不出来），
+   * 所以浏览器自己拿 `uiWorkspace.listDirectory()` 是列不出这些目录的。
+   *
+   * @param {string} distro
+   * @param {string} [path] 缺省 = 这个发行版的 home
+   */
+  async wslList (distro, path) {
+    const { listWslDirectory } = await import('../core/wsl.js')
+    return listWslDirectory({ distro, path })
+  }
 }
 
 /**

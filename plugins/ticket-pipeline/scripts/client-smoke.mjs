@@ -417,6 +417,9 @@ function makeHost () {
   const calls = {
     mutate: [], credentialSet: [], credentialUnset: [], doctor: 0, mounted: 0, projects: 0,
     pickDirectory: [], setProjectTable: [],
+    // 「选择 WSL 目录」（2026-11-24）：`wslList` 记整个实参表 ——
+    // 断言要验「点目录下钻时传了 distro 和 path 两个位置实参」。
+    wslDistros: 0, wslList: [],
     // 运行页签（#16）的五个方法各记一份，断言要验「点了按钮有没有真的发出去」。
     // reset / forget 记的是**整个实参表**（不是第一个）：浏览器侧的位置参数
     // 个数是硬校验（`parameters.length`），少传一个就抛 `expected N argument(s)` ——
@@ -476,7 +479,7 @@ function makeHost () {
     $mount: async (contribution) => {
       calls.mounted += 1
       check('$mount 收到的包名', contribution.package === '@local/ticket-pipeline', contribution.package)
-      check('$mount 收到十一个描述符', contribution.descriptors.length === 11, String(contribution.descriptors.length))
+      check('$mount 收到十三个描述符', contribution.descriptors.length === 13, String(contribution.descriptors.length))
       check('第三个描述符是 projects',
         contribution.descriptors.some((item) => item.method === 'projects' &&
           item.result.typeSymbol === 'ticket-pipeline#ProjectList'),
@@ -624,6 +627,54 @@ function makeHost () {
               table: 'tblWhx',
               blockers: [],
               text: '✅ 认证：能换到 tenant_access_token\n✅ 表：能读到表元数据\n✅ 数据：能读到第一页\n结论：这张表能读、能收到票。改完记得点顶部的「保存」。',
+            },
+          }
+        },
+        // 「选择 WSL 目录」（2026-11-24）：两个只读方法。
+        //
+        // 断言验的是「面板有没有把宿主给的东西原样画出来、选中的是不是
+        // `target` 而不是 `path`」，不是「WSL 探测对不对」（那是宿主的事，
+        // dev-run 里另有针对 core/wsl.js 与 remote 的用例）。
+        wslDistros: async function () {
+          calls.wslDistros += 1
+          return {
+            ok: true,
+            value: {
+              available: true,
+              distros: [
+                { name: 'Ubuntu-24.04', default: true, version: 2 },
+                { name: 'docker-desktop', default: false, version: 2 },
+              ],
+            },
+          }
+        },
+        wslList: async function (distro, path) {
+          calls.wslList.push([distro, path])
+          // 缺省（path 没传）回 home；传了就回那个目录的一层。
+          // 特意让 `/home/me/projects` 这一层的 `target` 与 `path` 不同 ——
+          // 断言要能抓住「面板回填了 path 而不是 target」这个错。
+          if (path === undefined) {
+            return {
+              ok: true,
+              value: {
+                distro,
+                path: '/home/me',
+                parent: '/home',
+                target: '\\\\wsl.localhost\\' + distro + '\\home\\me',
+                entries: [{ name: 'projects', path: '/home/me/projects', hidden: false }],
+                truncated: false,
+              },
+            }
+          }
+          return {
+            ok: true,
+            value: {
+              distro,
+              path,
+              parent: '/home/me',
+              target: '\\\\wsl.localhost\\' + distro + '\\home\\me\\projects\\mgiot-pms',
+              entries: [],
+              truncated: false,
             },
           }
         },
@@ -2126,6 +2177,89 @@ async function main () {
   check('宿主没提供 uiWorkspace 时不画「选择目录」按钮', findButton(tree, '选择目录') === undefined)
   check('宿主没提供 uiWorkspace 时仓库路径输入框照常可填',
     findInput(tree, (node) => node.props.value === 'D:/WorkSpace/.repos/mgiot-pms') !== undefined)
+
+  // ⑦b 「选择 WSL 目录」（2026-11-24）。
+  //
+  // 为什么这一组单独钉：Windows 原生选择器**只看得见盘符**，检出在 WSL 里的人
+  // 用它永远找不到自己的仓库。这组断言要保证三件事：
+  // 1. 按钮真的在，而且点下去走的是宿主的 `wslDistros` / `wslList`（不是自己 readdir）；
+  // 2. 列出来的目录点得下去、能下钻（传满 distro + path 两个位置实参）；
+  // 3. 「就选这个目录」填进草稿的是 `target` 而**不是** `path` —— 两者在
+  //    `/mnt/d` 这类 drvfs 挂载点上是不同的（`D:\` vs `/mnt/d`），
+  //    填错了 git 就找不到仓库。所以假宿主故意让这两个值不一样。
+  {
+    delete services.uiWorkspace
+    RENDER.hooks = []
+    RENDER.effects = []
+    RENDER.dirty = true
+    dispose.length = 0
+    registrations.length = 0
+    injects.length = 0
+    await exports.apply(ctx)
+    const WslPanel = registrations.find((r) => r.options.name === 'plugins.row.config').component
+    tree = await render(WslPanel, { view: 'page' })
+
+    const wslButton = findButton(tree, '选择 WSL 目录')
+    check('仓库路径旁边有「选择 WSL 目录」按钮', wslButton !== undefined)
+    check('「选择 WSL 目录」按钮可用',
+      wslButton !== undefined && wslButton.props.disabled === false,
+      wslButton === undefined ? '没找到' : String(wslButton.props.disabled))
+
+    if (wslButton !== undefined) {
+      const distrosBefore = ctx.calls.wslDistros
+      const mutateBeforeWsl = ctx.calls.mutate.length
+      wslButton.props.onClick()
+      tree = await render(WslPanel, { view: 'page' })
+
+      check('点「选择 WSL 目录」会问宿主要发行版清单',
+        ctx.calls.wslDistros === distrosBefore + 1, String(ctx.calls.wslDistros))
+      check('浏览框画出来了（有「就选这个目录」）', findButton(tree, '就选这个目录') !== undefined)
+      check('发行版下拉里有两项',
+        findAll(tree, (node) => node.type === 'select' &&
+          findAll(node, (child) => child.type === 'option').length === 2).length === 1,
+        JSON.stringify(findAll(tree, (node) => node.type === 'select')
+          .map((node) => findAll(node, (child) => child.type === 'option').length)))
+      check('缺省落在默认发行版的 home（path 没传）',
+        ctx.calls.wslList.length >= 1 && ctx.calls.wslList[0][0] === 'Ubuntu-24.04' &&
+        ctx.calls.wslList[0][1] === undefined,
+        JSON.stringify(ctx.calls.wslList))
+      check('画出了 home 那一层的目录条目', textOf(tree).indexOf('projects/') >= 0)
+      check('面包屑显示的是 Linux 路径', textOf(tree).indexOf('/home/me') >= 0)
+
+      // 点条目下钻：必须传满 distro + path（浏览器侧位置参数硬校验）。
+      const entryButton = findButton(tree, 'projects/')
+      check('目录条目可点', entryButton !== undefined)
+      if (entryButton !== undefined) {
+        const before = ctx.calls.wslList.length
+        entryButton.props.onClick()
+        tree = await render(WslPanel, { view: 'page' })
+        check('点目录会按 distro + path 再列一层',
+          ctx.calls.wslList.length === before + 1 &&
+          ctx.calls.wslList[ctx.calls.wslList.length - 1][0] === 'Ubuntu-24.04' &&
+          ctx.calls.wslList[ctx.calls.wslList.length - 1][1] === '/home/me/projects',
+          JSON.stringify(ctx.calls.wslList))
+      }
+
+      // 「就选这个目录」：填的必须是 target（UNC），不是 path（Linux 路径）。
+      const useButton = findButton(tree, '就选这个目录')
+      check('有「就选这个目录」', useButton !== undefined)
+      if (useButton !== undefined) {
+        useButton.props.onClick()
+        tree = await render(WslPanel, { view: 'page' })
+        check('选中的是 target（UNC 路径），不是 Linux 路径',
+          findInput(tree, (node) => node.props.value ===
+            '\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\projects\\mgiot-pms') !== undefined,
+          JSON.stringify(findAll(tree, (node) => node.type === 'input')
+            .map((node) => node.props.value)
+            .filter((value) => typeof value === 'string' && value.indexOf('wsl') >= 0)))
+        check('没把 Linux 路径 /home/me/projects 填进仓库路径',
+          findInput(tree, (node) => node.props.value === '/home/me/projects') === undefined)
+        check('选完 WSL 目录不写宿主（只改草稿）',
+          ctx.calls.mutate.length === mutateBeforeWsl, String(ctx.calls.mutate.length))
+        check('选完 WSL 目录后浏览框收起了', findButton(tree, '就选这个目录') === undefined)
+      }
+    }
+  }
 
   // ⑥ summary 视图只给一句话，不渲染整页。
   resetRender()

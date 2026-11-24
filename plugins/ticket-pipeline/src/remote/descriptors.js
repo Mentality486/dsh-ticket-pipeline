@@ -120,6 +120,23 @@ const forgetResult = codec('ForgetResult', (value) => value)
 /** 「测这张表」的结果：`{ ok, project, platform, text, blockers? }`。 */
 const projectProbeResult = codec('ProjectProbeResult', (value) => value)
 
+/**
+ * WSL 发行版清单：`{ available, distros: [{ name, default, version }], note? }`。
+ *
+ * `available: false` 是**正常返回**，不是异常 —— 大多数机器没装 WSL，
+ * 面板只需要把「选择 WSL 目录」变成不可点 + 一句说明。
+ */
+const wslDistroList = codec('WslDistroList', (value) => value)
+
+/**
+ * WSL 目录列表：`{ distro, path, parent, target, entries, truncated, note? }`。
+ *
+ * `target` 是**该写进 `repo.path` 的那个路径**（drvfs 挂载点会换算成真实盘符
+ * 路径），面板原样回填即可 —— 让浏览器判断「这条是不是 drvfs」等于把
+ * `core/wsl.js` 那套规则抄第二遍。
+ */
+const wslListing = codec('WslListing', (value) => value)
+
 /** 一个非空字符串参数。 */
 function requiredString (method, name, description) {
   return parameter(method, name, description, (value) => {
@@ -327,8 +344,56 @@ function forget () {
   }
 }
 
-/** 宿主与浏览器共用的方法表。 */
-export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
+/**
+ * 面板「选择 WSL 目录」的发行版清单：`listWslDistros()`（无参）。
+ *
+ * 为什么不在浏览器侧直接调 `uiWorkspace.listDirectory` 拿：`\\wsl.localhost\`
+ * 这个**根列不出来**（9P 不提供「有哪些发行版」这一层，实测 `ENOENT`），
+ * 所以发行版清单只能问 Windows（注册表 / `wsl.exe`）—— 那是宿主进程的事。
+ *
+ * 无参是刻意的：多一个参数就多一条 `assertExactArguments` 能炸的路，
+ * 而这里确实没有需要面板告诉宿主的东西。
+ */
+function wslDistros () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/wslDistros`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'wslDistros',
+    invocation: { kind: 'direct' },
+    result: wslDistroList,
+    parameters: [],
+  }
+}
+
+/**
+ * 面板「选择 WSL 目录」的列表：`wslList(distro, path?)`。
+ *
+ * `path` 可选：不传等于「先给我这个发行版的 home」（宿主那边要读
+ * `/etc/wsl.conf` + `/etc/passwd`，起不了 `wsl.exe` 时就问 `$HOME`）。
+ *
+ * 为什么只列**目录**：这一格填的是 git 检出根目录，列出文件只是噪音。
+ */
+function wslList () {
+  return {
+    id: `ticket-pipeline#${TICKET_PIPELINE_NAMESPACE}/wslList`,
+    service: TICKET_PIPELINE_NAMESPACE,
+    namespace: TICKET_PIPELINE_NAMESPACE,
+    method: 'wslList',
+    invocation: { kind: 'direct' },
+    result: wslListing,
+    parameters: [
+      requiredString('wslList', 'distro', 'WSL 发行版名（如 Ubuntu-24.04），从 wslDistros() 拿'),
+      parameter('wslList', 'path', '要列的 Linux 路径（如 /home/me/projects）；不传等于这个发行版的 home', (value) => {
+        if (value === undefined) return undefined
+        if (typeof value !== 'string') throw new TypeError('wslList: path 必须是字符串')
+        return value
+      }, true),
+    ],
+  }
+}
+
+/** 宿主与浏览器共用的方法表。 */export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   method('doctor'),
   method('config'),
   method('projects'),
@@ -344,6 +409,10 @@ export const TICKET_PIPELINE_DESCRIPTORS = Object.freeze([
   forget(),
   // 「测这张表」（工单 #43）：配项目时当场验这张表能不能读，不用跑全量体检。
   testProject(),
+  // 「选择 WSL 目录」（2026-11-24）：仓库路径要能选 WSL 里的检出。
+  // 这两个方法都只读文件系统、不写任何东西。
+  wslDistros(),
+  wslList(),
 ])
 
 /**

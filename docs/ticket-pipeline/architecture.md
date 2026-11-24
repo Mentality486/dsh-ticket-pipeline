@@ -1,7 +1,19 @@
 # 工单流水线插件 · 架构设计
 
 > 状态：设计定稿（对应地图票 #10）；§4 / §7.2 / §12A 于 2026-11-04 按实现回填，§2 / §9 / §10 / §11 / §12.7 于 2026-11-05 按当前代码回填，「本地提交」改造（§5.4 / §7.1 / §9 / §11）于 2026-11-06 回填，「改代码落点」改造（§5.4 / §7.4–§7.7 / §9 / §11）于 2026-11-06 晚回填，四项改造与「选择分支」（§5.2 / §5.4 / §6.5 / §9 / §10 / §11）于 2026-11-06 深夜回填
-> 日期：2026-11-03（最近一次按实现校准：2026-11-17 当天第四轮，**失败只说「失败」，不说到哪一步；
+> 日期：2026-11-03（最近一次按实现校准：**2026-11-24，「选择仓库路径」多一个「选择 WSL 目录」** ——
+> 用户原话「插件选择仓库路径 时支持选择windows文件夹和WSL文件夹」。插件原来只有一个「选择目录」，
+> 接 `uiWorkspace.pickDirectory()`：**系统选择器只看得到盘符**，检出在 `/home/<user>/…` 的人找不到仓库。
+> 截图里那套「Windows 文件夹 / WSL 文件夹」对话框不是宿主的（asar 里 0 命中、`uiWorkspace` 十个方法
+> 无 WSL），是 `dsh-wsl-folder` 插件占了两个 directoryFlow slot；**没有复用它**（私有 HTTP 路由，
+> 只在装了它的机器上存在）。新增 `src/core/wsl.js`（502 行，零依赖，本仓第一处 `node:child_process`）：
+> `\\wsl.localhost\` 根**列不出来** ⇒ 发行版清单只能问注册表/`wsl.exe`（其输出是 **UTF-16LE**）；
+> `/mnt/d` 在 UNC 上是 **EPERM** ⇒ 必须换算成 `D:\`；git 全套在 UNC 上都能跑，但
+> `rev-parse --show-toplevel` 回 `//wsl.localhost/…` ⇒ 路径比较要先归一。Remote 加
+> `wslDistros()` / `wslList(distro, path?)`（共 **13 个方法**）。判据：**「别的插件有」不等于「我该复用」
+> —— 先确认那是公共契约还是别人的实现细节**。见 §12.30。
+>
+> 上一轮 2026-11-17 当天第四轮，**失败只说「失败」，不说到哪一步；
 > 重开一律整票从头跑** —— 用户原话「这失败了也没告诉用户哪一步失败了 是工单处理问题失败了
 > 还是测试失败了 / 不要重新跑 / 还在那个失败的会话中继续」。三句话拆成三个问题：面板点名
 > 「卡在哪一步」（用**人要做的动作**命名：改代码 / 跑验证 / 提交）、失败收尾把「倒在哪一站」
@@ -3532,6 +3544,90 @@ async function withCommitMessageFile (text, fn) {
 **自测**：`dev-run` 626 项不变（原来的两条 `sanitizeCommitText` 用例合并成「说明原样保留双引号与撇号」）；
 `gitlab-checks` 96 → **104**（新增一条端到端：跑真执行器走完整条 `commitLocally`，
 断言 `-F` 指向的文件里有双引号、有撇号、有 `工单标识:`，且临时文件用完被删掉）。
+
+### 12.30 「选择仓库路径」要能进 WSL：两种路径形态与一条只能问 Windows 的规矩（2026-11-24）
+
+用户贴来的是宿主「添加工作区」对话框 —— 上面两个入口「Windows 文件夹 / WSL 文件夹」。
+而插件这一格只有一个「选择目录」，接的是 `uiWorkspace.pickDirectory()`：**系统原生选择器只看得到盘符**，
+检出在 `/home/<user>/projects/...` 的人永远找不到自己的仓库。
+
+#### 那个对话框不是宿主的
+
+asar 里搜「Windows 文件夹」「WSL 文件夹」「最近的 WSL 位置」**全部 0 命中**；
+`uiWorkspace` 的十个方法里也没有任何 WSL 相关方法。它来自 profile 里装的
+`dsh-wsl-folder` 插件 —— 该插件以更低优先级占住了
+`sidebar.workspaces.directoryFlow` 与 `conversation.hero.workspace.directoryFlow` 两个 slot。
+
+**没有复用它的私有 HTTP 路由**（`GET /dsh-wsl-folder/{distros,home,list,warm}`、`POST /dsh-wsl-folder/pick`）：
+那是别人的实现细节，只在装了它的机器上存在。依赖可选邻座的私有接口，等于把可用性绑在别人的版本上。
+
+#### 三条实测事实决定了模块形状
+
+| 事实（探针真跑） | 后果 |
+| --- | --- |
+| `readdirSync('\\\\wsl.localhost')` / `'\\\\wsl.localhost\\'` / `'\\\\wsl$'` / `'\\\\?\\UNC\\wsl.localhost'` **全 ENOENT**；只有 `'\\\\wsl.localhost\\Ubuntu-24.04'` 能列 | **发行版清单拿不到，只能问 Windows**：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss` 优先（`reg.exe query /s`，不起进程），失败才 `wsl.exe -l -v` |
+| `wsl.exe -l -q` 输出是 **UTF-16LE**（`55 00 62 00 75 00…`） | 一律 `encoding:'buffer'`，自己判：**先看 BOM `FF FE`、再看有无 NUL 字节**，都中才 `utf16le`（纯中文输出靠 NUL 判不出来，但 BOM 一定在） |
+| `\\\\wsl.localhost\\<distro>\\mnt\\d` → **EPERM**（9P 不服务 drvfs 挂载点） | `/mnt/<盘符>/...` 必须换算成真实盘符路径（`/mnt/d/x` → `D:\x`）；它在 Windows 盘上，**不是** WSL 目录 |
+| UNC 上 `git init/add/commit/status --porcelain -z/rev-parse/diff/hash-object/worktree add/remove/stash create` 全通，`status` 约 1046 ms | 不做「WSL 路径不支持」的拦截 —— 那是假话 |
+| `rev-parse --show-toplevel` 回 **`//wsl.localhost/...`**（正斜杠双前缀） | 任何路径相等比较都得先归一，不能跟配置里的 `\\wsl.localhost\...` 字面比 |
+| UNC 上 `linkSync`（硬链接）**`ENOTSUP`**，普通写 / `flag:'wx'` / `.tmp`+`rename` 都 OK | 宿主写工具在 UNC 上依赖 `dsh-wsl-folder` 的 write 补丁；缺了 agent 会在改码阶段挂 |
+
+#### 落点：`src/core/wsl.js`（502 行，零 npm 依赖，本仓第一处 `node:child_process`）
+
+纯函数与副作用分开，副作用都可注入 `run` 替身：
+
+- 纯函数：`decodeWslOutput` / `parseWslUnc`（认 `\\wsl.localhost`、`\\wsl$`、`\\?\UNC\` 命名空间与两种斜杠，
+  `DISTRO_NAME` 白名单，`..` 在归一化时被吃掉）/ `toWslUnc` / `normalizeLinuxPath` / `drvfsWindowsPath` /
+  `parseLxssRegistry` / `parseWslListVerbose` / `wslAutomountRoot` / `passwdHome` / `wslDefaultUser` /
+  `requireDistro` / `wslDirectoryOf` / `describeWslTarget`
+- 副作用：`listWslDistros` / `resolveWslHome` / `listWslDirectory`
+
+三条设计决定：
+
+1. **`listWslDistros` 永不抛错**。没装 WSL 是常态，面板只需知道「这里没有」，不需要接异常；
+   返回 `{available, distros, note?}`。
+2. **失败结果不进缓存**（`DISTRO_TTL_MS = 30_000` 只缓存成功）—— 装好 WSL 后不必重启插件。
+3. **`listWslDirectory` 给 `note` 不给异常**（`not-found` / `denied` / `unreadable` 三档人话），
+   抛到顶层只会让整个面板白屏。
+
+#### 三层接线
+
+`src/remote/descriptors.js` 加 `wslDistros()`（**无参** —— 多一个参数就多一条
+`assertExactArguments` 能炸的路）与 `wslList(distro, path?)` ⇒ Remote 共 **13 个方法**；
+`src/remote/host.js` 两个方法动态 `import('../core/wsl.js')` 转调（与 `config()` 同风格）；
+`lib/client.js` 补两侧描述符 + `WslBrowser` 组件 + CSS。
+
+#### 面板：两个取舍
+
+- **回填 `target` 不填 `path`**。drvfs 下 `path` 是 `/mnt/d/x`、`target` 是 `D:\x`；
+  填错 git 报 `not a git repository`，而人看到的是「我明明选对了」。所以 `client-smoke` 的假宿主
+  **刻意让 `target ≠ path`**，断言选中后输入框里是 UNC、不是 Linux 路径。
+- **`wslWho` 记草稿键（`p1.repo.path`）不记卡片下标**。第一版按下标写，`client-smoke` 6 条红 ——
+  按钮传下来的 `key` 是 `projectKey(index, field.path)`（字符串），判定却用数字下标，永不相等。
+  且同一张卡上可能有两格都带目录选择器，比下标会让两个框同时展开、都显示宿主最后列的那一层。
+
+浏览框是**内联展开**不是 modal：面板本来没有 modal/overlay 基础设施，而且它是「这一格的选择器」，
+不是独立对话框。
+
+#### 配置层：不拦，但要说清代价
+
+`src/core/config.js` 的 `validateProject()` 只 `warnings.push`（不 `fail`）：
+9P 比 Windows 盘慢；缺 `dsh-wsl-folder` 的 write 适配会在改码阶段 `ENOTSUP`；
+git 返回的路径形态与配置字面值不同。面板侧 `projectIssues()` 给对应的 `soft` 提示。
+
+拦下来的真实后果是：用户以为自己配错了，去改一个没坏的东西。
+
+#### 判据
+
+- **「别的插件有」不等于「我该复用」**：先确认那个能力是不是公共契约。
+- **平台差异要先用探针撞一遍再设计**：上面三条事实任意一条猜错，模块结构都会不一样。
+- **「不支持」和「能跑但有代价」是两回事**：能跑就放行 + 提醒。
+- **同一个值有两个形态时，把「写哪一个」写进断言**：`path` 与 `target` 就是这样一对，
+  只断言「有东西被填进去了」等于没测。
+
+**自测**：`dev-run` 577 → **634**（第 24 节 7 条：UTF-16LE 解码、UNC 四种写法 + `..` 不越界、
+三种路径形态互转、注册表/`wsl -l -v` 解析、清单拿不到时给人话且不起多余进程、入口校验、
+WSL 路径是合法配置只提醒）；`client-smoke` 282 → **297**（15 条覆盖浏览框全流程）。
 
 ## 13. 事实来源
 

@@ -511,6 +511,101 @@ window.__ModuleLoader__.load({
             },
           ],
         },
+        {
+          // 「选择 WSL 目录」的发行版清单（2026-11-24）。无参。
+          //
+          // 为什么必须由宿主给：`\\wsl.localhost\` 这个根**列不出来**
+          // （9P 不提供「有哪些发行版」这一层，实测 ENOENT），
+          // 唯一来源是注册表或 `wsl.exe` —— 浏览器碰不到。
+          id: 'ticket-pipeline#ticketPipeline/wslDistros',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'wslDistros',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#WslDistroList', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [],
+        },
+        {
+          // 「选择 WSL 目录」的列表：`wslList(distro, path?)`。
+          //
+          // 返回体的 `target` 就是该写进 repo.path 的路径 —— 让浏览器自己判断
+          // 「这条是不是 /mnt 挂载点」等于把 core/wsl.js 的规则抄第二遍。
+          id: 'ticket-pipeline#ticketPipeline/wslList',
+          service: 'ticketPipeline',
+          namespace: 'ticketPipeline',
+          method: 'wslList',
+          invocation: { kind: 'direct' },
+          result: { mode: 'strict', typeSymbol: 'ticket-pipeline#WslListing', create: function () { return { parse: function (value) { return value } } } },
+          parameters: [
+            {
+              name: 'distro',
+              wire: 'distro',
+              description: 'WSL 发行版名（如 Ubuntu-24.04），从 wslDistros() 拿',
+              source: 'json',
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/wslList:distro',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('wslList: distro 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/wslList:distro',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('wslList: distro 必须是非空字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+            {
+              name: 'path',
+              wire: 'path',
+              description: '要列的 Linux 路径（如 /home/me/projects）；不传等于这个发行版的 home',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/wslList:path',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('wslList: path 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+              strictCodec: {
+                mode: 'strict',
+                typeSymbol: 'ticket-pipeline#ticketPipeline/wslList:path',
+                create: function () {
+                  return {
+                    parse: function (value) {
+                      if (value === undefined) return undefined
+                      if (typeof value !== 'string') throw new TypeError('wslList: path 必须是字符串')
+                      return value
+                    },
+                  }
+                },
+                jsonSchema: {},
+              },
+            },
+          ],
+        },
       ],
     }
 
@@ -1098,7 +1193,17 @@ window.__ModuleLoader__.load({
         key: 'repo',
         label: '仓库',
         fields: [
-          { path: ['repo', 'path'], from: 'repoPath', label: '仓库路径', kind: 'text', required: true, pick: 'directory', hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。点「选择目录」可以直接挑，也可以手打。' },
+          {
+            path: ['repo', 'path'],
+            from: 'repoPath',
+            label: '仓库路径',
+            kind: 'text',
+            required: true,
+            pick: 'directory',
+            hint: '本地 git 检出根目录，绝对路径或相对 DSH 工作目录。'
+              + '「选择目录」走系统选择器（只看得到盘符）；检出在 WSL 里的人用「选择 WSL 目录」，'
+              + '选中后会填成 \\\\wsl.localhost\\<发行版>\\... 的形式（若目录在 /mnt/<盘符> 下则填真实盘符路径）。',
+          },
           { path: ['repo', 'baseBranch'], from: 'repoBaseBranch', label: '基准分支', kind: 'branch', hint: '从哪条分支切出工作分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'targetBranch'], from: 'repoTargetBranch', label: '目标分支', kind: 'branch', hint: 'MR 的目标分支。可从下拉里选，也可以直接手打。' },
           { path: ['repo', 'remote'], from: 'repoRemote', label: 'GitLab 仓库地址', kind: 'text', advanced: true, hint: '只有要开 draft MR 时才需要。填仓库地址（https://gitlab.x/group/repo.git 或 git@gitlab.x:group/repo.git），不是 git 远端名，别填 origin。' },
@@ -1710,8 +1815,22 @@ window.__ModuleLoader__.load({
       }
 
       var repoPath = read(['repo', 'path']).trim()
+      // WSL 里的检出填的是 UNC（`\\wsl.localhost\<发行版>\...`），在 9P 共享上。
+      // 它能跑，但有三件人该提前知道的事，所以给一条软提示而不是让它在半年后
+      // 变成一个查不出来的怪毛病：
+      //   · 比原生路径慢（`git status` 一次实测约 1 秒）；
+      //   · 新建文件走硬链接会 `ENOTSUP` —— 宿主写工具需要 `dsh-wsl-folder` 的
+      //     write 补丁，否则 agent 在改码阶段就挂；
+      //   · `/mnt/d/...` 这类不该填 UNC，它就在 Windows 盘上，选完 WSL 目录时
+      //     已经自动换算成 `D:\...`。
+      var wslRepo = /^\\\\wsl(\$|\.localhost)\\/i.test(repoPath)
       if (repoPath.length === 0) {
         add(['repo', 'path'], 'error', '必须是非空字符串（本地 git 检出根目录）')
+      } else if (wslRepo) {
+        add(['repo', 'path'], 'soft',
+          '这是 WSL 里的目录（9P 共享）：能跑，但比 Windows 盘上的检出慢；'
+          + 'agent 写文件依赖宿主里那份 9P 写入适配（`dsh-wsl-folder` 的 write），'
+          + '缺了会在改码阶段报 ENOTSUP。')
       } else if (!looksLikePath(repoPath)) {
         add(['repo', 'path'], 'soft', '看起来不像路径（没有目录分隔符）。确认是相对 DSH 工作目录的路径？')
       }
@@ -2068,6 +2187,23 @@ window.__ModuleLoader__.load({
       '.tp-pick{display:flex;gap:6px;align-items:center}',
       '.tp-pick .tp-input{flex:1 1 auto;min-width:0}',
       '.tp-pick-btn{flex:0 0 auto;white-space:nowrap}',
+      // 「选择 WSL 目录」展开后的浏览框：与卡片同宽、缩进一级，左边一条竖线
+      // 表示「这东西属于上面那个字段」，不是另起一个区块。
+      '.tp-wsl{margin:6px 0 0;padding:8px 10px;border-left:3px solid #6366f1;',
+      '  background:var(--dsw-alias-bg-layer-2,#f9fafb);border-radius:0 6px 6px 0}',
+      '.tp-wsl-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px}',
+      '.tp-wsl-crumb{font-size:12px;font-family:var(--dsw-font-family,ui-monospace,monospace);',
+      '  color:var(--dsw-alias-label-secondary,#61666b);word-break:break-all;flex:1 1 auto;min-width:0}',
+      '.tp-wsl-list{max-height:220px;overflow:auto;margin:0;padding:0;list-style:none;',
+      '  border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.08));border-radius:6px;',
+      '  background:var(--dsw-alias-bg-layer-1,#fff)}',
+      '.tp-wsl-item{display:flex;align-items:center;gap:6px;padding:3px 8px;cursor:pointer;',
+      '  font-size:12px;font-family:var(--dsw-font-family,ui-monospace,monospace)}',
+      '.tp-wsl-item:hover{background:var(--dsw-alias-bg-layer-3,#eef0f3)}',
+      '.tp-wsl-item.tp-wsl-hidden{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.tp-wsl-item .tp-wsl-name{flex:1 1 auto;min-width:0;word-break:break-all}',
+      '.tp-wsl-empty{padding:10px 8px;font-size:12px;',
+      '  color:var(--dsw-alias-label-tertiary,#81858c);text-align:center}',
       // 「粘贴工单表链接」：输入框 + 按钮横排，与「选择目录」同一套手感。
       '.tp-link-row{grid-column:1/-1}',
       '.tp-link-input{display:flex;gap:6px;align-items:center}',
@@ -3074,6 +3210,111 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 「选择 WSL 目录」展开后的浏览框（2026-11-24）。
+     *
+     * 为什么要有它：仓库路径那一格原来只有「选择目录」，走的是 Windows 原生
+     * 选择器 —— 它**只看得见 Windows 盘符**，而检出完全可能在 WSL 里
+     * （`\\wsl.localhost\Ubuntu-24.04\home\me\proj`）。那种情况下人只能手打
+     * 二十几个字符的 UNC 路径，错一个字符整条流水线就起不来。
+     *
+     * 为什么不做成 modal：面板里此前一个 modal 都没有（`tp-modal` / `overlay`
+     * / `dialog` 全零命中），为这一格新建一套遮罩 + 焦点管理 + Esc 处理，成本
+     * 远大于收益。内联展开的形态与「高级设置」「工单表链接」一致，人也更容易
+     * 看出「这东西属于上面那个字段」。
+     *
+     * 数据全部由宿主给（`wslDistros()` / `wslList()`）：
+     *   · 发行版清单只能问 Windows（`\\wsl.localhost\` 这个根列不出来）
+     *   · `/mnt/d` 这类 drvfs 挂载点在 UNC 视图里是 EPERM，换算成 `D:\` 的
+     *     活也必须在宿主做（见 `src/core/wsl.js` 的 `drvfsWindowsPath`）
+     * 所以这里一个文件系统调用都没有，只画。
+     */
+    function WslBrowser (props) {
+      var distros = Array.isArray(props.distros) ? props.distros : []
+      var distro = typeof props.distro === 'string' ? props.distro : ''
+      var listing = props.listing
+      var busy = props.busy === true
+      var disabled = props.disabled === true || busy
+      var path = listing && typeof listing.path === 'string' ? listing.path : ''
+      // `target` 才是该写进 repo.path 的东西：drvfs 下它是 `D:\...`，
+      // 其余是 UNC。面板原样回填，不自己判断「这是哪种」。
+      var target = listing && typeof listing.target === 'string' ? listing.target : ''
+      var entries = listing && Array.isArray(listing.entries) ? listing.entries : []
+      var note = listing && typeof listing.note === 'string' ? listing.note : ''
+      var truncated = listing && listing.truncated === true
+
+      var distroOptions = distros.map(function (item) {
+        var label = item.name + (item.default === true ? '（默认）' : '')
+        return h('option', { key: item.name, value: item.name }, label)
+      })
+
+      var items = entries.map(function (entry) {
+        return h('li', { key: entry.path },
+          h('button', {
+            type: 'button',
+            className: 'tp-wsl-item' + (entry.hidden ? ' tp-wsl-hidden' : ''),
+            title: entry.path,
+            disabled: busy,
+            onClick: function () { props.onOpen(entry.path) },
+          },
+            h('span', { className: 'tp-wsl-name' }, entry.name + '/'),
+            h('span', null, '›')))
+      })
+
+      return h('div', { className: 'tp-wsl' },
+        h('div', { className: 'tp-wsl-head' },
+          h('select', {
+            className: 'tp-select tp-sm',
+            value: distro,
+            disabled: disabled,
+            title: '选一个 WSL 发行版（清单来自宿主，浏览器看不到这一层）',
+            onChange: function (event) { props.onDistro(event.target.value) },
+          }, distroOptions),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: disabled || distro.length === 0,
+            title: '回到这个发行版的家目录',
+            onClick: function () { props.onHome() },
+          }, '家目录'),
+          h('span', { className: 'tp-spacer' }),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm tp-primary',
+            disabled: disabled || target.length === 0,
+            title: target.length === 0 ? '先列出目录才能选' : '把 ' + target + ' 填进仓库路径',
+            onClick: function () { props.onSelect() },
+          }, '就选这个目录'),
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: busy,
+            title: '收起浏览框（已填的路径不动）',
+            onClick: function () { props.onClose() },
+          }, '收起')),
+        h('div', { className: 'tp-wsl-head' },
+          h('button', {
+            type: 'button',
+            className: 'tp-btn tp-sm',
+            disabled: disabled || path === '' || path === '/',
+            title: '上一层',
+            onClick: function () { props.onUp() },
+          }, '↑ 上一层'),
+          h('span', { className: 'tp-wsl-crumb' }, busy ? '读取中…' : (path === '' ? '(还没读)' : path))),
+        note.length > 0 ? h('p', { className: 'tp-err' }, note) : null,
+        // 一个条目都没有时要说清是「空目录」还是「读不出来」—— 后者上面已经有 note。
+        entries.length === 0 && note.length === 0 && busy !== true
+          ? h('div', { className: 'tp-wsl-empty' }, '这个目录下面没有子目录。')
+          : h('ul', { className: 'tp-wsl-list' }, items),
+        truncated ? h('p', { className: 'tp-help' }, '条目太多，只列了前面一部分；进到具体子目录继续找。') : null,
+        h('p', { className: 'tp-help' },
+          '选中的路径：',
+          h('code', null, target.length === 0 ? '(未选)' : target),
+          '。WSL 里的目录通过 `\\\\wsl.localhost` 共享访问，比原生路径慢一些；'
+          + '改文件用的是 Windows 侧的工具，所以宿主里那份 9P 写入适配（`dsh-wsl-folder` 的 write）不在时，'
+          + 'agent 写文件会报 `ENOTSUP`。'))
+    }
+
+    /**
      * 单个项目卡片。
      *
      * 字段表是手写的（`PROJECT_SECTIONS`），对应 `src/core/config.js:validateProject`。
@@ -3216,6 +3457,10 @@ window.__ModuleLoader__.load({
             // 选择器拿不到时（没装 uiWorkspace / 老版本宿主）就只画输入框 ——
             // 手打路径这条退路必须一直在，不能因为选择器缺席就填不了。
             var canPick = typeof props.onPickDirectory === 'function'
+            // 「选择 WSL 目录」（2026-11-24）：原生选择器只看得到 Windows 盘符，
+            // 而检出完全可能在 WSL 里。两个入口并列，是因为它们各自解决一半情况，
+            // 谁也不能替代谁 —— 合并成一个按钮就必然要做「猜你想选哪种」。
+            var canWsl = typeof props.onOpenWsl === 'function'
             control = h('div', { className: 'tp-pick' },
               h('input', {
                 className: 'tp-input',
@@ -3235,7 +3480,42 @@ window.__ModuleLoader__.load({
                     props.onPickDirectory(key, String(value === undefined || value === null ? '' : value))
                   },
                 }, '选择目录')
+                : null,
+              canWsl
+                ? h('button', {
+                  type: 'button',
+                  className: 'tp-btn tp-sm tp-pick-btn tp-wsl-btn',
+                  disabled: disabled || props.wslBusy === true,
+                  title: '浏览 WSL 发行版里的 Linux 目录（Windows 原生选择器看不到这些目录）',
+                  onClick: function () { props.onOpenWsl(key) },
+                }, '选择 WSL 目录')
                 : null)
+            // 浏览框紧跟在输入框下面（同一个字段块里），而不是弹到页面另一处 ——
+            // 它是这一格的选择器，不是独立的对话框。
+            // 认的是草稿键（`p1.repo.path` 那种）不是卡片下标：同一张卡上可能有两格
+            // 都带目录选择器，光比下标会同时展开两个浏览框，而且宿主那边只留了最后一次
+            // 的目录内容 —— 两个框会显示同一份，看起来像点错了。key 天然唯一，直接用它。
+            if (props.wslWho !== null && props.wslWho !== undefined && props.wslWho.key === key) {
+              control = h('div', null, control,
+                h(WslBrowser, {
+                  distros: props.wslDistros || [],
+                  distro: props.wslWho.distro === undefined ? '' : props.wslWho.distro,
+                  listing: props.wslListing,
+                  busy: props.wslBusy === true,
+                  disabled: disabled,
+                  onDistro: function (name) { props.onWslDistro(key, name) },
+                  onHome: function () { props.onWslDistro(key, props.wslWho.distro) },
+                  onOpen: function (path) { props.onWslOpen(key, props.wslWho.distro, path) },
+                  onUp: function () {
+                    var here = props.wslListing && typeof props.wslListing.path === 'string' ? props.wslListing.path : ''
+                    if (here === '' || here === '/') return
+                    var cut = here.lastIndexOf('/')
+                    props.onWslOpen(key, props.wslWho.distro, cut <= 0 ? '/' : here.slice(0, cut))
+                  },
+                  onSelect: function () { props.onWslUse(key) },
+                  onClose: function () { props.onWslClose() },
+                }))
+            }
           } else {
             control = h('input', {
               className: 'tp-input',
@@ -3431,6 +3711,17 @@ window.__ModuleLoader__.load({
             branchNote: entry && entry.ok === false && entry.reason ? entry.reason : '',
             onPickDirectory: props.onPickDirectory,
             picking: props.picking === true,
+            // 「选择 WSL 目录」（2026-11-24）：同样只在拿得到通道时才画按钮 ——
+            // 画一个点了必然报「宿主没提供」的按钮，比如实说没有更糟。
+            onOpenWsl: props.onOpenWsl,
+            wslWho: props.wslWho,
+            wslDistros: props.wslDistros,
+            wslListing: props.wslListing,
+            wslBusy: props.wslBusy === true,
+            onWslDistro: props.onWslDistro,
+            onWslOpen: props.onWslOpen,
+            onWslUse: props.onWslUse,
+            onWslClose: props.onWslClose,
             onPasteLink: props.onPasteLink,
             linkBusy: props.linkBusy === index,
             linkMessage: props.linkMessage && props.linkMessage.index === index ? props.linkMessage.text : '',
@@ -3575,6 +3866,21 @@ window.__ModuleLoader__.load({
       // `probeResult[index]` 是 `{ ok, text }`：ok 决定那句话是绿还是红。
       var [testBusy, setTestBusy] = useState(-1)
       var [probeResult, setProbeResult] = useState({})
+
+      // 「选择 WSL 目录」（2026-11-24）的状态：哪一格在浏览、发行版清单、
+      // 当前那一层目录。
+      //
+      // 只留一份的原因是「同一时刻只可能展开一个浏览框」—— 按 index 各存一份
+      // 会让「切到另一张卡」时旧的那份残留在内存里，而它已经没人看得见了。
+      // `{ key, distro }` 为 null 表示没有字段在浏览。
+      //
+      // `key` 是草稿键（`p1.repo.path`），**不是卡片下标**：同一张卡上可能有两格
+      // 都带目录选择器，比下标会让两个框同时展开、却都显示宿主最后列的那一层。
+      var [wslWho, setWslWho] = useState(null)
+      var [wslDistros, setWslDistros] = useState(null)
+      var [wslListing, setWslListing] = useState(null)
+      var [wslBusy, setWslBusy] = useState(false)
+      var [wslError, setWslError] = useState('')
 
       // 折叠状态与「服务端拒绝后挂到字段上的错误」都按 key 存。
       // 当前页签：整页一次只摊开一块，其余收在页签标题里（见 TABS）。
@@ -4085,6 +4391,99 @@ window.__ModuleLoader__.load({
             var message = error && error.message ? error.message : String(error)
             setSaveError('打开目录选择器失败：' + message)
           })
+      }
+
+      /**
+       * 「选择 WSL 目录」：打开某张卡片的浏览框（2026-11-24）。
+       *
+       * 与 `onPickDirectory` 的分工：那个走 Windows 原生选择器（只看得到盘符），
+       * 这个走宿主自研的 WSL 浏览。两个入口并存是刻意的 —— 检出在 WSL 里的人
+       * 用原生选择器**永远找不到**自己的仓库。
+       *
+       * 打开就要先拿发行版清单：`\\wsl.localhost\` 这个根列不出来，清单只能问
+       * Windows（注册表 / `wsl.exe`），那是宿主的活。
+       */
+      function onOpenWslBrowser (key, current) {
+        var ns = getNamespace('ticketPipeline')
+        if (!ns || typeof ns.wslDistros !== 'function' || typeof ns.wslList !== 'function') {
+          setSaveError('宿主 Remote 没挂上「选择 WSL 目录」通道（typert 缺席或插件版本旧）。可以手打 \\\\wsl.localhost\\<发行版>\\... 路径。')
+          return
+        }
+        setWslError('')
+        setWslWho({ key: key })
+        setWslListing(null)
+        if (wslDistros !== null) { loadWslDirectoryFrom(key, defaultWslDistro(wslDistros), undefined); return }
+        setWslBusy(true)
+        Promise.resolve()
+          .then(function () { return ns.wslDistros() })
+          .then(function (response) {
+            setWslBusy(false)
+            if (!response || !response.ok) {
+              setWslError('读 WSL 发行版清单失败：' + ((response && response.error && response.error.message) || '未知错误'))
+              return
+            }
+            var value = response.value || {}
+            var list = Array.isArray(value.distros) ? value.distros : []
+            setWslDistros(list)
+            if (value.available !== true || list.length === 0) {
+              // 没装 WSL 是常态，不是错误。给一句人话 + 让人收起来。
+              setWslError(typeof value.note === 'string' && value.note.length > 0
+                ? value.note
+                : '这台机器上没有 WSL 发行版。要选 WSL 里的目录，先装一个发行版（`wsl --install`）；现在只能手打 Windows 路径。')
+              return
+            }
+            loadWslDirectoryFrom(key, defaultWslDistro(list), undefined)
+          }, function (error) {
+            setWslBusy(false)
+            setWslError('读 WSL 发行版清单失败：' + (error && error.message ? error.message : String(error)))
+          })
+      }
+
+      /** 清单里带 `default: true` 的那个；都没有就取第一个（注册表顺序有意义）。 */
+      function defaultWslDistro (list) {
+        for (var i = 0; i < list.length; i += 1) {
+          if (list[i] && list[i].default === true) return String(list[i].name)
+        }
+        return list.length > 0 && list[0] ? String(list[0].name) : ''
+      }
+
+      /**
+       * 列一层 WSL 目录。`path` 传 undefined 等于「这个发行版的 home」。
+       *
+       * 失败不抛：浏览框里显示一句人话就够，把异常抛到顶层只会让整个面板白屏。
+       */
+      function loadWslDirectoryFrom (key, distro, path) {
+        var ns = getNamespace('ticketPipeline')
+        if (!ns || typeof ns.wslList !== 'function' || typeof distro !== 'string' || distro.length === 0) return
+        setWslWho({ key: key, distro: distro })
+        setWslBusy(true)
+        setWslError('')
+        Promise.resolve()
+          .then(function () { return ns.wslList(distro, path) })
+          .then(function (response) {
+            setWslBusy(false)
+            if (!response || !response.ok) {
+              setWslError('列目录失败：' + ((response && response.error && response.error.message) || '未知错误'))
+              setWslListing(null)
+              return
+            }
+            setWslListing(response.value || null)
+          }, function (error) {
+            setWslBusy(false)
+            setWslListing(null)
+            setWslError('列目录失败：' + (error && error.message ? error.message : String(error)))
+          })
+      }
+
+      /** 浏览框里选中的那个目录 → 写进仓库路径草稿（**只改草稿，不 mutate**）。 */
+      function onUseWslTarget (key) {
+        var target = wslListing && typeof wslListing.target === 'string' ? wslListing.target : ''
+        if (target.length === 0) return
+        onProjectEdit(key, target)
+        setWslWho(null)
+        setWslListing(null)
+        // 换了路径，分支候选一定变了。取不到是常态，所以不 await、不报错。
+        try { setTimeout(function () { loadBranches() }, 0) } catch (error) {}
       }
 
       /**
@@ -4998,6 +5397,18 @@ window.__ModuleLoader__.load({
             pickDirectory: props.pickDirectory,
             picking: picking,
             onPickDirectory: typeof props.pickDirectory === 'function' ? onPickDirectory : undefined,
+            // 「选择 WSL 目录」：由宿主 Remote 合同决定，不是一个独立的宿主服务，
+            // 所以这里只能先把句柄传下去，按钮是否会真的出现 / 能不能点由
+            // `onOpenWslBrowser` 打开时再判（它拿不到通道会给一句手打提示）。
+            onOpenWsl: onOpenWslBrowser,
+            wslWho: wslWho,
+            wslDistros: wslDistros,
+            wslListing: wslListing,
+            wslBusy: wslBusy,
+            onWslDistro: function (key, distro) { loadWslDirectoryFrom(key, distro, undefined) },
+            onWslOpen: function (key, distro, path) { loadWslDirectoryFrom(key, distro, path) },
+            onWslUse: onUseWslTarget,
+            onWslClose: function () { setWslWho(null); setWslListing(null); setWslError('') },
             onPasteLink: onPasteLink,
             linkBusy: linkBusy,
             linkMessage: linkMessage,
